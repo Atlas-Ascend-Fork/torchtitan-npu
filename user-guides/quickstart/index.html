@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>快速上手 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "\u5feb\u901f\u4e0a\u624b";
+        var mkdocs_page_input_path = "user-guides/quickstart.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_cp/">DeepSeek-V4 上下文并行（CP）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">快速上手</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_2">数据准备</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#cann">配置 CANN 环境变量</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">启动训练任务</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#_4">单卡训练任务</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#8-ep8">单机 8 卡 EP8 训练任务</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#deepseek-v4-torchao-npu">DeepSeek-V4 TorchAO-NPU 低精度训练</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#deepseek-v41-torchao-npu">DeepSeek-V4.1 TorchAO-NPU 低精度训练</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#rank">排查启动报错：查看更多 rank 日志</a>
+    </li>
+        </ul>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+      <li class="breadcrumb-item active">快速上手</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="_1">快速上手</h1>
+<p>参考 <a href="../installation/">软件安装</a> 准备环境后，进入 <code>torchtitan-npu</code> 仓库根目录。除另有说明外，本文中的相对路径和命令均以仓库根目录为基准。本文先以 DeepSeek V3 说明通用启动方式，再给出 DeepSeek-V4/V4.1 多卡训练和 TorchAO-NPU 低精度训练入口。</p>
+<h2 id="_2">数据准备</h2>
+<ol>
+<li>使用仓库预置的 DeepSeek V3 Tokenizer，目录为 <code>tests/assets/deepseek_v3/</code>，单卡默认命令会直接使用该目录，无需额外下载。</li>
+</ol>
+<pre><code class="language-text">tests/assets/deepseek_v3/
+├── tokenizer.json
+└── tokenizer_config.json
+</code></pre>
+<p>如需使用其他 Tokenizer，可通过 <code>HF_ASSETS_PATH</code> 指定：</p>
+<pre><code class="language-bash">export HF_ASSETS_PATH=/path/to/tokenizer
+</code></pre>
+<ol>
+<li>准备数据集。</li>
+</ol>
+<p>已在 <code>tests/assets/c4_test/</code> 中预置 <code>c4_test</code> 测试数据集，示例 wrapper 默认使用该目录，无需额外下载。</p>
+<p>使用其他数据集时，需同时指定数据集名称和目录：</p>
+<pre><code class="language-bash">export DATASET=dataset_name
+export DATASET_PATH=/path/to/dataset
+</code></pre>
+<h2 id="cann">配置 CANN 环境变量</h2>
+<p>当 CANN 安装在其他目录时，推荐通过 <code>ASCEND_SET_ENV_PATH</code> 指定 <code>set_env.sh</code> 的路径，并将其传给脚本：</p>
+<pre><code class="language-bash">ASCEND_SET_ENV_PATH=/path/to/ascend-toolkit/set_env.sh \
+  bash scripts/run_train.sh
+</code></pre>
+<p>未设置该变量时，<code>scripts/run_train.sh</code> 会自动按以下顺序查找可用的 <code>set_env.sh</code>：</p>
+<pre><code class="language-text">/usr/local/Ascend/cann/set_env.sh
+/usr/local/Ascend/ascend-toolkit/set_env.sh
+/home/developer/Ascend/ascend-toolkit/set_env.sh
+</code></pre>
+<p>无需在当前 shell 中重复执行 <code>source</code>。</p>
+<h2 id="_3">启动训练任务</h2>
+<p>DeepSeek V3 单卡训练任务可直接使用 <code>scripts/run_train.sh</code> 启动。<code>scripts/run_train.sh</code> 默认使用 1 张 NPU 和 <code>deepseek_v3_debugmodel</code> 配置，并把额外命令行参数原样透传给训练入口。</p>
+<h3 id="_4">单卡训练任务</h3>
+<p>使用默认配置启动训练：</p>
+<pre><code class="language-bash">NGPU=1 \
+bash scripts/run_train.sh \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dataloader.dataset c4_test \
+  --dataloader.dataset-path tests/assets/c4_test \
+  --training.local-batch-size 1 \
+  --training.seq-len 2048 \
+  --training.steps 5
+</code></pre>
+<blockquote>
+<p>[!NOTE]
+示例 wrapper / 底层 launcher 配置项说明：
+- <code>ASCEND_SET_ENV_PATH</code>：可选，自定义 CANN <code>set_env.sh</code> 路径；设置后优先加载该文件。
+- <code>MODULE</code>：模型 Python 模块，默认为 <code>torchtitan.models.deepseek_v3</code>。
+- <code>CONFIG</code>：<code>torchtitan/models/deepseek_v3/config_registry.py</code> 中注册的配置函数，默认为 <code>deepseek_v3_debugmodel</code>。
+- <code>NGPU</code>：当前节点参与训练的 NPU 数量，默认为 <code>1</code>。
+- <code>HF_ASSETS_PATH</code>：Tokenizer 目录，默认为仓内 <code>tests/assets/deepseek_v3</code>。
+- <code>DATASET</code> 和 <code>DATASET_PATH</code>：数据集名称和目录，默认使用仓内的 <code>tests/assets/c4_test/</code>。
+- 脚本后的其他参数会原样传给 <code>torchtitan_npu.train</code>，可用于覆盖配置函数中的训练和并行参数。</p>
+</blockquote>
+<h3 id="8-ep8">单机 8 卡 EP8 训练任务</h3>
+<p>直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 <code>deepseek_v4_flash_43layers_16experts</code> 模型配置。运行前需准备与 DeepSeek-V4 配套的 Tokenizer，并将下面的 <code>HF_ASSETS_PATH</code> 替换为其实际目录：</p>
+<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5
+</code></pre>
+<p>DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 <a href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>。</p>
+<h3 id="deepseek-v4-torchao-npu">DeepSeek-V4 TorchAO-NPU 低精度训练</h3>
+<p>先按<a href="../installation/#4-安装-torchao-npu可选">软件安装</a>安装仓内适配包，或将
+<code>torchao_npu</code> 源码的父目录加入 <code>PYTHONPATH</code>。随后在普通训练命令后显式增加量化 CLI：</p>
+<blockquote>
+<p>[!NOTE]
+当前低精度训练仅支持 A5（Ascend 950）硬件。</p>
+</blockquote>
+<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V4-Flash \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5 \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8
+</code></pre>
+<p>源码方式示例：</p>
+<pre><code class="language-bash">python3 -m pip install torchao==0.17.0
+export PYTHONPATH=&quot;/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}&quot;
+</code></pre>
+<p>自定义目录必须直接包含 <code>torchao_npu/__init__.py</code>；使用仓内源码时，对应目录为
+<code>&lt;torchtitan-npu&gt;/experiments/torchao-npu</code>。单机和多机示例分别调用
+<code>scripts/run_train.sh</code> 和 <code>scripts/run_train_multinodes.sh</code>，脚本只透传量化 CLI。
+未设置
+<code>--extension.quantization.enable-quantized-training</code> 时，仍使用高精度训练。</p>
+<p>该入口复用 torchtitan 的预训练/续训练循环，并不表示已经提供 SFT 专用数据处理或训练入口。</p>
+<p>启用低精度训练时，每个节点需使用
+A5（Ascend 950）硬件，安装相同版本的 <code>torchao_npu</code> 及其依赖，并执行相同命令；
+<code>NODE_IPS</code> 的顺序决定节点 rank：</p>
+<pre><code class="language-bash">NODE_IPS=your_ip1,your_ip2,... \
+HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+CKPT_SAVE_LOAD_PATH=/path/to/save_ckpt \
+CKPT_INIT_LOAD_PATH=/path/to/init_load_ckpt \
+bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8 \
+  --training.steps 5
+</code></pre>
+<p>常用低精度配置如下，均位于 <code>--extension.quantization</code> 下；表中参数和布尔开关省略该公共前缀：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>选项</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>enable-quantized-training</code></td>
+<td><code>--enable-quantized-training</code> / <code>--no-enable-quantized-training</code></td>
+<td>启用或关闭低精度训练，默认关闭。</td>
+</tr>
+<tr>
+<td><code>recipe</code></td>
+<td><code>all_mxfp8</code>、<code>mix</code>、<code>all_block_fp8</code>、<code>all_hif8</code></td>
+<td>选择全 MXFP8、混合 MXFP8/Block FP8、全 Block FP8 或全 HiF8。</td>
+</tr>
+<tr>
+<td><code>enable-mxfp4-qat</code></td>
+<td><code>--enable-mxfp4-qat</code> / <code>--no-enable-mxfp4-qat</code></td>
+<td>为 routed expert 启用或关闭 MXFP4 QAT 约束，默认关闭。</td>
+</tr>
+<tr>
+<td><code>li-quantization</code></td>
+<td><code>fp8</code>、<code>mxfp8</code>、<code>mxfp4</code>、<code>hif8</code></td>
+<td>选择 LI Q/K 的量化类型，默认不启用；DeepSeek-V4.1 仅支持 <code>mxfp4</code>。</td>
+</tr>
+<tr>
+<td><code>kv-norm-quantization.format</code></td>
+<td><code>mxfp8</code></td>
+<td>启用 DeepSeek-V4 KV Cache 的 MXFP8 量化。</td>
+</tr>
+<tr>
+<td><code>enable-fsdp-prequantize</code></td>
+<td><code>--enable-fsdp-prequantize</code> / <code>--no-enable-fsdp-prequantize</code></td>
+<td>在 FSDP all-gather 前预量化 Block FP8 权重，减少通信量，默认关闭。</td>
+</tr>
+<tr>
+<td><code>fsdp-prequantize-fqns</code></td>
+<td>FQN 后缀模式列表（默认 <code>None</code>）</td>
+<td>仅在 <code>enable-fsdp-prequantize</code> 下生效。白名单内的权重保留预量化、其余显式关闭；<code>None</code> 用 recipe 默认白名单，显式空表与开关开启冲突会报 <code>ValueError</code>。命中权重的分片若不满足对齐约束，运行时立即报错终止（不静默回退），并给出移除该 FQN 或调整并行度的提示。</td>
+</tr>
+<tr>
+<td><code>enable-hif8-save-quant-codes</code></td>
+<td><code>--enable-hif8-save-quant-codes</code> / <code>--no-enable-hif8-save-quant-codes</code></td>
+<td>把 HiF8 量化矩乘算子（<code>npu_quantize</code>/<code>npu_dynamic_quant</code>/<code>npu_grouped_matmul</code>/<code>npu_quant_matmul</code>）结果保留在 selective activation checkpointing 保存边界内，backward 不再重新推导；仅在 <code>recipe=all_hif8</code> 时生效，默认关闭。</td>
+</tr>
+<tr>
+<td><code>save-block-ops-level</code></td>
+<td><code>0</code>-<code>3</code>（默认 <code>0</code>）</td>
+<td>把 attention / mHC / MoE-routing 相关 NPU 自定义算子加入 selective activation checkpointing 的 MUST_SAVE 列表，用显存换取 backward 更少重复计算。</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deepseek-v41-torchao-npu">DeepSeek-V4.1 TorchAO-NPU 低精度训练</h3>
+<p>DeepSeek-V4.1 复用上述 TorchAO-NPU 低精度入口，当前面向 A5（Ascend 950）硬件。Lightning Indexer 与稀疏 attention 量化的配置、组合、依赖和限制见<a href="../../feature_guides/low_precision_training/#deepseek-v41-li-与稀疏-attention-量化">低精度训练特性指南</a>。</p>
+<p>DeepSeek-V4.1 使用 <code>li-quantization=mxfp4</code> 启用 Lightning Indexer量化，使用
+<code>enable-sparse-attention-quantization</code> 启用 KV source Compressor 与稀疏 attention 量化。两项可在
+标准 A5 融合路径提供 BF16 fallback 的前提下独立选择；<code>USE_GOLDEN=1</code> 不提供这些
+fallback。启动日志中出现
+<code>Applied TorchAO-NPU recipe=...</code> 表示 recipe 已应用。</p>
+<p>DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：</p>
+<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V41_tokenizer \
+bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh
+</code></pre>
+<p>DeepSeek-V4.1 模型做 QAT 训练可运行以下脚本。该入口同时启用 routed expert MXFP4
+fake quant、Lightning Indexer 和稀疏 attention/KV source Compressor 量化：</p>
+<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V41_tokenizer \
+bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_qat_4k_a5.sh
+</code></pre>
+<h3 id="rank">排查启动报错：查看更多 rank 日志</h3>
+<blockquote>
+<p>[!TIP]
+<code>scripts/run_train.sh</code> 默认只在控制台打印 <code>LOG_RANK=0</code>，即 rank 0 的日志。多卡任务异常退出但控制台没有具体 Python 报错时，可指定需要打印的 rank 后重新运行：</p>
+<p><code>bash
+export LOG_RANK=0,1,2,3</code></p>
+<p>排查完成后，可执行 <code>unset LOG_RANK</code> 恢复默认设置。</p>
+</blockquote>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../installation/" class="btn btn-neutral float-left" title="软件安装"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../sdc/" class="btn btn-neutral float-right" title="静默数据损坏检测（SDC）">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../installation/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../sdc/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

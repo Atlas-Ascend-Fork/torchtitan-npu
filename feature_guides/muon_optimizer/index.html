@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DeepSeek-V4 Muon 优化器 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DeepSeek-V4 Muon \u4f18\u5316\u5668";
+        var mkdocs_page_input_path = "feature_guides/muon_optimizer.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_cp/">DeepSeek-V4 上下文并行（CP）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DeepSeek-V4 Muon 优化器</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">当前方案</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#muon">如何使用 Muon</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#hsdp-replica-dedup">HSDP replica dedup</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#swap">如何开启 swap</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">能力边界</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">DeepSeek-V4 Muon 优化器</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="deepseek-v4-muon">DeepSeek-V4 Muon 优化器</h1>
+<p>本文说明当前实现中的 Muon 方案、使用方法和能力边界。实现以 TorchTitan 上游
+<code>DistMuon</code>/FlexShard 为核心；上游的 <code>ComputeLayout</code>、<code>Owned</code>、<code>BlockShard</code>、bucket
+和 storage-to-compute 语义参见 <a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/flex_shard/README.md">TorchTitan FlexShard README</a>。</p>
+<h2 id="_1">当前方案</h2>
+<p>DSV4 使用混合优化器容器：匹配 Muon 规则的二维矩阵参数交给 <code>DistMuon</code>，其余参数交给
+AdamW。<code>torchtitan_npu/models/deepseek_v4/config_registry.py</code> 中的
+<code>_dsv4_optimizer_config()</code> 提供常规 DSV4 optimizer schema；
+<code>_dsv4_muon_profile()</code> 提供参数匹配、FlexShard compute layout 和 bucket 元数据。
+<code>--optimizer.name Muon</code> 才 materialize 出 DistMuon 与 AdamW fallback 两组。</p>
+<p>Muon 覆盖 attention 投影、compressor/indexer 投影、shared/routed experts、router、
+mHC 的 <code>hc_fn</code> 和全局 <code>hc_head.hc_fn</code>，以及对应的二维 <code>ape</code> 参数。embedding、输出头、
+归一化和其他 1D 参数落入 AdamW 组。</p>
+<p>DSV4 recipe 的默认 Muon 参数为：</p>
+<pre><code class="language-text">momentum=0.95
+weight_decay=0.1
+ns_steps=10
+adjust_lr_fn=&quot;match_rms_adamw&quot;
+foreach=False
+</code></pre>
+<p>Muon 与 AdamW fallback 当前共用 <code>--optimizer.lr</code>，没有独立 <code>muon_lr</code> 字段；
+<code>--optimizer.muon_momentum</code>、<code>--optimizer.muon_ns_steps</code> 和
+<code>--optimizer.muon_adjust_lr_fn</code> 可以分别覆盖。</p>
+<h2 id="muon">如何使用 Muon</h2>
+<p>使用常规 <code>deepseek_v4_flash_43layers_16experts</code> recipe，并显式选择 Muon。以下是单机
+8 卡的直接启动命令；swap override 也是显式列出，而非 recipe 隐式启用：</p>
+<pre><code class="language-bash">MODULE=torchtitan_npu.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_43layers_16experts \
+NGPU=8 \
+bash scripts/run_train.sh \
+  --hf-assets-path /path/to/DeepSeekV4_tokenizer \
+  --dataloader.dataset c4_test \
+  --dataloader.dataset-path tests/assets/c4_test \
+  --parallelism.spmd-backend spmd_types \
+  --parallelism.data-parallel-shard-degree 8 \
+  --parallelism.data-parallel-replicate-degree 1 \
+  --parallelism.expert-parallel-degree 8 \
+  --parallelism.tensor-parallel-degree 1 \
+  --parallelism.context-parallel-degree 1 \
+  --parallelism.pipeline-parallel-degree 1 \
+  --training.local-batch-size 1 \
+  --training.global-batch-size -1 \
+  --training.seq-len 4096 \
+  --training.steps 100 \
+  --optimizer.name Muon \
+  --optimizer.lr 2.2e-4 \
+  --optimizer.weight_decay 0.1 \
+  --optimizer.muon_momentum 0.95 \
+  --optimizer.muon_enable_nesterov \
+  --optimizer.muon_ns_steps 10 \
+  --optimizer.muon_adjust_lr_fn match_rms_adamw \
+  --debug.no-moe-force-load-balance \
+  --checkpoint.no-enable \
+  --override.imports \
+    torchtitan_npu.override.common.rms_norm.asc \
+    torchtitan_npu.override.common.rope.asc_complex \
+    torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata \
+    torchtitan_npu.override.deepseek_v4.sparse_attn.asc \
+    torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \
+    torchtitan_npu.override.common.token_dispatcher.asc \
+    torchtitan_npu.override.common.optimizer.swap_optimizer
+</code></pre>
+<p>DeepSeek-V4 示例脚本默认使用 Muon，并固定同一组 Muon 与 swap 参数。</p>
+<p>当前只验证并支持 TP=1、PP=1；routed experts 的 layout 同时声明 DP shard、EFSDP 和
+EP，以兼容当前 EP=8/EP=1 的 storage mesh。</p>
+<h2 id="hsdp-replica-dedup">HSDP replica dedup</h2>
+<p>HSDP 的 <code>dp_replicate</code> 轴保存相同的本地参数分片。开启 replica dedup 后，DistMuon 为每个
+参数 FQN 在该轴上选择一个确定的 owner；只有 owner 保留并更新该参数的 Muon momentum，随后将
+更新后的本地参数分片异步 broadcast 给同一 replica group 的其他坐标。该路径减少重复的
+storage-to-compute、Newton--Schulz 和参数更新计算，同时不改变模型参数的 storage layout。</p>
+<p>该功能仅作用于 <code>DistMuon</code>，默认关闭。使用 HSDP 且显式启用 Muon 时，在启动参数中增加：</p>
+<pre><code class="language-text">--optimizer.muon-enable-hsdp-replica-dedup
+</code></pre>
+<p>不使用 HSDP，或未启用该开关时，DistMuon 保持原有行为。DCP 保存和恢复沿用常规 checkpoint
+配置，无需增加 dedup 专用 checkpoint 参数。</p>
+<h2 id="swap">如何开启 swap</h2>
+<p>swap 是显式 opt-in override，不存在 <code>swap_optimizer=true</code> 配置字段。在同一条命令的
+<code>--override.imports</code> 末尾增加：</p>
+<pre><code class="language-text">torchtitan_npu.override.common.optimizer.swap_optimizer
+</code></pre>
+<p><code>swap_optimizer</code> 与
+<code>torchtitan_npu.override.common.optimizer.virtual</code>（Virtual Optimizer）都替换
+<code>OptimizersContainer.Config</code>，不能同时启用。使用 Muon state swap 时，
+<code>override.imports</code> 中不得包含 Virtual Optimizer；需要 Virtual Optimizer 时则移除
+<code>swap_optimizer</code>。</p>
+<p>swap 将 optimizer state 置于 NovaSwap 管理的 CPU/NPU 生命周期中。PyTorch 仍在首次梯度
+更新时懒创建 optimizer state；swap 不会在模型初始化阶段预分配完整 state storage。Muon
+和 AdamW 使用不同的唯一 swap name，因此多个 optimizer 实例不会互相覆盖 state。</p>
+<p>Muon 的 <code>momentum_buffer</code> 首次创建后注册为 NovaSwap tensor 并执行 D2H。后续 step 按
+FlexShard bucket 调度：</p>
+<ol>
+<li>FlexShard 准备执行一个 redistributed bucket 的 storage-to-compute enqueue 时，swap
+   在 prefetch stream 上为该 bucket 的 <code>redistributed_items</code> 和 <code>unredistributed_items</code>
+   提交 H2D。</li>
+<li>每个 tensor 到达 <code>_prepare_local()</code> 时仍执行 <code>WAIT_DEVICE</code>，随后由上游更新 momentum。
+   H2D 提前提交不改变 tensor 的消费依赖。</li>
+<li>transfer stream 完成该 bucket 的 prepare、pack 和 inbound <code>all_to_all_single</code> 提交后，
+   swap 在同一 transfer stream 上提交该 bucket 已更新 redistributed momentum 的 D2H。
+   NovaSwap 的 offload stream 因而等待 transfer-stream event；D2H 不会抢在该 bucket 的
+   inbound A2A 前提交。</li>
+<li>caller stream 等待 <code>compute_input_ready</code> 后执行 Newton--Schulz。FlexShard 可以在
+   caller stream 计算前一个 bucket 时预取后一个 bucket 的 H2D 和 inbound A2A。</li>
+</ol>
+<p><code>unredistributed_items</code> 不进入 storage-to-compute A2A。它们在 caller stream 上执行
+<code>_prepare_local()</code>、Muon 计算和参数更新，随后沿现有单 tensor 路径提交 D2H。</p>
+<p>AdamW 的 <code>exp_avg</code>、<code>exp_avg_sq</code>（AMSGrad 时还包括 <code>max_exp_avg_sq</code>）按 bucket 拼成连续
+flat state。每个 bucket 执行 H2D、<code>WAIT_DEVICE</code>、上游 AdamW 更新和 D2H，并在当前 bucket
+更新前提交下一个 bucket 的 H2D。</p>
+<p>开启 swap 之后，checkpoint 的存储和加载支持同步模式和基于 CPU snapshot 的异步模式 <code>async</code>，暂不支持
+<code>async_with_pinned_mem</code>。</p>
+<h2 id="_2">能力边界</h2>
+<p>当前方案适合 DSV4 单机 8 卡、TP/PP=1、EP/DP-shard 并行的实验和训练。尚未证明：</p>
+<ul>
+<li>TP&gt;1 或 PP&gt;1 的 DistMuon；</li>
+<li><code>async_with_pinned_mem</code>、跨 world size 恢复及更复杂并行拓扑下的 swap checkpoint；</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../mtp/" class="btn btn-neutral float-left" title="DeepSeek-V3.2 / DeepSeek-V4 MTP"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../sdc/" class="btn btn-neutral float-right" title="静默数据损坏检测（SDC）">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../mtp/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../sdc/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
