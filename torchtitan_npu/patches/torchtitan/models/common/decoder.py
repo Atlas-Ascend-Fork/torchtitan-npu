@@ -79,7 +79,13 @@ def _get_attention_metadata(
     exactly as upstream.
     """
     attention_metadata: dict[Any, Any] = {}
-    for layer_config in self.config.layers:
+    # MTP depths are layers too: a decoder that keeps them in their own config list (upstream's
+    # ``MTPDecoder.Config.mtp_layers``) runs attention backends whose geometries the map has to
+    # cover, and with one entry per geometry a depth whose ratio no main layer pools at would
+    # otherwise have no entry at all.
+    for layer_config in (
+        layer for layers in (self.config.layers, getattr(self.config, "mtp_layers", None) or []) for layer in layers
+    ):
         traverse = getattr(layer_config, "traverse", None)
         if traverse is None:
             continue

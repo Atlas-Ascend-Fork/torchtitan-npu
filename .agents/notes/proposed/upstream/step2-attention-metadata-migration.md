@@ -35,11 +35,13 @@
 - 删除模型里构造期 warn-once 与 `reads_asc_metadata` ClassVar（几何来自同一份配置后不再需要）。
 - 验证：`tests/unit_tests/override/deepseek_v4_1/test_asc_metadata_reuse.py`、`test_lightning_indexer_fused.py`、`tests/unit_tests/models/deepseek_v4_1/`。
 
-### 2c. V4
-- `models/deepseek_v4/metadata.py`：`CompressedVarlenMetadata` 增 records；`build_compressed_varlen_metadata` 保持为共享契约构建，算子记录由 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 产出（原 `_fill_asc_metadata` 的四个算子 + `_mark_dynamic`）。
-- `override/deepseek_v4/sparse_attn/ascendc.py`：删 `AscMetadataExtension`、`AscLightningIndexerMetadata`、`AscCompressedVarlenMetadata`；消费侧 `metadata.asc_plans[ratio]` → records 查找。
-- MTP batch 准备（`prepare_mtp_batch`）迁到模型的 `preprocess_inputs` override（上游 #4116 的模型侧钩子）。
-- 验证：`tests/unit_tests/models/deepseek_v4/`、`tests/unit_tests/override/deepseek_v4/`、`tests/unit_tests/models/deepseek_v4/test_cp_dispatch.py`。
+### 2c. V4 — 已落地
+- `models/deepseek_v4/metadata.py`：一条 entry 一个几何 —— `plans: dict[ratio, …]` 换成 `ratio` + `plan`；`build_compressed_varlen_metadata(varlen, ratio, *, window_size)` 只建这个几何的 plan，`_build_plan` 是单 ratio 的私有 builder；没有 `plan_for`（层直接读自己的 `plan`），也没有 `cu_seq_q_host` / `seq_len_host`（用上游 `VarlenMetadata` 的字段与 `max_k`）；参考契约的 `prepare_cp_metadata` 直接拒绝 CP（与 V4.1 的参考栈一致）。
+- `models/deepseek_v4/attention.py`：`CompressedSparseInnerAttention.Config.attention_metadata_key = (type(self), compress_ratio)`，`build_attention_metadata` 只建这一份 plan（selector 的记录不是它的业务）；`Attention.attention_metadata_key` 透传到 core。
+- `override/deepseek_v4/sparse_attn/ascendc.py`：删 `AscMetadataExtension`；`AscV4Metadata`（新 `override/deepseek_v4/metadata.py`）带 `asc` 记录 + `AicpuGeometry`，其 `prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`（`build_cp_row` + `build_cp_block_plan`）重建 rank-local plan，再在其上 `build_aicpu_metadata` 重填记录；`AscCompressedSparseInnerAttention.Config` 的 `num_heads` / `head_dim` / `index_num_heads` / `index_head_dim` 是**必填**字段，由 `sparse_attn.asc` / `pypto` 的参数写入（默认 V4-Flash 形状；`head_dim` 恒为 512，recipe 不再重复），`window_size` / `index_topk` 读层自己的 model config 字段。量化的 selector 是独立 backend（`torchao_npu` 实验包），自建 entry 并拒绝 CP 重切，port 不感知量化。
+- `models/deepseek_v4/model.py`：删 `build_attention_masks` / `_build_cp_metadata`；MTP batch 准备迁到 `preprocess_inputs`（全局行上 roll、再按同一 load balancer 切分），并对 map 的每条 entry 施加一次 `MetadataExtension`。
+- `patches/.../decoder.py`：`_get_attention_metadata` 的遍历补上 `mtp_layers`（MTP 深度也是层；pro 的主层没有 ratio 1 几何，缺了会直接报没有 entry）。
+- 验证：`tests/unit_tests/models/deepseek_v4/`、`tests/unit_tests/override/deepseek_v4/`、`tests/unit_tests/extensions/experiment/cv_parallel/` 全绿；950（A5 单卡、CANN 9.2.0/20261016）deepseek_v4_debugmodel 20 step、seed 42、deterministic：`master d81d1833` vs 本分支 loss / grad_norm 等 6 个数值 tag **逐 step 位一致**（各 2 次重跑亦一致）。
 
 ### 2d. 收尾
 - `extensions/adaptor/torchao/converter.py`：量化 LI provider 改为**注册 record builder**，不再 subclass `LightningIndexerMetadata`。

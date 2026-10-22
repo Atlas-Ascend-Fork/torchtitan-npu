@@ -27,9 +27,10 @@ _WINDOW, _SCALE, _TOPK = 8, 0.25, 8
 
 
 def _metadata(dsv4, cu):
+    """One entry per geometry, the way each layer's own config builds it."""
     longest = int((cu[1:] - cu[:-1]).max())
     varlen = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=longest, max_k=longest)
-    return dsv4.metadata.build_compressed_varlen_metadata(varlen, _RATIOS)
+    return {ratio: dsv4.metadata.build_compressed_varlen_metadata(varlen, ratio) for ratio in _RATIOS}
 
 
 def _core(dsv4, ratio, *, return_lse=False):
@@ -57,10 +58,11 @@ def _inputs(ratio, cu, seed=0):
 
 def _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp):
     """The HCA rule spelled out again: own document, whole groups, causally complete."""
-    starts = metadata.plans[ratio].cu_seqlens_cmp_k
-    documents = torch.searchsorted(metadata.varlen.cu_seq_q[1:], torch.arange(seqlen), right=True)
+    entry = metadata[ratio]
+    starts = entry.plan.cu_seqlens_cmp_k
+    documents = torch.searchsorted(entry.varlen.cu_seq_q[1:], torch.arange(seqlen), right=True)
     doc_start = starts[documents]
-    local = torch.arange(seqlen) - metadata.varlen.cu_seq_q[documents]
+    local = torch.arange(seqlen) - entry.varlen.cu_seq_q[documents]
     ends = torch.minimum(starts[documents + 1], doc_start + (local + 1) // ratio)
     slots = torch.arange(n_cmp).unsqueeze(0)
     visible = (slots >= doc_start.unsqueeze(1)) & (slots < ends.unsqueeze(1))
@@ -78,13 +80,13 @@ def test_the_core_reads_only_the_packed_offsets(dsv4):
         torch.randn(1, seqlen, 4, 8),
         torch.randn(1, seqlen // 4, 8),
         torch.randn(1, seqlen, 4),
-        common.varlen.cu_seq_q,
-        common.plans[4].cu_seqlens_cmp_k,
+        common[4].varlen.cu_seq_q,
+        common[4].plan.cu_seqlens_cmp_k,
         _TOPK,
     )
 
     with torch.no_grad():
-        out = _core(dsv4, 4)(q, swa_k, cmp_k, attn_sink=sink, sparse_indices=picks, attention_masks=common)
+        out = _core(dsv4, 4)(q, swa_k, cmp_k, attn_sink=sink, sparse_indices=picks, attention_metadata=common[4])
 
     assert out.shape == (1, seqlen, 3, HD) and torch.isfinite(out).all()
 
@@ -96,9 +98,8 @@ def test_hca_slots_stay_inside_the_query_document(dsv4):
     seqlen, ratio = int(cu[-1]), 128
     n_cmp = seqlen // ratio
 
-    local = _core(dsv4, ratio)._slots(
-        None, metadata.varlen.cu_seq_q, metadata.plans[ratio].cu_seqlens_cmp_k, seqlen, n_cmp
-    )
+    entry = metadata[ratio]
+    local = _core(dsv4, ratio)._slots(None, entry.varlen.cu_seq_q, entry.plan.cu_seqlens_cmp_k, seqlen, n_cmp)
 
     assert torch.equal(local, _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp))
 
@@ -111,8 +112,10 @@ def test_the_teacher_exit_is_reserved_and_inert(dsv4):
     q, swa_k, cmp_k, sink = _inputs(128, cu)
 
     with torch.no_grad():
-        plain = _core(dsv4, 128)(q, swa_k, cmp_k, attn_sink=sink, attention_masks=metadata)
-        with_lse, lse = _core(dsv4, 128, return_lse=True)(q, swa_k, cmp_k, attn_sink=sink, attention_masks=metadata)
+        plain = _core(dsv4, 128)(q, swa_k, cmp_k, attn_sink=sink, attention_metadata=metadata[128])
+        with_lse, lse = _core(dsv4, 128, return_lse=True)(
+            q, swa_k, cmp_k, attn_sink=sink, attention_metadata=metadata[128]
+        )
 
     assert torch.equal(plain, with_lse)
     assert lse.shape == (1, 3, seqlen) and torch.isfinite(lse).all()

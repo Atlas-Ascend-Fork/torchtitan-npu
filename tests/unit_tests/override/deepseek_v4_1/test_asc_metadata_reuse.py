@@ -31,7 +31,7 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
     tiny_v41_model,
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.common.metadata_extension import register_pytree_node_for_dataclass
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
@@ -449,10 +449,9 @@ def test_the_metadata_flatten_through_the_pytree_registry(monkeypatch):
     row_leaves, _ = tree_flatten(row)
     assert row_leaves == [row]
     # Idempotent: the module-level registrations already ran at import.
-    register_pytree_node_for_dataclass(AscV41Metadata)
-    register_pytree_node_for_dataclass(KernelFrame)
-    register_pytree_node_for_dataclass(AicpuGeometry)
-    register_pytree_node_for_dataclass(AicpuMetadata)
+    for node in (AscV41Metadata, KernelFrame, AicpuGeometry, AicpuMetadata):
+        if node not in SUPPORTED_NODES:
+            register_dataclass(node, serialized_type_name=f"{node.__module__}.{node.__name__}")
 
 
 def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):

@@ -31,13 +31,13 @@ class QuantizedLightningIndexerInputs:
     cmp_residual_k: torch.Tensor
 
 
-def quantized_lightning_indexer_forward(self, idx_q, idx_k, idx_w, *, attention_masks):
+def quantized_lightning_indexer_forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
     """Run the quantized LI kernel using a host-provided input adapter."""
 
     config = self._torchao_npu_module_swap_config
     if config.input_adapter is None:
         raise RuntimeError("Quantized LI requires a host input adapter")
-    inputs = config.input_adapter(self, idx_q, idx_k, idx_w, attention_masks)
+    inputs = config.input_adapter(self, idx_q, idx_k, idx_w, attention_metadata)
     sparse_indices, _ = quant_lightning_indexer(
         inputs.query,
         inputs.key,

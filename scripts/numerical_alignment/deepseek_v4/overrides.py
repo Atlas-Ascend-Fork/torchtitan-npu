@@ -10,9 +10,7 @@ GOLDEN_OVERRIDES = ("torchtitan_npu.override.common.rope.workaround",)
 TEST_OVERRIDES = (
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.rope.asc_complex",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",

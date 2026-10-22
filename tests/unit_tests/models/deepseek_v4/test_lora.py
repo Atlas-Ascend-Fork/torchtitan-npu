@@ -14,6 +14,7 @@ from torchtitan_npu.models import deepseek_v4 as dsv4
 from torchtitan_npu.models.deepseek_v4 import lora, parallelize as dsv4_parallelize
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
+from tests.unit_tests.models.mtp_test_utils import preprocess
 
 
 @pytest.fixture
@@ -203,11 +204,7 @@ def test_registry_model_forward_backward_freezes_base_and_differentiates_adapter
     model.init_states()
     model = spec.parallelize_fn(model, **parallelize_kwargs)
     inputs = torch.arange(128).reshape(1, 128)
-    inputs, _, kwargs = model.build_attention_masks(
-        inputs,
-        inputs,
-        {"positions": torch.arange(128).reshape(1, 128)},
-    )
+    inputs, _, kwargs = preprocess(model, inputs, inputs, torch.arange(128).reshape(1, 128))
     output = model(inputs, **kwargs)
     assert torch.isfinite(output).all()
     output.float().square().mean().backward()

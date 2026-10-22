@@ -26,7 +26,7 @@ _PICKS = torch.tensor([[0, 1]] * _DOC + [[0, -1]] * _DOC + [[1, -1]] * _DOC, dty
 
 def _metadata(dsv4):
     varlen = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=_DOC, max_k=_DOC)
-    return dsv4.metadata.build_compressed_varlen_metadata(varlen, (_RATIO,))
+    return dsv4.metadata.build_compressed_varlen_metadata(varlen, _RATIO)
 
 
 def _inputs(seqlen, seed=0):
@@ -40,7 +40,7 @@ def _inputs(seqlen, seed=0):
 
 def _rescore(dsv4, metadata, idx_q, idx_k, idx_w, picks):
     return dsv4.compressor.student_logits_at_picks(
-        idx_q, idx_k, idx_w, picks, metadata.varlen.cu_seq_q, metadata.plans[_RATIO].cu_seqlens_cmp_k
+        idx_q, idx_k, idx_w, picks, metadata.varlen.cu_seq_q, metadata.plan.cu_seqlens_cmp_k
     )
 
 
@@ -48,7 +48,7 @@ def test_student_logits_rescore_a_document_local_selection(dsv4):
     """Each pick is read as its own document's entry, not as a row-wide one."""
     metadata = _metadata(dsv4)
     seqlen = int(_CU[-1])
-    starts = metadata.plans[_RATIO].cu_seqlens_cmp_k
+    starts = metadata.plan.cu_seqlens_cmp_k
     idx_q, idx_k, idx_w = _inputs(seqlen)
 
     scores = _rescore(dsv4, metadata, idx_q, idx_k, idx_w, _PICKS)

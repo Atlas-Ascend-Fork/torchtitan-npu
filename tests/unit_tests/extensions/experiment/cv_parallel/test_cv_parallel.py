@@ -27,7 +27,11 @@ from torchtitan_npu.extensions.experiment.cv_parallel.cv_parallel import (
     event_frontiers,
     materialize,
 )
+from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
+    chunk_attention_metadata,
+)
 from torchtitan_npu.extensions.experiment.cv_parallel.schedule_calibration import build_profile_schedule
+from torchtitan_npu.override.deepseek_v4.metadata import AscV4Metadata
 from torchtitan_npu.extensions.experiment.cv_parallel.whole_graph_runtime_profile import (
     RankLocalProfileCosts,
     assign_stable_node_tags,
@@ -885,21 +889,24 @@ def test_npu_reorder_retains_window_and_effect_boundaries(rms_reorder_window, co
 
 
 @pytest.mark.parametrize(
-    "shared_qk,chunk_only_metadata,quantized",
-    [(False, False, False), (True, True, False), (True, False, True)],
-    ids=["separate_qk", "shared_qk_extra_roles", "fp8_li"],
+    "shared_qk,chunk_only_metadata",
+    [(False, False), (True, True)],
+    ids=["separate_qk", "shared_qk_extra_roles"],
 )
 def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
-    dsv4, shared_qk, chunk_only_metadata, quantized, monkeypatch
+    dsv4, shared_qk, chunk_only_metadata, monkeypatch
 ):
+    import dataclasses
+
     from torchtitan.config.override import apply_overrides
     from torchtitan.models.common.attention import VarlenMetadata
 
-    from torchtitan_npu.models.common.metadata_extension import MetadataExtension
+    from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
+        _batch_chunk_metadata,
+    )
     from torchtitan_npu.models.deepseek_v4.config_registry import (
         graph_trainer_deepseek_v4_debugmodel,
     )
-    from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
     from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 
     li_calls = []
@@ -919,58 +926,42 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
 
         monkeypatch.setattr(ascendc, "sparse_flash_mla_metadata", optional_smla_metadata)
 
+    # The fused stack: the core's own config builds the records.
     config = graph_trainer_deepseek_v4_debugmodel()
-    config.override.imports.extend(
-        (
-            "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata",
-            "torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata.asc_metadata",
-        )
+    # The record geometry is the port's own, so selecting the port states it.
+    config.override.imports.append(
+        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"num_heads": 16, "index_num_heads": 8})
     )
-    config.model_spec.model.metadata_extension = MetadataExtension.Config(
-        window_size=128,
-        num_heads=16,
-        head_dim=512,
-        index_n_heads=8,
-        index_head_dim=128,
-        index_topk=512,
-    )
-    cu_seq = torch.tensor([0, 128, 256], dtype=torch.int32)
-    varlen = VarlenMetadata(
-        cu_seq_q=cu_seq,
-        cu_seq_k=cu_seq if shared_qk else cu_seq.clone(),
-        max_q=128,
-        max_k=128,
-    )
-
-    if quantized:
-        pytest.importorskip("torchao_npu")
-        from torchtitan_npu.extensions.adaptor.torchao import converter as torchao_converter
-        from torchtitan_npu.config.configs import QuantizationExtensionConfig
-
-        monkeypatch.setattr(torchao_converter, "_npu_quantized_module_cache", {})
-        monkeypatch.setattr(dsv4.cann_ops, "quant_lightning_indexer_metadata", record_li_metadata, raising=False)
-        config.model_spec = torchao_converter.apply_quantization_converter(
-            config.model_spec,
-            QuantizationExtensionConfig(enable_quantized_training=True, recipe="all_block_fp8", li_quantization="fp8"),
-            model_compile_enabled=False,
-        )
+    # The sharding pass the fused override asserts on runs at config
+    # resolution, as it does in the trainer (upstream asks for exactly this).
+    config.model_spec.model.update_from_config(config=config)
     apply_overrides(config.override, config)
-    # Bypass weight construction and distributed Trainer initialization only;
-    # retain config selection, the post-init hook and the model metadata path.
-    model = SimpleNamespace(
-        _lightning_indexer_metadata=config.model_spec.model.lightning_indexer_metadata.build(),
-        _metadata_extension=config.model_spec.model.metadata_extension.build(),
-        compress_ratios=(1, 4, 128),
-        get_attention_masks=lambda **kwargs: varlen,
+
+    # Two documents of 128 tokens.  The map holds one entry per geometry, so this case takes
+    # the ratio-4 layer's own entry: that is the geometry the LI record belongs to.
+    positions = torch.cat([torch.arange(128), torch.arange(128)]).unsqueeze(0)
+    core_config = next(
+        layer.attention.compressed_sparse_attention.inner_attention
+        for layer in config.model_spec.model.layers
+        if layer.attention.compressed_sparse_attention.inner_attention.compress_ratio == 4
     )
-    trainer = SimpleNamespace(
-        model_parts=[model],
-        _make_fx_forward_backward_step=lambda *args: None,
-        _prepare_trace_inputs=lambda *args: None,
-    )
-    POST_INIT_HOOKS["cv_parallel"](trainer)
-    _, _, kwargs = DeepSeekV4Model.build_attention_masks(model, None, None, {})
-    metadata = kwargs["attention_masks"]
+    metadata = core_config.build_attention_metadata(positions)
+    assert metadata.ratio == 4
+    if not shared_qk:
+        # A stack whose q/k boundaries are distinct (but equal) tensors: the
+        # local re-cut has to keep both roles apart.
+        varlen = metadata.varlen
+        metadata = dataclasses.replace(
+            metadata,
+            varlen=VarlenMetadata(
+                cu_seq_q=varlen.cu_seq_q,
+                cu_seq_k=varlen.cu_seq_q.clone(),
+                max_q=varlen.max_q,
+                max_k=varlen.max_k,
+                cu_seq_q_host=varlen.cu_seq_q_host,
+            ),
+        )
+    metadata = _batch_chunk_metadata(metadata)
 
     assert metadata.varlen.cu_seq_q.tolist() == [0, 128, 256]
     assert (metadata.varlen.cu_seq_k is metadata.varlen.cu_seq_q) == shared_qk
@@ -983,26 +974,28 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
         assert call["cu_seqlens_q"].tolist() == q_bounds
         assert call["cu_seqlens_k"].tolist() == k_bounds
         assert (call["layout_q"], call["layout_k"], call["mask_mode"], call["cmp_ratio"]) == ("TND", "TND", 3, 4)
-    assert metadata.plans[4].li_metadata is metadata.asc_plans[4].li_metadata
-    assert metadata.plans[4].li_metadata.tolist() == [int(quantized), 256]
+    assert metadata.asc.lightning_indexer.fwd.tolist() == [0, 256]
     for chunk_id, tensors in enumerate(metadata.batch_chunk_tensors):
         fields = {value._npu_chunk_cv_metadata_pair: value for value in tensors}
         assert fields["varlen.cu_seq_q", chunk_id].tolist() == [0, 128]
         assert (("varlen.cu_seq_k", chunk_id) in fields) != shared_qk
         if not shared_qk:
             assert fields["varlen.cu_seq_k", chunk_id].tolist() == [0, 128]
-        for ratio in (1, 4, 128):
-            assert ((f"asc_plans.{ratio}.smla_metadata", chunk_id) in fields) != chunk_only_metadata
-            assert (f"asc_plans.{ratio}.smla_grad_metadata", chunk_id) in fields
-        assert ("asc_plans.4.li_metadata", chunk_id) in fields
-        assert fields["asc_plans.4.li_metadata", chunk_id].tolist() == [int(quantized), 128]
+        # One entry is one geometry: the chunk re-cut carries this geometry's record set, and
+        # the role names are geometry-free because the ratio is part of the metadata.
+        assert (("asc.sparse_attn.fwd", chunk_id) in fields) != chunk_only_metadata
+        assert ("asc.sparse_attn.bwd", chunk_id) in fields
+        assert ("asc.lightning_indexer.fwd", chunk_id) in fields
+        assert fields["asc.lightning_indexer.fwd", chunk_id].tolist() == [0, 128]
 
-    if quantized:
-        consumer = SimpleNamespace(_torchao_npu_module_swap_config=SimpleNamespace(cmp_ratio=4), index_topk=512)
-        prepared = torchao_converter._prepare_quant_lightning_indexer_inputs(
-            consumer, torch.empty(2, 128, 8, 128), torch.empty(2, 32, 128), torch.empty(2, 128, 8), metadata
-        )
-        assert prepared.metadata is metadata.plans[4].li_metadata
-        assert prepared.metadata._npu_chunk_cv_metadata_pair == ("asc_plans.4.li_metadata", -1)
-        assert prepared.cu_seqlens_q.tolist() == [0, 128, 256]
-        assert prepared.cu_seqlens_k.tolist() == [0, 32, 64]
+
+def test_chunk_attention_metadata_refuses_other_record_tiers():
+    """A quantized selector's entry is its own backend's; the chunk re-cut refuses it."""
+
+    class _OtherTier(AscV4Metadata):
+        pass
+
+    entry = object.__new__(_OtherTier)
+    extra_kwargs = {"attention_metadata": {("other", 4): entry}}
+    with pytest.raises(TypeError, match="cannot re-cut"):
+        chunk_attention_metadata(extra_kwargs)

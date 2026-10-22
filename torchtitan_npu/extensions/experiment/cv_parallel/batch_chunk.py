@@ -39,21 +39,24 @@ _RUNTIME_CONTEXT: ContextVar[Callable[[], dict[str, Any]] | None] = ContextVar("
 
 @register_post_init_hook(CV_PARALLEL_PIPELINE)
 def configure_runtime_context(trainer):
-    """Adapt only this opted-in trainer; leave upstream classes and registries intact."""
-    from .batch_chunk_metadata import BatchChunkMetadataExtension
+    """Adapt only this opted-in trainer; leave upstream classes and registries intact.
 
-    for model in trainer.model_parts:
-        metadata_extension = getattr(model, "_metadata_extension", None)
-        if isinstance(metadata_extension, BatchChunkMetadataExtension):
-            # Quantization selects the LI provider before model construction.
-            # Local layouts must use that same provider's opaque kernel contract.
-            metadata_extension._chunk_li_metadata = model._lightning_indexer_metadata
-
+    The LI record provider a chunked layout reuses rides on the metadata the
+    core itself builds (upstream #4897), so no provider has to be read back off
+    the model here.
+    """
     make_step = trainer._make_fx_forward_backward_step
     prepare_inputs = trainer._prepare_trace_inputs
 
     @functools.wraps(make_step)
     def with_live_inputs(model, inputs, labels, global_valid_tokens, params, extra_kwargs):
+        # The fused core's own builder produced one entry per geometry; the experiment's
+        # re-cut is a property of this batch, so it happens here, before the trace or the
+        # replay reads the map (the trace's input preparer sees the same kwargs object).
+        # Imported lazily so selecting the dispatcher does not pull the fused attention in.
+        from .batch_chunk_metadata import chunk_attention_metadata
+
+        chunk_attention_metadata(extra_kwargs)
         # Resolve traced_result lazily: the trainer creates it during make_step.
         token = _RUNTIME_CONTEXT.set(
             lambda: {
@@ -228,7 +231,7 @@ def remap_prebuilt_batch_metadata_pass(
     if not full_by_pair:
         raise ValueError(
             "batch chunking of full DeepSeek-V4 layers requires eager-built "
-            "attention metadata; enable the batch_chunk_metadata.asc_metadata override"
+            "attention metadata; enable the batch_chunk_token_dispatcher.asc_dispatcher override"
         )
     missing = [
         (pair_id, chunk_id)

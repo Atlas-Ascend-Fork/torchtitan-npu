@@ -23,7 +23,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata, MetadataExtension
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention, UnitScaleRMSNorm
@@ -611,6 +610,9 @@ def _make_v4_config(
         original_seq_len=original_seq_len,
     )
 
+    # The per-microbatch metadata is one entry per geometry, and the MTP depths'
+    # dense (ratio 1) layers share the ratio-1 entry the main layers read.
+
     layers = _build_v4_layers(
         n_layers=n_layers,
         dim=dim,
@@ -668,23 +670,6 @@ def _make_v4_config(
             param_init=_output_linear_init(dim),
         ),
         layers=layers,
-        window_size=window_size,
-        # The default extension is the identity: the packed offsets are the whole contract.
-        # The geometry fields are for the vendor extensions that replace it.
-        metadata_extension=MetadataExtension.Config(
-            window_size=window_size,
-            num_heads=n_heads,
-            head_dim=head_dim,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-        ),
-        lightning_indexer_metadata=LightningIndexerMetadata.Config(
-            window_size=window_size,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-        ),
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
         n_layers=n_layers,

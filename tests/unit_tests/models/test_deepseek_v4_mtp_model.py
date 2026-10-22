@@ -17,6 +17,7 @@ from tests.unit_tests.models.mtp_test_utils import (
     VOCAB_SIZE,
     assert_packed_mtp_training,
     build_cpu_model,
+    preprocess,
 )
 from torchtitan_npu.models.common.linear import SharedLinear
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
@@ -84,13 +85,13 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     labels = (tokens + 1) % VOCAB_SIZE
     positions = torch.arange(SEQ_LEN).view(BATCH_SIZE, -1)
 
-    _, _, extra_kwargs = model.build_attention_masks(
-        tokens,
-        labels,
-        {"positions": positions},
-    )
+    _, _, extra_kwargs = preprocess(model, tokens, labels, positions)
 
-    assert set(extra_kwargs["attention_masks"].plans) == {1, 4, 128}
+    # One entry per geometry: the stack's ratios -- the MTP depths' uncompressed one included --
+    # are one map key each, and each entry carries only its own ratio's plan.
+    entries = extra_kwargs["attention_metadata"]
+    assert {ratio for _, ratio in entries} == {1, 4, 128}
+    assert all(entry.ratio == ratio for (_, ratio), entry in entries.items())
     output = model(tokens, **extra_kwargs)
     assert isinstance(output, list) and len(output) == 2
 
@@ -100,11 +101,7 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
     tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
-    tokens, labels, extra_kwargs = model.build_attention_masks(
-        tokens,
-        labels,
-        {"positions": positions},
-    )
+    tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
     assert "mtp_batch" not in extra_kwargs
     object.__setattr__(model, "_skip_lm_head", True)
     output = model(tokens, **extra_kwargs)
@@ -185,9 +182,7 @@ def test_deepseek_v4_mtp_isolation_rejects_replaced_model_head():
         model = build_cpu_model(config)
         model.lm_head = torch.nn.Linear(32, VOCAB_SIZE, bias=False)
         tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
-        tokens, _, extra_kwargs = model.build_attention_masks(
-            tokens, (tokens + 1) % VOCAB_SIZE, {"positions": PACKED_POSITIONS.clone()}
-        )
+        tokens, _, extra_kwargs = preprocess(model, tokens, (tokens + 1) % VOCAB_SIZE, PACKED_POSITIONS.clone())
 
         with pytest.raises(ValueError, match="mtp_isolate_gradients requires a SharedLinear LM head"):
             model(tokens, **extra_kwargs)
@@ -201,7 +196,7 @@ def test_deepseek_v4_mtp_detaches_all_shared_parameters(num_mtp_layers):
         model = build_cpu_model(config)
         tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
         labels = (tokens + 1) % VOCAB_SIZE
-        tokens, _, extra_kwargs = model.build_attention_masks(tokens, labels, {"positions": PACKED_POSITIONS.clone()})
+        tokens, _, extra_kwargs = preprocess(model, tokens, labels, PACKED_POSITIONS.clone())
 
         output = model(tokens, **extra_kwargs)
         sum(item.square().sum() for item in output[1:]).backward()
@@ -227,7 +222,7 @@ def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_thre
         tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
         labels = (tokens + 1) % VOCAB_SIZE
         positions = PACKED_POSITIONS.clone()
-        tokens, labels, extra_kwargs = model.build_attention_masks(tokens, labels, {"positions": positions})
+        tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
         if chunked:
             object.__setattr__(model, "_skip_lm_head", True)
             object.__setattr__(reference, "_skip_lm_head", True)
@@ -361,6 +356,20 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
     monkeypatch.setattr(model_mod, "cp_shard", fake_cp_shard)
 
+    # The base seam is exercised in its own tests; here the model's own
+    # responsibility is the MTP batch: build it on the global row, then cut it.
+    from torchtitan.models.common.decoder import Decoder
+
+    base_calls = []
+
+    def fake_base(self, input_dict, labels, **kwargs):
+        base_calls.append((input_dict["input"].shape, labels.shape))
+        cut, _ = model_mod.cp_shard(
+            mesh, (input_dict["input"], labels, input_dict["positions"]), None, None, 1
+        )
+        return cut[0], cut[1], {"positions": cut[2]}
+
+    monkeypatch.setattr(Decoder, "preprocess_inputs", fake_base)
     mesh = SimpleNamespace(size=lambda *_: cp_size, get_local_rank=lambda: rank, device_type="cpu")
     parallel_dims = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
     parallelism = SimpleNamespace(
@@ -384,6 +393,7 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     assert torch.equal(global_positions, positions)
 
     # Two cuts, both fed the full row: the base inputs, then the MTP batch.
+    assert base_calls == [(tokens.shape, labels.shape)]
     assert len(shard_calls) == 2
     for got, expected in zip(shard_calls[0], (tokens, labels, positions), strict=True):
         assert torch.equal(got, expected)

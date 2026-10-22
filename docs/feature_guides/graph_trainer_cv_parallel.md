@@ -37,19 +37,29 @@ config = graph_trainer_deepseek_v4_flash_43layers_16experts
 如果通过 CLI 整体替换 `--override.imports`，须保留以下实验依赖：
 
 ```text
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata
 torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
-torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata.asc_metadata
 torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_token_dispatcher.asc_dispatcher
 ```
 
-实验 `batch_chunk_metadata.asc_metadata` 在启用时注册 `cv_parallel` pipeline。实验 metadata、dispatcher 分别替换普通 `sparse_attn.asc_metadata`、`common.token_dispatcher.asc`，同一配置节点不能同时启用两种 override。RoPE 沿用公共实现；dispatcher 的包装只适配符号 token 数，实际前后向仍调用原生 NPU kernel。普通配置不会选中实验实现。
+实验 dispatcher 入口 `batch_chunk_token_dispatcher.asc_dispatcher` 在启用时注册 `cv_parallel` pipeline，
+并在 trainer 的 per-step hook 里安装 metadata 重切。它替换 `common.token_dispatcher.asc`，同一配置节点不能
+同时启用两种 override。RoPE 沿用公共实现；
+dispatcher 的包装只适配符号 token 数，实际前后向仍调用原生 NPU kernel。普通配置不会选中实验实现。
+
+> **接缝**：DeepSeek-V4 的 metadata 由 attention backend 自己的 config 按几何构建
+> （upstream PR #4897）。fused compressor 的状态表由同一个构建器在 eager 边界写进 plan
+> （表宽随 batch 的文档走，不能在建图时构）。
+> CV chunking 的重切不发生在模型里：`cv_parallel` 的 post-init hook 在每一步的
+> `_make_fx_forward_backward_step` 入口把 `extra_kwargs` 里的每条 entry 重切成
+> full + 两个 chunk（`batch_chunk_metadata.chunk_attention_metadata`），因此重切发生在
+> 追踪/重放之前、每 rank 的 plan 上，模型与内核都不需要知道实验的存在；几何与 LI provider
+> 契约从被重切的元数据读出。
 
 完整 batch 在追踪时约束为 `B >= 2`，图切分后每个 chunk 可以只有一个样本。运行时输入和追踪适配通过 `cv_parallel` 的 post-init hook 绑定到当前 trainer 实例，不替换公共 GraphTrainer 方法或原有 `ep_overlap` 注册项。
 
 ## 实现流程
 
-1. 在 eager 阶段为两个半 batch 分别构建 sparse-attention metadata。文档边界必须与等分点对齐；压缩 plan、AscendC metadata 和 host 字段不能按 tensor 长度机械切半。
+1. 在 eager 阶段把每条已构建的 entry 重切成 full + 两个半 batch。文档边界必须与等分点对齐；压缩 plan、AscendC 记录和 host 字段不能按 tensor 长度机械切半。
 2. 复用 torchtitan 的 batch graph chunk pass，将两个 chunk 固定到两条流，并把 duplicated layer 的 metadata 输入重映射到预构建的局部值。
 3. `dependency_only_schedule` 保留数据依赖、流内 FIFO、通信、主机观察和共享状态屏障；跨流消费和最终输出汇合仍会产生必要 event。
 4. 对同一个 batch 重放 free 图，采集各 rank 的节点设备耗时和 kernel 资源类型。校准会克隆输入、恢复可变 buffer，并验证参数和梯度状态未改变。

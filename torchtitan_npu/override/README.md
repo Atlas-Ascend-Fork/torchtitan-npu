@@ -27,7 +27,7 @@ python -m torchtitan_npu.train \
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff": 2.0}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff": 2.0,"num_heads":128}'
 ```
 
 NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模型配置选择
@@ -161,7 +161,7 @@ Replacement 类采用「variant + target」命名，并保留标准缩写的大�
 | AscendC 实现 | `AscRMSNorm`、`AscComplexRoPE` |
 | Workaround 实现 | `WorkaroundComplexRoPE` |
 | 行为实现 | `VirtualOptimizersContainer` |
-| 后端协议或元数据 | `AscCompressedVarlenMetadata`、`AscBlockLayoutMetadata` |
+| 后端协议或元数据 | `AscV4Metadata`、`AscBlockLayoutMetadata` |
 
 不作为公开 override 入口的内部函数和类使用前导下划线。
 
@@ -341,8 +341,6 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `sparse_attn.asc_metadata` | `SparseAttentionMetadata.Config` | `SparseAttentionMetadata.Config` | 选择 `AscMetadataExtension` |
-| `compressor.asc_metadata` | `CompressorMetadata.Config` | `CompressorMetadata.Config` | 独立预构建 compressor 状态表 |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | — |
 | `sparse_attn.pypto` (replaces `sparse_attn.asc`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` | — |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
@@ -357,10 +355,30 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `TilelangFeedForward.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
 | `moe_router.tilelang` | `HashRouter.Config`（精确匹配） | `TilelangHashRouter.Config` | 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
 
-`sparse_attn.asc_metadata` 无需参数。`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
-使用 fused compressor 时，同时启用 `compressor.asc` 和 `compressor.asc_metadata`；稀疏注意力保留 `sparse_attn.asc_metadata`。
-CV metadata 入口也可与 `compressor.asc_metadata` 同时启用；它只与 `sparse_attn.asc_metadata` 互斥。
-仅启用 sparse-attention metadata 时不分配 compressor 状态表；CP 保持原有交换后构表路径。
+`sparse_attn.asc` 支持可选的 `indexer_loss_coeff`（默认 `1.0`）与记录几何
+（`num_heads`/`head_dim`/`index_num_heads`/`index_head_dim` 默认 `64`/`512`/`64`/`128`，
+即 V4-Flash 的发布形状；debug/pro 等其它宽度在同一个入口上给出，例如
+`sparse_attn.asc={"num_heads":16,"index_num_heads":8}`）。四者是 port config 自己的必需
+字段、无默认值——记录由它们定尺寸，未声明就无法构建；`head_dim` 恒为 `512`，因此任何
+recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它们是层自己的 model config
+字段，由模型声明一次，port 读取即可。
+
+metadata 不再是独立入口：每个 microbatch、每个几何一份 entry，由被替换的
+`AscCompressedSparseInnerAttention.Config.build_attention_metadata` 直接构建
+（upstream PR #4897 的 backend-owned 接缝）：参考后端在这一步给出该 ratio 的 plan，
+port 在其上补四个算子的记录。map key 是 `(端口类, compress_ratio)`，每层只读自己 ratio 的
+entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI record 属于 selector：BF16 的
+由 port 在同一入口按 `AicpuGeometry` 构建；量化的 selector 是**另一个 backend**
+（`torchao_npu.quantized_modules.deepseek_v4.QuantizedV4SparseAttention`），它替换融合核的
+config、用 `quant_lightning_indexer_metadata` 构建自己的 entry，并拒绝 CP 重切（其记录契约
+不属于本 port）。`override/` 与 `models/` 都不知道量化存在。CP 下由
+`AscV4Metadata.prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`
+按 rank-local 行重建 plan，再在其上重填记录（upstream PR #4617）；参考契约的 hook 直接拒绝 CP。
+compressor 的状态表由**融合 attention 的 metadata 构建器**在 eager 边界写进 plan（表宽随 batch 的
+文档走，不能在建图时构），因此选 `sparse_attn.asc` 就带上了它，不再有独立的 compressor 状态表入口。非融合的 attention backend（参考核）不建表，压缩器在 forward 里按当前 batch 自行构表（eager 下逐
+batch 正确；只有「参考 attention + 融合 compressor + 图训练」这一组合目前没有 recipe 使用）。CV 的 metadata 重切不再是一个配置节点：启用
+`batch_chunk_token_dispatcher.asc_dispatcher` 即激活实验，`cv_parallel` 的 post-init hook 在每一步的
+`_make_fx_forward_backward_step` 入口把 map 的每条 entry 重切成 full + 两个 chunk。
 MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` / `tilelang_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。`triton_hc_head` 与 `tilelang_hc_head` 声明同一 `HcHead.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` / `asc_hc_post` 共存。
 
@@ -382,7 +400,6 @@ USE_GOLDEN=1 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 ```text
 torchtitan_npu.override.common.rms_norm.asc
 torchtitan_npu.override.common.rope.asc_complex
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
 torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 torchtitan_npu.override.common.swiglu_group.asc
 torchtitan_npu.override.common.swiglu_group.asc_shared_experts
@@ -399,14 +416,13 @@ torchtitan_npu.override.common.rope.workaround
 （Attention Gym 的 `gather_attn`，逐文档 FP32），不再有独立的 attention 数值基线
 入口。
 
-`sparse_attn.asc` 必须与 `sparse_attn.asc_metadata` 配套使用；它与
-`sparse_attn.pypto` 声明同一 target，不能同时启用。
+`sparse_attn.asc` 与 `sparse_attn.pypto` 声明同一 target，不能同时启用。
 
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
 token 数时应调整 `seq_len`。参考 recipe（模型目录默认内核）使用公共的
-`CompressedVarlenMetadata`（只含 kernel contract 与 packed 偏移），当前仅支持无
-context parallel 的连续文档布局。AscendC 路径使用独立的精简
-`AscCompressedVarlenMetadata`，只携带 kernel contract 和预计算的 AscendC metadata。
+`DeepSeekV4Metadata`（每个几何一份：kernel contract、packed 偏移与 window plan），当前仅支持无
+context parallel 的连续文档布局。AscendC 路径的 entry（`AscV4Metadata`）在它之上携带按 kernel
+分组的预计算记录。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 

@@ -37,4 +37,9 @@ class BatchChunkTokenDispatcher(AscAllToAllTokenDispatcher):
 
 @override(target=AllToAllTokenDispatcher.Config, exact=True, description="Symbolic-size-safe fused token permutation")
 def asc_dispatcher(cfg: AllToAllTokenDispatcher.Config) -> BatchChunkTokenDispatcher.Config:
+    # Selecting the experiment's dispatcher is selecting the experiment: this is the entry
+    # that imports the pass pipeline (registering it by name) and, with it, the per-step
+    # metadata re-cut.  There is no second metadata node to flip.
+    from . import cv_parallel  # noqa: F401
+
     return derive(cfg, BatchChunkTokenDispatcher.Config)

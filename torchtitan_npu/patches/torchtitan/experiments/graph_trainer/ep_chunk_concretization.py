@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     import torch.fx as fx
     from torchtitan.experiments.graph_trainer.configs import EpOverlapChunkDim
 
+# The keys a stack hands its per-microbatch attention metadata in: the pinned
+# single-mask shape and the backend-owned map (upstream #4897).
+_DROPPED_METADATA_KEYS = frozenset({"attention_masks", "attention_metadata"})
+
 
 def _owned_chunk_symbol_hints(gm: fx.GraphModule, mode: str) -> dict[object, int]:
     """Collect symbols only from dimensions carrying the EP chunk shape ID."""
@@ -75,10 +79,18 @@ def _restore_placeholder_shape_ids(gm: fx.GraphModule, example_inputs: tuple[Any
 
 
 def _drop_attention_masks(value: object) -> object:
-    if not isinstance(value, dict) or "attention_masks" not in value:
+    """Drop the metadata the EP chunk pass cannot chunk.
+
+    The metadata is built for the whole microbatch and describes its frames
+    (document offsets, kernel block tables); the pass re-traces the body at half
+    size, so it must not enter the traced inputs — neither the 0.3.0 single mask
+    nor the backend-owned map.  A dict without either key is left untouched.
+    """
+    if not isinstance(value, dict) or not _DROPPED_METADATA_KEYS & value.keys():
         return value
     copied = dict(value)
-    copied.pop("attention_masks")
+    for key in _DROPPED_METADATA_KEYS:
+        copied.pop(key, None)
     return copied
 
 

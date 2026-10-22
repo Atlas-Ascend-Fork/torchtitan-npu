@@ -121,29 +121,6 @@ def test_quantization_converter_keeps_linear_forward(converter_module, quantizat
     torch.testing.assert_close(linear(torch.tensor([[2.0, 3.0]])), torch.tensor([[8.0, 18.0]]))
 
 
-def test_quantization_converter_preserves_li_metadata_replacement(converter_module, quantization_calls):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import (
-        _DeepSeekV4QuantizedLightningIndexerMetadataAdapter,
-    )
-
-    source = converter_module.DeepSeekV4LightningIndexerMetadata.Config(
-        index_n_heads=64, index_head_dim=128, index_topk=512
-    )
-    replacement_type = _DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config
-    converter = converter_module.NpuQuantizeConverter.Config(
-        replacement_config_type=replacement_type,
-        replacement_kwargs={"quant_mode": 3},
-    ).build()
-
-    converted = converter.convert(source)
-
-    assert isinstance(converted, replacement_type)
-    assert converted.quant_mode == 3
-    assert converted.index_n_heads == 64
-    assert converted.index_head_dim == 128
-    assert converted.index_topk == 512
-    assert converted.li_kernel_config == source.li_kernel_config
-    assert not quantization_calls
 
 
 def _v41_attention():
@@ -274,18 +251,6 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
     assert calls[0]["model_type"] == expected_model_type
 
 
-def test_parameter_quantization_skips_li_metadata(converter_module, quantization_calls):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _mxfp8_param_swap
-
-    source = converter_module.DeepSeekV4LightningIndexerMetadata.Config()
-    converter = converter_module.NpuQuantizeConverter.Config(
-        base_config=_mxfp8_param_swap(), require_match=False
-    ).build()
-
-    assert converter.convert(source) is source
-    assert not quantization_calls
-
-
 @pytest.mark.parametrize("quant_format", ["mx", "block_mx"])
 def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, converter_module, quant_format):
     from torchtitan_npu.extensions.adaptor.torchao.converter import _block_fp8_param_swap, _mxfp8_param_swap
@@ -385,7 +350,8 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
 
 def _source_compressor_layer(spec, ratio):
     return next(
-        i for i, layer in enumerate(spec.model.layers)
+        i
+        for i, layer in enumerate(spec.model.layers)
         if layer.attention.compressor.is_source and layer.attention.compressor.compress_ratio == ratio
     )
 

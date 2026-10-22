@@ -344,7 +344,7 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
                 ],
             )
             comp.token_dispatcher = comp_disp
-            md = _slim_cp_metadata(plan_dicts[r])
+            md = _slim_cp_metadata(plan_dicts[r], ratio)
             pooled = comp(x_local.view(1, shard_len, DIM), md)
             container = contexts[r].select(pooled, plan_dicts[r][ratio])
             n_kept = int(plan_dicts[r][ratio].compressed_rows.numel())
@@ -407,17 +407,17 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
 # ---------------------------------------------------------------------------
 
 
-def _slim_cp_metadata(plans, window=None):
-    """A minimal kernel-contract holder exposing the per-ratio block plans
-    at ``plans[ratio]`` and the window plan at ``window`` (the same access
-    points the AscendC handler builds in CP mode)."""
+def _slim_cp_metadata(plans, ratio, window=None):
+    """A minimal kernel-contract holder for one geometry: this ratio's plan
+    at ``plan`` and the window plan at ``window``."""
 
     class _Slim:
         pass
 
     md = _Slim()
     md.batch_size = 1
-    md.plans = dict(plans)
+    md.ratio = ratio
+    md.plan = plans[ratio]
     md.window = window
     return md
 
@@ -459,7 +459,7 @@ def test_compressor_cp_branch(dsv4_globals, case):
                 ],
             )
             comp.token_dispatcher = comp_disp
-            md = _slim_cp_metadata(plan_dicts[r])
+            md = _slim_cp_metadata(plan_dicts[r], ratio)
             pooled = comp(x_local.view(1, shard_len, DIM), md)
             rplan = plan_dicts[r][ratio]
             n_plan = rplan.gather_indices.numel() // ratio
@@ -484,63 +484,6 @@ def test_compressor_cp_branch(dsv4_globals, case):
 # ---------------------------------------------------------------------------
 
 
-def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
-    """The AscendC metadata extension over the model-built CP metadata (the
-    pure global-context plan derivation — no rounds, no transport)."""
-    ratio = 4
-    docs = (1000, 1000, 1000, 1000)
-    _v, cp_metas, shard_len = make_cp_metas(docs, 2)
-    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-        AscLightningIndexerMetadata,
-        AscMetadataExtension,
-    )
-
-    for r in range(2):
-        dsv4.cann_ops.calls.clear()
-        cp_meta, plans, window = cp_mod.build_cp_plan(
-            _v,
-            rank=r,
-            cp_size=2,
-            shard_len=shard_len,
-            window_size=128,
-            ratios=[1, ratio, 128],
-        )
-        md = AscLightningIndexerMetadata(
-            AscLightningIndexerMetadata.Config(window_size=128, index_n_heads=8, index_head_dim=128, index_topk=512)
-        )(dsv4.metadata.CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window))
-        md = AscMetadataExtension(
-            AscMetadataExtension.Config(
-                window_size=128,
-                num_heads=16,
-                head_dim=512,
-                index_n_heads=8,
-                index_head_dim=128,
-                index_topk=512,
-            )
-        )(md)
-        assert md.batch_size == 1 and md.seq_len == shard_len
-        assert md.window is not None
-        # the window plan's packed-ori cumsum drives the kernel tensors
-        smla = [c for c in dsv4.cann_ops.calls if c[0] == "sparse_flash_mla_metadata"]
-        assert len(smla) == 3
-        for k, c in {c[2]["cmp_ratio"]: c for c in smla}.items():
-            assert torch.equal(c[2]["cu_seqlens_ori_kv"], md.window.cu_seqlens_ori_kv), k
-        segs = segment_structure(cp_metas[r])
-        for k in (4, 128):
-            exp_cu = torch.tensor([0, *[s[2] // k for s in segs]], dtype=torch.int32).cumsum(0, dtype=torch.int32)
-            exp_rem = torch.tensor([s[2] % k for s in segs], dtype=torch.int32)
-            assert torch.equal(md.plans[k].cu_seqlens_cmp_k, exp_cu)
-            assert torch.equal(md.plans[k].block_remainder, exp_rem)
-            # The full per-ratio plan (part 1 + part 2) is exposed at
-            # ``plans[ratio]`` — the same access point as the no-CP layout.
-            assert md.plans[k].first_indices is not None
-            assert md.plans[k].block_positions is not None
-            assert md.plans[k].compressed_rows is not None
-            assert md.plans[k].cmp_k_global_gather_indices is not None
-            assert md.plans[k].gather_indices is not None
-            assert md.plans[k].exchange is not None
-
-
 # ---------------------------------------------------------------------------
 # 5. CPAttention end-to-end (recording inner core)
 # ---------------------------------------------------------------------------
@@ -560,7 +503,7 @@ class _RecorderCore(nn.Module):
 
 
 class _RecorderLI(nn.Module):
-    def forward(self, idx_q, idx_k, idx_w, *, attention_masks):
+    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
         self.last = (idx_q, idx_k, idx_w)
         return torch.zeros(
             idx_q.shape[0],
@@ -649,7 +592,7 @@ def make_indexer_cfg(dim, n_heads, hd, rd, ratio):
                 def _rotate_activation(self, x):
                     return x
 
-                def forward(self, x, qr, *, positions, attention_masks):
+                def forward(self, x, qr, *, positions, attention_metadata):
                     bsz, seqlen, _ = qr.size()
                     rd = self.rope_head_dim
                     idx_q = self.wq_b(qr)
@@ -658,7 +601,7 @@ def make_indexer_cfg(dim, n_heads, hd, rd, ratio):
                     q_rope = self.rope(q_rope, positions=positions)
                     idx_q = torch.cat([q_nope, q_rope], dim=-1)
                     idx_q = self._rotate_activation(idx_q)
-                    idx_k = self.compressor(x, attention_masks)
+                    idx_k = self.compressor(x, attention_metadata)
                     idx_k = self._rotate_activation(idx_k)
                     idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
                     return idx_q, idx_k, idx_w
@@ -715,7 +658,7 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
 
     mds = []
     for r in range(2):
-        mds.append(_slim_cp_metadata(plan_dicts[r], windows[r]))
+        mds.append(_slim_cp_metadata(plan_dicts[r], ratio, windows[r]))
 
     # stage 1: the compressors over the local stream with their own pack
     # exchanges -> the kept blocks via the plan-driven packing
@@ -735,7 +678,7 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
                 ],
             )
             comp.token_dispatcher = disp
-        md = _slim_cp_metadata(plan_dicts[rr], windows[rr])
+        md = _slim_cp_metadata(plan_dicts[rr], ratio, windows[rr])
         cmp_k = contexts[rr].select(attn.compressor(xl.view(1, shard_len, DIM), md), plan_dicts[rr][ratio])
         idx_k = contexts[rr].select(
             attn.indexer.compressor(xl.detach().view(1, shard_len, DIM), md),
@@ -886,21 +829,21 @@ def test_cp_gather_compile_reuses_graph_across_dynamic_splits_gloo():
     assert len(compiled_graphs) == 1
 
 
-def test_cp_metadata_rejects_a_head_tail_load_balancer():
-    """The contiguous-slab stack refuses the upstream default instead of silently permuting."""
-    from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
+def test_fused_cp_metadata_rejects_a_head_tail_load_balancer():
+    """The fused CP rebuild refuses the upstream default rather than folding its permutation in."""
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import shard_compressed_varlen_metadata
+    from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
     class _Mesh:
         def size(self, dim: int = 0) -> int:
             return 2
 
-    with pytest.raises(ValueError, match="context-parallel-load-balancer None"):
-        DeepSeekV4Model._build_cp_metadata(
-            None,
-            None,
-            None,
-            None,
-            SimpleNamespace(seq_len=2048),
-            _Mesh(),
-            "headtail",
-        )
+        def get_local_rank(self) -> int:
+            return 0
+
+    positions = torch.zeros((1, 8), dtype=torch.long)
+    with (
+        cp_shard_context_set(cp_mesh=_Mesh(), load_balancer_type="headtail", positions=positions),
+        pytest.raises(ValueError, match="context-parallel-load-balancer None"),
+    ):
+        shard_compressed_varlen_metadata(SimpleNamespace(window_size=128))

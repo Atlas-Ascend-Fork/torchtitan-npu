@@ -115,15 +115,16 @@ class _GlooDispatcher(CPTokenDispatcher):
         return self._portable.all_to_all(x, in_splits, out_splits)
 
 
-def _slim_metadata(plans, window):
-    """A minimal kernel-contract holder (the AscendC handler's slim shape)."""
+def _slim_metadata(plans, window, ratio):
+    """A minimal kernel-contract holder for one geometry."""
 
     class _Slim:
         pass
 
     md = _Slim()
     md.batch_size = 1
-    md.plans = plans
+    md.ratio = ratio
+    md.plan = plans[ratio]
     md.window = window
     return md
 
@@ -224,7 +225,7 @@ def verify_dispatch(rank, context, plans, window, cp_meta, ratio, failures):
     # ---- container packing (the exchange payloads are the projected rows
     # ---- the portable transport carries automatically)
     comp.token_dispatcher = context
-    md = _slim_metadata(plans, window)
+    md = _slim_metadata(plans, window, ratio)
     pooled = comp(x_local, md)
     container = context.select(pooled, rplan)
     n_kept = int(rplan.compressed_rows.numel())

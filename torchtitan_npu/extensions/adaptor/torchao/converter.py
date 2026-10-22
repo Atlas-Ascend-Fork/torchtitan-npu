@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast
 
 import torch
 import tyro
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 from torchao.core.config import AOBaseConfig  # noqa: TC002
 from torchao.quantization.quant_api import quantize_
 from torchao_npu.configs import (
@@ -49,13 +50,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerKernelConfig as DeepSeekV4LightningIndexerKernelConfig,
-)
-from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerMetadata as DeepSeekV4LightningIndexerMetadata,
-)
-from torchtitan_npu.models.common.metadata_extension import register_pytree_node_for_dataclass
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer as DeepSeekV4LightningIndexer
 from torchtitan_npu.models.deepseek_v4_1.attention import (
     CompressedSparseInnerAttention2 as DeepSeekV41CompressedSparseInnerAttention2,
@@ -67,6 +61,13 @@ from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as DeepSee
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector
 from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts, _ensure_cann_ops_loaded
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
+
+# The fused selector's wire contract, mirrored from
+# ``override/deepseek_v4/metadata.py::LI_*``: the extension layer must not import the
+# override package (architecture check), so the three values are repeated here.
+_V4_LI_LAYOUT = "TND"
+_V4_LI_MASK_MODE = 3
+_V4_LI_CMP_RATIO = 4
 
 if TYPE_CHECKING:
     from torchtitan.protocols.model_spec import ModelSpec
@@ -97,9 +98,9 @@ def match_config_fqn_suffix(*suffixes: str) -> ConfigFilterFn:
     """Match config-tree FQNs by a dotted suffix or an exact root name.
 
     ``Config.traverse`` reports nested fields as dotted FQNs, but a field on
-    the model config itself has no leading component (for example,
-    ``lightning_indexer_metadata``).  Accepting both forms keeps filters
-    useful for root-owned extension configs as well as nested modules.
+    the model config itself has no leading component (for example, a token
+    dispatcher node).  Accepting both forms keeps filters useful for root-owned
+    extension configs as well as nested modules.
     """
 
     normalized = tuple(suffix.lstrip(".") for suffix in suffixes)
@@ -130,7 +131,6 @@ _DEFAULT_TARGET_CONFIG_TYPES = (
     BatchedLinear.Config,
     GroupedExperts.Config,
     DeepSeekV4LightningIndexer.Config,
-    DeepSeekV4LightningIndexerMetadata.Config,
     DeepSeekV41CompressedSparseInnerAttention2.Config,
     DeepSeekV41Compressor.Config,
     DeepSeekV41Selector.Config,
@@ -207,6 +207,11 @@ class NpuQuantizeConverter(QuantizationConverter):
         filter_fn: Annotated[ConfigFilterFn | None, tyro.conf.Suppress] = None
         replacement_config_type: Annotated[type | None, tyro.conf.Suppress] = None
         replacement_kwargs: Annotated[dict[str, object], tyro.conf.Suppress] = field(default_factory=dict)
+        target_config_types: Annotated[tuple[type, ...], tyro.conf.Suppress] = _DEFAULT_TARGET_CONFIG_TYPES
+        """The config classes this converter walks.  A replacement that is not a module of its
+        own (the quantized metadata backend) narrows this to the node it replaces."""
+        recurse: Annotated[bool, tyro.conf.Suppress] = False
+        """Descend into matched configs too; a FQN-filtered replacement of one node needs it."""
         require_match: bool = True
         prequantize_fqns: Annotated[tuple[str, ...] | None, tyro.conf.Suppress] = None
         """Whitelist of FQN suffix patterns that keep ``fsdp_prequantize=True``.
@@ -258,8 +263,8 @@ class NpuQuantizeConverter(QuantizationConverter):
         converted = 0
         matches = []
         seen_fqns = set()
-        for config_type in _DEFAULT_TARGET_CONFIG_TYPES:
-            for match in model_config.traverse(config_type):
+        for config_type in self.config.target_config_types:
+            for match in model_config.traverse(config_type, recurse=self.config.recurse):
                 if match[0] not in seen_fqns:
                     matches.append(match)
                     seen_fqns.add(match[0])
@@ -270,11 +275,6 @@ class NpuQuantizeConverter(QuantizationConverter):
                 replacement = derive(config, self.config.replacement_config_type, **self.config.replacement_kwargs)
                 replacement_name = self.config.replacement_config_type.__qualname__
             else:
-                # Metadata is a Configurable provider, not an nn.Module.  It
-                # shares the target set only so the replacement branch can
-                # handle it; parameter quantization must skip it.
-                if isinstance(config, DeepSeekV4LightningIndexerMetadata.Config):
-                    continue
                 assert self.config.base_config is not None
                 parent_cls = cast("type[Module] | None", type(config)._owner)
                 if parent_cls is None:
@@ -530,8 +530,17 @@ _DSV4_CONFIG_FILTERS = {
     "dense": match_config_fqn_suffix(*_DENSE_SCOPE_SUFFIXES),
     "routed_expert": match_config_fqn_suffix(*_ROUTED_EXPERT_SCOPE_SUFFIXES),
     "lightning_indexer": match_config_fqn_suffix(".attention.compressed_sparse_attention.lightning_indexer"),
-    "lightning_indexer_metadata": match_config_fqn_suffix(".lightning_indexer_metadata"),
 }
+
+# The V4 inner attention, at both places the stack carries it: the decoder builds the metadata
+# map from `attention.inner_attention`, while `Attention` reads its key and builds the module from
+# `attention.compressed_sparse_attention.inner_attention`.  The quantized backend replaces the
+# whole node, so both copies have to become its config -- otherwise the map is keyed by the
+# quantized class while every layer asks for the fused one and reads no metadata at all.
+_v4_inner_attention_filter = match_config_fqn_suffix(
+    ".attention.inner_attention",
+    ".compressed_sparse_attention.inner_attention",
+)
 
 _v41_compressor_fqn_filter = match_config_fqn_suffix(".attention.compressor")
 
@@ -655,30 +664,38 @@ def _prepare_quant_lightning_indexer_inputs(
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
     idx_w: torch.Tensor,
-    attention_masks,
+    attention_metadata,
 ):
+    from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import QuantV4Metadata
     from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer import (
         QuantizedLightningIndexerInputs as DeepSeekV4QuantizedLightningIndexerInputs,
     )
 
-    ratio = module._torchao_npu_module_swap_config.cmp_ratio
-    plan = attention_masks.plans.get(ratio)
-    if plan is None:
-        raise ValueError(f"LI compression ratio {ratio} is not present in attention metadata")
-    if plan.li_metadata is None:
-        raise RuntimeError("Quantized LI requires the quantized LI metadata provider")
+    if type(attention_metadata) is not QuantV4Metadata:
+        raise TypeError(
+            "the quantized selector consumes its own backend's entry, got "
+            f"{type(attention_metadata).__name__}; build the stack with the quantized "
+            "sparse-attention selector (quantized_attention) instead of the BF16 record."
+        )
+    plan = attention_metadata.plan
+    asc = attention_metadata.asc
+    li_metadata = None if asc is None else asc.lightning_indexer.fwd
+    if li_metadata is None:
+        raise RuntimeError("Quantized LI requires the quantized selector record provider")
     key = idx_k.flatten(0, 1)
     if plan.cmp_k_global_gather_indices is not None:
         key = key[plan.cmp_k_global_gather_indices]
     else:
-        key = key[: plan.n_cmp_blocks_host]
+        if plan.block_positions is None:
+            raise ValueError("Quantized LI requires plan.block_positions.")
+        key = key[: plan.block_positions.numel()]
     return DeepSeekV4QuantizedLightningIndexerInputs(
         query=idx_q.flatten(0, 1),
         key=key.unsqueeze(1).contiguous(),
         weights=idx_w.flatten(0, 1).float(),
         topk=module.index_topk,
-        metadata=plan.li_metadata,
-        cu_seqlens_q=attention_masks.varlen.cu_seq_q,
+        metadata=li_metadata,
+        cu_seqlens_q=attention_metadata.varlen.cu_seq_q,
         cu_seqlens_k=plan.cu_seqlens_cmp_k,
         cmp_residual_k=plan.block_remainder,
     )
@@ -846,7 +863,11 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
         )
 
 
-register_pytree_node_for_dataclass(_V41QuantAttentionMetadata)
+if _V41QuantAttentionMetadata not in SUPPORTED_NODES:
+    register_dataclass(
+        _V41QuantAttentionMetadata,
+        serialized_type_name=f"{_V41QuantAttentionMetadata.__module__}.{_V41QuantAttentionMetadata.__name__}",
+    )
 
 
 def _v41_attention_numbers(model_config) -> dict[str, int]:
@@ -907,57 +928,11 @@ def _v41_attention_numbers(model_config) -> dict[str, int]:
     }
 
 
-class _DeepSeekV4QuantizedLightningIndexerMetadataAdapter(DeepSeekV4LightningIndexerMetadata):
-    """Bridge TorchTitan metadata to the TorchAO-NPU DeepSeek-V4 LI provider."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(DeepSeekV4LightningIndexerMetadata.Config):
-        index_n_heads: int  # pyrefly: ignore [bad-override]
-        index_head_dim: int  # pyrefly: ignore [bad-override]
-        index_topk: int  # pyrefly: ignore [bad-override]
-        quant_mode: int
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata import (
-            QuantizedLightningIndexerMetadata as DeepSeekV4QuantizedLightningIndexerMetadata,
-        )
-        from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata import (
-            QuantizedLightningIndexerMetadataConfig as DeepSeekV4QuantizedLightningIndexerMetadataConfig,
-        )
-
-        cfg = cast("_DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config", config)
-        kernel = cfg.li_kernel_config
-        self._provider = DeepSeekV4QuantizedLightningIndexerMetadata(
-            DeepSeekV4QuantizedLightningIndexerMetadataConfig(
-                index_n_heads=cfg.index_n_heads,
-                index_head_dim=cfg.index_head_dim,
-                index_topk=cfg.index_topk,
-                layout_q=kernel.layout_q,
-                layout_k=kernel.layout_k,
-                mask_mode=kernel.mask_mode,
-                cmp_ratio=kernel.cmp_ratio,
-                quant_mode=cfg.quant_mode,
-            )
-        )
-
-    def __call__(self, metadata):
-        ratio = self.config.li_kernel_config.cmp_ratio
-        plan = metadata.plans.get(ratio)
-        if plan is None:
-            raise ValueError(f"LI compression ratio {ratio} is not present in attention metadata")
-        if plan.gather_indices.numel() == 0:
-            raise ValueError("batch has no complete compression block for the configured LI ratio")
-        plan.li_metadata = self._provider(
-            cu_seqlens_q=metadata.varlen.cu_seq_q,
-            cu_seqlens_k=plan.cu_seqlens_cmp_k,
-            cmp_residual_k=plan.block_remainder,
-        )
-        return metadata
+# The V4 selector's wire contract: TND, right-down causal, ratio-4 blocks.  It is a property of
+# the fused selector, not of a recipe, so it is stated once here for the quantized kernel.
 
 
 def _quant_deepseek_v4_lightning_indexer(
-    kernel_config: DeepSeekV4LightningIndexerKernelConfig,
     *,
     li_quantization: LIQuantization,
     dst_type_max: float = 0.0,
@@ -975,10 +950,10 @@ def _quant_deepseek_v4_lightning_indexer(
         raise ValueError("Quantized LI requires mxfp4, mxfp8, fp8, or hif8")
     quant_mode = quant_mode_for_config(qk_config)
     return DeepSeekV4QuantLightningIndexerConfig(
-        layout_q=kernel_config.layout_q,
-        layout_k=kernel_config.layout_k,
-        mask_mode=kernel_config.mask_mode,
-        cmp_ratio=kernel_config.cmp_ratio,
+        layout_q=_V4_LI_LAYOUT,
+        layout_k=_V4_LI_LAYOUT,
+        mask_mode=_V4_LI_MASK_MODE,
+        cmp_ratio=_V4_LI_CMP_RATIO,
         query_config=qk_config,
         key_config=qk_config,
         quant_mode=quant_mode,
@@ -1174,6 +1149,8 @@ def _quantization_converter(
     replacement_config_type: type | None = None,
     replacement_kwargs: dict[str, object] | None = None,
     prequantize_fqns: tuple[str, ...] | None = None,
+    target_config_types: tuple[type, ...] = _DEFAULT_TARGET_CONFIG_TYPES,
+    recurse: bool = False,
 ) -> NpuQuantizeConverter.Config:
     return NpuQuantizeConverter.Config(
         base_config=base_config,
@@ -1182,6 +1159,8 @@ def _quantization_converter(
         replacement_config_type=replacement_config_type,
         replacement_kwargs=replacement_kwargs or {},
         prequantize_fqns=prequantize_fqns,
+        target_config_types=target_config_types,
+        recurse=recurse,
     )
 
 
@@ -1223,10 +1202,10 @@ def _recipe_converters(
     enable_fsdp_prequantize: bool,
     model_compile_enabled: bool,
     li_quantization: LIQuantization | None = None,
-    li_kernel_config: DeepSeekV4LightningIndexerKernelConfig | None = None,
     kv_norm_quantization: KVNormQuantizationConfig | None = None,
     prequantize_fqns_by_scope: dict[str, tuple[str, ...]] | None = None,
     model_config=None,
+    override_config=None,
     fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = "fp8",
     enable_hif8_save_quant_codes: bool = False,
 ) -> list[QuantizationConverter.Config]:
@@ -1316,7 +1295,6 @@ def _recipe_converters(
             li_config = DeepSeekV41QuantLightningIndexerConfig()
         else:
             li_config = _quant_deepseek_v4_lightning_indexer(
-                li_kernel_config or DeepSeekV4LightningIndexerKernelConfig(),
                 li_quantization=li_quantization,
                 dst_type_max=dst_type_max,
             )
@@ -1328,15 +1306,44 @@ def _recipe_converters(
             )
         )
         if model_type == "v4":
+            # The quantized selector is a backend of its own: its config owns the entry's record
+            # operator and replaces the fused inner attention, so nothing is injected into the
+            # fused config and the fused backend never learns that a quantized selector exists.
+            from torchao_npu.quantized_modules.deepseek_v4.sparse_attention import (
+                QuantizedV4SparseAttention,
+            )
+
+            # The recipe lists the port entry; quantization runs before the override pass, so
+            # this replacement *is* the port (it subclasses the fused config) and the entry's
+            # arguments are read from the recipe rather than from the node.
+            asc_kwargs = _override_kwargs(override_config, "sparse_attn.asc")
+            if asc_kwargs is None:
+                raise ValueError(
+                    "V4 LightningIndexer quantization requires the fused stack: add "
+                    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc (and .asc_li) to "
+                    "--override.imports."
+                )
+            geometry = _v4_attention_numbers(model_config)
+            for name, value in geometry.items():
+                if name in asc_kwargs and asc_kwargs[name] != value:
+                    raise ValueError(
+                        f"the fused attention entry states {name}={asc_kwargs[name]!r} but the model "
+                        f"config runs {value}: the quantized selector's records are sized by the "
+                        "model's own geometry"
+                    )
             converters.append(
                 _quantization_converter(
                     None,
-                    filters["lightning_indexer_metadata"],
+                    _v4_inner_attention_filter,
                     model_compile_enabled=model_compile_enabled,
-                    replacement_config_type=_DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config,
+                    replacement_config_type=QuantizedV4SparseAttention.Config,
                     replacement_kwargs={
+                        **geometry,
+                        "indexer_loss_coeff": asc_kwargs.get("indexer_loss_coeff", 1.0),
                         "quant_mode": cast("DeepSeekV4QuantLightningIndexerConfig", li_config).quant_mode,
                     },
+                    target_config_types=(Module.Config,),
+                    recurse=True,
                 )
             )
     if enable_sparse_attention_quantization:
@@ -1384,27 +1391,60 @@ def _recipe_converters(
     return converters
 
 
-def _get_deepseek_v4_li_kernel_config(model_config) -> DeepSeekV4LightningIndexerKernelConfig:
-    metadata_matches = [
-        match
-        for match in model_config.traverse(DeepSeekV4LightningIndexerMetadata.Config)
-        if _DSV4_CONFIG_FILTERS["lightning_indexer_metadata"](match[1], match[0])
-    ]
-    li_matches = [
-        match
-        for match in model_config.traverse(DeepSeekV4LightningIndexer.Config)
-        if _DSV4_CONFIG_FILTERS["lightning_indexer"](match[1], match[0])
-    ]
-    if len(metadata_matches) != 1:
-        raise ValueError("Quantized LI requires one lightning_indexer_metadata config")
-    if not li_matches:
-        raise ValueError("Quantized LI requires a DeepSeek-V4 LightningIndexer config")
+def _override_kwargs(override_config, suffix: str) -> dict[str, object] | None:
+    """The kwargs a recipe states for the override entry ending in ``suffix``.
 
-    metadata = metadata_matches[0][1]
-    for fqn, li_config, _, _ in li_matches:
-        if li_config.li_kernel_config != metadata.li_kernel_config or li_config.index_topk != metadata.index_topk:
-            raise ValueError(f"LightningIndexer at {fqn!r} disagrees with its metadata config")
-    return metadata.li_kernel_config
+    Quantization runs before the override pass, so a config-class replacement has to state the
+    arguments the port's own factory would have received (the port entry is listed, but its
+    factory never sees the node).  ``None`` means the recipe did not select that entry.
+    """
+    if override_config is None:
+        return None
+    suffix_parts = suffix.split(".")
+    found: dict[str, object] | None = None
+    for entry in override_config.imports:
+        target, kwargs = entry if isinstance(entry, tuple) else (entry, {})
+        target_parts = str(target).split(".")
+        if len(target_parts) < len(suffix_parts) or target_parts[-len(suffix_parts) :] != suffix_parts:
+            continue
+        if found is not None:
+            raise ValueError(f"multiple override entries end with {suffix!r}: the recipe must select it once.")
+        found = dict(kwargs)
+    return found
+
+
+def _v4_attention_numbers(model_config) -> dict[str, int]:
+    """The widths the quantized V4 selector's entry is sized with, off the model config.
+
+    One config describes one geometry, so they are read once here instead of being restated by
+    every layer; a stack that mixes geometries is refused, since one quantized backend cannot
+    describe two.  The selector's record operator and the fused builder both read these, and the
+    kernels are where a wrong statement surfaces.
+    """
+    layers = [layer for layer in model_config.layers if layer.attention.indexer is not None]
+    if not layers:
+        raise ValueError("the quantized selector needs a layer that runs one (compress_ratio 4)")
+    attention = layers[0].attention
+    indexer = attention.indexer
+    first = (attention.n_heads, attention.head_dim, indexer.num_index_heads, indexer.index_head_dim)
+    for layer in layers[1:]:
+        other = (
+            layer.attention.n_heads,
+            layer.attention.head_dim,
+            layer.attention.indexer.num_index_heads,
+            layer.attention.indexer.index_head_dim,
+        )
+        if other != first:
+            raise ValueError(
+                f"the stack mixes attention geometries ({first} vs {other}), which one quantized "
+                "backend cannot describe"
+            )
+    return {
+        "num_heads": first[0],
+        "head_dim": first[1],
+        "index_num_heads": first[2],
+        "index_head_dim": first[3],
+    }
 
 
 def apply_quantization_converter(
@@ -1412,6 +1452,7 @@ def apply_quantization_converter(
     quantization_config: QuantizationExtensionConfig,
     *,
     model_compile_enabled: bool,
+    override_config=None,
 ) -> ModelSpec:
     """Apply the selected TorchAO-NPU recipe to an existing BF16 model spec.
 
@@ -1435,11 +1476,6 @@ def apply_quantization_converter(
     model_config = model_spec.model
     model_type = _model_type_for_spec(model_spec)
 
-    li_kernel_config = (
-        _get_deepseek_v4_li_kernel_config(model_spec.model)
-        if model_type == "v4" and quantization_config.li_quantization is not None
-        else None
-    )
     prequantize_fqns_by_scope = _resolve_prequantize_fqns(
         quantization_config.fsdp_prequantize_fqns,
         enabled=quantization_config.enable_fsdp_prequantize,
@@ -1454,11 +1490,11 @@ def apply_quantization_converter(
         fsdp_prequantize_dtype=quantization_config.fsdp_prequantize_dtype,
         model_compile_enabled=model_compile_enabled,
         li_quantization=quantization_config.li_quantization,
-        li_kernel_config=li_kernel_config,
         kv_norm_quantization=quantization_config.kv_norm_quantization,
         prequantize_fqns_by_scope=prequantize_fqns_by_scope,
         enable_hif8_save_quant_codes=quantization_config.enable_hif8_save_quant_codes,
         model_config=model_config,
+        override_config=override_config,
     )
     validate_converter_order(converter_configs)
 

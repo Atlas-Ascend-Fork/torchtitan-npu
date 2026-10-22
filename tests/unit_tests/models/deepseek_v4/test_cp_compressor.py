@@ -191,7 +191,6 @@ def doc_plan(docs, ratio):
         token_start += length
     return SimpleNamespace(
         cu_seqlens_cmp_k=torch.tensor(block_cu, dtype=torch.int32),
-        n_cmp_blocks_host=block_cu[-1],
         is_empty_host=not gather,
         block_remainder=torch.tensor(
             [length % ratio for length in docs], dtype=torch.int32
@@ -689,7 +688,7 @@ def run_case(name, docs, cp_size, dtype=torch.float32, ratio=RATIO):
     # the reference keeps the per-document contract (``doc_plan``).
     plan = doc_plan(docs, ratio)
     md = SimpleNamespace(
-        plans={ratio: plan}, varlen=v, batch_size=1, seq_len=seq_len
+        plan=plan, ratio=ratio, varlen=v, batch_size=1, seq_len=seq_len
     )
     comp = build_compressor(dtype, ratio)
     comp_idx = build_compressor(dtype, ratio)  # indexer mirror (own modules)
@@ -1034,7 +1033,7 @@ def test_degeneracy(dsv4_globals, docs, ratio):
     seq = sum(docs)
     cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=max(docs), max_k=max(docs))
-    plain = meta_mod.build_kernel_layout(v, (ratio,))
+    plain = meta_mod.build_compressed_varlen_metadata(v, ratio).plan
     _cp_meta, cp1_plans, _window = build_cp_plan(
         v,
         rank=0,
@@ -1044,10 +1043,10 @@ def test_degeneracy(dsv4_globals, docs, ratio):
         ratios=[ratio],
     )
     cp1 = cp1_plans[ratio]
-    assert torch.equal(plain[ratio].cu_seqlens_cmp_k, cp1.cu_seqlens_cmp_k)
-    assert torch.equal(plain[ratio].block_remainder, cp1.block_remainder)
+    assert torch.equal(plain.cu_seqlens_cmp_k, cp1.cu_seqlens_cmp_k)
+    assert torch.equal(plain.block_remainder, cp1.block_remainder)
     # at cp=1 every row is local and the assembly order is the doc-major
     # order, so the gather indices and the contract match bitwise
-    assert torch.equal(plain[ratio].gather_indices, cp1.gather_indices)
-    assert torch.equal(plain[ratio].block_positions, cp1.block_positions)
-    assert torch.equal(plain[ratio].first_indices, cp1.first_indices)
+    assert torch.equal(plain.gather_indices, cp1.gather_indices)
+    assert torch.equal(plain.block_positions, cp1.block_positions)
+    assert torch.equal(plain.first_indices, cp1.first_indices)

@@ -19,10 +19,13 @@ from functools import cache
 import torch
 
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.override.deepseek_v4.metadata import AscV4Metadata
 
 from .ascendc import (
+    _LI_CMP_RATIO,
+    _LI_LAYOUT,
+    _LI_MASK_MODE,
     AscCompressedSparseInnerAttention,
-    AscCompressedVarlenMetadata,
     _SparseAttentionHooks,
 )
 
@@ -74,32 +77,37 @@ class PyPTOLightningIndexer(LightningIndexer):
     class Config(LightningIndexer.Config):
         pass
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_masks):
-        if not isinstance(attention_masks, AscCompressedVarlenMetadata):
-            raise TypeError("PyPTOLightningIndexer requires AscCompressedVarlenMetadata.")
-        plan = attention_masks.plans.get(4)
-        if plan is None or plan.cu_seqlens_cmp_k is None or plan.li_metadata is None:
-            raise ValueError("PyPTOLightningIndexer requires a ratio-4 plan with LI metadata.")
+    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+        if not isinstance(attention_metadata, AscV4Metadata):
+            raise TypeError("PyPTOLightningIndexer requires AscV4Metadata.")
+        plan = attention_metadata.plan
+        asc = attention_metadata.asc
+        li_metadata = None if asc is None else asc.lightning_indexer.fwd
+        if plan.cu_seqlens_cmp_k is None or li_metadata is None:
+            raise ValueError("PyPTOLightningIndexer requires a ratio-4 plan with a selector record.")
         flat_k = idx_k.flatten(0, 1)
         if plan.cmp_k_global_gather_indices is not None:
             idx_k_tnd = flat_k[plan.cmp_k_global_gather_indices].unsqueeze(1).contiguous()
         else:
-            idx_k_tnd = flat_k[: plan.n_cmp_blocks_host].unsqueeze(1).contiguous()
-        cfg = self.li_kernel_config
+            if plan.block_positions is None:
+                raise ValueError("PyPTOLightningIndexer requires plan.block_positions.")
+            # The dynamic block count, exactly as the AscendC selector reads it: a host int
+            # would specialize the traced graph on the batch's block count.
+            idx_k_tnd = flat_k[: plan.block_positions.numel()].unsqueeze(1).contiguous()
         op = _load_pypto_op(_LI_MODULE, "lightning_indexer", _device_index(idx_q))
         sparse_indices, _ = op(
             idx_q.flatten(0, 1),
             idx_k_tnd,
             idx_w.flatten(0, 1).float(),
             self.index_topk,
-            cu_seqlens_q=attention_masks.varlen.cu_seq_q,
+            cu_seqlens_q=attention_metadata.varlen.cu_seq_q,
             cu_seqlens_k=plan.cu_seqlens_cmp_k,
             cmp_residual_k=plan.block_remainder,
-            metadata=plan.li_metadata,
-            layout_q=cfg.layout_q,
-            layout_k=cfg.layout_k,
-            mask_mode=cfg.mask_mode,
-            cmp_ratio=cfg.cmp_ratio,
+            metadata=li_metadata,
+            layout_q=_LI_LAYOUT,
+            layout_k=_LI_LAYOUT,
+            mask_mode=_LI_MASK_MODE,
+            cmp_ratio=_LI_CMP_RATIO,
             return_value=1,
         )
         return sparse_indices.reshape(idx_q.shape[0], idx_q.shape[1], 1, -1)

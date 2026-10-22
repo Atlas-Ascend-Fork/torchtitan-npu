@@ -18,7 +18,6 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerKernelConfig
 
 from .token_dispatcher import CPTokenDispatcher
 
@@ -43,15 +42,15 @@ class CompressorImplementation(Configurable):
     def __init__(self, config: Config):
         del config
 
-    def forward(self, compressor, x, attention_masks):
-        return compressor._forward(x, attention_masks)
+    def forward(self, compressor, x, attention_metadata):
+        return compressor._forward(x, attention_metadata)
 
 
 class Compressor(Module):
     """Document-packed key compression.
 
-    Consumes the unified per-ratio compressor contract from the metadata's
-    ``plans[ratio]`` — ``gather_indices`` / ``block_positions`` /
+    Consumes the unified compressor contract of this layer's geometry from
+    the metadata's ``plan`` — ``gather_indices`` / ``block_positions`` /
     ``first_indices`` — and returns the pooled key stream ``[n_blocks, D]``.
     The contract is provided identically under context parallel and
     without: the projection (``wkv`` / ``wgate``) is per-token and runs on
@@ -137,10 +136,10 @@ class Compressor(Module):
         state_b = state[:, :, head_dim:]
         return torch.cat([state_a, state_b], dim=1)
 
-    def forward(self, x, attention_masks):
-        return self.implementation.forward(self, x, attention_masks)
+    def forward(self, x, attention_metadata):
+        return self.implementation.forward(self, x, attention_metadata)
 
-    def _forward(self, x, attention_masks):
+    def _forward(self, x, attention_metadata):
         """Project kv/score locally, gather the plan-block rows through the
         dispatcher, pool, and RoPE.
 
@@ -158,15 +157,15 @@ class Compressor(Module):
         # The contract is checked by the attribute the compressor reads rather than by
         # ``isinstance``: this protocol is runtime-checkable, and inside a dynamo region the
         # static path rejects metadata that carries every member the check is about.
-        if getattr(attention_masks, "plans", None) is None:
+        if getattr(attention_metadata, "plan", None) is None:
             raise TypeError(
                 "DSV4 compression requires a CompressedKernelContract (the "
-                "model-dir CompressedVarlenMetadata or the NPU slim type), "
-                f"got {type(attention_masks)}."
+                "model-dir DeepSeekV4Metadata or the NPU slim type), "
+                f"got {type(attention_metadata)}."
             )
         ratio = self.compress_ratio
-        plan = attention_masks.plans.get(ratio)
-        if plan is None or plan.gather_indices is None:
+        plan = attention_metadata.plan
+        if plan.gather_indices is None:
             raise ValueError(f"No compressor plan for ratio={ratio}")
 
         # -- project the local stream (BF16 weights, FP32 compute via
@@ -236,7 +235,7 @@ class Indexer(Module):
         H = _hadamard(d, dtype=x.dtype, device=x.device)
         return F.linear(x, H) * (d**-0.5)
 
-    def forward(self, x, qr, *, positions, attention_masks):
+    def forward(self, x, qr, *, positions, attention_metadata):
         """Project raw indexer queries, keys, and per-head weights.
 
         ``x`` is the caller's **local** stream (never the augmented
@@ -257,7 +256,7 @@ class Indexer(Module):
         idx_q = idx_q.view(bsz, seqlen, self.num_index_heads, self.head_dim)
         idx_q = self.rope(idx_q, positions=positions)
         idx_q = self._rotate_activation(idx_q)
-        idx_k = self.compressor(x, attention_masks)
+        idx_k = self.compressor(x, attention_metadata)
         idx_k = self._rotate_activation(idx_k)
         idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
         return idx_q, idx_k, idx_w
@@ -332,22 +331,22 @@ class LightningIndexer(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         index_topk: int
-        li_kernel_config: LightningIndexerKernelConfig = field(default_factory=LightningIndexerKernelConfig)
 
     def __init__(self, config: Config):
         super().__init__()
         self.index_topk = config.index_topk
-        self.li_kernel_config = config.li_kernel_config
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_masks):
-        plan = attention_masks.plans.get(4)
-        if plan is None or plan.cu_seqlens_cmp_k is None:
+    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+        # The selector runs on a layer of its own ratio and reads that layer's entry; a
+        # geometry without a compressed pool is the only shape it refuses.
+        plan = attention_metadata.plan
+        if plan.cu_seqlens_cmp_k is None:
             raise ValueError("LightningIndexer requires a ratio-4 plan carrying a compressed pool.")
         return select_compressed_slots(
             idx_q,
             idx_k,
             idx_w,
-            attention_masks.varlen.cu_seq_q,
+            attention_metadata.varlen.cu_seq_q,
             plan.cu_seqlens_cmp_k,
             self.index_topk,
         )

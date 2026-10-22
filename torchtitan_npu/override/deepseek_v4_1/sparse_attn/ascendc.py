@@ -7,10 +7,8 @@
 from dataclasses import dataclass
 
 import torch
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.common.metadata_extension import (
-    register_pytree_node_for_dataclass,
-)
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.context_parallel import cp_plan
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
@@ -166,7 +164,8 @@ class AscV41Metadata(DeepSeekV41Metadata):
 # ``DeepSeekV41Metadata`` therefore stays an opaque pytree leaf -- the golden path's flattening
 # behavior is untouched -- and only the Asc node is registered, mirroring DSV4's seam so the
 # fused metadata is pytree-transparent from day one when such a path arrives.
-register_pytree_node_for_dataclass(AscV41Metadata)
+if AscV41Metadata not in SUPPORTED_NODES:
+    register_dataclass(AscV41Metadata, serialized_type_name=f"{AscV41Metadata.__module__}.{AscV41Metadata.__name__}")
 
 
 def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: AicpuGeometry) -> AscV41Metadata:

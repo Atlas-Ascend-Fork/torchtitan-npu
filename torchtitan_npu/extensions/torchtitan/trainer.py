@@ -142,6 +142,7 @@ class TrainerEx(Trainer):
                 config.model_spec,
                 quantization_config,
                 model_compile_enabled=model_compile_enabled,
+                override_config=config.override,
             )
 
         set_allow_hf32(config.training.extension.allow_hf32)

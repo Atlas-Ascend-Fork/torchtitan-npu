@@ -443,7 +443,7 @@ def test_trainer_ex_applies_enabled_quantization_before_base_initialization(monk
     quantized_model_spec = object()
     converter_module = types.ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
 
-    def apply_quantization(model_spec, quantization_config, *, model_compile_enabled):
+    def apply_quantization(model_spec, quantization_config, *, model_compile_enabled, override_config=None):
         events.append(
             (
                 "quantize",

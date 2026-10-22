@@ -29,7 +29,6 @@ from torchtitan.components.loss import (
 )
 from torchtitan.config import derive
 from torchtitan.distributed.utils import get_spmd_backend
-from torchtitan.models.common.attention import AttentionMasksType  # noqa: TC002
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE  # noqa: TC002
@@ -42,6 +41,9 @@ from torchtitan.models.deepseek_v3.mtp import (
 from torchtitan.protocols.module import ModuleList
 
 from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (  # noqa: TC001
+    AttentionMetadataMap,
+)
 
 from .mhc import HcHead, HcPost, HcPre  # noqa: TC001
 
@@ -231,8 +233,26 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
 
 
 class _MTPAttentionContext(NamedTuple):
-    attention_masks: AttentionMasksType | None
+    """What every DSV4 layer reads for its attention, main and MTP depths.
+
+    The per-microbatch metadata map (upstream #4897) is built once for the whole
+    stack -- main layers and MTP depths together -- and each layer reads the entry
+    its own attention backend named.  There is no single-object fallback: the V4
+    cores all build their own metadata, so a layer whose key is missing is a
+    config that built none for a backend it runs, not a reason to hand it another
+    geometry's grid.
+    """
+
+    attention_metadata: AttentionMetadataMap
     positions: torch.Tensor | None
+
+    def for_layer(self, layer: Any) -> Any:
+        """The metadata one layer reads: its own map entry, keyed by its backend."""
+        key = layer.attention.attention_metadata_key
+        metadata = self.attention_metadata.get(key)
+        if metadata is None:
+            raise ValueError(f"no attention metadata was built for {key!r}")
+        return metadata
 
 
 class _MTPForwardState(NamedTuple):
@@ -274,7 +294,7 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         self.mtp_norm = config.mtp_norm.build()
         self.hc_head = config.hc_head.build()
 
-    def forward(  # pyrefly: ignore [bad-param-name-override]
+    def forward(  # pyrefly: ignore [bad-override]
         self,
         mtp_input_embed: torch.Tensor,
         prev_hc_hidden: torch.Tensor,
@@ -298,7 +318,7 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         hidden, post, comb = self.hc_attn_pre(hidden)
         hidden = self.attention(
             self.attention_norm(hidden),
-            attention_context.attention_masks,
+            attention_context.for_layer(self),
             attention_context.positions,
         )
         hidden = self.hc_post(hidden, residual, post, comb)
@@ -366,14 +386,21 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         for layer_config in config.mtp_layers:
             self.mtp_layers.append(layer_config.build())
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
+        *,
+        attention_metadata: AttentionMetadataMap,
         mtp_batch: MTPBatch | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
-        attention_context = _MTPAttentionContext(attention_masks, positions)
+        """The metadata map is the pinned argument's replacement, not a renaming of it.
+
+        The pinned ``MTPDecoder.forward`` takes one mask object for every layer; this decoder
+        takes the decoder's map and hands each layer the entry of its own geometry, so the
+        parameter is keyword-only and the pinned name would be a lie.
+        """
+        attention_context = _MTPAttentionContext(attention_metadata, positions)
         state = self._forward_main(tokens, attention_context)
 
         if self.mtp_layers is None:
@@ -411,7 +438,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
             hidden = layer(
                 hidden,
                 input_ids,
-                attention_context.attention_masks,
+                attention_context.for_layer(layer),
                 attention_context.positions,
             )
 

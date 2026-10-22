@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 
 import torch
 from attn_gym.sparse import AuxRequest, gather_attn
-from torchtitan.models.common.attention import BaseAttention, VarlenAttention
+from torchtitan.models.common.attention import (
+    BaseAttention,
+    VarlenAttention,
+    create_varlen_metadata_for_document,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -17,7 +21,7 @@ from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
-from .metadata import CompressedVarlenMetadata
+from .metadata import DeepSeekV4Metadata, build_compressed_varlen_metadata
 from .token_dispatcher import CPTokenDispatcher
 
 
@@ -41,22 +45,6 @@ class UnitScaleRMSNorm(RMSNorm):
         # Preserve the original query normalization's input-dtype rounding.
         assert self.eps is not None
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-
-
-def _reject_cp_frames(metadata: CompressedVarlenMetadata) -> None:
-    """The reference consumers read one contiguous document stream.
-
-    Under context parallel the query offsets describe this rank's chunks while the compressed
-    pool is the gathered row, so a reference consumer would read boundaries that are not there.
-    Only the fused kernels carry those frames (through their own metadata).  The reference tier
-    used to refuse the shape on the model's behalf; now that the default extension is the
-    identity, the refusal belongs to the consumers themselves.
-    """
-    if not torch.equal(metadata.varlen.cu_seq_q, metadata.varlen.cu_seq_k):
-        raise ValueError(
-            "the reference core requires cu_seq_q == cu_seq_k (contiguous documents); under "
-            "context parallel the fused AscendC path carries the frames."
-        )
 
 
 class CompressedSparseInnerAttention(Module):
@@ -87,8 +75,9 @@ class CompressedSparseInnerAttention(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
         # The int DSA window, replacing the varlen attention's ``(left, right)`` tuple: the
-        # model's window is a count of preceding tokens.  The varlen type is also what the
-        # model's mask dispatch recognises.
+        # model's window is a count of preceding tokens.  The varlen base is also the type the
+        # pinned decoder's mask dispatch recognises on the stacks that still build a single
+        # mask object; this stack builds its metadata through the seam instead.
         window_size: int  # pyrefly: ignore [bad-override]
         compress_ratio: int
         softmax_scale: float
@@ -96,6 +85,40 @@ class CompressedSparseInnerAttention(Module):
         return_lse: bool = False
         """Hand back the per-head log-sum-exp beside the output.  A test hook: nothing in the
         model consumes it, and a fused core takes its own from the kernel."""
+
+        @property
+        def attention_metadata_key(self):
+            """This layer's own entry: the core's class plus its compression ratio.
+
+            One entry per geometry is what lets the builder derive exactly the plan this layer
+            grids -- no stack-wide ratio table on any config, and no entry shared by layers whose
+            kernels address different pools.
+            """
+            return (type(self), self.compress_ratio)
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> DeepSeekV4Metadata:
+            """This geometry's per-microbatch contract (upstream #4897).
+
+            Built from the pre-shard ``positions`` alone: the entry carries its own ratio's plan
+            over the row this builder derives, so one build serves every layer of this geometry --
+            the decoder keys the map by this config's :attr:`attention_metadata_key`.  This
+            builder's contract refuses context parallel; the fused core's config builds an entry
+            whose hook rebuilds it for this rank.
+            """
+            del padding_mask, max_num_documents, max_context_length
+            # A document starts where ``positions`` resets to 0; the window size is the core's
+            # own field, so it is part of what this entry's plan was derived for.
+            varlen = create_varlen_metadata_for_document(positions)
+            # The selector's record is the selector port's business: this builder produces the
+            # packed contract only, and a fused selector backend attaches its own record.
+            return build_compressed_varlen_metadata(varlen, self.compress_ratio, window_size=self.window_size)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -117,21 +140,20 @@ class CompressedSparseInnerAttention(Module):
         *,
         attn_sink: torch.Tensor | None = None,
         sparse_indices=None,
-        attention_masks: CompressedVarlenMetadata | None = None,
+        attention_metadata: DeepSeekV4Metadata | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # The indexer's projections are the selector's business, not the core's.
         del idx_q, idx_k, idx_w
         if attn_sink is None:
             raise ValueError("CompressedSparseInnerAttention requires attn_sink")
-        if not isinstance(attention_masks, CompressedVarlenMetadata):
+        if not isinstance(attention_metadata, DeepSeekV4Metadata):
             raise TypeError(
-                "CompressedSparseInnerAttention requires CompressedVarlenMetadata "
-                f"attention masks, got {type(attention_masks).__name__}."
+                "CompressedSparseInnerAttention requires DeepSeekV4Metadata "
+                f"attention metadata, got {type(attention_metadata).__name__}."
             )
-        _reject_cp_frames(attention_masks)
         bsz, seqlen, _, head_dim = q.size()
         n_cmp = 0 if cmp_k is None else cmp_k.size(1)
-        cu_seqlens = attention_masks.varlen.cu_seq_q
+        cu_seqlens = attention_metadata.varlen.cu_seq_q
         if n_cmp == 0:
             # A window-only layer: the pool is empty, and the operator wants both offsets.
             cu_seqlens_k = cu_seqlens
@@ -140,7 +162,7 @@ class CompressedSparseInnerAttention(Module):
         else:
             # ``n_cmp`` is this tensor's width, so it is present here.
             assert cmp_k is not None
-            cu_seqlens_k = attention_masks.plans[self.compress_ratio].cu_seqlens_cmp_k
+            cu_seqlens_k = attention_metadata.plan.cu_seqlens_cmp_k
             if cu_seqlens_k is None:
                 raise ValueError(f"No compressed pool layout for ratio={self.compress_ratio}.")
             kv_indices = self._slots(sparse_indices, cu_seqlens, cu_seqlens_k, seqlen, n_cmp)
@@ -206,11 +228,11 @@ class CompressedSparseAttention(Module):
         self.inner_attention = config.inner_attention.build()
 
     def forward(
-        self, q, swa_k, cmp_k=None, *, idx_q=None, idx_k=None, idx_w=None, attn_sink=None, attention_masks=None
+        self, q, swa_k, cmp_k=None, *, idx_q=None, idx_k=None, idx_w=None, attn_sink=None, attention_metadata=None
     ):
         sparse_indices = None
         if self.lightning_indexer is not None:
-            sparse_indices = self.lightning_indexer(idx_q, idx_k, idx_w, attention_masks=attention_masks)
+            sparse_indices = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=attention_metadata)
         return self.inner_attention(
             q,
             swa_k,
@@ -220,7 +242,7 @@ class CompressedSparseAttention(Module):
             idx_w=idx_w,
             sparse_indices=sparse_indices,
             attn_sink=attn_sink,
-            attention_masks=attention_masks,
+            attention_metadata=attention_metadata,
         )
 
 
@@ -296,7 +318,18 @@ class Attention(BaseAttention):
         super().parallelize(parallel_dims)
         self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
 
-    def forward(self, x, attention_masks, positions):
+    @property
+    def attention_metadata_key(self):
+        """The map key of the metadata this layer reads (upstream #4897).
+
+        ``BaseAttention``'s default forwards to the built ``inner_attention``;
+        this wrapper builds a ``compressed_sparse_attention`` around the DSA
+        core instead (the same config node sits at ``inner_attention`` for the
+        decoder's traversal), so the key comes from the core one level down.
+        """
+        return self.compressed_sparse_attention.inner_attention.attention_metadata_key
+
+    def forward(self, x, attention_metadata, positions):
         """The unified attention forward (CP and non-CP).
 
         The Q side and the swa projection run on the local stream; the
@@ -309,7 +342,7 @@ class Attention(BaseAttention):
         ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the wrapper
         boundary.
         """
-        window = attention_masks.window
+        window = attention_metadata.window
         bsz, seqlen, _ = x.size()
 
         qr = self.q_norm(self.wq_a(x))
@@ -342,16 +375,16 @@ class Attention(BaseAttention):
                 x.detach(),
                 qr.detach(),
                 positions=positions,
-                attention_masks=attention_masks,
+                attention_metadata=attention_metadata,
             )
             # The indexer's outputs: idx_q / idx_w (local), idx_k (the
             # pooled stream — packed into the container).
-            idx_k = self.token_dispatcher.select(idx_k, attention_masks.plans[4])
+            idx_k = self.token_dispatcher.select(idx_k, attention_metadata.plan)
 
         if self.compress_ratio > 1:
             assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
-            plan = attention_masks.plans[self.compress_ratio]
-            pooled = self.compressor(x, attention_masks)
+            plan = attention_metadata.plan
+            pooled = self.compressor(x, attention_metadata)
             cmp_k = self.token_dispatcher.select(pooled, plan)
 
         # Inner-attention positional contract: absent components are None.
@@ -365,7 +398,7 @@ class Attention(BaseAttention):
             idx_k=idx_k,
             idx_w=idx_w,
             attn_sink=self.attn_sink,
-            attention_masks=attention_masks,
+            attention_metadata=attention_metadata,
         )
 
         o = self.rope(o, positions=positions, inverse=True)

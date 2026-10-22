@@ -53,10 +53,7 @@ builds its own entry from its own classes in its own package instead of adding f
 from dataclasses import dataclass
 
 import torch
-
-from torchtitan_npu.models.common.metadata_extension import (
-    register_pytree_node_for_dataclass,
-)
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
 __all__ = [
     "AicpuGeometry",
@@ -140,8 +137,23 @@ class AicpuMetadata:
     lightning_indexer: AscLightningIndexerMetadata
 
 
-register_pytree_node_for_dataclass(KernelFrame)
-register_pytree_node_for_dataclass(AicpuGeometry)
-register_pytree_node_for_dataclass(AscLightningIndexerMetadata)
-register_pytree_node_for_dataclass(AscSparseAttentionMetadata)
-register_pytree_node_for_dataclass(AicpuMetadata)
+if KernelFrame not in SUPPORTED_NODES:
+    register_dataclass(KernelFrame, serialized_type_name=f"{KernelFrame.__module__}.{KernelFrame.__name__}")
+
+if AicpuGeometry not in SUPPORTED_NODES:
+    register_dataclass(AicpuGeometry, serialized_type_name=f"{AicpuGeometry.__module__}.{AicpuGeometry.__name__}")
+
+if AscLightningIndexerMetadata not in SUPPORTED_NODES:
+    register_dataclass(
+        AscLightningIndexerMetadata,
+        serialized_type_name=f"{AscLightningIndexerMetadata.__module__}.{AscLightningIndexerMetadata.__name__}",
+    )
+
+if AscSparseAttentionMetadata not in SUPPORTED_NODES:
+    register_dataclass(
+        AscSparseAttentionMetadata,
+        serialized_type_name=f"{AscSparseAttentionMetadata.__module__}.{AscSparseAttentionMetadata.__name__}",
+    )
+
+if AicpuMetadata not in SUPPORTED_NODES:
+    register_dataclass(AicpuMetadata, serialized_type_name=f"{AicpuMetadata.__module__}.{AicpuMetadata.__name__}")

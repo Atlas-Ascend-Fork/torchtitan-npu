@@ -38,7 +38,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 注意事项：
 
 - 同一 target 有多个同类实现时，在 variant 后增加职责限定，例如
-`rope.asc_complex`、`rope.asc_cossin`、`sparse_attn.asc_metadata`。
+`rope.asc_complex`、`rope.asc_cossin`、`sparse_attn.asc_li`。
 
 - replacement 类采用「variant + target」命名，并保留标准缩写大小写，例如
 `AscRMSNorm`、`AscCompressedSparseInnerAttention`。
@@ -110,10 +110,15 @@ torchtitan_npu/override/<scope>/<target>/
   那一组换成量化 selector 的 QLI schedule 并多出 `fwd_sparse`（QSLI）与 `sparse_length`（逐行候选数）；
   候选池的容量与块大小从模型 config 读取，只作为 launch 参数与候选数推导的输入。因此 `asc` 在这条路径上
   不生效，非量化 entry 的 `fwd_sparse`/`sparse_length` 保持为空，等带 candidate 的非量化算子落地后由端口填。
-- DeepSeek-V4 的 `sparse_attn.asc_metadata` 生成 CANN `*_metadata`，
-  `sparse_attn.asc` 桥接 LightningIndexer/SparseFlashMLA 的正反向；`sparse_attn.pypto` 用
-  PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。（V4 尚未迁移到 backend-owned
-  接缝，仍由 `metadata_extension` 预计算。）
+- DeepSeek-V4 的 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 在
+  `CompressedSparseInnerAttention.Config` 建好这个几何的 plan（一条 entry 一个 ratio，直接读 `metadata.plan`）
+  之后，再按自身几何补上四个算子的记录；`sparse_attn.asc` 桥接
+  LightningIndexer/SparseFlashMLA 的正反向，`sparse_attn.pypto` 用 PyPTO 实现 LI/LIG，并复用
+  AscendC 的其余 attention kernel 与同一份记录。几何（heads/head dim）是该 config 自己的必填
+  字段、无默认值，由 override 参数一次写入，默认值即 V4-Flash 的发布形状。CP 下由
+  `AscV4Metadata.prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`
+  用 rank-local 行重建 plan，再在其上重填记录；参考契约的 hook 直接拒绝 CP。
+
 - MoE token dispatcher 的 `npu_moe_token_unpermute` 与 `npu_moe_re_routing` 在
   `torchtitan_npu/ops/ascendc/` 中以 `torch.library.custom_op` 做编译兼容封装，并提供 Fake 和
   Autograd；
@@ -169,15 +174,14 @@ python -m torchtitan_npu.train \
   --config deepseek_v4_debugmodel \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \
-    torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata \
-    torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}'
 ```
 
 多个无参数入口可用空格或逗号分隔。带参数的入口必须将 JSON 作为一个 shell 参数，例如：
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff":2.0}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8,"indexer_loss_coeff":2.0}'
 ```
 
 同一模块包含多个 override 入口时，只会启用命令中点名的入口函数。`torchtitan` 在配置构造完成、组件
@@ -196,8 +200,8 @@ python -m torchtitan_npu.train \
   （默认值为 V4.1-Flash 形状）。本入口不声明量化：量化 selector 的 metadata 由量化后的 attention
   自己建（另一条 backend，见上文），池的容量与块大小取自模型 config。它与 `lightning_indexer.asc`
   必须同开（教师边只有两侧都在时才存在），见 `torchtitan_npu/override/README.md#deepseek-v41`。
-- DeepSeek-V4 的 `sparse_attn.asc_metadata` 必须与 `sparse_attn.asc` 或 `sparse_attn.pypto` 配套；
-  `sparse_attn.asc` 与 `sparse_attn.pypto` 声明同一 attention target，二者只能选一。
+- DeepSeek-V4 的 `sparse_attn.asc` / `sparse_attn.pypto` 各自构建自己的 metadata（每个几何一份 entry）；
+  两者声明同一 attention target，只能选一。
 - DeepSeek-V4 MHC 的 AscendC 入口声明 `HcPre.Config`/`HcPost.Config`，Triton 入口还包含
   `HcHead.Config`；同一节点只能选择一个实现。
 - 两个 override 声明同一节点，或一个声明另一个的祖先/后代节点时会冲突；可移除互斥入口，

@@ -3,28 +3,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.distributed.context_parallel import cp_shard
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
-from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerMetadata,
-    MetadataExtension,
-)
-
-from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
+from .metadata import DeepSeekV4Metadata
 from .mhc import HcPost, HcPre
 from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
-from .token_dispatcher import build_cp_plan
 
 if TYPE_CHECKING:
     from .compressor import Indexer
@@ -60,12 +52,12 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_metadata: DeepSeekV4Metadata | None,
         positions: torch.Tensor | None = None,
     ):
         residual = x
         x, post, comb = self.hc_attn_pre(x)
-        x = self.attention(self.attention_norm(x), attention_masks, positions)
+        x = self.attention(self.attention_norm(x), attention_metadata, positions)
         x = self.hc_post(x, residual, post, comb)
         residual = x
         x, post, comb = self.hc_ffn_pre(x)
@@ -80,11 +72,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         vocab_size: int
         compress_ratios: tuple[int, ...]
         n_layers: int
-        window_size: int
-        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        lightning_indexer_metadata: LightningIndexerMetadata.Config = field(
-            default_factory=LightningIndexerMetadata.Config
-        )
 
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
@@ -107,9 +94,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                         raise ValueError(f"n_groups ({n_groups}) must be divisible by tp ({tp})")
 
             # Context parallel is supported on the AscendC fused path only: the
-            # model's build_attention_masks derives the per-rank dispatch
-            # plan when the trainer passes the CP mesh, and only the fused
-            # kernels take those frames through their own metadata.
+            # core's own metadata (its records depend on the frames) derives the
+            # per-rank dispatch plan when the model's preprocessing hands the CP
+            # mesh to the seam, and only the fused kernels take those frames
+            # through their own metadata.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -174,112 +162,8 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        cfg = config
 
         self.lora_config = getattr(config, "lora", None)
-        self.compress_ratios = tuple(cfg.compress_ratios) + tuple(
-            layer.attention.compress_ratio for layer in cfg.mtp_layers
-        )
-        self.window_size = cfg.window_size
-
-        self._metadata_extension = cfg.metadata_extension.build()
-        self._lightning_indexer_metadata = cfg.lightning_indexer_metadata.build()
-
-    def build_attention_masks(
-        self,
-        inputs,
-        labels,
-        extra_kwargs,
-        *,
-        cp_mesh: DeviceMesh | None = None,
-        load_balancer_type: str | None = None,
-    ):
-        """The model-owned per-batch metadata construction (the single
-        overridable mask-handling seam).
-
-        One entry for both modes: the common contract
-        (``build_compressed_varlen_metadata``) is always built; under CP
-        ``_build_cp_metadata`` shards the inputs and derives the rank-local
-        plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (the AscendC kernel metadata, for one)
-        runs last.
-        """
-        positions = extra_kwargs.get("positions")
-        masks = self.get_attention_masks(positions=positions)
-        if not isinstance(masks, VarlenMetadata):
-            raise TypeError(
-                "DeepSeek-V4 compression requires a varlen stream (the "
-                "inner attention is varlen-typed), got "
-                f"{type(masks)}."
-            )
-        common = build_compressed_varlen_metadata(masks, self.compress_ratios)
-        if cp_mesh is not None:
-            inputs, labels, positions, common = self._build_cp_metadata(
-                inputs,
-                labels,
-                positions,
-                common,
-                cp_mesh,
-                load_balancer_type,
-            )
-            extra_kwargs["positions"] = positions
-        if self._lightning_indexer_metadata is not None:
-            common = self._lightning_indexer_metadata(common)
-        if self._metadata_extension is not None:
-            common = self._metadata_extension(common)
-        extra_kwargs["attention_masks"] = common
-        return inputs, labels, extra_kwargs
-
-    def _build_cp_metadata(
-        self,
-        inputs,
-        labels,
-        positions,
-        common,
-        cp_mesh,
-        load_balancer_type,
-    ):
-        """The context-parallel metadata: shard the tensors via the generic
-        path and derive the rank-local plan from the global context (the
-        common metadata's varlen; the stack shards contiguous slabs).
-
-        Returns ``(inputs, labels, positions, metadata)``.  The MTP depths'
-        rolled tokens are prepared by ``preprocess_inputs`` *before* this
-        shard, because a shift across a shard boundary is not a shift."""
-        seq_len = common.seq_len
-        cp_size = cp_mesh.size(0)
-        if seq_len % cp_size != 0:
-            raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
-        shard_len = seq_len // cp_size
-        if load_balancer_type is not None:
-            raise ValueError(
-                f"the DeepSeek-V4 stack shards contiguous slabs, but the context-parallel load "
-                f"balancer is {load_balancer_type!r}: run with "
-                "--parallelism.context-parallel-load-balancer None."
-            )
-        tensors, _ = cp_shard(
-            cp_mesh,
-            (inputs, labels, positions),
-            None,
-            load_balancer_type,
-            1,
-        )
-        inputs, labels, positions = tensors
-        rank = cp_mesh.get_local_rank()
-        cp_meta, plans, window = build_cp_plan(
-            common.varlen,
-            rank=rank,
-            cp_size=cp_size,
-            shard_len=shard_len,
-            window_size=self.window_size,
-            ratios=sorted(set(self.compress_ratios)),
-        )
-        return (
-            inputs,
-            labels,
-            positions,
-            CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
-        )
 
     def preprocess_inputs(
         self,
@@ -292,15 +176,15 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Prepare the MTP depths' rolled batch on the *global* row, then shard it.
+        """Prepare the MTP batch on the global row, then let the seam shard it.
 
-        A depth's rolled tokens have to be derived from the whole row: a shift
-        across a shard boundary is not a shift, so slicing first and rolling
-        afterwards would pick the wrong neighbour at every boundary.  The batch
-        is therefore built here, before the base seam shards the inputs, and
-        the same ``cp_shard`` cut is applied to it afterwards (a local slice,
-        no communication, same contiguous-slab layout as the inputs).
-        Without context parallel or without MTP depths nothing changes.
+        The base seam (upstream #4116) builds each attention backend's metadata
+        once per microbatch and shards the inputs for context parallel.  The MTP
+        depths' rolled tokens have to be derived from the *global* row — a shift
+        across a shard boundary is not a shift — so they are prepared here,
+        before the base call, and cut by the same contiguous-slab ``cp_shard``
+        afterwards (a local slice, no communication).  Without context parallel
+        or without MTP depths nothing changes.
         """
         cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
         positions = input_dict.get("positions")
@@ -321,6 +205,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 positions,
                 len(self.mtp_layers),
             )
+
         inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
             input_dict,
             labels,

@@ -11,6 +11,7 @@ All knowledge of the DSV4 forward protocol and module layout stays here (or in
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -119,6 +120,21 @@ def forward_logits(
         .unsqueeze(0)
         .expand(tokens.shape[0], -1)
     )
-    tokens, _, extra_kwargs = model.build_attention_masks(tokens, None, {"positions": positions})
+    # The model owns the metadata seam (upstream #4897/#4116): it builds one entry per
+    # attention geometry and hands the map to the forward, so an offline forward owes it the
+    # same preprocessing the trainer does.
+    parallel_dims = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
+    parallelism = SimpleNamespace(
+        spmd_backend=None,
+        context_parallel_load_balancer=None,
+        context_parallel_ptrr_mask_key=None,
+    )
+    tokens, _, extra_kwargs = model.preprocess_inputs(
+        {"input": tokens, "positions": positions},
+        None,
+        parallel_dims=parallel_dims,
+        device=tokens.device,
+        parallelism=parallelism,
+    )
     logits = model(tokens, **extra_kwargs)
     return logits[:, -1, :] if last_token_only else logits

@@ -1,9 +1,16 @@
 # Agent Note: 移除 `metadata_extension` —— attention metadata 的所有权回到 attention backend
 
-Status: proposed（分三步实施，本 Note 随 A 合入；B/C 落地时更新本文状态）
+Status: implemented（A/B/C 全部落地：三栈迁移、`metadata_extension` 删除、`.ci` 债务边清零）
 Created: 2026-10-14
-Last updated: 2026-10-14
-Tracking: upstream PR #4897 / #4116 / #4617（回移层）；本仓 A（接缝）、B（三栈迁移）、C（删除收尾）
+Last updated: 2026-10-21
+Tracking: upstream PR #4897 / #4116 / #4617（回移层）；本仓 A/B/C 由 !1063 / !1064 / !1065 / !1066 交付
+
+## 落地状态（2026-10-21）
+
+A（接缝回移）、B（V3.2 / V4.1 / V4 三栈迁移）、C（删除 `metadata_extension` 与 `.ci` 债务边）均已交付：模型不再定义
+`build_attention_masks`，每个 attention backend 由自己的 config 构建 entry，CP 半边由 metadata 的
+`prepare_cp_metadata` 重建。V4 的 CP 当前是连续 slab；后续先把它迁移到 V4.1 的 CP 模式（query exchange + KV 保持
+整行），再在该模式上重新添加 head-tail，见 `./2026-10-21-temporary-head-tail-removal.md`。
 
 ## Context
 
@@ -20,12 +27,16 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 
 ## 目标状态（「重构完成」的判据）
 
-1. `metadata_extension.py` 不存在；无模型定义 `build_attention_masks`，也无 `metadata_extension` /
-   `lightning_indexer_metadata` 字段；
-2. per-batch metadata 由 backend config 构建（每 microbatch 每 backend 一次、同几何共享），CP 下由 **backend 类**自己的
-   `prepare_cp_metadata` 产出 rank-local 副本（几何由 `cp_shard_context` 发布）（V4/V4.1 的记录在 CP 后**重建**）；
-3. `.ci/architecture_import_baseline.json` 的两条 `extensions → models.common.metadata_extension` 债务边消失
-   （activation order 不动）；
+1. `metadata_extension.py` 与 `metadata_nodes.py` 都不存在；无模型定义
+   `build_attention_masks`，也无 `metadata_extension` / `lightning_indexer_metadata` 字段：metadata 需要的几何与
+   记录契约只存在于 port 自己的 config 上（`AicpuGeometry`），`models/` 与 `patches/` 不留任何 GPU 上无用的
+   provider 节点；
+2. per-batch metadata 由 backend config 构建（每 microbatch 每 backend 一次、同几何共享），CP 下由 **metadata 自己**的
+   `prepare_cp_metadata` 产出 rank-local 副本（几何由 `cp_shard_context` 发布）（V4/V4.1 的记录在 CP 后**重建**）。
+   宿主是 metadata 而不是 backend 类：被重建的就是它，key 因此退化成纯寻址（V3.2 三栈均如此）；
+3. `.ci/architecture_import_baseline.json` 不再有 metadata 相关的 `extensions → models` 债务边：metadata dataclass
+   直接用 `torch.utils._pytree.register_dataclass` 注册（没有自定义 pytree shim，也没有 patch 目录里的新文件），
+   activation order 不动；
 4. torchao 量化 LI 与 cv_parallel 的分块 metadata 走同一接缝选中，不再有 `model._metadata_extension` 这类反手接线。
 
 ## 重构流程（三步，各自独立 review / 合并）
@@ -62,20 +73,32 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
   拿着没经过端口构建的 metadata 前向会直接失败）。输入的连续 slab 交回
   通用 CP 路径（recipe 本就 `load-balancer None`），模型只留 engram halo。删 `AscV41MetadataExtension` 与
   `asc_metadata`。
-- **V4**：`CompressedVarlenMetadata` 的帧 + CP plan 搬到 backend；`AscCompressedSparseInnerAttention.Config` 构建四算子
-  records，LI record 的 provider 成为该 config 的字段（torchao 量化 / cv_parallel 分块仍以 `@override` 替换该节点
-  选中），`prepare_cp_metadata` 在 CP 后重建并 `_mark_dynamic`；MTP batch 在 `preprocess_inputs` 里于全局行 roll 后
-  单独切分。删 `metadata_extension` / `lightning_indexer_metadata` 与 `asc_metadata` / `asc_li_metadata`。
+- **V4**（已落地）：一条 entry 一个几何（`(端口类, compress_ratio)`）——`DeepSeekV4Metadata` 的 `ratio` + `plan`
+  取代 `plans` 表，builder 只建本 ratio（`build_compressed_varlen_metadata(varlen, ratio)`），没有 `plan_for`、没有
+  跨几何表、也没有 `cu_seq_q_host` / `seq_len_host` 这类宿主缓存（上游 `VarlenMetadata.cu_seq_q_host` 与 `max_k` 足够）。
+  `AscCompressedSparseInnerAttention.Config` 用 `AicpuGeometry`（四个必填宽度 + 层自己的 `window_size` /
+  `index_topk`）构建四算子 records；LI record 由 port 建，量化的 selector 是**另一个 backend**
+  （`torchao_npu.quantized_modules.deepseek_v4.QuantizedV4SparseAttention`：自己的 config、自己的 entry、
+  `quant_lightning_indexer_metadata`、CP 重切直接拒绝），所以 `override/` 与 `models/` 都不感知量化，
+  也没有可替换的 provider 节点。`prepare_cp_metadata` 在 metadata 上、CP 后重建并 `_mark_dynamic`；MTP batch 在
+  `preprocess_inputs` 里于全局行 roll 后单独切分。
+  `MetadataExtension` 类在第 C 步已删：它的两个用途各自归位 —— 状态表改由融合 attention 的 metadata 构建器
+  在 eager 边界写进 plan（不再有 `compressor.asc_metadata` 入口，也没往 `models/deepseek_v4/` 或公共路径
+  加钩子）；CV 分块重切
+  改由它自己的模型子类（`BatchChunkDeepSeekV4Model` / `BatchChunkGraphTrainerDeepSeekV4Model`）在
+  `preprocess_inputs` 里做，`chunk_metadata` 现在替换的是模型 config。
 - 验收（每栈）：相关 CPU UT 全绿且失败集合同改动前；NPU 侧同 checkpoint 的逐 step loss / grad_norm 一致（本仓无设备，
   待补）；`build_attention_masks` 调用点全改走 `preprocess_inputs`。
 
-### C. 删除与收尾
+### C. 删除与收尾（已落地）
 
-- 删 `metadata_extension.py`：`register_pytree_node_for_dataclass` 与 `LightningIndexerKernelConfig` 搬到
-  `models/common/` 下不以 extension 命名的模块（前者让 graph_trainer 的 `minimal_fx_tracer` 把 metadata 展开成
-  tensor/primitive 叶子）；torchao 的 `_QuantizedLightningIndexerMetadataAdapter` 去基类化；cv_parallel 的
-  `BatchChunkMetadataExtension` 重新接到新节点（B 之后它匹配不到节点，pipeline 会静默不注册）。
-- `.ci` 删两条债务边；`fused_ops.md`、`deepseek_v4_tnd.md`、`deepseek_v4_cp.md`、`deepseek_v4_graph_trainer.md`、
+- 删 `metadata_extension.py` 与 `models/common/metadata_nodes.py`：`LightningIndexerMetadata` /
+  `LightningIndexerKernelConfig` 没有替代物（LI record 由 port 按 `AicpuGeometry` 在同一 builder 里建，
+  量化的 selector 是独立 backend），`register_pytree_node_for_dataclass` 改为各 metadata 模块
+  直接调用 `torch.utils._pytree.register_dataclass`。`MetadataExtension` 与 `CompressorMetadata`
+  两个类删除，模型不再有 `metadata_extension` / `lightning_indexer_metadata` 字段；
+  `batch_chunk_metadata.chunk_metadata` 改为替换模型 config。
+- `.ci` 的 metadata 债务边全部删除（`metadata_nodes` 两条 + `batch_chunk_metadata → models/deepseek_v4.model`）；`fused_ops.md`、`deepseek_v4_tnd.md`、`deepseek_v4_cp.md`、`deepseek_v4_graph_trainer.md`、
   `graph_trainer_cv_parallel.md`、`override/README.md` 同步；本 Note 精简后移入 `implemented/architecture/`。
 - 退出条件：pinned `torchtitan` 升到同时含 #4897 / #4116 / #4617 的 release 后，删除 A 引入的四个 patch 模块与 `.ci` 的
   activation 条目；B 叠在 A 的两个 commit 之上（A 被 squash 时 B 需一次 `git rebase --onto`，A 保留 commit 则无需）。
@@ -105,8 +128,11 @@ CP 变换落在模型的 `Decoder._cp_shard`（与上游同名同职责；0.3.0 
 | `_varlen_from_masks` + `patched_cp_shard` | pinned `cp_shard` 不处理 varlen mask | **qwen3.5 迁到接缝之后**。三个 DeepSeek 栈不再往 `extra_kwargs` 放 `attention_masks`（V3.2+asc+CP 下该函数已等价于 `original_cp_shard`，只做输入切分，rank-local metadata 由 `_cp_shard` → `prepare_cp_metadata_map` → 各栈 **backend 类**的 `prepare_cp_metadata` 产生），只剩 qwen3.5 的兜底 `get_attention_masks()` 产出 `VarlenMetadata`，由 varlen 分支改写成 `CPVarlenMetadata` 供它的掩码适配器读 `k_global_gather_indices` |
 | `apply()` 里的 `_compiled_create_block_mask` eager 改写 | **NPU 运行时约束**：torch CP helper 内部惰性 `torch.compile(create_block_mask)`（`torch/distributed/tensor/experimental/_context_parallel/_attention.py`）会起 worker 进程、无法再初始化 NPU，「CP + BlockMask」路径必须换成 eager | 搬到 **`patches/torch_npu/`**（它改的是 torch 内部符号，不属于 torchtitan 的 CP 语义补丁；`extensions/torchtitan/eager_flex.py` 里那份改写的是另一个同名符号 `torchtitan.models.common.attention._compiled_create_block_mask`，两者不重复），或等 torch/torch_npu 不再用 worker 进程建 mask |
 
-两个条件都满足后该文件整体删除。`varlen_cp.py` 的 `CPVarlenMetadata`/`from_global` **不随之删**：三栈的 map 路径仍用它
-构造 rank-local varlen，它随上游 #5071（`HeadTailCPVarlenMetadata`）或「把 V4.1 的 CP 方案推广到 V3.2/V4」一起退场。
+两个条件都满足后该文件整体删除。`varlen_cp.py` 的 `CPVarlenMetadata`/`from_global` **不随之删**：V3.2 与 V4 的 map
+路径仍用它构造 rank-local varlen。V4 的 CP 计划是：先迁移到 V4.1 的 CP 模式（query exchange + KV 保持整行、文档按
+`cp_size` 对齐），届时 V4 不再需要 `from_global`；随后在该模式上重新添加 head-tail（见
+`./2026-10-21-temporary-head-tail-removal.md` 的 Restoration）。V3.2 的 CP 仍拒绝，`from_global` 随上游 #5071 或
+V3.2 迁到 V4.1 模式一起退场。
 
 qwen3.5 那一步的核对点：它的 inner attention 要声明 `build_attention_metadata`（+ 需要的 geometry key），并把 rank-local
 转换从 forward 的掩码适配器挪进自己的 `prepare_cp_metadata`。这条路径**参与数值**，删前须做 NPU CP=1/CP=2 对齐。
