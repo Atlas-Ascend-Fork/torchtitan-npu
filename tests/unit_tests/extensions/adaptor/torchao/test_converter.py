@@ -48,11 +48,11 @@ def quantization_calls(monkeypatch, converter_module):
 
 @pytest.mark.parametrize("source_kind", ["grouped", "asc"])
 def test_quantized_grouped_experts_keep_config_and_skip_reconversion(converter_module, quantization_calls, source_kind):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _mxfp8_param_swap
+    from torchtitan_npu.extensions.adaptor.torchao.converter import mxfp8_param_swap
 
     source_cls = converter_module.GroupedExperts if source_kind == "grouped" else converter_module.AscGroupedExperts
     source = source_cls.Config(dim=2, hidden_dim=4, num_experts=2, swiglu_limit=1.5)
-    quant_config = _mxfp8_param_swap()
+    quant_config = mxfp8_param_swap()
     converter = converter_module.NpuQuantizeConverter.Config(base_config=quant_config, require_match=False).build()
 
     converted = converter.convert(source)
@@ -72,7 +72,7 @@ def test_quantized_grouped_experts_keep_config_and_skip_reconversion(converter_m
 
 
 def test_quantization_converter_preserves_custom_experts(converter_module, quantization_calls):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _mxfp8_param_swap
+    from torchtitan_npu.extensions.adaptor.torchao.converter import mxfp8_param_swap
 
     class CustomExperts(converter_module.GroupedExperts):
         @dataclass(kw_only=True, slots=True)
@@ -88,7 +88,7 @@ def test_quantization_converter_preserves_custom_experts(converter_module, quant
 
     source = CustomExperts.Config(dim=2, hidden_dim=4, num_experts=2, output_scale=5.0)
     converter = converter_module.NpuQuantizeConverter.Config(
-        base_config=_mxfp8_param_swap(), require_match=False
+        base_config=mxfp8_param_swap(), require_match=False
     ).build()
 
     converted = converter.convert(source)
@@ -102,10 +102,10 @@ def test_quantization_converter_preserves_custom_experts(converter_module, quant
 
 
 def test_quantization_converter_keeps_linear_forward(converter_module, quantization_calls):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _mxfp8_param_swap
+    from torchtitan_npu.extensions.adaptor.torchao.converter import mxfp8_param_swap
 
     source = converter_module.Linear.Config(in_features=2, out_features=2, bias=False)
-    quant_config = _mxfp8_param_swap()
+    quant_config = mxfp8_param_swap()
     converter = converter_module.NpuQuantizeConverter.Config(base_config=quant_config, require_match=False).build()
 
     converted = converter.convert(source)
@@ -253,14 +253,14 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
 
 @pytest.mark.parametrize("quant_format", ["mx", "block_mx"])
 def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, converter_module, quant_format):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _block_fp8_param_swap, _mxfp8_param_swap
+    from torchtitan_npu.extensions.adaptor.torchao.converter import block_fp8_param_swap, mxfp8_param_swap
 
     wrapper_module = importlib.import_module(f"torchao_npu.wrapper_tensors.{quant_format}_wrapper_tensor")
     if quant_format == "mx":
-        quant_config = _mxfp8_param_swap()
+        quant_config = mxfp8_param_swap()
         wrapper_cls = wrapper_module.MXTrainingWeightWrapperTensor
     else:
-        quant_config = _block_fp8_param_swap()
+        quant_config = block_fp8_param_swap()
         wrapper_cls = wrapper_module.BlockMXTrainingWeightWrapperTensor
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     source = converter_module.GroupedExperts.Config(dim=32, hidden_dim=32, num_experts=2)

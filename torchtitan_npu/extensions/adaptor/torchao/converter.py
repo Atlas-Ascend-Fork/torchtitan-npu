@@ -961,7 +961,7 @@ def _quant_deepseek_v4_lightning_indexer(
     )
 
 
-def _mxfp8_param_swap() -> ParamSwapConfig:
+def mxfp8_param_swap() -> ParamSwapConfig:
     mx_config = MXQuantizeConfig()
     return ParamSwapConfig(
         weight_config=mx_config,
@@ -969,7 +969,7 @@ def _mxfp8_param_swap() -> ParamSwapConfig:
     )
 
 
-def _block_fp8_param_swap(
+def block_fp8_param_swap(
     *,
     enable_mxfp4_qat: bool = False,
     dst_type_max: float = 0.0,
@@ -1219,7 +1219,7 @@ def _recipe_converters(
     if recipe == "all_mxfp8":
         converters = [
             _quantization_converter(
-                _mxfp8_param_swap(),
+                mxfp8_param_swap(),
                 any_config_filter(dense_filter, filters["routed_expert"]),
                 model_compile_enabled=model_compile_enabled,
             )
@@ -1235,16 +1235,16 @@ def _recipe_converters(
         ]
 
     else:
-        routed_config = _block_fp8_param_swap(
+        routed_config = block_fp8_param_swap(
             enable_mxfp4_qat=enable_mxfp4_qat,
             dst_type_max=dst_type_max,
             enable_fsdp_prequantize=enable_fsdp_prequantize,
             fsdp_prequantize_dtype=fsdp_prequantize_dtype,
         )
         if recipe == "mix":
-            dense_config = _mxfp8_param_swap()
+            dense_config = mxfp8_param_swap()
         elif recipe == "all_block_fp8":
-            dense_config = _block_fp8_param_swap(
+            dense_config = block_fp8_param_swap(
                 enable_fsdp_prequantize=enable_fsdp_prequantize,
                 # Dense weights retain Block FP8; MXFP4 QAT is expert-only.
                 fsdp_prequantize_dtype="fp8",
@@ -1555,5 +1555,7 @@ __all__ = [
     "NpuQuantizedAscGroupedExpertsModule",
     "any_config_filter",
     "apply_quantization_converter",
+    "block_fp8_param_swap",
     "match_config_fqn_suffix",
+    "mxfp8_param_swap",
 ]
