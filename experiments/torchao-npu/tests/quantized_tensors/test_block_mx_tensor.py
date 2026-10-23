@@ -244,6 +244,127 @@ def test_t_rejects_more_than_2d():
 
 
 # =========================================================================
+# View / reshape
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "dst_shape, expected_shape, expected_qdata, expected_scale1, expected_scale2",
+    [
+        ((1, 64, 128), (1, 64, 128), (1, 64, 128), (1, 64, 2, 2), (1, 1, 128, 2)),
+        ((1, 1, 64, 128), (1, 1, 64, 128), (1, 1, 64, 128), (1, 1, 64, 2, 2), (1, 1, 1, 128, 2)),
+        ((64, -1), (64, 128), (64, 128), (64, 2, 2), (1, 128, 2)),
+        ((-1, 128), (64, 128), (64, 128), (64, 2, 2), (1, 128, 2)),
+    ],
+    ids=["one-leading-dim", "two-leading-dims", "inferred-last-dim", "inferred-first-dim"],
+)
+def test_view_refactors_the_leading_dims(dst_shape, expected_shape, expected_qdata, expected_scale1, expected_scale2):
+    """The components are re-viewed, never copied or re-quantized."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)  # [R, ceil(ceil(C/32)/2), 2]
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)  # [ceil(ceil(R/32)/2), C, 2]
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    y = x.view(dst_shape)
+
+    assert y.shape == torch.Size(expected_shape), f"view{dst_shape} gave shape {tuple(y.shape)}"
+    assert y.qdata.shape == torch.Size(expected_qdata), (
+        f"view{dst_shape} gave qdata shape {tuple(y.qdata.shape)}, expected {expected_qdata}"
+    )
+    assert y.scale1.shape == torch.Size(expected_scale1), (
+        f"view{dst_shape} gave scale1 shape {tuple(y.scale1.shape)}, expected {expected_scale1}"
+    )
+    assert y.scale2.shape == torch.Size(expected_scale2), (
+        f"view{dst_shape} gave scale2 shape {tuple(y.scale2.shape)}, expected {expected_scale2}"
+    )
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "the re-shape must share the stored qdata, not copy it"
+
+
+def test_reshape_matches_view():
+    """A contiguous tensor makes ``reshape`` the same re-factor as ``view``."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    reshaped = x.reshape(1, 64, 128)
+    viewed = x.view(1, 64, 128)
+
+    assert reshaped.shape == viewed.shape, f"reshape gave {tuple(reshaped.shape)}, view gave {tuple(viewed.shape)}"
+    assert torch.equal(reshaped.qdata.view(torch.uint8), viewed.qdata.view(torch.uint8)), (
+        "reshape and view produced different qdata"
+    )
+    assert reshaped.scale2.shape == viewed.scale2.shape, (
+        f"reshape gave scale2 shape {tuple(reshaped.scale2.shape)}, view gave {tuple(viewed.scale2.shape)}"
+    )
+
+
+def test_view_keeps_an_fp4_pack_axis_last():
+    """FP4 packs two values per element along the last dim, and a re-shape never resizes it."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    qdata = torch.randint(0, 256, (64, 64), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config, pack_axis=-1)
+
+    y = x.view(1, 64, 128)
+
+    assert y.shape == torch.Size([1, 64, 128]), f"view gave shape {tuple(y.shape)}"
+    assert y.qdata.shape == torch.Size([1, 64, 64]), f"view gave qdata shape {tuple(y.qdata.shape)}"
+    assert y.pack_axis == y.ndim - 1, f"pack axis {y.pack_axis} is not the last dim of a {y.ndim}D tensor"
+
+
+def test_view_rejects_a_dim_minus_2_that_splits_a_block_row():
+    """The blocks of ``dim -2`` are read in packed pairs, so that dim may not halve."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    with pytest.raises(ValueError, match="dim -2 must be a multiple"):
+        x.view(2, 32, 128)
+
+
+def test_view_rejects_moving_the_last_dim():
+    """The last dim carries the block boundaries, so a re-shape has to keep its size."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    with pytest.raises(ValueError, match="keep the last dim"):
+        x.view(128, 64)
+
+
+def test_view_rejects_a_result_that_is_not_2d():
+    """Both scales cover the trailing two dims, so the result has to have them."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    with pytest.raises(ValueError, match="at least a 2D tensor"):
+        x.view(8192)
+
+
+def test_view_rejects_non_contiguous_components():
+    """A strided component cannot be re-viewed without copying, which the class never does."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(64, 128).to(torch.float8_e4m3fn)
+    scale1 = torch.full((64, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    scale2 = torch.full((1, 128, 2), 4.0, dtype=torch.float8_e8m0fnu)
+    x = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config)
+
+    with pytest.raises(ValueError, match="contiguous components"):
+        x.t().view(1, 64, 128)
+
+
+# =========================================================================
 # Conversion to the single-axis MXTensor
 # =========================================================================
 
@@ -310,7 +431,7 @@ def test_values_are_frozen():
     scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
     x = BlockMXTensor(qdata, scale, scale, torch.bfloat16, config)
 
-    with pytest.raises(RuntimeError, match="immutable"):
+    with pytest.raises(NotImplementedError, match=type(x).__name__):
         x.zero_()
 
 
@@ -356,6 +477,16 @@ def test_from_hp_matches_block_mx_quantize():
     assert torch.equal(y.scale2.view(torch.uint8), scale2.view(torch.uint8)), (
         "scale2 values differ from the primitive's"
     )
+
+
+def test_from_hp_propagates_requires_grad():
+    """A weight quantized for training keeps the autograd flag of the tensor it came from."""
+    config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    x = torch.randn(64, 128, device="npu", dtype=torch.bfloat16, requires_grad=True)
+
+    y = BlockMXTensor.from_hp(x, config)
+
+    assert y.requires_grad, "from_hp dropped the input's requires_grad"
 
 
 # =========================================================================

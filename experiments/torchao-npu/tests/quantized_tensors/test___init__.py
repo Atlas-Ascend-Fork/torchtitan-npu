@@ -14,6 +14,7 @@ from torchao_npu.quantized_tensors import (
     logical_qdata_shape,
     permutation_from_transpose,
     resolve_pack_axis,
+    resolve_view_shape,
 )
 
 
@@ -156,3 +157,37 @@ def test_resolve_pack_axis_requires_fp4(shape):
 
     with pytest.raises(AssertionError, match="must be"):
         resolve_pack_axis(qdata)
+
+
+@pytest.mark.parametrize(
+    "elem_num, new_shape, expected",
+    [
+        (256, (4, 64), (4, 64)),
+        (256, (16, 16), (16, 16)),
+        (256, (2, 4, 32), (2, 4, 32)),
+        (256, (-1,), (256,)),
+        (256, (-1, 64), (4, 64)),
+        (256, (4, -1, 4), (4, 16, 4)),
+    ],
+)
+def test_resolve_view_shape_accounts_for_the_elements(elem_num, new_shape, expected):
+    resolved = resolve_view_shape(elem_num, new_shape)
+
+    assert isinstance(resolved, torch.Size), f"resolve_view_shape returned a {type(resolved).__name__}"
+    assert tuple(resolved) == expected, (
+        f"resolve_view_shape({elem_num}, {new_shape}) gave {tuple(resolved)}, expected {expected}"
+    )
+
+
+@pytest.mark.parametrize(
+    "elem_num, new_shape, message",
+    [
+        (256, (-1, -1), "Only one dimension can be inferred"),
+        (256, (4, 0), "only -1 and positive dims are allowed"),
+        (256, (7, 37), "invalid for input of size 256"),
+        (256, (3, -1), "the -1 dim is not divisible"),
+    ],
+)
+def test_resolve_view_shape_rejects_every_other_shape(elem_num, new_shape, message):
+    with pytest.raises(ValueError, match=message):
+        resolve_view_shape(elem_num, new_shape)

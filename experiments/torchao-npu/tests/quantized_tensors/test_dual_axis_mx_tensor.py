@@ -241,19 +241,21 @@ def test_swap_then_to_mx_tensor_pairs_the_quantized_dims():
     y = x.transpose(-1, -2)
 
     # axis -1 of the swapped tensor is the original -2, which qdata2 covered
+    along_minus_1 = y.to_mx_tensor(-1)
     expected = x.qdata2.transpose(-1, -2)
-    assert y.to_mx_tensor(-1).qdata.shape == expected.shape, (
-        f"swapped to_mx_tensor(-1) qdata shape {tuple(y.to_mx_tensor(-1).qdata.shape)} != {tuple(expected.shape)}"
+    assert along_minus_1.qdata.shape == expected.shape, (
+        f"swapped to_mx_tensor(-1) qdata shape {tuple(along_minus_1.qdata.shape)} != {tuple(expected.shape)}"
     )
-    assert torch.equal(y.to_mx_tensor(-1).qdata.view(torch.uint8), expected.view(torch.uint8)), (
+    assert torch.equal(along_minus_1.qdata.view(torch.uint8), expected.view(torch.uint8)), (
         "swapped to_mx_tensor(-1) must pair with the original qdata2"
     )
 
+    along_minus_2 = y.to_mx_tensor(-2)
     expected = x.qdata1.transpose(-1, -2)
-    assert y.to_mx_tensor(-2).qdata.shape == expected.shape, (
-        f"swapped to_mx_tensor(-2) qdata shape {tuple(y.to_mx_tensor(-2).qdata.shape)} != {tuple(expected.shape)}"
+    assert along_minus_2.qdata.shape == expected.shape, (
+        f"swapped to_mx_tensor(-2) qdata shape {tuple(along_minus_2.qdata.shape)} != {tuple(expected.shape)}"
     )
-    assert torch.equal(y.to_mx_tensor(-2).qdata.view(torch.uint8), expected.view(torch.uint8)), (
+    assert torch.equal(along_minus_2.qdata.view(torch.uint8), expected.view(torch.uint8)), (
         "swapped to_mx_tensor(-2) must pair with the original qdata1"
     )
 
@@ -365,7 +367,7 @@ def test_values_are_frozen():
     scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
     x = DualAxisMXTensor(qdata, scale, qdata, scale, torch.bfloat16, config)
 
-    with pytest.raises(RuntimeError, match="immutable"):
+    with pytest.raises(NotImplementedError, match=type(x).__name__):
         x.zero_()
 
 
@@ -426,6 +428,16 @@ def test_from_hp_matches_mx_quantize_dual_axis(elem_dtype):
     assert torch.equal(y.scale2.view(torch.uint8), scale2.view(torch.uint8)), (
         "scale2 values differ from the primitive's"
     )
+
+
+def test_from_hp_propagates_requires_grad():
+    """A weight quantized for training keeps the autograd flag of the tensor it came from."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    x = torch.randn(64, 128, device="npu", dtype=torch.bfloat16, requires_grad=True)
+
+    y = DualAxisMXTensor.from_hp(x, config)
+
+    assert y.requires_grad, "from_hp dropped the input's requires_grad"
 
 
 @pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float4_e2m1fn_x2])

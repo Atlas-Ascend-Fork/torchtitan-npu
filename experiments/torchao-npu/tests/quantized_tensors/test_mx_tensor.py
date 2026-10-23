@@ -9,8 +9,9 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 from torchao_npu.ops.mx_ops import to_mx_then_bmm, to_mx_then_grouped_mm, to_mx_then_mm
-from torchao_npu.quantization.quant_configs import MXQuantizeConfig
+from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
 from torchao_npu.quantization.quant_primitives.mx import mx_fake_quantize
+from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
 
 # =========================================================================
@@ -247,23 +248,22 @@ def test_fp4_shape_ops_track_the_pack_axis():
 # =========================================================================
 
 
-@pytest.mark.parametrize("op", ["zero_", "fill_", "copy_"])
+@pytest.mark.parametrize("op", ["zero_", "fill_"])
 def test_in_place_ops_are_rejected(op):
+    """Values are frozen: ``copy_`` is the only in-place op the class registers."""
     config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
     qdata = torch.randn(4, 64).to(torch.float8_e4m3fn)
     scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
     x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
     qdata_before = x.qdata.clone()
 
-    with pytest.raises(RuntimeError, match="immutable"):
-        if op == "copy_":
-            x.copy_(x)
-        elif op == "zero_":
+    with pytest.raises(NotImplementedError, match=type(x).__name__):
+        if op == "zero_":
             x.zero_()
         else:
             x.fill_(1.0)
 
-    assert torch.equal(x.qdata, qdata_before)
+    assert torch.equal(x.qdata.view(torch.uint8), qdata_before.view(torch.uint8)), f"qdata changed after {op}"
 
 
 # =========================================================================
@@ -364,19 +364,26 @@ def test_mm_rejects_a_plain_left_operand_without_an_activation_config():
         torch.mm(torch.randn(4, 64, dtype=torch.bfloat16), weight)
 
 
-def test_mm_rejects_a_left_operand_that_requires_grad():
+def test_mm_requires_matching_block_size():
+    """The kernel pairs blocks of one size, so operands with different ``block_size`` are rejected."""
     config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
-    activation = torch.randn(4, 64, dtype=torch.bfloat16, requires_grad=True)
+    activation = MXTensor(
+        torch.randn(4, 64).to(torch.float8_e4m3fn),
+        torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu),
+        torch.bfloat16,
+        -1,
+        config,
+    )
     weight = MXTensor(
         torch.randn(8, 64).to(torch.float8_e4m3fn),  # stored [N, K], quantized along K
         torch.full((8, 1, 2), 2.0, dtype=torch.float8_e8m0fnu),
         torch.bfloat16,
         -1,
-        config,
-        act_quant_config=config,
+        MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn, block_size=64),
+        act_quant_config=config,  # what the left operand was quantized with
     ).transpose(-2, -1)  # [K, N]: what a matmul receives
 
-    with pytest.raises(RuntimeError, match="inference-only"):
+    with pytest.raises(ValueError, match="agree on ``block_size``"):
         torch.mm(activation, weight)
 
 
@@ -752,6 +759,21 @@ def test_matmul_handler_matches_to_mx_then_mm(elem_dtype, shape):
 
 
 # =========================================================================
+# Quantization (NPU kernels)
+# =========================================================================
+
+
+def test_from_hp_propagates_requires_grad():
+    """A weight quantized for training keeps the autograd flag of the tensor it came from."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    tensor = torch.randn(64, 128, device="npu", dtype=torch.bfloat16, requires_grad=True)
+
+    x = MXTensor.from_hp(tensor, config, axis=-1)
+
+    assert x.requires_grad, "from_hp dropped the input's requires_grad"
+
+
+# =========================================================================
 # Dequantize
 # =========================================================================
 
@@ -806,3 +828,96 @@ def test_dequantize_rejects_a_strided_quant_axis():
 
     with pytest.raises(AssertionError, match="unit stride"):
         x.dequantize()
+
+
+# =========================================================================
+# Conversion to Block MX
+# =========================================================================
+
+
+def test_to_block_mx_hands_both_configs_and_the_axis_to_the_primitive(monkeypatch):
+    """The tensor's own MX config is the source; the requested Block config is the target."""
+    import torchao_npu.quantized_tensors.mx_tensor as mx_tensor_module
+
+    config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    act_config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    block_config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn, mxfp4_fake_quantize_config=config)
+    qdata = torch.randint(0, 256, (4, 32), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config, act_quant_config=act_config, pack_axis=-1)
+    seen = []
+
+    def fake(fp4, mxscale, src_config, dst_config, *, quant_axis=None):
+        seen.append((fp4, mxscale, src_config, dst_config, quant_axis))
+        kernel_shape = (*fp4.shape[:-1], fp4.shape[-1] * 2)
+        return (
+            torch.zeros(kernel_shape, dtype=torch.float8_e4m3fn),
+            torch.zeros(*kernel_shape[:-1], 1, 2, dtype=torch.float8_e8m0fnu),
+            torch.zeros(*kernel_shape[:-2], 1, kernel_shape[-1], 2, dtype=torch.float8_e8m0fnu),
+        )
+
+    monkeypatch.setattr(mx_tensor_module, "mxfp4_to_block_mx", fake)
+
+    y = x.to_block_mx(block_config)
+
+    fp4, mxscale, src_config, dst_config, quant_axis = seen[0]
+    assert fp4 is x.qdata and mxscale is x.scale, "to_block_mx rebuilt the payload instead of passing it"
+    assert src_config is x.quant_config, "the source must be the tensor's own MX config"
+    assert dst_config is block_config, "the destination must be the requested Block config"
+    assert quant_axis == x.quant_axis, f"quant axis {quant_axis} != the tensor's {x.quant_axis}"
+
+    assert type(y) is BlockMXTensor, f"to_block_mx returned a {type(y).__name__}"
+    assert y.shape == x.shape, f"converted shape {tuple(y.shape)} != the source's {tuple(x.shape)}"
+    assert y.dtype is torch.bfloat16, f"converted dtype {y.dtype} != torch.bfloat16"
+    assert y.quant_config is block_config, "the converted tensor must keep the target config"
+    assert y.act_quant_config is act_config, "the converted tensor must keep the activation config"
+    assert y.pack_axis is None, f"an FP8 result gained pack_axis {y.pack_axis}"
+    assert y.qdata.dtype is torch.float8_e4m3fn, f"converted qdata dtype {y.qdata.dtype}"
+
+
+def test_to_block_mx_requires_the_quant_axis_to_be_the_packed_axis():
+    """The conversion doubles the quant axis, so this tensor must be packed along it."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    block_config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(4, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)  # FP8: pack_axis is None
+
+    with pytest.raises(AssertionError, match=r"quant_axis == self\.pack_axis"):
+        x.to_block_mx(block_config)
+
+
+def test_to_block_mx_requires_a_matching_mxfp4_config():
+    """A target Block config describing another quantization cannot be used for this payload."""
+    config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    other = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2, block_size=64)
+    block_config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn, mxfp4_fake_quantize_config=other)
+    qdata = torch.randint(0, 256, (4, 32), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config, pack_axis=-1)
+
+    with pytest.raises(AssertionError, match="not consistent"):
+        x.to_block_mx(block_config)
+
+
+def test_to_block_mx_matches_block_mx_quantize_of_the_same_tensor():
+    """``from_hp`` + ``to_block_mx`` must reproduce the block-MX quantization of the same tensor.
+
+    The two paths derive the kernel layout differently (``mx_quantize``'s stride rule vs
+    ``_to_block_quant_layout``), so equal components pin the permutation and its inverse.
+    """
+    fp4_config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    block_config = BlockMXQuantizeConfig(elem_dtype=torch.float8_e4m3fn, mxfp4_fake_quantize_config=fp4_config)
+    tensor = torch.randn(64, 128, device="npu", dtype=torch.bfloat16)
+
+    converted = MXTensor.from_hp(tensor, fp4_config, axis=-1).to_block_mx(block_config)
+    reference = BlockMXTensor.from_hp(tensor, block_config, axis=-1)
+
+    assert converted.pack_axis is None, f"an FP8 result gained pack_axis {converted.pack_axis}"
+    for name in ("qdata", "scale1", "scale2"):
+        actual = getattr(converted, name)
+        expected = getattr(reference, name)
+        assert actual.shape == expected.shape, f"{name} shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), (
+            f"{name} values differ from the directly quantized block MX tensor"
+        )
