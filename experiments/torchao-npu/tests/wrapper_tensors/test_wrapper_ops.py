@@ -50,7 +50,6 @@ from ..testing_utils import target_devices
             MXQuantizeConfig(),
             MXQuantizeConfig(),
         ),
-        (BlockMXTrainingWeightWrapperTensor, BlockMXQuantizeConfig(), MXQuantizeConfig()),
         (
             BlockMXTrainingWeightWrapperTensor,
             BlockMXQuantizeConfig(),
@@ -189,7 +188,6 @@ def test_pin_memory_preserves_subclass(wrapper_cls, weight_config, act_config):
             MXQuantizeConfig(),
             MXQuantizeConfig(),
         ),
-        (BlockMXTrainingWeightWrapperTensor, BlockMXQuantizeConfig(), MXQuantizeConfig()),
         (
             BlockMXTrainingWeightWrapperTensor,
             BlockMXQuantizeConfig(),
@@ -259,7 +257,6 @@ def test_wrapper_dispatch_non_preserved_op(wrapper_cls, weight_config, act_confi
             MXQuantizeConfig(),
             MXQuantizeConfig(),
         ),
-        (BlockMXTrainingWeightWrapperTensor, BlockMXQuantizeConfig(), MXQuantizeConfig()),
         (
             BlockMXTrainingWeightWrapperTensor,
             BlockMXQuantizeConfig(),
@@ -713,7 +710,6 @@ def test_op_fake_quantize(
             MXQuantizeConfig(),
             15,
         ),
-        (BlockMXTrainingWeightWrapperTensor, BlockMXQuantizeConfig(), MXQuantizeConfig(), 17),
         (
             BlockMXTrainingWeightWrapperTensor,
             BlockMXQuantizeConfig(),
