@@ -18,6 +18,7 @@ from torchao_npu.quantized_tensors import (
     logical_qdata_shape,
     permutation_from_transpose,
     resolve_pack_axis,
+    resolve_view_shape,
 )
 from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
@@ -35,7 +36,8 @@ class BlockMXTensor(BaseQuantizedTensor):
     permute / movedim -- and, because both scales cover the trailing two dims,
     they must keep those two dims in the trailing two slots; only a swap between
     them is allowed. A swap transposes ``qdata`` and exchanges the two scales
-    (each with its two trailing dims swapped). Every other op raises
+    (each with its two trailing dims swapped). ``view`` / ``reshape`` re-factor the
+    leading dims instead, with limitations (see :func:`_view`). Every other op raises
     ``NotImplementedError``, except the handlers inherited from
     :class:`~torchao_npu.quantized_tensors.base_quantized_tensor.BaseQuantizedTensor`.
 
@@ -53,8 +55,7 @@ class BlockMXTensor(BaseQuantizedTensor):
         scale2: uint8 E8M0 scales along the second-to-last dim:
             ``[..., ceil(ceil(R/32)/2), C, 2]``.
 
-        orig_dtype: The original high-precision dtype before quantization; also
-            this tensor's logical (outer) dtype.
+        dtype: The logical (high-precision) dtype this tensor presents; the dtype the values had before quantization.
 
         quant_config: The :class:`~torchao_npu.quantization.quant_configs.BlockMXQuantizeConfig`
             this tensor was quantized with.
@@ -69,7 +70,7 @@ class BlockMXTensor(BaseQuantizedTensor):
 
     tensor_data_names = ["qdata", "scale1", "scale2"]
     tensor_attribute_names = [
-        "orig_dtype",
+        "dtype",
         "quant_config",
         "act_quant_config",
     ]
@@ -80,20 +81,20 @@ class BlockMXTensor(BaseQuantizedTensor):
         qdata: torch.Tensor,
         scale1: torch.Tensor,
         scale2: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_config: BlockMXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
+        # Leave strides/storage_offset/layout at their defaults derived by torch:
+        # the metadata describes the logical (high-precision) tensor as a dense one.
         self = torch.Tensor._make_wrapper_subclass(
             cls,
             logical_qdata_shape(qdata, pack_axis),
-            strides=qdata.stride(),
-            storage_offset=qdata.storage_offset(),
-            layout=qdata.layout,
-            dtype=orig_dtype,
+            dtype=dtype,
             device=qdata.device,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         return self
 
@@ -102,10 +103,11 @@ class BlockMXTensor(BaseQuantizedTensor):
         qdata: torch.Tensor,
         scale1: torch.Tensor,
         scale2: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_config: BlockMXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
         if qdata.dtype not in _SUPPORTED_MX_ELEM_DTYPES:
             raise ValueError(f"{type(self).__name__} supports FP8 or FP4 qdata, got {qdata.dtype}.")
@@ -134,7 +136,6 @@ class BlockMXTensor(BaseQuantizedTensor):
         self.scale2 = scale2
         self.act_quant_config = act_quant_config
         self.quant_config = quant_config
-        self.orig_dtype = orig_dtype
         self.pack_axis = normalize_dim(pack_axis, qdata.ndim) if pack_axis is not None else None
 
     @classmethod
@@ -163,7 +164,8 @@ class BlockMXTensor(BaseQuantizedTensor):
         Returns:
             A :class:`~torchao_npu.quantized_tensors.block_mx_tensor.BlockMXTensor`
             holding the quantized ``qdata`` (FP8, or packed FP4 when
-            ``quant_config.elem_dtype`` is FP4) and the two block scales.
+            ``quant_config.elem_dtype`` is FP4) and the two block scales. The
+            returned tensor inherits ``requires_grad`` from ``tensor``.
 
         Raises:
             AssertionError: If the mxfp4-QAT path is selected and ``axis`` is
@@ -172,10 +174,19 @@ class BlockMXTensor(BaseQuantizedTensor):
 
         qdata, scale1, scale2 = block_mx_quantize(tensor, quant_config, axis)
         pack_axis = resolve_pack_axis(qdata) if qdata.dtype is torch.float4_e2m1fn_x2 else None
-        return cls(qdata, scale1, scale2, tensor.dtype, quant_config, act_quant_config, pack_axis)
+        return cls(
+            qdata,
+            scale1,
+            scale2,
+            tensor.dtype,
+            quant_config,
+            act_quant_config,
+            pack_axis,
+            requires_grad=tensor.requires_grad,
+        )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Dequantize back to ``orig_dtype``, using whichever block scale's axis is innermost-contiguous.
+        """Dequantize back to ``dtype``, using whichever block scale's axis is innermost-contiguous.
 
         Both scales cover the trailing two dims over one shared ``qdata``: ``scale1`` the last dim,
         ``scale2`` the second-to-last. Only a quant axis that is innermost-contiguous
@@ -186,7 +197,7 @@ class BlockMXTensor(BaseQuantizedTensor):
         :class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`.
 
         Args:
-            output_dtype: The dtype of the returned tensor, ``orig_dtype`` when ``None``;
+            output_dtype: The dtype of the returned tensor, ``dtype`` when ``None``;
 
         Returns:
             A plain tensor of dtype ``output_dtype``
@@ -244,7 +255,13 @@ class BlockMXTensor(BaseQuantizedTensor):
             **{f.name: getattr(self.quant_config, f.name) for f in fields(MXQuantizeConfig)}
         )
         return MXTensor(
-            self.qdata, scale, self.orig_dtype, quant_axis, quant_config, self.act_quant_config, self.pack_axis
+            self.qdata,
+            scale,
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            quant_axis,
+            quant_config,
+            self.act_quant_config,
+            self.pack_axis,
         )
 
 
@@ -290,7 +307,7 @@ def _permute(x: BlockMXTensor, perm: list[int]) -> BlockMXTensor:
         new_s1 = x.scale2.permute(scale_perm)
         new_s2 = x.scale1.permute(scale_perm)
 
-    return BlockMXTensor(new_qdata, new_s1, new_s2, x.orig_dtype, x.quant_config, x.act_quant_config, new_pack_axis)
+    return BlockMXTensor(new_qdata, new_s1, new_s2, x.dtype, x.quant_config, x.act_quant_config, new_pack_axis)
 
 
 @implements(aten.permute.default)
@@ -317,6 +334,85 @@ def _(func, types, args, kwargs):
         raise RuntimeError(f"t() expects a tensor with <= 2 dimensions, but self is {x.ndim}D")
     perm = permutation_from_transpose(0, 1, x.ndim) if x.ndim == 2 else list(range(x.ndim))
     return return_and_correct_aliasing(func, args, kwargs, _permute(x, perm))
+
+
+def _view(func, x: BlockMXTensor, new_shape: tuple[int, ...]) -> BlockMXTensor:
+    """Re-shape ``x``, allowing only the changes that its quantization block scales can follow.
+
+    A re-shape is only supported when
+
+    * the tensor is contiguous (every component, see :meth:`is_contiguous`);
+    * for FP4, the pack axis is the last dim -- its packed pairs may not be split;
+    * the last dim keeps its size -- its block boundaries may not move;
+    * ``dim -2`` is a multiple of ``2 * block_size`` both before and after, since the
+      blocks of ``dim -2`` are read in packed pairs.
+
+    The leading dims then re-factor freely and both scales follow with plain views: the
+    block count of ``dim -2`` divides evenly, so 2 x block_size consecutive rows cover
+    the same blocks before and after. The components are re-viewed with no copy, never
+    materialized into a copy of the quantized data.
+
+    Args:
+        func: The ``aten`` op being handled, named in the messages.
+        x: The tensor to re-shape.
+        new_shape: The requested shape, possibly holding one ``-1``.
+
+    Returns:
+        A :class:`BlockMXTensor` whose components are views of ``x``'s.
+
+    Raises:
+        ValueError: If an unsupported re-shape is requested.
+    """
+    src_shape = x.shape
+    dst_shape = resolve_view_shape(x.numel(), new_shape)
+    block_size = x.quant_config.block_size
+    packed_block_size = 2 * block_size
+
+    if not x.is_contiguous():
+        raise ValueError(f"{type(x).__name__}'s {func.name()} requires contiguous components.")
+
+    if x.qdata.dtype in _FP4_DTYPES and x.pack_axis != normalize_dim(-1, x.ndim):
+        raise ValueError(f"pack_axis must be the last dim for an FP4 quantized tensor, got pack_axis={x.pack_axis}")
+
+    if len(dst_shape) < 2:
+        raise ValueError(f"{type(x).__name__}'s {func.name()} must yield at least a 2D tensor, got {dst_shape}.")
+
+    if dst_shape[-1] != src_shape[-1]:
+        raise ValueError(
+            f"{type(x).__name__} only supports re-shapes that keep the last dim ({src_shape[-1]}); "
+            f"got {src_shape} -> {dst_shape}."
+        )
+    if src_shape[-2] % packed_block_size or dst_shape[-2] % packed_block_size:
+        raise ValueError(
+            f"{type(x).__name__} cannot represent {src_shape} -> {dst_shape}: dim -2 must be a "
+            f"multiple of {packed_block_size} both before and after, got {src_shape[-2]} and {dst_shape[-2]}."
+        )
+
+    # ``qdata``'s last dim is stored, not logical: FP4 packs two values per element, while
+    # FP8 stores one. The scales below are laid out per logical value, so they take the
+    # logical ``dst_shape``.
+    qdata = x.qdata.view(*dst_shape[:-1], x.qdata.shape[-1])
+    # ``scale1`` carries one block row per ``dim -2`` row, so it takes the same leading split.
+    scale1 = x.scale1.view(*dst_shape[:-1], *x.scale1.shape[-2:])
+    # ``scale2``'s block dim covers ``dim -2``, whose blocks now divide evenly.
+    scale2 = x.scale2.view(*dst_shape[:-2], dst_shape[-2] // packed_block_size, dst_shape[-1], x.scale2.shape[-1])
+    # FP4's pack axis is the (unit-stride) last dim, which a re-shape never resizes.
+    pack_axis = -1 if x.pack_axis is not None else None
+
+    return BlockMXTensor(qdata, scale1, scale2, x.dtype, x.quant_config, x.act_quant_config, pack_axis)
+
+
+@implements([aten.view.default, aten.reshape.default])
+def _(func, types, args, kwargs):
+    x, new_shape = args[0], args[1]
+    return return_and_correct_aliasing(func, args, kwargs, _view(func, x, tuple(new_shape)))
+
+
+@implements(aten._unsafe_view.default)
+def _(func, types, args, kwargs):
+    # Not an aliasing op per its schema; the re-view shares the components either way.
+    x, new_shape = args[0], args[1]
+    return _view(func, x, tuple(new_shape))
 
 
 # Safe-unpickling allowlist: DCP loads checkpoints with torch.load(weights_only=True).

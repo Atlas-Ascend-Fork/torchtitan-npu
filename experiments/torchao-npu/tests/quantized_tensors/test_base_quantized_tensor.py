@@ -79,7 +79,7 @@ def test_clone_and_detach_preserve_class_and_metadata(shape):
 
         assert y.quant_axis == x.quant_axis
         assert y.quant_config is x.quant_config
-        assert y.orig_dtype is x.orig_dtype
+        assert y.dtype is x.dtype
 
 
 def test_flatten_unflatten_round_trip():
@@ -95,7 +95,7 @@ def test_flatten_unflatten_round_trip():
     y = type(x).__tensor_unflatten__(data, attributes, None, None)
 
     assert data_names == ["qdata", "scale"]
-    assert set(attributes) == {"orig_dtype", "quant_axis", "quant_config", "act_quant_config", "pack_axis"}
+    assert set(attributes) == {"dtype", "quant_axis", "quant_config", "act_quant_config", "pack_axis"}
     assert y.qdata.shape == x.qdata.shape, (
         f"unflattened qdata shape {tuple(y.qdata.shape)} != the original {tuple(x.qdata.shape)}"
     )
@@ -127,7 +127,7 @@ def test_to_dtype_changes_only_the_logical_dtype(shape, dtype):
     y = x.to(dtype)
 
     assert y.dtype is dtype, f".to({dtype}) left the logical dtype at {y.dtype}"
-    assert y.orig_dtype is dtype, f".to({dtype}) left orig_dtype at {y.orig_dtype}"
+    assert y.dtype is dtype, f".to({dtype}) left the logical dtype at {y.dtype}"
     assert y.qdata is x.qdata, f".to({dtype}) cast the stored qdata"
     assert y.scale is x.scale, f".to({dtype}) cast the stored scale"
     assert x.dtype is torch.bfloat16, f".to({dtype}) changed the original's dtype to {x.dtype}"
@@ -192,8 +192,8 @@ def test_to_device_moves_the_components(shape):
 
 
 @pytest.mark.parametrize("shape", [(4, 64), (2, 4, 64)])
-def test_to_dtype_requires_the_class_to_declare_orig_dtype(shape):
-    """``.to(dtype)`` swaps ``orig_dtype``, so a subclass has to declare it."""
+def test_to_dtype_requires_the_class_to_declare_dtype(shape):
+    """``.to(dtype)`` swaps the logical dtype, so a subclass has to declare it."""
 
     class _NoOrigDtype(MXTensor):
         tensor_attribute_names = ["quant_axis", "quant_config", "act_quant_config"]

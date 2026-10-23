@@ -3,13 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Frozen, quantized NPU tensor subclasses (inference/rollout weight format).
+"""Frozen, quantized NPU tensor subclasses.
 
 Quantized tensors (:class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`,
 ``DualAxisMXTensor``, ``BlockMXTensor``) hold **already-quantized** low-precision
-data plus its scale(s). They are the inference/rollout counterpart of the
-training-time wrapper tensors in :mod:`torchao_npu.wrapper_tensors`, which keep a
-high-precision master weight and quantize on the fly inside matmuls.
+data plus its scale(s), whereas the training-time wrapper tensors in
+:mod:`torchao_npu.wrapper_tensors` keep a high-precision master weight and
+quantize on the fly inside matmuls.
 
 Design:
 
@@ -18,12 +18,54 @@ Design:
   (:class:`~torchao_npu.quantized_tensors.base_quantized_tensor.BaseQuantizedTensor`'s
   classmethod), bypassing the Python-level function layer entirely.
 - **Values are frozen.** ``__torch_dispatch__`` rejects every in-place
-  (mutable-schema) op; the stored quantization is immutable.
+  (mutable-schema) op, except a whole-tensor ``copy_`` with matching metadata
+  (inherited from ``TorchAOBaseTensor``); the stored quantization is immutable.
 """
 
 import torch
 
 from torchao_npu import normalize_dim
+
+
+def resolve_view_shape(elem_num: int, new_shape: tuple[int, ...]) -> torch.Size:
+    """Resolve the single ``-1`` a ``view`` shape may carry, against the element count.
+
+    Args:
+        elem_num: The number of elements the shape has to account for.
+
+        new_shape: The requested shape, possibly holding one ``-1``.
+
+    Returns:
+        ``new_shape`` as a :class:`torch.Size`, with any ``-1`` replaced by the inferred
+        dim.
+
+    Raises:
+        ValueError: If ``new_shape`` holds more than one ``-1``, holds a non-positive dim
+            other than ``-1``, does not multiply to ``elem_num``, or its inferred dim is not
+            an exact divisor of ``elem_num``.
+    """
+    infer_count = 0
+    known = 1
+    for dim in new_shape:
+        if dim == -1:
+            infer_count += 1
+        elif dim > 0:
+            known *= dim
+        else:
+            raise ValueError(f"Shape {new_shape} is invalid, only -1 and positive dims are allowed.")
+
+    if infer_count == 0:
+        if known != elem_num:
+            raise ValueError(f"Shape {new_shape} is invalid for input of size {elem_num}.")
+        return torch.Size(new_shape)
+
+    elif infer_count == 1:
+        if elem_num % known != 0:
+            raise ValueError(f"Shape {new_shape} is invalid for input of size {elem_num}: the -1 dim is not divisible.")
+        return torch.Size([elem_num // known if dim == -1 else dim for dim in new_shape])
+
+    else:
+        raise ValueError(f"Only one dimension can be inferred (-1), got {new_shape}.")
 
 
 def permutation_from_transpose(dim0: int, dim1: int, ndim: int) -> list[int]:
@@ -132,10 +174,12 @@ def logical_qdata_shape(qdata: torch.Tensor, pack_axis: int | None) -> torch.Siz
 # (then partially initialized) package.
 from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.quantized_tensors.dual_axis_mx_tensor import DualAxisMXTensor
+from torchao_npu.quantized_tensors.grouped_mx_tensor import GroupedMXTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
 
 __all__ = [
     "BlockMXTensor",
     "DualAxisMXTensor",
+    "GroupedMXTensor",
     "MXTensor",
 ]

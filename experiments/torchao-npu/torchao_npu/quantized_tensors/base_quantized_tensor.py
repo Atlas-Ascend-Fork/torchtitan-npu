@@ -6,117 +6,130 @@
 """Common base for the frozen, quantized NPU tensor subclasses."""
 
 import torch
-from torchao.utils import TorchAOBaseTensor
+from torch.utils._python_dispatch import return_and_correct_aliasing
+
+from torchao_npu import TorchAONpuBaseTensor
+from torchao_npu.quantization import _SUPPORTED_HP_DTYPES
 
 aten = torch.ops.aten
 
-# Logical dtypes a quantized tensor may be presented as; they are the high-precision
-# dtypes, since the stored ``qdata``/``scale`` are never cast.
-_SUPPORTED_TO_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-
-class BaseQuantizedTensor(TorchAOBaseTensor):
+class BaseQuantizedTensor(TorchAONpuBaseTensor):
     """Common base for frozen, quantized NPU tensor subclasses.
 
-    Subclasses declare their components and metadata through ``tensor_data_names``
-    / ``tensor_attribute_names``, plus their optional counterparts
-    ``optional_tensor_data_names`` / ``optional_tensor_attribute_names``, and
-    inherit the serialization and dispatch machinery from ``TorchAOBaseTensor``.
     Not intended to be instantiated directly.
 
-    Behavior inherited by all subclasses:
-        * Values are frozen: ``__torch_dispatch__`` rejects every in-place
-          (mutable-schema) op with a ``RuntimeError``.
+    Op behavior inherited by subclasses:
+        * Values are frozen: only in-place copy as a whole is supported.
 
         * ``__torch_function__`` is disabled, so every op routes straight to
           ``__torch_dispatch__``, bypassing the Python function layer.
 
-        * Op support is a whitelist: ``TorchAOBaseTensor`` leaves most ops
-          unimplemented, and each subclass registers the ops it supports
-          explicitly. ``detach`` / ``clone`` / ``alias`` / ``contiguous``
-          dispatch handlers and ``_apply_fn_to_data`` come free from
-          ``TorchAOBaseTensor``; every other unimplemented op raises
-          ``NotImplementedError``.
-
-        * ``.to`` moves the tensor between devices and additionally accepts
-          ``float16`` / ``bfloat16`` / ``float32`` as its logical dtype: only the
-          dtype the stored quantized data is presented as changes, never the data
-          itself (``qdata``/``scale`` keep their dtypes). Any other target dtype
-          raises ``ValueError``.
+        * Op support is a whitelist: aten ops below are customized
+            - aten._to_copy.default
+            - aten.is_pinned.default
+            - aten.as_strided.default
     """
 
-    # Disable the torch-function layer: ops route straight to __torch_dispatch__.
     __torch_function__ = torch._C._disabled_torch_function_impl
 
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args, kwargs=None):
-        # Frozen values: no in-place op may run on a quantized tensor. This also
-        # shadows the ``aten.copy_.default`` handler ``TorchAOBaseTensor``
-        # auto-registers; every other mutating op was already unregistered and
-        # would otherwise fall through to the NotImplementedError base fallback.
-        if func._schema.is_mutable:
-            raise RuntimeError(
-                f"{cls.__name__} is immutable; in-place op {func} is not supported. "
-                "Quantized tensors are frozen -- dequantize to a plain tensor first."
-            )
+    def __init_subclass__(cls, **kwargs):
+        """``dtype`` is enforced in ``tensor_attribute_names``"""
 
-        if func is aten._to_copy.default:
-            args = _args_with_requested_dtype_(args, kwargs)
+        super().__init_subclass__(**kwargs)
 
-        return super().__torch_dispatch__(func, types, args, kwargs)
+        names = getattr(cls, "tensor_attribute_names", None)
+        if names is None or "dtype" not in names:
+            raise TypeError(f"{cls.__name__} must declare ``dtype`` in ``tensor_attribute_names``.")
+
+    def is_contiguous(self, memory_format: torch.memory_format = torch.contiguous_format) -> bool:
+        """Report whether every component is contiguous in ``memory_format``.
+
+        A quantized tensor with no components at all is contiguous in every layout.
+
+        Args:
+            memory_format: The layout to test, ``torch.contiguous_format`` when omitted.
+
+        Returns:
+            Whether all of the tensor's components are contiguous in ``memory_format``.
+        """
+        # pyrefly: ignore [missing-attribute]
+        names = [*self.tensor_data_names, *getattr(self, "optional_tensor_data_names", [])]
+        return all(getattr(self, name).is_contiguous(memory_format=memory_format) for name in names)
 
 
-def _args_with_requested_dtype_(args: tuple, kwargs: dict | None) -> tuple:
-    """Update ``args`` so that ``args[0]`` carries the requested ``.to`` dtype.
+implements = BaseQuantizedTensor.implements
 
-    Why the operand has to be replaced: a wrapper's dtype is fixed when the tensor is
-    constructed, so it cannot be written onto the tensor the inherited handler rebuilds
-    -- that handler rebuilds the tensor from ``args[0]``'s components and attributes.
-    The requested dtype therefore has to travel inside ``args[0]``: it is replaced by a
-    copy of the tensor -- same components, device and other metadata, only ``orig_dtype``
-    differing -- which the handler rebuilds into the tensor the caller receives.
 
-    Warning:
-        ``kwargs`` is modified in place: the requested ``dtype`` is popped from it, since
-        the dtype is handled here and should not also trigger the parent class's dtype
-        handling.
+@implements(aten._to_copy.default)
+def _(func, types, args, kwargs):
+    """The op behind ``Tensor.to``.
 
-    Args:
-        args: The dispatched ``aten._to_copy.default`` args, ``args[0]`` being the
-            tensor.
-        kwargs: Its keyword args.
-
-    Returns:
-        ``args`` with ``args[0]`` carrying the requested dtype, or ``args`` unchanged
-        when no other dtype is requested.
+    For dtype, only values in `_SUPPORTED_HP_DTYPES` are supported.
 
     Raises:
         ValueError: If the requested dtype is not a supported logical dtype.
-        RuntimeError: If the tensor's class does not declare ``orig_dtype`` among its
-            ``tensor_attribute_names``.
     """
     x = args[0]
-    dtype = (kwargs or {}).get("dtype")
-    if dtype is None or dtype is x.dtype:
-        return args
+    dtype = (kwargs or {}).pop("dtype", None)
+    if not (dtype is None or dtype is x.dtype):
+        if dtype not in _SUPPORTED_HP_DTYPES:
+            raise ValueError(
+                f"{type(x).__name__} only supports the logical dtypes {_SUPPORTED_HP_DTYPES} for ``.to``, got {dtype}."
+            )
 
-    if dtype not in _SUPPORTED_TO_DTYPES:
-        raise ValueError(
-            f"{type(x).__name__} only supports the logical dtypes {_SUPPORTED_TO_DTYPES} for ``.to``, got {dtype}."
+        data = [getattr(x, name) for name in x.tensor_data_names]
+        attributes = [dtype if name == "dtype" else getattr(x, name) for name in x.tensor_attribute_names]
+        optional_data = {name: getattr(x, name) for name in getattr(x, "optional_tensor_data_names", [])}
+        optional_attributes = {name: getattr(x, name) for name in getattr(x, "optional_tensor_attribute_names", [])}
+
+        args = (type(x)(*data, *attributes, **optional_data, **optional_attributes), *args[1:])
+
+    return TorchAONpuBaseTensor._ATEN_OP_TABLE[TorchAONpuBaseTensor][func](func, types, args, kwargs)
+
+
+@implements(aten.is_pinned.default)
+def _(func, types, args, kwargs):
+    """Report whether the quantized tensor's storage is pinned.
+
+    A quantized tensor has no storage of its own: the answer is derived from its
+    components. So the answer from components must be uniform. Otherwise, a
+    ``RuntimeError`` is raised. A quantized tensor with no components at all holds
+    no storage, so it reports ``False``.
+    """
+    x = args[0]
+    names = [*x.tensor_data_names, *getattr(x, "optional_tensor_data_names", [])]
+    if not names:
+        return False
+
+    first, *rest = names
+    expected = getattr(x, first).is_pinned()
+
+    if any(getattr(x, name).is_pinned() is not expected for name in rest):
+        raise RuntimeError(f"{type(x).__name__} components must agree on ``is_pinned``.")
+
+    return expected
+
+
+@implements(aten.as_strided.default)
+def _(func, types, args, kwargs):
+    """
+    Accept only the layout-preserving ``as_strided`` arguments, in which case
+    this aten is a no-op.
+
+    If the arguments imply a different layout, a ``NotImplementedError`` is raised.
+    """
+    x = args[0]
+    size = args[1] if len(args) > 1 else kwargs.get("size")
+    stride = args[2] if len(args) > 2 else kwargs.get("stride")
+    storage_offset = args[3] if len(args) > 3 else kwargs.get("storage_offset")
+    offset = x.storage_offset() if storage_offset is None else storage_offset
+
+    if tuple(size) != tuple(x.shape) or tuple(stride) != tuple(x.stride()) or offset != x.storage_offset():
+        raise NotImplementedError(
+            f"{type(x).__name__} only supports the layout-preserving ``as_strided`` "
+            f"(size={tuple(x.shape)}, stride={tuple(x.stride())}, storage_offset={x.storage_offset()}), "
+            f"got size={tuple(size)}, stride={tuple(stride)}, storage_offset={offset}."
         )
 
-    if "orig_dtype" not in x.tensor_attribute_names:
-        raise RuntimeError(
-            f"{type(x).__name__} must declare ``orig_dtype`` in ``tensor_attribute_names``; "
-            "its logical dtype cannot be changed by ``.to``."
-        )
-
-    # ``kwargs`` is a dict here: the dtype checked above was read off it, so it cannot be
-    # ``None``; pyrefly just cannot narrow ``dict | None`` through that read.
-    kwargs.pop("dtype")  # pyrefly: ignore [missing-attribute]
-
-    data = [getattr(x, name) for name in x.tensor_data_names]
-    attributes = [dtype if name == "orig_dtype" else getattr(x, name) for name in x.tensor_attribute_names]
-    optional_data = [getattr(x, name) for name in getattr(x, "optional_tensor_data_names", [])]
-    optional_attributes = [getattr(x, name) for name in getattr(x, "optional_tensor_attribute_names", [])]
-    return (type(x)(*data, *attributes, *optional_data, *optional_attributes), *args[1:])
+    return return_and_correct_aliasing(func, args, kwargs, x._apply_fn_to_data(lambda t: t))

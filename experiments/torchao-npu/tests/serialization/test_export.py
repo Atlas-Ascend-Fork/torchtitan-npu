@@ -198,7 +198,7 @@ def test_saved_mx_tensor_rebuilds_via_torchao_unflatten(tmp_path):
     assert isinstance(got, MXTensor)
     assert torch.equal(got.qdata, mx.qdata)
     assert torch.equal(got.scale, mx.scale)
-    assert (got.orig_dtype, got.quant_axis, got.pack_axis) == (mx.orig_dtype, mx.quant_axis, mx.pack_axis)
+    assert (got.dtype, got.quant_axis, got.pack_axis) == (mx.dtype, mx.quant_axis, mx.pack_axis)
 
     def enc(config) -> str:
         return json.dumps(config, cls=TensorSubclassAttributeJSONEncoder, sort_keys=True)

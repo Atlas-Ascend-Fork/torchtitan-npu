@@ -329,7 +329,7 @@ def test_to_mx_tensor_shares_components(qdata, pack_axis, quant_axis, qdata_name
     assert y.quant_axis == quant_axis, f"quantized along {y.quant_axis}, expected {quant_axis}"
     assert y.pack_axis == x.pack_axis, f"pack axis {y.pack_axis} != the source's {x.pack_axis}"
     assert y.qdata is getattr(x, qdata_name), f"quantized along {quant_axis} must reuse {qdata_name}"
-    assert y.orig_dtype is x.orig_dtype, f"orig_dtype {y.orig_dtype} != the source's {x.orig_dtype}"
+    assert y.dtype is x.dtype, f"dtype {y.dtype} != the source's {x.dtype}"
 
 
 def test_to_mx_tensor_rejects_other_axes():

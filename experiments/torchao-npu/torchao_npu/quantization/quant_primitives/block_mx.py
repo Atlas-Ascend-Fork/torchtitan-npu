@@ -14,7 +14,8 @@ import importlib
 import torch
 import torch_npu
 
-from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig
+from torchao_npu import normalize_dim
+from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
 
 importlib.import_module("cann_ops_nn")
 
@@ -65,7 +66,9 @@ def _mxfp4_fake_quantize_then_block_mx_quantize(
     """
 
     fp4_tensor, mxscale, perm_indices = quantize_mxfp4_payload(tensor, config, axis)
-    q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4_tensor, mxscale, config)
+    mxfp4_config = config.mxfp4_fake_quantize_config
+    assert mxfp4_config is not None
+    q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4_tensor, mxscale, mxfp4_config, config)
     return from_block_quant_layout(tensor.shape, perm_indices, q_p, s1_p, s2_p)
 
 
@@ -98,19 +101,60 @@ def quantize_mxfp4_payload(
 
 
 def mxfp4_to_block_mx(
-    fp4_tensor: torch.Tensor, mxscale: torch.Tensor, config: BlockMXQuantizeConfig
+    fp4_tensor: torch.Tensor,
+    mxscale: torch.Tensor,
+    src_config: MXQuantizeConfig,
+    dst_config: BlockMXQuantizeConfig,
+    *,
+    quant_axis: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert kernel-layout MXFP4 into Block FP8 without an intermediate BF16 tensor."""
-    mxfp4_config = config.mxfp4_fake_quantize_config
-    assert mxfp4_config is not None
-    q_p, s1_p, s2_p = torch.ops.cann_ops_nn.mx_to_block_mx_quant(
-        fp4_tensor,
-        mxscale,
-        dst_type=config.npu_elem_dtype,
-        x_type=mxfp4_config.npu_elem_dtype,
-    )
+    """Convert MXFP4 into Block FP8 without an intermediate BF16 tensor.
 
-    return q_p, s1_p, s2_p
+    With ``quant_axis`` omitted, both components must already be in the kernel
+    layout (quant axis trailing), as the fused quantizer emits them. With
+    ``quant_axis`` given, they are taken in their logical layout: the components
+    are permuted into the kernel layout and the result is permuted back,
+    following :func:`mx_quantize`'s rule -- the non-quant dims in descending
+    stride order, the quant axis last -- so it inverts exactly the layout the
+    quantizer produced.
+
+    Args:
+        fp4_tensor: Packed FP4 values.
+        mxscale: The MX scale, one dim more than ``fp4_tensor`` (trailing pack-2 dim).
+        src_config: The MX configuration the payload was quantized with.
+        dst_config: The Block MX configuration to convert to.
+        quant_axis: The axis ``fp4_tensor`` was quantized along when the
+            components are in the logical layout; ``None`` when they are
+            already in the kernel layout.
+
+    Returns:
+        ``(q, s1, s2)``, the Block FP8 values and the dim -1 / dim -2 scales, in
+        the layout of the inputs.
+    """
+    assert src_config.elem_dtype is torch.float4_e2m1fn_x2, (
+        f"elem_dtype is {src_config.elem_dtype}, expecting {torch.float4_e2m1fn_x2}"
+    )
+    ndim = fp4_tensor.ndim
+    quant_axis = normalize_dim(-1 if quant_axis is None else quant_axis, ndim)
+
+    perm_indices = sorted(
+        (d for d in range(ndim) if d != quant_axis),
+        key=lambda d: fp4_tensor.stride(d),
+        reverse=True,
+    )
+    perm_indices.append(quant_axis)
+    fp4 = fp4_tensor.permute(perm_indices)
+    scale = mxscale.permute([*perm_indices, ndim])
+
+    q_p, s1_p, s2_p = torch.ops.cann_ops_nn.mx_to_block_mx_quant(
+        fp4,
+        scale,
+        dst_type=dst_config.npu_elem_dtype,
+        x_type=src_config.npu_elem_dtype,
+    )
+    logical_shape = list(fp4_tensor.shape)
+    logical_shape[quant_axis] *= 2
+    return from_block_quant_layout(tuple(logical_shape), perm_indices, q_p, s1_p, s2_p)
 
 
 def _direct_block_mx_quantize(

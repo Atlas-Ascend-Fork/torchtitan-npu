@@ -426,7 +426,9 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         # concatenating that leading dimension for both 2D and 3D weights.
         fp4 = fp4.view(world_size, *fp4_shape).reshape(world_size * fp4_shape[0], *fp4_shape[1:])
         scale = scale.view(world_size, *scale_shape).reshape(world_size * scale_shape[0], *scale_shape[1:])
-        q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4, scale, self.weight_config)
+        mxfp4_config = self.weight_config.mxfp4_fake_quantize_config
+        assert mxfp4_config is not None
+        q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4, scale, mxfp4_config, self.weight_config)
         logical_shape = list(local_shape)
         logical_shape[0] *= world_size
         q, s1, s2 = from_block_quant_layout(tuple(logical_shape), list(permutation), q_p, s1_p, s2_p)

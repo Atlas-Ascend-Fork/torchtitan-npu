@@ -58,8 +58,7 @@ class DualAxisMXTensor(BaseQuantizedTensor):
         scale2: uint8 E8M0 scales along the second-to-last dim:
             ``[..., ceil(ceil(R/32)/2), C, 2]``.
 
-        orig_dtype: The original high-precision dtype before quantization; also
-            this tensor's logical (outer) dtype.
+        dtype: The logical (high-precision) dtype this tensor presents; the dtype the values had before quantization.
 
         quant_config: The :class:`~torchao_npu.quantization.quant_configs.MXQuantizeConfig`
             this tensor was quantized with.
@@ -74,7 +73,7 @@ class DualAxisMXTensor(BaseQuantizedTensor):
 
     tensor_data_names = ["qdata1", "scale1", "qdata2", "scale2"]
     tensor_attribute_names = [
-        "orig_dtype",
+        "dtype",
         "quant_config",
         "act_quant_config",
     ]
@@ -86,19 +85,20 @@ class DualAxisMXTensor(BaseQuantizedTensor):
         scale1: torch.Tensor,
         qdata2: torch.Tensor,
         scale2: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
         # Neither qdata1 nor qdata2 can be preferred for the initialization of
         # strides/storage_offset/layout. So their default values are used.
         self = torch.Tensor._make_wrapper_subclass(
             cls,
             logical_qdata_shape(qdata1, pack_axis),
-            dtype=orig_dtype,
+            dtype=dtype,
             device=qdata1.device,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         return self
 
@@ -108,10 +108,11 @@ class DualAxisMXTensor(BaseQuantizedTensor):
         scale1: torch.Tensor,
         qdata2: torch.Tensor,
         scale2: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
         if qdata2.dtype is not qdata1.dtype:
             raise ValueError(f"``qdata1`` and ``qdata2`` must share a dtype, got {qdata1.dtype} and {qdata2.dtype}.")
@@ -155,7 +156,6 @@ class DualAxisMXTensor(BaseQuantizedTensor):
         self.scale2 = scale2
         self.act_quant_config = act_quant_config
         self.quant_config = quant_config
-        self.orig_dtype = orig_dtype
         self.pack_axis = normalize_dim(pack_axis, qdata1.ndim) if pack_axis is not None else None
 
     @classmethod
@@ -178,7 +178,8 @@ class DualAxisMXTensor(BaseQuantizedTensor):
 
         Returns:
             A :class:`~torchao_npu.quantized_tensors.dual_axis_mx_tensor.DualAxisMXTensor`
-            holding the quantized ``qdata1``/``qdata2`` and their scales.
+            holding the quantized ``qdata1``/``qdata2`` and their scales. The
+            returned tensor inherits ``requires_grad`` from ``tensor``.
 
         Raises:
             ValueError: If ``tensor.ndim < 2``.
@@ -188,10 +189,20 @@ class DualAxisMXTensor(BaseQuantizedTensor):
 
         qdata1, scale1, qdata2, scale2 = mx_quantize_dual_axis(tensor, quant_config)
         pack_axis = resolve_pack_axis(qdata1) if qdata1.dtype is torch.float4_e2m1fn_x2 else None
-        return cls(qdata1, scale1, qdata2, scale2, tensor.dtype, quant_config, act_quant_config, pack_axis)
+        return cls(
+            qdata1,
+            scale1,
+            qdata2,
+            scale2,
+            tensor.dtype,
+            quant_config,
+            act_quant_config,
+            pack_axis,
+            requires_grad=tensor.requires_grad,
+        )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Dequantize back to ``orig_dtype``, using whichever quant axis is innermost-contiguous.
+        """Dequantize back to ``dtype``, using whichever quant axis is innermost-contiguous.
 
         The tensor stores one quantization per trailing dim, and only a pair whose quant axis is
         innermost-contiguous (``stride == 1``) can back the dequantization op. The pair covering
@@ -202,7 +213,7 @@ class DualAxisMXTensor(BaseQuantizedTensor):
         :class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`.
 
         Args:
-            output_dtype: The dtype of the returned tensor, ``orig_dtype`` when ``None``;
+            output_dtype: The dtype of the returned tensor, ``dtype`` when ``None``;
 
         Returns:
             A plain tensor of dtype ``output_dtype``
@@ -255,7 +266,13 @@ class DualAxisMXTensor(BaseQuantizedTensor):
 
         qdata, scale = (self.qdata1, self.scale1) if quant_axis == self.qdata1.ndim - 1 else (self.qdata2, self.scale2)
         return MXTensor(
-            qdata, scale, self.orig_dtype, quant_axis, self.quant_config, self.act_quant_config, self.pack_axis
+            qdata,
+            scale,
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            quant_axis,
+            self.quant_config,
+            self.act_quant_config,
+            self.pack_axis,
         )
 
 
@@ -314,7 +331,7 @@ def _permute(x: DualAxisMXTensor, perm: list[int]) -> DualAxisMXTensor:
         new_s1,
         new_qdata2,
         new_s2,
-        x.orig_dtype,
+        x.dtype,
         x.quant_config,
         x.act_quant_config,
         new_pack_axis,

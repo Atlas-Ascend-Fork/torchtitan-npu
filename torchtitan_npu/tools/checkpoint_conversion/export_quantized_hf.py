@@ -132,7 +132,7 @@ def _quantize_to_mx_tensor(weight: torch.Tensor, swap_config, device: str):
     return MXTensor(
         mx.qdata.cpu(),
         mx.scale.cpu(),
-        mx.orig_dtype,
+        mx.dtype,
         mx.quant_axis,
         mx.quant_config,
         mx.act_quant_config,
@@ -189,14 +189,14 @@ def _check_expert_attrs_match(reference, candidate) -> None:
     Configs compare by value: the block-FP8 path derives a fresh config per expert.
     """
     reference_attrs = (
-        reference.orig_dtype,
+        reference.dtype,
         reference.quant_axis,
         reference.pack_axis,
         reference.quant_config,
         reference.act_quant_config,
     )
     candidate_attrs = (
-        candidate.orig_dtype,
+        candidate.dtype,
         candidate.quant_axis,
         candidate.pack_axis,
         candidate.quant_config,
@@ -270,7 +270,7 @@ def _merge_routed_experts(hf_state_dict, quantized):
         merged[key] = MXTensor(
             qdata,
             scale,
-            first.orig_dtype,
+            first.dtype,
             -1,
             first.quant_config,
             first.act_quant_config,

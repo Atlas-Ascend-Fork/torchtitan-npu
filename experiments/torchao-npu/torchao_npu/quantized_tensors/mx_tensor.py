@@ -5,13 +5,16 @@
 
 """MX quantized tensor: a single-axis MX-quantized tensor"""
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch_npu
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 from torchao_npu import normalize_dim
 from torchao_npu.quantization import _FP4_DTYPES, _SUPPORTED_MX_ELEM_DTYPES
-from torchao_npu.quantization.quant_configs import MXQuantizeConfig
+from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
+from torchao_npu.quantization.quant_primitives.block_mx import mxfp4_to_block_mx
 from torchao_npu.quantization.quant_primitives.mx import mx_dequantize, mx_quantize
 from torchao_npu.quantized_tensors import (
     logical_qdata_shape,
@@ -19,6 +22,9 @@ from torchao_npu.quantized_tensors import (
     resolve_pack_axis,
 )
 from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
+
+if TYPE_CHECKING:
+    from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 
 aten = torch.ops.aten
 
@@ -44,8 +50,8 @@ class MXTensor(BaseQuantizedTensor):
     high-precision tensor, which is quantized on the fly along ``dim=-1`` with
     that config -- a ``RuntimeError`` is raised when it is unset. The product is
     computed by the NPU kernels from the stored ``qdata``/``scale``, without
-    re-quantizing, and returned as a plain high-precision tensor. Inference only:
-    there is no backward.
+    re-quantizing, and returned as a plain high-precision tensor. There is no
+    backward.
 
     ``torch.matmul`` is only partially supported: it may apply various shape
     operations to an ``MXTensor`` operand, and raises an error for any of them
@@ -66,8 +72,7 @@ class MXTensor(BaseQuantizedTensor):
         scale: ``float8_e8m0fnu`` block scales with ndim = ``qdata.ndim + 1``, readers are
             referred to the doc of ``torch_npu.npu_dynamic_mx_quant`` for its shape details.
 
-        orig_dtype: The original high-precision dtype before quantization;
-            also this tensor's logical (outer) dtype.
+        dtype: The logical (high-precision) dtype this tensor presents; the dtype the values had before quantization.
 
         quant_axis: Non-negative dim along which the tensor is quantized.
 
@@ -85,7 +90,7 @@ class MXTensor(BaseQuantizedTensor):
 
     tensor_data_names = ["qdata", "scale"]
     tensor_attribute_names = [
-        "orig_dtype",
+        "dtype",
         "quant_axis",
         "quant_config",
         "act_quant_config",
@@ -96,21 +101,21 @@ class MXTensor(BaseQuantizedTensor):
         cls,
         qdata: torch.Tensor,
         scale: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_axis: int,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
+        # Leave strides/storage_offset/layout at their defaults derived by torch:
+        # the metadata describes the logical (high-precision) tensor as a dense one.
         self = torch.Tensor._make_wrapper_subclass(
             cls,
             logical_qdata_shape(qdata, pack_axis),
-            strides=qdata.stride(),
-            storage_offset=qdata.storage_offset(),
-            layout=qdata.layout,
-            dtype=orig_dtype,
+            dtype=dtype,
             device=qdata.device,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         return self
 
@@ -118,11 +123,12 @@ class MXTensor(BaseQuantizedTensor):
         self,
         qdata: torch.Tensor,
         scale: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_axis: int,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
         elem_dtype = quant_config.elem_dtype
         if elem_dtype not in _SUPPORTED_MX_ELEM_DTYPES:
@@ -149,7 +155,6 @@ class MXTensor(BaseQuantizedTensor):
         self.act_quant_config = act_quant_config
         self.quant_config = quant_config
         self.quant_axis = normalize_dim(quant_axis, qdata.ndim)
-        self.orig_dtype = orig_dtype
         self.pack_axis = normalize_dim(pack_axis, qdata.ndim) if pack_axis is not None else None
 
     @classmethod
@@ -160,17 +165,29 @@ class MXTensor(BaseQuantizedTensor):
         axis: int,
         act_quant_config: MXQuantizeConfig | None = None,
     ) -> "MXTensor":
-        """Quantize a high-precision ``tensor`` along ``axis`` into an ``MXTensor``."""
+        """Quantize a high-precision ``tensor`` along ``axis`` into an ``MXTensor``.
+
+        The returned tensor inherits ``requires_grad`` from ``tensor``.
+        """
         axis = normalize_dim(axis, tensor.ndim)
         qdata, scale = mx_quantize(tensor, axis, quant_config)
         pack_axis = resolve_pack_axis(qdata) if qdata.dtype is torch.float4_e2m1fn_x2 else None
-        return cls(qdata, scale, tensor.dtype, axis, quant_config, act_quant_config, pack_axis)
+        return cls(
+            qdata,
+            scale,
+            tensor.dtype,
+            axis,
+            quant_config,
+            act_quant_config,
+            pack_axis,
+            requires_grad=tensor.requires_grad,
+        )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Dequantize back to ``orig_dtype``, or to ``output_dtype`` when given.
+        """Dequantize back to ``dtype``, or to ``output_dtype`` when given.
 
         Args:
-            output_dtype: The dtype of the returned tensor, ``orig_dtype`` when ``None``. Must be
+            output_dtype: The dtype of the returned tensor, ``dtype`` when ``None``. Must be
                 a dtype the dequantization op supports: ``torch.float32``, ``torch.bfloat16`` or
                 ``torch.float16``.
 
@@ -183,7 +200,46 @@ class MXTensor(BaseQuantizedTensor):
             self.quant_axis,
             block_size=self.quant_config.block_size,
             src_dtype=self.quant_config.elem_dtype,
-            output_dtype=self.orig_dtype if output_dtype is None else output_dtype,
+            # pyrefly: ignore [missing-attribute]
+            output_dtype=self.dtype if output_dtype is None else output_dtype,
+        )
+
+    def to_block_mx(self, quant_config: BlockMXQuantizeConfig) -> "BlockMXTensor":
+        """Convert this MXFP4 tensor into its Block MX form.
+
+        Args:
+            quant_config: The Block MX configuration of the returned tensor.
+
+        Returns:
+            A :class:`BlockMXTensor` with this tensor's logical shape,
+            ``dtype`` and ``act_quant_config``.
+        """
+        assert self.quant_axis == self.pack_axis, (
+            "The conversion is supported only when self.quant_axis == self.pack_axis, "
+            f"got self.quant_axis={self.quant_axis}, self.pack_axis={self.pack_axis}"
+        )
+        if quant_config.mxfp4_fake_quantize_config is not None:
+            assert self.quant_config == quant_config.mxfp4_fake_quantize_config, (
+                f"self.quant_config ({self.quant_config}) is not consistent with the target quant_config "
+                f"{quant_config.mxfp4_fake_quantize_config}"
+            )
+
+        q, s1, s2 = mxfp4_to_block_mx(
+            self.qdata, self.scale, self.quant_config, quant_config, quant_axis=self.quant_axis
+        )
+
+        # Imported here because ``block_mx_tensor`` imports this module.
+        from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
+
+        return BlockMXTensor(
+            q,
+            s1,
+            s2,
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            quant_config,
+            self.act_quant_config,
+            None,
+            requires_grad=self.requires_grad,  # pyrefly: ignore [missing-attribute]
         )
 
 
@@ -208,7 +264,7 @@ def _permute(x: MXTensor, perm: list[int]) -> MXTensor:
     return MXTensor(
         x.qdata.permute(perm),
         x.scale.permute(scale_perm),
-        x.orig_dtype,
+        x.dtype,
         new_axis,
         x.quant_config,
         x.act_quant_config,
@@ -265,11 +321,11 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
             - If either operand is quantized along the wrong dim;
             - If an :class:`MXTensor` ``A`` was not quantized with
               ``B.act_quant_config``;
-            - If ``A`` is a quantized tensor of another class.
+            - If ``A`` is a quantized tensor of another class;
+            - If the two operands' ``quant_config.block_size`` differ.
 
-        RuntimeError: If ``A`` is a high-precision tensor with
-            ``requires_grad=True``, or if ``B`` carries no ``act_quant_config``
-            to quantize a high-precision ``A`` with.
+        RuntimeError: If ``A`` is a high-precision tensor and ``B`` carries no
+            ``act_quant_config`` to quantize it with.
     """
     if A.shape[-1] != B.shape[-2]:
         raise ValueError(f"Contracting dim mismatch: {A.shape[-1]} != {B.shape[-2]}.")
@@ -296,12 +352,6 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
         )
 
     else:
-        if A.requires_grad:
-            raise RuntimeError(
-                f"{MXTensor.__name__} matmul is inference-only and has no backward; "
-                f"got a left operand with requires_grad=True."
-            )
-
         if B.act_quant_config is None:
             raise RuntimeError(
                 "The left operand is a high-precision tensor, but the right operand carries no "
@@ -309,6 +359,12 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
             )
 
         A = MXTensor.from_hp(A, B.act_quant_config, axis=-1)
+
+    if A.quant_config.block_size != B.quant_config.block_size:
+        raise ValueError(
+            "The operands must agree on ``block_size``, got "
+            f"{A.quant_config.block_size} for ``A`` and {B.quant_config.block_size} for ``B``."
+        )
 
     return A, B
 

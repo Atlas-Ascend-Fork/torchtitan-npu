@@ -40,7 +40,7 @@ _CFG = _FakeQuantizeConfig(torch.int32)
 class _FakeMXTensor:
     """The ``MXTensor`` attribute surface the export script reads or writes."""
 
-    def __init__(self, qdata, scale, orig_dtype, quant_axis, quant_config, act_quant_config=None, pack_axis=None):
+    def __init__(self, qdata, scale, dtype, quant_axis, quant_config, act_quant_config=None, pack_axis=None):
         if qdata.dtype is not quant_config.elem_dtype:
             raise ValueError(
                 f"qdata dtype {qdata.dtype} does not match quant_config.elem_dtype {quant_config.elem_dtype}"
@@ -49,7 +49,7 @@ class _FakeMXTensor:
             raise ValueError(f"scale.ndim must be qdata.ndim + 1 = {qdata.ndim + 1}, got {scale.ndim}")
         self.qdata = qdata
         self.scale = scale
-        self.orig_dtype = orig_dtype
+        self.dtype = dtype
         self.quant_axis = quant_axis % qdata.ndim
         self.quant_config = quant_config
         self.act_quant_config = act_quant_config
