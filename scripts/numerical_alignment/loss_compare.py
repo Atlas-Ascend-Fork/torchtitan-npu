@@ -6,14 +6,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-r"""比较两个 Git 版本的训练 loss 和 grad norm。
+r"""比较两个训练脚本或 Git 版本的 loss 和 grad norm。
 
-每个版本在独立的 Git worktree 和输出目录中运行。默认启用确定性训练，并加载
-同一份 seed checkpoint；共享 checkpoint 要求两侧模型权重兼容。
+省略 Git ref 时，直接使用当前工作区（包括未提交的代码和脚本）；指定两个 Git ref 时，
+每个版本在独立的 Git worktree 中运行。两侧始终使用独立输出目录，默认启用确定性训练，
+并加载同一份 seed checkpoint；共享 checkpoint 要求两侧模型权重兼容。
 
 验证流程：
 
-解析 baseline/test Git ref → 创建独立 worktree → 在 baseline worktree 中生成
+选择当前工作区或解析 baseline/test Git ref 并创建独立 worktree → 使用 baseline 入口生成
 共享 seed checkpoint → baseline/test 加载该 checkpoint 并运行相同步数 → 从
 TensorBoard 读取每个 step 的 loss 和 grad_norm → 按 bitwise 或 close 模式判定
 → 将结果写入 comparison.json。
@@ -31,12 +32,34 @@ Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-m
 
 用法示例：
 
-1. 比较两个 Git 分支或提交
+1. 比较自行准备的两个训练脚本
+
+    python scripts/numerical_alignment/loss_compare.py \
+        --baseline-runner examples/deepseek_v4/debug/base.sh \
+        --test-runner examples/deepseek_v4/debug/test.sh
+
+两侧均从当前仓库根目录启动，相对路径以仓库根目录为基准，脚本无需提交。
+模型配置、数据路径和 override 等可直接写入各自脚本；脚本必须将 "$@" 追加到
+训练命令末尾，以接收比较脚本控制的步数、序列长度、确定性和 TensorBoard 等参数。
+入口脚本须具有执行权限。base 脚本还用于生成共享 seed checkpoint。
+
+2. 比较两个 Git 分支或提交
 
     python scripts/numerical_alignment/loss_compare.py branch1 branch2
     python scripts/numerical_alignment/loss_compare.py HEAD COMMIT_SHA
 
-2. 指定入口脚本
+也可用当前工作区准备的脚本启动历史版本的代码，脚本无需存在于被测提交中：
+
+    python scripts/numerical_alignment/loss_compare.py branch1 branch2 \
+        --baseline-runner examples/deepseek_v4/debug/base.sh \
+        --test-runner examples/deepseek_v4/debug/test.sh
+
+上述相对入口路径会先基于当前仓库根目录转为绝对路径，再从对应 worktree 执行，无需写为绝对路径。
+入口脚本须沿用该工作目录，以相对路径启动训练，例如 `bash scripts/run_train.sh "$@"`。
+若基于 `dirname "$0"` 切回原工作区，或使用原工作区的绝对路径定位训练源码，
+两侧可能运行同一份源码，产生未实际比较版本差异的 PASS。
+
+3. 指定共享入口脚本
 
 默认入口脚本为：
 
@@ -45,9 +68,12 @@ Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-m
 通过 --runner 可指定其他入口脚本：
 
     python scripts/numerical_alignment/loss_compare.py main HEAD \
-        --runner examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+        --runner examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh
 
-3. 使用不同精度比较模式
+这里的 --runner 为相对路径，两侧分别读取各自 ref 中的 A5 脚本，因此两个 ref 都须包含该文件。
+若脚本仅存在于当前工作区，使用前述 --baseline-runner / --test-runner 指定。
+
+4. 使用不同精度比较模式
 
 比特一致模式为默认模式：
 
@@ -57,7 +83,7 @@ Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-m
 
     python scripts/numerical_alignment/loss_compare.py branch1 branch2 --mode close
 
-4. 比较不同训练参数或 override
+5. 比较不同训练参数或 override
 
     python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
         --baseline-options='--override.imports baseline.factory' \
@@ -75,10 +101,15 @@ Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-m
 常用参数：
 
 - --steps：训练步数，默认 100；不支持恢复完整训练状态的续训比较。
-- --runner：相对路径分别使用两个 Git ref 中的入口脚本；绝对路径两侧共用。
+- --baseline-runner / --test-runner：分别指定两侧入口，覆盖 --runner。
+  相对路径始终使用当前工作区根目录中的文件，不受 Git ref 影响；
+  绝对路径直接使用指定文件，入口脚本无需提交。
+- --runner：两侧入口的默认值；未指定时使用上述 DeepSeek-V4 mini 脚本。
+  指定 Git ref 时，相对路径分别使用对应 ref 中的脚本；绝对路径两侧共用。
 - --seq-len：seed 和两侧训练的序列长度，默认 4096；例如 `--seq-len 2048`。
-- --ngpus：NPU 进程数，默认 1；两侧拓扑不同时用 --baseline-ngpus /
-  --test-ngpus 分别指定。
+- --ngpus：可选的两侧 NPU 进程数覆盖值；默认沿用环境变量和各自 runner 的卡数设置。
+  两侧拓扑不同时用 --baseline-ngpus / --test-ngpus 分别覆盖；显式卡数参数优先于
+  NGPU 环境变量。默认 unsharded seed 使用单进程初始化。
 - --seed-mode：默认 unsharded 使用单卡 CPU 初始化；distributed 保留 baseline
   的并行布局，需要与 baseline 相同的卡数和显存资源，runner 必须支持 TRAIN_FILE。
   distributed 不能与 --baseline-env TRAIN_FILE=... 同用。
@@ -150,6 +181,7 @@ BITWISE_THRESHOLDS = MetricThresholds(
 ANSI_BOLD = "\033[1m"
 ANSI_CYAN = "\033[1;36m"
 ANSI_GREEN = "\033[1;32m"
+ANSI_YELLOW = "\033[1;33m"
 ANSI_RED = "\033[1;31m"
 ANSI_DIM = "\033[2m"
 ANSI_RESET = "\033[0m"
@@ -193,6 +225,11 @@ def log_info(message: str) -> None:
 
 def log_success(message: str) -> None:
     marker = _colorize("✓", ANSI_GREEN)
+    print(f"{marker} [loss_compare] {message}", flush=True)
+
+
+def log_warning(message: str) -> None:
+    marker = _colorize("! WARNING", ANSI_YELLOW)
     print(f"{marker} [loss_compare] {message}", flush=True)
 
 
@@ -272,7 +309,10 @@ def resolve_runner(repo_root: Path, runner: Path) -> Path:
     path = runner if runner.is_absolute() else repo_root / runner
     path = path.resolve()
     if not runner.is_absolute() and not path.is_relative_to(repo_root.resolve()):
-        raise ValueError("relative runner must stay inside the worktree; use an absolute path for a shared runner")
+        raise ValueError(
+            "relative runner must stay inside the repository or selected worktree root; "
+            "use an absolute path for an external runner"
+        )
     if not path.is_file():
         raise ValueError(f"training runner not found: {path}")
     if not os.access(path, os.X_OK):
@@ -430,13 +470,23 @@ def run_with_realtime_output(
         raise subprocess.CalledProcessError(return_code, command)
 
 
-def training_env(ngpus: int, extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
+def training_env(ngpus: int | None, extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    env["NGPU"] = str(ngpus)
     env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
+    if ngpus is not None:
+        env["NGPU"] = str(ngpus)
     return env
+
+
+def describe_npu_processes(ngpus: int | None, env: Mapping[str, str]) -> dict[str, int | str | None]:
+    """Describe launcher inputs, not the actual count a runner may override internally."""
+    return {
+        "override": ngpus,
+        "ngpu_env": env.get("NGPU"),
+        "source": "override" if ngpus is not None else "environment" if "NGPU" in env else "runner",
+    }
 
 
 def extract_metrics_from_tensorboard(
@@ -628,6 +678,8 @@ def write_report(
     test_commit: str,
     baseline_runner: Path,
     test_runner: Path,
+    baseline_npu_processes: Mapping[str, int | str | None],
+    test_npu_processes: Mapping[str, int | str | None],
     runner_scope: str,
     expected_steps: int,
     mode: str,
@@ -636,8 +688,18 @@ def write_report(
     seed_mode: str = "unsharded",
 ) -> None:
     report: dict[str, Any] = {
-        "baseline": {"ref": baseline_ref, "commit": baseline_commit, "runner": str(baseline_runner)},
-        "test": {"ref": test_ref, "commit": test_commit, "runner": str(test_runner)},
+        "baseline": {
+            "ref": baseline_ref,
+            "commit": baseline_commit,
+            "runner": str(baseline_runner),
+            "npu_processes": dict(baseline_npu_processes),
+        },
+        "test": {
+            "ref": test_ref,
+            "commit": test_commit,
+            "runner": str(test_runner),
+            "npu_processes": dict(test_npu_processes),
+        },
         "runner_scope": runner_scope,
         "expected_step_range": {"first": 1, "last": expected_steps},
         "mode": mode,
@@ -677,8 +739,8 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("baseline_ref", help="baseline Git branch, tag, or commit")
-    parser.add_argument("test_ref", help="test Git branch, tag, or commit")
+    parser.add_argument("baseline_ref", nargs="?", help="baseline Git ref (omit both refs to use the working tree)")
+    parser.add_argument("test_ref", nargs="?", help="test Git ref (must be provided together with baseline_ref)")
     parser.add_argument(
         "--mode",
         choices=("bitwise", "close"),
@@ -698,7 +760,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seq-len", type=int, default=DEFAULT_SEQ_LEN, help="sequence length for seed and both runs (default: 4096)"
     )
-    parser.add_argument("--ngpus", type=int, default=1, help="NPU processes for both runs (default)")
+    parser.add_argument(
+        "--ngpus", type=int, help="override NGPU for both runs (default: keep each runner/environment setting)"
+    )
     parser.add_argument(
         "--baseline-ngpus",
         type=int,
@@ -716,7 +780,18 @@ def parse_args() -> argparse.Namespace:
         "--runner",
         type=Path,
         default=DEFAULT_RUNNER,
-        help="relative path: run each ref's own script; absolute path: use one shared script",
+        help="default runner for both sides; relative to the repo root or each ref's worktree",
+    )
+    parser.add_argument(
+        "--baseline-runner",
+        type=Path,
+        help="baseline script from the current repo root, independent of Git refs "
+        "(overrides --runner; also used for seed creation)",
+    )
+    parser.add_argument(
+        "--test-runner",
+        type=Path,
+        help="test script from the current repo root, independent of Git refs (overrides --runner)",
     )
     parser.add_argument(
         "--output-dir",
@@ -765,6 +840,8 @@ def parse_args() -> argparse.Namespace:
         help="do not enable deterministic algorithms (required by unsupported fused ops)",
     )
     args = parser.parse_args()
+    if (args.baseline_ref is None) != (args.test_ref is None):
+        parser.error("provide both baseline_ref and test_ref, or omit both to use the current working tree")
     if args.seed_mode == "distributed" and "TRAIN_FILE" in _merged_env(args.baseline_env):
         parser.error("--seed-mode distributed cannot be combined with --baseline-env TRAIN_FILE=...")
     if args.steps <= 0:
@@ -791,7 +868,7 @@ def parse_args() -> argparse.Namespace:
                     key, "TensorBoard settings are fixed to record every step in the comparison output"
                 )
                 parser.error(f"--{name}-options must not set {option.partition('=')[0]}; {hint}")
-    if args.ngpus <= 0:
+    if args.ngpus is not None and args.ngpus <= 0:
         parser.error("--ngpus must be positive")
     for name in ("baseline", "test"):
         ngpus = getattr(args, f"{name}_ngpus")
@@ -807,45 +884,80 @@ def main() -> None:
     repo_root = find_repo_root()
     output_dir = prepare_output_dir(args.output_dir)
 
-    log_step("Resolving Git revisions")
-    baseline_commit = resolve_ref(repo_root, args.baseline_ref)
-    test_commit = resolve_ref(repo_root, args.test_ref)
+    use_worktrees = args.baseline_ref is not None
+    if use_worktrees:
+        log_step("Resolving Git revisions")
+        baseline_commit = resolve_ref(repo_root, args.baseline_ref)
+        test_commit = resolve_ref(repo_root, args.test_ref)
+    else:
+        log_step("Using current working tree, including uncommitted code and scripts")
+        baseline_commit = test_commit = resolve_ref(repo_root, "HEAD")
     thresholds = MetricThresholds(
         mean_ae=args.mean_ae_threshold,
         max_re=args.max_re_threshold,
         mean_re=args.mean_re_threshold,
     )
 
-    log_info(f"Baseline: {args.baseline_ref} ({baseline_commit})")
-    log_info(f"Test: {args.test_ref} ({test_commit})")
-    base_n = args.baseline_ngpus or args.ngpus
-    test_n = args.test_ngpus or args.ngpus
-    if base_n == test_n:
-        log_info(f"Mode: {args.mode}; steps: {args.steps}; NPU processes: {args.ngpus}")
-    else:
-        log_info(f"Mode: {args.mode}; steps: {args.steps}; NPU processes: baseline={base_n}, test={test_n}")
+    baseline_ref = args.baseline_ref if use_worktrees else "working-tree"
+    test_ref = args.test_ref if use_worktrees else "working-tree"
+    log_info(f"Baseline: {baseline_ref} ({baseline_commit})")
+    log_info(f"Test: {test_ref} ({test_commit})")
+    base_n = args.baseline_ngpus if args.baseline_ngpus is not None else args.ngpus
+    test_n = args.test_ngpus if args.test_ngpus is not None else args.ngpus
+    baseline_env = training_env(base_n, _merged_env(args.baseline_env))
+    test_env = training_env(test_n, _merged_env(args.test_env))
+    baseline_npu_processes = describe_npu_processes(base_n, baseline_env)
+    test_npu_processes = describe_npu_processes(test_n, test_env)
+    log_info(f"Mode: {args.mode}; steps: {args.steps}")
+    for side, config in (("baseline", baseline_npu_processes), ("test", test_npu_processes)):
+        log_info(f"{side} NPU launch config: NGPU={config['ngpu_env']!r}; source={config['source']}")
     log_info(f"Sequence length: {args.seq_len}")
     log_info(f"Deterministic algorithms: {not args.no_deterministic}")
     log_info(f"Output: {output_dir}")
 
-    worktree_root = Path(tempfile.mkdtemp(prefix="loss-compare-worktrees-"))
-    baseline_worktree = worktree_root / "baseline"
-    test_worktree = worktree_root / "test"
+    worktree_root = Path(tempfile.mkdtemp(prefix="loss-compare-worktrees-")) if use_worktrees else None
+    baseline_worktree = worktree_root / "baseline" if worktree_root is not None else repo_root
+    test_worktree = worktree_root / "test" if worktree_root is not None else repo_root
     added_worktrees: list[Path] = []
     original_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
-        log_step("Creating isolated Git worktrees")
-        add_worktree(repo_root, baseline_worktree, baseline_commit)
-        added_worktrees.append(baseline_worktree)
-        add_worktree(repo_root, test_worktree, test_commit)
-        added_worktrees.append(test_worktree)
-        log_success("Git worktrees are ready")
-        baseline_runner = resolve_runner(baseline_worktree, args.runner)
-        test_runner = resolve_runner(test_worktree, args.runner)
-        runner_scope = "shared" if args.runner.is_absolute() else "per-ref"
+        if use_worktrees:
+            log_step("Creating isolated Git worktrees")
+            add_worktree(repo_root, baseline_worktree, baseline_commit)
+            added_worktrees.append(baseline_worktree)
+            add_worktree(repo_root, test_worktree, test_commit)
+            added_worktrees.append(test_worktree)
+            log_success("Git worktrees are ready")
+        baseline_runner = resolve_runner(
+            repo_root if args.baseline_runner is not None else baseline_worktree,
+            args.baseline_runner or args.runner,
+        )
+        test_runner = resolve_runner(
+            repo_root if args.test_runner is not None else test_worktree,
+            args.test_runner or args.runner,
+        )
+        if not use_worktrees:
+            runner_scope = "working-tree"
+        elif args.baseline_runner is not None or args.test_runner is not None:
+            runner_scope = "per-side"
+        else:
+            runner_scope = "shared" if args.runner.is_absolute() else "per-ref"
         log_info(f"Runner scope: {runner_scope}")
         log_info(f"Baseline runner: {baseline_runner}")
         log_info(f"Test runner: {test_runner}")
+        if use_worktrees:
+            for side, requested, runner, worktree, commit in (
+                ("baseline", args.baseline_runner, baseline_runner, baseline_worktree, baseline_commit),
+                ("test", args.test_runner, test_runner, test_worktree, test_commit),
+            ):
+                if requested is not None or args.runner.is_absolute():
+                    log_warning(
+                        f"[{side}] Current-workspace runner={runner}; target commit={commit}; "
+                        f"expected training cwd={worktree}. Preserve this cwd and use relative training paths. "
+                        "Do not cd via dirname $0 or use training paths into the original workspace: "
+                        "both sides may run the same code and produce a false PASS. "
+                        "The runner's actual source selection is not verified."
+                    )
         log_info(f"Expected metric steps: 1..{args.steps}")
 
         seed_checkpoint = None
@@ -898,10 +1010,7 @@ def main() -> None:
                 seq_len=args.seq_len,
             ),
             cwd=baseline_worktree,
-            env=training_env(
-                args.baseline_ngpus if args.baseline_ngpus is not None else args.ngpus,
-                _merged_env(args.baseline_env),
-            ),
+            env=baseline_env,
             log_file=baseline_dump / "training.log",
         )
         log_success("Baseline training completed")
@@ -926,10 +1035,7 @@ def main() -> None:
                 seq_len=args.seq_len,
             ),
             cwd=test_worktree,
-            env=training_env(
-                args.test_ngpus if args.test_ngpus is not None else args.ngpus,
-                _merged_env(args.test_env),
-            ),
+            env=test_env,
             log_file=test_dump / "training.log",
         )
         log_success("Test training completed")
@@ -953,12 +1059,14 @@ def main() -> None:
         log_step("Writing comparison report")
         write_report(
             output_dir,
-            baseline_ref=args.baseline_ref,
+            baseline_ref=baseline_ref,
             baseline_commit=baseline_commit,
-            test_ref=args.test_ref,
+            test_ref=test_ref,
             test_commit=test_commit,
             baseline_runner=baseline_runner,
             test_runner=test_runner,
+            baseline_npu_processes=baseline_npu_processes,
+            test_npu_processes=test_npu_processes,
             runner_scope=runner_scope,
             expected_steps=args.steps,
             mode=args.mode,
@@ -974,17 +1082,19 @@ def main() -> None:
     finally:
         signal.signal(signal.SIGTERM, original_sigterm)
         if args.cleanup_after_test:
-            log_step("Cleaning seed directory and temporary Git worktrees")
+            log_step("Cleaning temporary artifacts")
             for worktree in reversed(added_worktrees):
                 remove_worktree(repo_root, worktree)
-            shutil.rmtree(worktree_root, ignore_errors=True)
+            if worktree_root is not None:
+                shutil.rmtree(worktree_root, ignore_errors=True)
             seed_dir = output_dir / "seed"
             if seed_dir.exists():
                 shutil.rmtree(seed_dir)
-            log_success("Seed directory and temporary Git worktrees removed")
+            log_success("Temporary artifacts removed; training outputs and comparison report kept")
         else:
             log_info(f"Cleanup disabled; training artifacts kept in: {output_dir}")
-            log_info(f"Git worktrees kept in: {worktree_root}")
+            if worktree_root is not None:
+                log_info(f"Git worktrees kept in: {worktree_root}")
         log_info("Consider using the .agents/skills/training-log-visualization skill to plot training log curves.")
 
 

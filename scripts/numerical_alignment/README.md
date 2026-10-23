@@ -1,45 +1,19 @@
 # 数值一致性检查（精度对比）
 
-本目录提供局部模块前反向对比、Transformers 推理基线对齐，以及两个 Git 版本的训练指标对比。
-整网对比以 DeepSeek-V4（DSV4）为例；只比较训练 `loss` 和 `grad_norm` 时，可直接使用「步骤四」，无需准备推理权重。
+本目录提供三类精度对比：局部模块前反向、Transformers 推理基线对齐、两个训练脚本或 Git 版本的训练指标对比。
+整网对比以 DeepSeek-V4（DSV4）为例；**只比较训练 `loss` 和 `grad_norm` 时，直接看「步骤四」即可，无需准备推理权重。**
 
-`utils/` 维护模型无关的指标、checkpoint 加载和 trace hook。DSV4 的配置、权重适配、前向协议及模块映射集中在 `deepseek_v4/`；训练入口和 override 选择由 `examples/` 下的 runner 提供。
-
-## 目录结构
-
-```text
-scripts/numerical_alignment/
-├── README.md
-├── compare_module_example.py          # RMSNorm 前向输出和梯度对比
-├── loss_compare.py                    # 两个 Git 版本的 loss、grad_norm 对比
-├── create_seed_checkpoint.py          # 按 baseline 并行布局保存 step-0
-├── requirements.txt                   # 推理基线的额外依赖
-├── configs/
-│   └── dsv4_4l.json                    # DSV4 四层、四专家推理配置
-├── deepseek_v4/
-│   ├── compare_dsv4_with_transformers.py  # Transformers 与 TorchTitan 前向对比
-│   ├── config.py                      # 模型裁层、专家缩减和 hash routing
-│   ├── hf_model.py                    # HF 权重视图、模型加载及前向
-│   ├── tt_model.py                    # TorchTitan 模型构造、DCP 加载及前向
-│   ├── overrides.py                   # golden、test 两组 override
-│   ├── trace.py                       # 两侧模块输出的统一映射
-│   └── transformers_dsv4_patch.py      # Transformers 数值对齐补丁
-└── utils/
-    ├── checkpoint.py                  # DCP 权重过滤和加载
-    ├── metrics.py                     # tensor 精度指标和 logits 阈值
-    └── trace_hooks.py                 # hook 注册、记录和清理
-```
+指标定义与验收要求见[数值对齐开发指南](../../docs/developer_guides/numerical_alignment.md)，完整参数见各入口的 `--help`。
 
 ## 环境准备
 
-以下命令从仓库根目录执行。需先安装项目依赖，配置 CANN、`torch_npu`，并准备空闲的 Ascend NPU。
-CANN 路径按实际安装位置替换；脚本不会自动 source 环境：
+以下命令均从仓库根目录执行。需先安装项目依赖，配置 CANN、`torch_npu`，并准备空闲的 Ascend NPU。脚本不会自动 source 环境：
 
 ```bash
 source /path/to/cann/set_env.sh
 ```
 
-推理基线固定使用 `transformers==5.13.0`，运行时会校验版本。在独立的对齐环境中，安装项目依赖后再安装：
+推理基线固定使用 `transformers==5.13.0`（运行时会校验版本），建议在独立环境中安装：
 
 ```bash
 python -m pip install -r scripts/numerical_alignment/requirements.txt
@@ -47,69 +21,48 @@ python -m pip install -r scripts/numerical_alignment/requirements.txt
 
 ## 局部模块对比
 
-[`compare_module_example.py`](compare_module_example.py) 以 RMSNorm 为例，比较 Torch 实现与 AscRMSNorm 融合实现。
-两侧共享相同输入、权重、dtype 和上游梯度，分别检查前向输出、输入梯度和权重梯度。
+以 RMSNorm 为例，比较 Torch 实现与 AscRMSNorm 融合实现的前向输出、输入梯度和权重梯度：
 
 ```bash
 python -m scripts.numerical_alignment.compare_module_example
 ```
 
-默认 shape 为 `(2, 17, 4096)`、dtype 为 `bfloat16`、eps 为 `1e-6`、seed 为 `1234`。`--dtype` 支持 `bfloat16`、`float16`、`float32`，`--device` 仅支持 NPU。
-
-控制台按 `forward`、`input_grad`、`weight_grad` 打印 `mean_ae`、`max_re`、`mean_re`、`cos` 和 `PASS` / `FAIL`。
-三项检查均须满足 `mean_ae <= 0.02`、`mean_re <= 0.02`、`cos >= 0.9999`；`max_re` 仅用于诊断。
-全部通过返回 `0`，任一检查不通过返回 `1`。
+默认 shape `(2, 17, 4096)`、`bfloat16`、seed `1234`；`--dtype` 支持 `bfloat16` / `float16` / `float32`，`--device` 仅支持 NPU。
+三项检查均须满足 `mean_ae <= 0.02`、`mean_re <= 0.02`、`cos >= 0.9999`（`max_re` 仅用于诊断）。全部通过返回 `0`，否则返回 `1`。
 
 ## 整网精度对比
 
+推理基线对齐使用 DSV4 Flash 的前 1～4 层，保留前 4 个 routed experts、top-3，关闭 MTP。
+
 ### 步骤一：准备 HF 权重
 
-推理对齐使用 DeepSeek-V4 Flash 的前 1～4 层，保留前 4 个 routed experts、top-3，并关闭 MTP。需准备官方 HF 命名的 Safetensors 权重，覆盖所选层、embedding、最终 norm、head 和 mHC head 等全局参数。
-
-默认四层使用官方 [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) 的 48 分片版本，下载 `config.json`、`model.safetensors.index.json`、`model-00001-of-00048.safetensors`～`model-00005-of-00048.safetensors` 和 `model-00045-of-00048.safetensors` 即可。第 1～5 号分片覆盖 embedding 和前四层，第 45 号分片包含最终 norm、head 和 mHC head。更换版本或层数时，按官方索引重新确认所需分片。
-
-本例使用以下目录，按实际位置替换：
+需要覆盖所选层、embedding、最终 norm、head 和 mHC head 的官方命名 Safetensors。
+默认四层可从 [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) 下载 `config.json`、`model.safetensors.index.json`、分片 1～5（embedding 与前四层）和分片 45（最终 norm、head、mHC head）。更换版本或层数时按官方索引重新确认分片。
 
 ```bash
-export HF_QUANTIZED=/path/to/dsv4
-export HF_BF16=/path/to/dsv4-bf16
-export TT_DCP=/path/to/dsv4-dcp-4L
+export HF_QUANTIZED=/path/to/dsv4        # 量化分片及 config.json
+export HF_BF16=/path/to/dsv4-bf16        # 反量化输出目录（须为空）
+export TT_DCP=/path/to/dsv4-dcp-4L       # DCP 输出目录（须为空）
 ```
 
-`HF_QUANTIZED` 存放量化分片及 `config.json`；`HF_BF16` 和 `TT_DCP` 是后续转换的空输出目录。
-已有 BF16 HF 权重时，将 `HF_BF16` 指向该目录，跳过下一步的反量化。
+已有 BF16 HF 权重时，将 `HF_BF16` 指向该目录并跳过下一步的反量化。
 
 ### 步骤二：权重转换
 
-#### FP8 / FP4 → BF16
-
-[`dequant_save_hf_dsv4.py`](../checkpoint_conversion/dequant_save_hf_dsv4.py) 在 CPU 上逐分片反量化。
-FP8 E4M3FN 权重按 block scale 还原，int8 打包的 FP4 权重按分组 scale 还原；每个量化权重及其 `.scale` 须在同一分片中。
-输出保留 HF 参数名，移除 scale tensor，并生成新的权重索引和去除量化配置的 `config.json`。
-
 ```bash
-python scripts/checkpoint_conversion/dequant_save_hf_dsv4.py \
-    "$HF_QUANTIZED" "$HF_BF16"
-```
+# FP8 / FP4 → BF16（CPU 上逐分片反量化）
+python scripts/checkpoint_conversion/dequant_save_hf_dsv4.py "$HF_QUANTIZED" "$HF_BF16"
 
-#### HF → DCP
-
-TorchTitan 使用 DCP 格式。将同一份 BF16 HF 权重转换为四层、四专家、top-3 的 DCP：
-
-```bash
-python scripts/checkpoint_conversion/convert_dsv4_hf_to_dcp.py \
-    "$HF_BF16" "$TT_DCP" \
+# HF → DCP（四层、四专家、top-3）
+python scripts/checkpoint_conversion/convert_dsv4_hf_to_dcp.py "$HF_BF16" "$TT_DCP" \
     --num-experts 4 --top-k 3
 ```
 
-转换使用当前 `DeepSeekV4StateDictAdapter` 和 `routed_experts.inner_experts` 权重格式。
-`--n-layers` 必须与步骤三一致，专家数和 top-k 必须与推理配置一致。
-两项转换的输出目录均须为空或不存在，并需准备足够的 CPU 内存和磁盘空间。详细格式见[权重转换说明](../checkpoint_conversion/README.md)。
+`--n-layers`、专家数和 top-k 必须与下一步的推理配置一致。输出目录须为空或不存在，并需足够的 CPU 内存和磁盘空间。格式细节见[权重转换说明](../checkpoint_conversion/README.md)。
 
 ### 步骤三：Transformers 和 TorchTitan 前向对比
 
-[`deepseek_v4/compare_dsv4_with_transformers.py`](deepseek_v4/compare_dsv4_with_transformers.py) 在同一张 NPU 上依次加载两侧模型，
-使用相同的随机 token，比较最后一个 token 的 BF16 logits。默认 batch size 为 `1`、sequence length 为 `4096`、输入 seed 为 `1234`，无需 tokenizer。
+在同一张 NPU 上依次加载两侧模型，用相同随机 token 比较最后一个 token 的 BF16 logits（默认 batch 1、seq 4096、seed 1234，无需 tokenizer）：
 
 ```bash
 python -m scripts.numerical_alignment.deepseek_v4.compare_dsv4_with_transformers \
@@ -117,102 +70,101 @@ python -m scripts.numerical_alignment.deepseek_v4.compare_dsv4_with_transformers
     --tt-checkpoint-path "$TT_DCP"
 ```
 
-脚本关闭 NPU matmul、conv 和 ACLNN 的 HF32，并启用确定性算法；确定性补丁自动设置 `CLOSE_MATMUL_K_SHIFT=1` 和 `HCCL_DETERMINISTIC=true`。
-HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch size 为 `1`（attention metadata 按单条打包序列构建）；参考模式（`--attention golden`，模型默认 attn-gym 路径）还要求序列长度为 `128` 的倍数。不支持的配置会在加载权重前报错。
-
-默认启用 Transformers 数值补丁，使 RoPE、RMSNorm、mHC、indexer、稀疏 attention 和 MoE 的计算顺序及 BF16 边界匹配 TorchTitan。因此，对齐结果的参考是打补丁后的 Transformers 实现。
+HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch size 为 `1`；参考模式（`--attention golden`）还要求序列长度为 `128` 的倍数，不支持的配置会在加载权重前报错。
+默认启用 Transformers 数值补丁，使两侧的计算顺序与 BF16 边界一致，因此对齐参考是**打补丁后**的 Transformers 实现。
 
 常用选项：
 
-- `--mode bitwise`：默认模式，要求 logits 逐元素完全相同；patched Transformers 的 attention 直接复用模型参考路径的 attn-gym `gather_attn`，因此两侧逐位可比。
+- `--mode bitwise`：默认，要求 logits 逐元素完全相同。
 - `--mode close`：要求 `mean_ae <= 0.02`、`mean_re <= 0.02`、`cos >= 0.9999`。
-- `--no-apply-transformers-patch`：观察未经修改的 Transformers 模型结果。
-- `--attention test`：使用 AscendC override 组合，需要对应 CANN 算子，结果按所选模式独立判定。
-- `--trace-modules`：输出 embedding、各层 attention / MoE / mHC、最终 norm 和 logits 的对比指标；中间结果只用于定位，不参与最终判定。
+- `--no-apply-transformers-patch`：观察未修改的 Transformers 结果。
+- `--attention test`：使用 AscendC override 组合，需对应 CANN 算子。
+- `--trace-modules`：输出逐模块对比指标，仅用于定位，不参与判定。
 
-控制台先输出 HF32 状态、Transformers 版本和两侧加载过程，再输出 logits shape、四项指标及 `PASS` / `FAIL`。`max_re` 仅用于诊断。精度通过返回 `0`，不通过返回 `1`。
+精度通过返回 `0`，否则返回 `1`。
 
 ### 步骤四：训练 loss 和 grad_norm 对比
 
-[`loss_compare.py`](loss_compare.py) 在独立 Git worktree 中运行两个版本，默认入口为
-`examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh`。
-脚本从 TensorBoard 事件读取逐 step 的 `loss` 和 `grad_norm`，默认比较 100 步、序列长度 4096，开启确定性算法，固定训练 seed 为 42。
+[`loss_compare.py`](loss_compare.py) 比较两个训练脚本或两个 Git 版本，从 TensorBoard 事件读取逐 step 的 `loss` 和 `grad_norm`。
+默认比较 100 步、序列长度 4096、训练 seed 42、开启确定性算法，默认入口为 `examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh`。
 
-执行前需确保两个 Git ref 已存在于本地，相关修改已提交；未提交改动不会出现在 worktree 中。
-准备 tokenizer、checkpoint 环境变量，并为以下示例统一选择 Golden 实现：
+省略 Git ref 时直接使用当前工作区（含未提交改动）；指定两个 ref 时，两侧在独立 worktree 中运行，ref 须已存在于本地且改动已提交。
+两个 ref 须同时提供或同时省略，暂不支持单个 ref 与当前未提交改动的比较。
+
+#### 比较两个 Git 版本
 
 ```bash
 export HF_ASSETS_PATH=/path/to/tokenizer
 export CKPT_SAVE_LOAD_PATH=checkpoint
 export USE_GOLDEN=1
-```
 
-#### 比特一致对比
-
-使用 Golden 实现比较前后两个提交：
-
-```bash
+# 比特一致对比：前后两个提交
 python scripts/numerical_alignment/loss_compare.py HEAD~1 HEAD
 ```
 
 #### 数值近似对比
 
-同一提交下比较 Golden 和融合算子，只需覆盖 test 的环境变量：
+同一提交下比较 Golden 实现与融合算子，只需覆盖 test 的环境变量：
 
 ```bash
 python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
     --mode close --test-env USE_GOLDEN=0
 ```
 
-如有不支持确定性算法的融合算子，可开启 `--no-deterministic`。
+若融合算子不支持确定性算法，可加 `--no-deterministic`。
 
-#### 不同训练参数或 runner
+#### 比较自备的 base / test 脚本
 
-使用 `--baseline-options` / `--test-options` 比较两组训练参数。例如，将 test 的学习率从默认 `1e-5` 改为 `2e-5`：
+将模型配置、数据路径和 override 分别写入两个脚本，二者须有执行权限，并在训练命令末尾追加 `"$@"` 以接收比较脚本控制的参数：
 
 ```bash
+python scripts/numerical_alignment/loss_compare.py \
+    --baseline-runner examples/deepseek_v4/debug/base.sh \
+    --test-runner examples/deepseek_v4/debug/test.sh
+```
+
+同样可在命令前加上两个 Git ref 来比较历史版本的代码；入口脚本始终从当前工作区读取，无需存在于被测提交中。
+显式指定两侧入口时，相对入口路径会先基于当前仓库根目录解析为绝对路径，因此命令中仍可使用相对路径；脚本中的相对训练路径则以对应 worktree 为基准。
+
+指定两个 Git ref 时，两侧分别从对应 worktree 根目录启动。入口脚本须沿用该工作目录，以相对路径启动训练，例如 `bash scripts/run_train.sh "$@"`。若基于 `dirname "$0"` 切回原工作区，或使用原工作区的绝对路径定位训练入口，两侧可能运行同一份源码，产生未实际比较版本差异的 `PASS`。
+此组合会在运行前打印警告，列出入口、目标提交及预期训练目录；该提示不会验证 runner 内部实际选择的源码。
+
+#### 比较不同训练参数或 runner
+
+```bash
+# 只改 test 的学习率
 python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
     --mode close --test-options=--optimizer.lr=2e-5
 ```
 
-步数和序列长度统一通过 `--steps`、`--seq-len` 控制。
+常用参数：
 
-`--runner` 可指定其他入口。相对路径使用各自 Git ref 中的脚本，可比较同一路径下不同版本的 runner；绝对路径让两侧共用同一份脚本。
-例如使用 DeepSeek-V4 Flash 八卡入口：
+- `--steps` / `--seq-len`：统一控制两侧步数和序列长度。
+- `--baseline-options` / `--test-options`：分别追加训练参数。
+- `--baseline-env` / `--test-env`：分别注入 `KEY=VALUE[,...]` 环境变量，可重复指定。
+- `--runner` 设置两侧默认入口。指定 Git ref 时，相对路径使用对应 ref 中的脚本；绝对路径让两侧共用同一份脚本。绝对路径入口同样须沿用对应 worktree 的工作目录，运行前会打印相同告警。
+- `--baseline-runner` / `--test-runner` 分别覆盖单侧入口，相对路径始终以当前工作区根目录为基准（不受 ref 影响），绝对路径直接使用指定文件。
+- `--ngpus` 统一覆盖卡数，`--baseline-ngpus` / `--test-ngpus` 分别覆盖且优先。省略卡数参数时沿用环境变量和各自 runner 的设置；入口脚本需支持 `NGPU="${NGPU:-8}"` 形式接收卡数。
 
-```bash
-python scripts/numerical_alignment/loss_compare.py HEAD~1 HEAD \
-    --runner examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-    --ngpus 8
-```
+比较并行策略时，需自行保证全局 batch、输入数据和训练配置一致。
 
-两侧卡数不同时使用 `--baseline-ngpus` / `--test-ngpus`，并通过各自 options 设置对应并行拓扑。
-比较并行策略时，还需保证全局 batch、输入数据和训练配置一致。
+**卡数默认行为变更**：旧版未传 `--ngpus` 时固定注入 `NGPU=1`；现在两次训练依次采用显式卡数参数、单侧环境参数、继承的 `NGPU`、runner 默认值。已有命令可能因此使用更多设备；需要保持旧版单卡行为时，显式添加 `--ngpus=1`，并确认 runner 接受该环境变量。
 
-#### Seed checkpoint 与运行环境
+#### Seed checkpoint
 
-默认通过同一份 seed checkpoint 初始化两侧模型，创建方式由 `--seed-mode` 指定：
+默认通过同一份 seed checkpoint 初始化两侧模型，由 `--seed-mode` 指定创建方式：
 
-- `unsharded`：默认模式，使用单进程 CPU 初始化完整权重。
-- `distributed`：使用 baseline 的卡数、runner、配置和 `--baseline-options` 构建并行模型，需要预留与 baseline 相同的卡数和显存资源。Engram 等原生 checkpoint 依赖并行布局的模型可使用该模式。
+- `unsharded`（默认）：单进程 CPU 初始化完整权重，单独使用 `NGPU=1`。
+- `distributed`：按 baseline 的卡数、runner 和配置构建并行模型，需预留与 baseline 相同的卡数和显存；Engram 等依赖并行布局的 checkpoint 适用。该模式下 runner 必须读取并传递 `TRAIN_FILE`，不能写死训练入口，且不能与 `--baseline-env TRAIN_FILE=...` 同用。
 
-`--baseline-env` / `--test-env` 分别注入 `KEY=VALUE[,...]` 环境变量，可重复指定；seed 使用 baseline 环境，进程数由 `--seed-mode` 决定。
-`distributed` 不能与 `--baseline-env TRAIN_FILE=...` 同用，以免 seed 与训练使用不同的模型构建入口。
-
-分布式模式通过 `TRAIN_FILE=create_seed_checkpoint` 选择辅助入口，runner 必须读取并传递 `TRAIN_FILE`，不能写死训练入口。
-辅助入口只保存 model-only 的 step-0，不执行 forward、backward 或优化器更新；仍会构建 baseline 配置的优化器。
-seed 命令额外设置 `--training.steps=1`，限制 runner 忽略 `TRAIN_FILE` 时的误训练步数。
-两侧加载同一份 seed 权重；跨并行布局加载是否受支持取决于模型的 checkpoint 实现。
-当前不支持恢复完整训练状态的续训比较。
+两种模式都不改变两次训练本身的卡数。跨并行布局加载是否支持取决于模型的 checkpoint 实现；当前不支持恢复完整训练状态的续训比较。
+若两侧无法共用 seed checkpoint，可用 `--no-seed-checkpoint` 改为固定种子初始化。
 
 #### 输出与清理
 
-默认在当前目录的 `outputs/compare_results/` 下创建独立结果目录；`--output-dir` 可指定空目录或尚不存在的目录。
-控制台实时打印 seed 创建和两次训练日志，结束时打印指标误差摘要及 `PASS` / `FAIL`，详细结果保存为 `comparison.json`。
-两侧指标须完整覆盖 `1..steps`；全部通过返回 `0`，比较不通过返回 `1`。
+默认在 `outputs/compare_results/` 下创建独立结果目录，可用 `--output-dir` 指定空目录或尚不存在的目录。
+控制台实时打印 seed 创建和两次训练日志，结束时打印误差摘要及 `PASS` / `FAIL`，详细结果写入 `comparison.json`。两侧指标须完整覆盖 `1..steps`；通过返回 `0`，否则返回 `1`。
 
-默认在退出时清理 seed 目录和临时 worktree，保留 baseline / test 训练日志、TensorBoard 数据及 `comparison.json`；
-使用 `--no-cleanup-after-test` 保留全部产物，包括 seed checkpoint。训练失败或比较不通过时也按该开关清理。
-若两侧不能共用 seed checkpoint，可用 `--no-seed-checkpoint` 改为固定种子初始化，但仍需确保两侧初始权重可比。
+报告的 `baseline.npu_processes` / `test.npu_processes` 记录启动配置：`override` 为显式卡数覆盖值，`ngpu_env` 为传给 runner 的 `NGPU`（未设置时为 `null`），`source` 为 `override`、`environment` 或 `runner`。runner 可在内部覆盖环境变量，因此这些字段不代表实际运行卡数；`source=runner` 时由脚本自行决定。
 
-指标定义与验收要求见[数值对齐开发指南](../../docs/developer_guides/numerical_alignment.md)，完整参数见各入口的 `--help`。
+退出时默认清理 seed 目录和临时 worktree，保留训练日志、TensorBoard 数据和 `comparison.json`；`--no-cleanup-after-test` 可保留全部产物（含 seed checkpoint）。

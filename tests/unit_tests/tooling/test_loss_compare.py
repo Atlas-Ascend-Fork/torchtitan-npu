@@ -48,14 +48,19 @@ p.add_argument('--training.steps', type=int, dest='steps')
 p.add_argument('--value', type=float)
 p.add_argument('--recorded-steps')
 p.add_argument('--checkpoint.folder', type=Path, dest='checkpoint_folder')
+p.add_argument('--checkpoint.create_seed_checkpoint', action='store_true', dest='create_seed_checkpoint')
 args, _ = p.parse_known_args()
-if os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
-    entrypoint = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])
-    print('seed-imports=' + ','.join(sorted(path.name for path in entrypoint.iterdir())))
+if args.create_seed_checkpoint or os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
+    if os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
+        entrypoint = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])
+        print('seed-imports=' + ','.join(sorted(path.name for path in entrypoint.iterdir())))
+        print('seed-processes=' + os.environ.get('NGPU', 'unset'))
     (args.checkpoint_folder / 'step-0').mkdir(parents=True)
-    print('seed-processes=' + os.environ['NGPU'])
     print('seed-value=' + str(args.value))
+    print('seed-ngpu=' + os.environ.get('NGPU', 'unset'))
     raise SystemExit(0)
+print('runner-ngpu=' + os.environ.get('NGPU', 'unset'))
+print('runner-cwd=' + str(Path.cwd()))
 steps = range(1, args.steps + 1) if args.recorded_steps is None else map(int, args.recorded_steps.split(','))
 w = EventFileWriter(str(args.dump_folder / 'tensorboard' / 'rank_0'))
 try:
@@ -204,6 +209,218 @@ def test_loss_compare_bounds_training_when_runner_ignores_seed_entrypoint(tmp_pa
     assert not (output / "comparison.json").exists()
 
 
+def _write_metric_runner(repo, name, value, *, ngpus=None):
+    runner = repo / name
+    environment = f'export NGPU="${{NGPU:-{ngpus}}}"\n' if ngpus is not None else ""
+    runner.write_text(
+        f'#!/bin/bash\n{environment}echo runner-name={name}\n'
+        f'exec {shlex.quote(sys.executable)} emit_metrics.py --value={value} "$@"\n'
+    )
+    runner.chmod(0o755)
+    return runner
+
+
+@pytest.mark.parametrize("seed_mode", ["unsharded", "distributed"])
+@pytest.mark.parametrize(
+    ("inherited_ngpu", "options", "baseline_ngpu", "test_ngpu", "baseline_config", "test_config"),
+    [
+        (None, (), 8, 4, (None, None, "runner"), (None, None, "runner")),
+        ("6", (), 6, 6, (None, "6", "environment"), (None, "6", "environment")),
+        ("6", ("--ngpus=2",), 2, 2, (2, "2", "override"), (2, "2", "override")),
+        (
+            "6",
+            ("--ngpus=2", "--baseline-ngpus=3", "--test-ngpus=5"),
+            3,
+            5,
+            (3, "3", "override"),
+            (5, "5", "override"),
+        ),
+        (None, ("--baseline-ngpus=3",), 3, 4, (3, "3", "override"), (None, None, "runner")),
+        (
+            "6",
+            ("--ngpus=2", "--baseline-env=NGPU=9", "--test-env=NGPU=7"),
+            2,
+            2,
+            (2, "2", "override"),
+            (2, "2", "override"),
+        ),
+        (
+            "6",
+            ("--baseline-env=NGPU=9", "--test-env=NGPU=7"),
+            9,
+            7,
+            (None, "9", "environment"),
+            (None, "7", "environment"),
+        ),
+    ],
+    ids=[
+        "runner_defaults",
+        "inherited",
+        "shared_override",
+        "per_side_overrides",
+        "one_side",
+        "env_conflict",
+        "per_side_env",
+    ],
+)
+def test_loss_compare_preserves_runner_card_counts_unless_overridden(
+    tmp_path,
+    runner_repo,
+    monkeypatch,
+    seed_mode,
+    inherited_ngpu,
+    options,
+    baseline_ngpu,
+    test_ngpu,
+    baseline_config,
+    test_config,
+):
+    repo, _refs = runner_repo
+    _write_metric_runner(repo, "base.sh", 1, ngpus=8)
+    _write_metric_runner(repo, "test.sh", 1, ngpus=4)
+    monkeypatch.delenv("NGPU", raising=False)
+    if inherited_ngpu is not None:
+        monkeypatch.setenv("NGPU", inherited_ngpu)
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI),
+            "--baseline-runner=base.sh",
+            "--test-runner=test.sh",
+            "--steps=2",
+            f"--seed-mode={seed_mode}",
+            "--output-dir",
+            str(output),
+            *options,
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=40,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    seed_ngpu = 1 if seed_mode == "unsharded" else baseline_ngpu
+    assert f"seed-ngpu={seed_ngpu}\n" in result.stdout
+    report = json.loads((output / "comparison.json").read_text())
+    for side, ngpu, config in (("baseline", baseline_ngpu, baseline_config), ("test", test_ngpu, test_config)):
+        assert f"runner-ngpu={ngpu}\n" in (output / side / "training.log").read_text()
+        override, ngpu_env, source = config
+        assert report[side]["npu_processes"] == {"override": override, "ngpu_env": ngpu_env, "source": source}
+
+
+@pytest.mark.parametrize("test_value", [1, 2], ids=["matching", "different"])
+def test_loss_compare_runs_uncommitted_scripts_with_shared_seed(tmp_path, runner_repo, test_value):
+    repo, refs = runner_repo
+    base_runner = _write_metric_runner(repo, "base.sh", 1)
+    test_runner = _write_metric_runner(repo, "test.sh", test_value)
+    # The emitter must also come from the working tree, rather than HEAD.
+    emitter = repo / "emit_metrics.py"
+    emitter.write_text(emitter.read_text() + "\nprint('working-tree-emitter')\n")
+    status_before = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI),
+            "--baseline-runner=base.sh",
+            "--test-runner=test.sh",
+            "--steps=2",
+            "--output-dir",
+            str(output),
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=40,
+    )
+
+    assert result.returncode == (0 if test_value == 1 else 1), result.stdout + result.stderr
+    assert "seed-value=1.0" in result.stdout
+    report = json.loads((output / "comparison.json").read_text())
+    assert report["runner_scope"] == "working-tree"
+    assert report["passed"] is (test_value == 1)
+    assert "Current-workspace runner=" not in result.stdout
+    for side, runner, value in (("baseline", base_runner, 1), ("test", test_runner, test_value)):
+        assert report[side]["ref"] == "working-tree"
+        assert report[side]["commit"] == refs[-1]
+        assert report[side]["runner"] == str(runner)
+        log = (output / side / "training.log").read_text()
+        assert f"runner-name={runner.name}" in log
+        assert f"runner-value={value}.0" in log
+        assert "working-tree-emitter" in log
+        assert runner.is_file()
+    assert not (output / "seed").exists()
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True) == status_before
+    trees = subprocess.check_output(["git", "worktree", "list", "--porcelain"], cwd=repo, text=True)
+    assert trees.count("worktree ") == 1
+
+
+def test_loss_compare_runs_working_tree_scripts_against_selected_refs(tmp_path, runner_repo):
+    repo, _refs = runner_repo
+    emitter = repo / "emit_metrics.py"
+    source = emitter.read_text()
+    refs = []
+    for version in ("baseline", "test"):
+        emitter.write_text(source + f"\nprint('code-version={version}')\n")
+        subprocess.run(["git", "add", "emit_metrics.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", f"Emitter {version}"], cwd=repo, check=True)
+        refs.append(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip())
+    emitter.write_text(source + "\nprint('code-version=current')\n")
+    base_runner = _write_metric_runner(repo, "base.sh", 1)
+    test_runner = _write_metric_runner(repo, "test.sh", 1)
+    status_before = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
+    output = tmp_path / "comparison"
+
+    result = _compare(
+        repo,
+        refs,
+        output,
+        Path("missing-default.sh"),
+        "--baseline-runner=base.sh",
+        "--test-runner=test.sh",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((output / "comparison.json").read_text())
+    assert report["passed"]
+    for side, runner, commit in (("baseline", base_runner, refs[0]), ("test", test_runner, refs[1])):
+        assert report[side]["ref"] == commit
+        assert report[side]["commit"] == commit
+        assert report[side]["runner"] == str(runner)
+        log = (output / side / "training.log").read_text()
+        cwd = next(line.removeprefix("runner-cwd=") for line in log.splitlines() if line.startswith("runner-cwd="))
+        warning = next(line for line in result.stdout.splitlines() if f"[{side}] Current-workspace runner=" in line)
+        assert "WARNING" in warning
+        assert f"runner={runner}; target commit={commit}; expected training cwd={cwd}." in warning
+        assert Path(cwd) != repo
+        assert "actual source selection is not verified" in warning
+        assert f"runner-name={runner.name}" in log
+        assert f"code-version={side}" in log
+        assert "code-version=current" not in log
+        assert runner.is_file()
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True) == status_before
+
+
+@pytest.mark.parametrize("side", ["baseline", "test"])
+def test_loss_compare_keeps_shared_runner_as_other_side_default(tmp_path, runner_repo, side):
+    repo, refs = runner_repo
+    runner = _write_metric_runner(repo, "custom.sh", 1)
+    output = tmp_path / "comparison"
+
+    result = _compare(repo, [refs[0], refs[0]], output, Path("runner.sh"), f"--{side}-runner={runner.name}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    custom_side, default_side = ("baseline", "test") if side == "baseline" else ("test", "baseline")
+    assert f"[{custom_side}] Current-workspace runner=" in result.stdout
+    assert f"[{default_side}] Current-workspace runner=" not in result.stdout
+    assert "runner-name=custom.sh" in (output / custom_side / "training.log").read_text()
+    assert "runner-value=1.0" in (output / default_side / "training.log").read_text()
+
+
 @pytest.mark.parametrize("side", ["baseline", "test"])
 @pytest.mark.parametrize(
     ("options", "hint"),
@@ -291,6 +508,8 @@ def test_loss_compare_uses_requested_runner_scope(tmp_path, runner_repo, shared)
     report = json.loads((output / "comparison.json").read_text())
     assert result.returncode == (0 if shared else 1), result.stdout + result.stderr
     assert report["runner_scope"] == ("shared" if shared else "per-ref")
+    for side in ("baseline", "test"):
+        assert (f"[{side}] Current-workspace runner=" in result.stdout) is shared
     assert report["passed"] is shared
     assert "runner-value=2.0" in (output / "test/training.log").read_text()
     assert f"runner-value={2 if shared else 1}.0" in (output / "baseline/training.log").read_text()
