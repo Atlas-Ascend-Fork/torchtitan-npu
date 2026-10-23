@@ -1,7 +1,7 @@
 # Lint 指南
 
 本指南只覆盖代码静态检查、格式检查和开源合规检查，不包含模型训练、模型加载、NPU 算子验证或功能测试。
-Lint 可以在 CPU 环境执行，不需要 CANN、HCCL、可用的 Ascend NPU 或完整的运行时依赖。
+Lint 可以在 CPU 环境执行，不需要 CANN、HCCL 或可用的 Ascend NPU。Python 类型检查仍需要固定版本的上游源码和被检查代码导入的类型依赖；安装检查工具并不等于这些前提已经满足。
 
 ## 检查范围
 
@@ -33,21 +33,27 @@ python -m pip install pre-commit
 python -m pip install pre-commit pyrefly
 ```
 
-也可以安装仓库提供的开发依赖。该依赖集合用于 lint 和开发测试，不包含 `torch`、`torch_npu`、
-`torchtitan` 或 Triton 等训练运行时依赖：
+也可以安装仓库提供的开发依赖。该依赖集合提供检查工具和开发测试依赖，未包含 `torch`、`torch_npu`、
+`torchtitan` 或 Triton；Python 类型检查的源码与类型依赖前提见下一节：
 
 ```bash
 python -m pip install -r requirements-dev.txt
 ```
 
 `scripts/oat_check.sh` 在检测到本地没有 `oat-py` 时会尝试自动安装 `oat-py>=1.0.1`。
-`requirements.txt` 只在需要进行模型运行、训练或 NPU 功能验证时安装，本指南不要求安装它。
+`requirements.txt` 记录配套版本；仅安装检查工具时，并未安装其中的类型依赖。
+
+### Python 类型检查前提
+
+`pyproject.toml` 的 Pyrefly 配置使用 `search-path = ["/tmp/torchtitan"]`。执行 Python 或全仓检查前，应先确认该目录是 `requirements.txt` 所声明版本对应的 TorchTitan checkout；版本/tag 推导与源码准备逻辑见 [`.ci/setup_torchtitan.sh`](../../.ci/setup_torchtitan.sh)。仅安装 PyPI 包或把源码放在其他目录，不会创建该 checkout；按根开发规则，还应确认上述固定路径的源码。
+
+Pyrefly 使用当前 Python 环境查找类型导入。当前配置仅对清单中列出的模块忽略缺失导入，并将 `torch_npu` 和 `torch.npu` 替换为 `Any`；它不会忽略所有运行时模块。出现 `missing-import` 时，应按仓库配套版本准备相应 Python 类型依赖。不需要为类型检查启动训练或设备，但不能通过屏蔽检查规则来替代这些前提。
 
 ## 执行检查
 
 ### 检查本次修改
 
-提交 PR 前，优先对本次修改的文件执行增量检查：
+定位本次修改的格式或局部错误时，可先执行增量检查；仅增量通过不能视为完整 Lint 通过：
 
 ```bash
 python -m pre_commit run --files <file1> <file2> --show-diff-on-failure
@@ -63,7 +69,7 @@ python -m pre_commit run --files docs/developer_guides/lint_guide.md --show-diff
 
 ### 检查整个仓库
 
-需要复现仓库级 lint 时执行：
+按[根开发规则](../../.agents/AGENTS.md)，提交前从仓库根目录执行完整 Lint；仅此完整命令通过后，才视为 Lint 通过：
 
 ```bash
 python -m pre_commit run --all-files --show-diff-on-failure
