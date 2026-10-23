@@ -15,6 +15,7 @@ import torch
 import torch_npu
 
 from torchao_npu import normalize_dim
+from torchao_npu.quantization import _FP32_DTYPES
 from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
 
 importlib.import_module("cann_ops_nn")
@@ -175,6 +176,9 @@ def _direct_block_mx_quantize(
     # that reverses [-2, -1] decides the swap.
     swap = tensor.stride(-1) > tensor.stride(-2)
     tensor_f, perm_indices = _to_block_quant_layout(tensor, swap)
+
+    if tensor_f.dtype in _FP32_DTYPES:
+        tensor_f = tensor_f.to(torch.bfloat16)
 
     q_p, s1_p, s2_p = torch_npu.npu_dynamic_block_mx_quant(
         tensor_f,

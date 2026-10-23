@@ -3,67 +3,132 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Block MX low-precision matmul ops for NPU.
+"""Block MX low-precision matmul ops for training on NPU.
 
-Quantization scheme (non-grouped ``to_block_mx_then_mm``):
-- A (activation):  ``npu_dynamic_mx_quant_with_dual_axis``
-  - s1 = per-32-group scale along dim -1  (``A_s1``)
-  - s2 = per-32-group scale along dim -2  (``A_s2``)
-- B (weight):      ``npu_dynamic_block_mx_quant``
-  - s1 = per-32-group scale along dim -1  (``B_s1``)
-  - s2 = per-32-group scale along dim -2  (``B_s2``)
+Each op quantizes its high precision operands into the tensors of
+:mod:`torchao_npu.quantized_tensors`, which own the layouts and the operand checks,
+and multiplies those.
+
+Quantization scheme (non-grouped ``to_block_mx_then_mm`` / ``to_block_mx_then_bmm``):
+- A (activation):           a ``DualAxisMXTensor``
+- B ((transposed) weight):  a ``BlockMXTensor``
+- dY:                       a ``DualAxisMXTensor``
 
 Quantization scheme (grouped ``to_block_mx_then_grouped_mm``):
-- A (activation), K-dim:    ``npu_dynamic_mx_quant(axis=-1)``
-- A (activation), M-dim:    ``npu_grouped_dynamic_mx_quant``
-- B (weight):               ``npu_dynamic_block_mx_quant``
-- dY, N-dim:                ``npu_dynamic_mx_quant(axis=-1)``
-- dY, M-dim:                ``npu_grouped_dynamic_mx_quant``
+- A (activation), K-dim:    an ``MXTensor``
+- A (activation), M-dim:    a ``GroupedMXTensor``
+- B (weight):               a ``BlockMXTensor``
+- dY, N-dim:                an ``MXTensor``
+- dY, M-dim:                a ``GroupedMXTensor``
 """
 
 import torch
-import torch_npu
 
 from torchao_npu.quantization.quant_configs import (
     BlockMXQuantizeConfig,
     MXQuantizeConfig,
 )
-from torchao_npu.quantization.quant_primitives.block_mx import block_mx_quantize
-from torchao_npu.quantization.quant_primitives.mx import mx_quantize, mx_quantize_dual_axis
+from torchao_npu.quantized_tensors import BlockMXTensor, DualAxisMXTensor, GroupedMXTensor, MXTensor
+from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
 
 __all__ = [
     "to_block_mx_then_bmm",
-    "to_block_mx_then_bmm_from_prequantized",
     "to_block_mx_then_grouped_mm",
-    "to_block_mx_then_grouped_mm_from_prequantized",
-    "to_block_mx_then_linear_from_prequantized",
     "to_block_mx_then_mm",
-    "to_block_mx_then_mm_from_prequantized",
 ]
+
+
+def _maybe_quantize_weight_operand(
+    B: torch.Tensor,
+    config_A: MXQuantizeConfig,
+    config_B: BlockMXQuantizeConfig,
+    axis: int,
+) -> BlockMXTensor:
+    """Return the weight operand ``B`` as a
+    :class:`~torchao_npu.quantized_tensors.block_mx_tensor.BlockMXTensor`.
+
+    A pre-quantized ``B`` is reused as-is, after its ``quant_config`` and
+    ``act_quant_config`` are validated to be the caller's ``config_B`` and ``config_A``.
+    A high-precision ``B`` is quantized with ``config_B``, recording ``config_A`` as its
+    ``act_quant_config``.
+
+    Raises:
+        AssertionError: If a pre-quantized ``B`` carries a different ``quant_config``,
+            or an ``act_quant_config`` that is neither ``None`` nor ``config_A``.
+    """
+    if isinstance(B, BlockMXTensor):
+        assert B.quant_config is config_B, (
+            "The quantization configuration of the pre-quantized ``B`` is not consistent with ``config_B``, "
+            f"``B.quant_config`` is {B.quant_config}, "
+            f"``config_B`` is {config_B}."
+        )
+
+        if B.act_quant_config is not None:
+            assert B.act_quant_config == config_A, (
+                "The activation quantization configuration of the pre-quantized ``B`` is not consistent with "
+                f"that of the wrapper tensor. ``B.act_quant_config`` is {B.act_quant_config}, that of the "
+                f"wrapper tensor is {config_A}."
+            )
+
+        return B
+    else:
+        return BlockMXTensor.from_hp(B, config_B, axis, config_A)
+
+
+def _maybe_quantize_operands_then_save_for_backward(
+    ctx,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    config_A: MXQuantizeConfig,
+    config_B: BlockMXQuantizeConfig,
+    axis: int,
+) -> tuple[MXTensor, MXTensor]:
+    """Quantize the operands unless already quantized, return the forward forms
+    and save the backward forms.
+
+    A pre-quantized ``DualAxisMXTensor`` ``A`` is validated against ``config_A`` and
+    reused as-is; ``B`` goes through :func:`_maybe_quantize_weight_operand`. Saves
+    ``A``'s ``dim=-2`` and ``B``'s ``dim=-1`` form for backward, both as
+    :class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`.
+
+    Returns:
+        ``A``'s ``dim=-1`` and ``B``'s ``dim=-2`` form.
+    """
+    if isinstance(A, DualAxisMXTensor):
+        assert A.quant_config == config_A, (
+            "The quantization configuration of the pre-quantized ``A`` is not consistent with ``config_A``, "
+            f"``A.quant_config`` is {A.quant_config}, "
+            f"``config_A`` is {config_A}."
+        )
+        dual_axis_mx_A = A
+    else:
+        dual_axis_mx_A = DualAxisMXTensor.from_hp(A, config_A)
+
+    block_mx_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis)
+
+    ctx.save_for_backward(dual_axis_mx_A.to_mx_tensor(quant_axis=-2), block_mx_B.to_mx_tensor(quant_axis=-1))
+
+    return (dual_axis_mx_A.to_mx_tensor(quant_axis=-1), block_mx_B.to_mx_tensor(quant_axis=-2))
 
 
 class _BlockMXQuantMM(torch.autograd.Function):
     """Block MX matrix multiply: ``A[M,K] @ B[K,N] = Y[M,N]``.
 
-    Forward:
-      1. ``A_q1, A_s1, A_q2, A_s2 = npu_dynamic_mx_quant_with_dual_axis(A, **config_A)``
-         -- quantize A along both axes.  A_s1 = K-dim scale ``[M, ceil(ceil(K/32)/2), 2]``.
-      2. ``B_q, B_s1, B_s2 = npu_dynamic_block_mx_quant(B, **config_B)``
-         -- quantize B in 32×32 blocks.  B_s2 = K-dim scale ``[ceil(ceil(K/32)/2), N, 2]``.
-      3. ``Y = npu_quant_matmul(A_q1, B_q, pertoken_scale=A_s1, scale=B_s2)``
-         -- low-precision matmul contracting over K.
+    - A can be either a high precision tensor or a DualAxisMXTensor
+    - B can be either a high precision tensor or a BlockMXTensor
 
-    Backward (dY = grad_output):
-      1. ``dY_q1, dY_s1, dY_q2, dY_s2 = npu_dynamic_mx_quant_with_dual_axis(dY, **config_A)``
-         -- quantize dY along both axes.
-      2. dgrad: ``dA = dY @ B^T`` (contract over N)
-         x1 = dY_q1, x2 = B_q.t()
-         pertoken_scale = dY_s1  ``[M, ceil(ceil(N/32)/2), 2]``  (N-dim of dY)
-         scale          = B_s1.transpose(0,1)  ``[ceil(ceil(N/32)/2), K, 2]``  (N-dim of B)
-      3. wgrad: ``dB = A^T @ dY`` (contract over M)
-         x1 = A_q2.t(), x2 = dY_q2
-         pertoken_scale = A_s2.transpose(0,1)  ``[K, ceil(ceil(M/32)/2), 2]``  (M-dim of A)
-         scale          = dY_s2  ``[ceil(ceil(M/32)/2), N, 2]``  (M-dim of dY)
+    If either A or B is in high precision, it will be quantized first then multiplied.
+
+    Forward:
+        - Low-precision matmul contracting over K.
+        - Quantized version of A and B are saved in ctx for backward.
+
+
+    Backward (``dY = grad_output``):
+        - dY is quantized using A's config.
+        - dgrad ``dA = dY @ B^T`` (contract over N)
+        - wgrad ``dB = A^T @ dY`` (contract over M)
+        - All multiplications are done in low precision.
     """
 
     @staticmethod
@@ -78,85 +143,36 @@ class _BlockMXQuantMM(torch.autograd.Function):
         assert B.ndim == 2, f"B must be 2D, got {B.ndim}D"
         assert A.shape[-1] == B.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B[-2]={B.shape[-2]}"
 
-        # --- Step 1: quantize A with dual-axis MX quant ---
-        # Flatten leading dims inside the quant call (like MXfp8MM uses view_as_n_dim)
-        A_q1, A_s1, A_q2, A_s2 = mx_quantize_dual_axis(A.reshape(-1, A.shape[-1]), config_A)
-
-        # --- Step 2: block MX quantize B (with optional mxfp4 fake-quant pre-pass) ---
-        # B [K, N] → B_s1 (N-dim scale) [K, ceil(ceil(N/32)/2), 2]
-        #           → B_s2 (K-dim scale) [ceil(ceil(K/32)/2), N, 2]
-        B_q, B_s1, B_s2 = block_mx_quantize(B, config=config_B, axis=-2)
-
-        # --- Step 3: low-precision matmul, contracting over K ---
-        # x1 = A_q1 [M, K] → pertoken_scale = A_s1 [M, ceil(ceil(K/32)/2), 2]
-        # x2 = B_q  [K, N] → scale          = B_s2 [ceil(ceil(K/32)/2), N, 2]
-        Y = torch_npu.npu_quant_matmul(
-            A_q1,
-            B_q,
-            B_s2,
-            pertoken_scale=A_s1,
-            output_dtype=A.dtype,
-            scale_dtype=config_B.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_B.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
+        mx_A, mx_B = _maybe_quantize_operands_then_save_for_backward(
+            ctx, A.reshape(-1, A.shape[-1]), B, config_A, config_B, axis=-2
         )
+
+        Y = torch.mm(mx_A, mx_B)
 
         if A.ndim != 2:
             Y = Y.reshape(*A.shape[:-1], *Y.shape[1:])
 
-        Y.requires_grad_(A.requires_grad or B.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        ctx.config_B = config_B
         return Y
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1 = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-        config_B = ctx.config_B
+        mx_A: MXTensor
+        mx_B: MXTensor
+        mx_A, mx_B = ctx.saved_tensors
 
-        # --- Step 1: quantize dY with dual-axis MX quant ---
-        # Flatten leading dims inside the quant call (like MXfp8MM)
-        dY_q1, dY_s1, dY_q2, dY_s2 = mx_quantize_dual_axis(dY.reshape(-1, dY.shape[-1]), config_A)
-
-        # --- Step 2: dgrad  dA = dY @ B^T  (contract over N) ---
-        # x1 = dY_q1 [M, N] → pertoken_scale = dY_s1 [M, ceil(ceil(N/32)/2), 2]
-        # x2 = B_q.t() [N, K] → scale = B_s1.transpose(0,1) [ceil(ceil(N/32)/2), K, 2]
-        dA = torch_npu.npu_quant_matmul(
-            dY_q1,
-            B_q.t(),
-            B_s1.transpose(0, 1),
-            pertoken_scale=dY_s1,
-            output_dtype=A_dtype,
-            scale_dtype=config_B.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_B.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
+        # dY is quantized along both axes with the same config as A's, providing
+        # both GEMMs' dY operands below.
+        dual_axis_mx_Y = DualAxisMXTensor.from_hp(
+            dY.reshape(-1, dY.shape[-1]), mx_A.quant_config, act_quant_config=mx_A.quant_config
         )
 
-        # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
-        # x1 = A_q2.t() [K, M] → pertoken_scale = A_s2.transpose(0,1) [K, ceil(ceil(M/32)/2), 2]
-        # x2 = dY_q2 [M, N]   → scale          = dY_s2 [ceil(ceil(M/32)/2), N, 2]
-        # group_sizes[2] assumes config_A.block_size == config_B.block_size and uses config_B.
-        dB = torch_npu.npu_quant_matmul(
-            A_q2.t(),
-            dY_q2,
-            dY_s2,
-            pertoken_scale=A_s2.transpose(0, 1),
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
-        )
+        # dgrad: dA = dY @ B^T (contract over N) -- dY's -1 form against the saved
+        # B form transposed.
+        dA = torch.mm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-1), mx_B.transpose(-1, -2))
+
+        # wgrad: dB = A^T @ dY (contract over M) -- the saved A form transposed
+        # against dY's -2 form.
+        dB = torch.mm(mx_A.transpose(-1, -2), dual_axis_mx_Y.to_mx_tensor(quant_axis=-2))
 
         # Restore dA to original shape
         if dY.ndim != 2:
@@ -173,9 +189,10 @@ def to_block_mx_then_mm(
 ) -> torch.Tensor:
     """Block MX matrix multiply: ``A @ B`` with mixed-format quantization.
 
-    Quantization scheme:
-    - A: ``npu_dynamic_mx_quant_with_dual_axis`` (params from ``config_A``)
-    - B: ``npu_dynamic_block_mx_quant``, 32×32 blocks (params from ``config_B``)
+    Neither operand has to be high precision: ``A`` may already be a
+    ``DualAxisMXTensor`` quantized with ``config_A``, ``B`` a ``BlockMXTensor``
+    quantized with ``config_B``, both validated against the configs here.
+    High-precision operands are quantized before multiplied.
 
     See ``_BlockMXQuantMM`` for details of the three GEMMs.
 
@@ -191,12 +208,60 @@ def to_block_mx_then_mm(
     return _BlockMXQuantMM.apply(A, B, config_A, config_B)
 
 
+def _maybe_quantize_gmm_operands_then_save_for_backward(
+    ctx,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    offs: torch.Tensor,
+    config_A: MXQuantizeConfig,
+    config_B: BlockMXQuantizeConfig,
+) -> tuple[MXTensor, MXTensor]:
+    """Quantize the grouped matmul's operands, return the forward forms and save the
+    backward forms.
+
+    ``A`` must be high precision; it is quantized along both axes here: along ``dim=-1``
+    (the contracting dim) for the forward, and along ``dim=-2`` with a group-aware quant
+    op for the wgrad.
+
+    ``B`` goes through :func:`_maybe_quantize_weight_operand`.
+
+    Saves ``A``'s ``dim=-2`` form -- a group-aware
+    :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor` -- and
+    ``B``'s ``dim=-1`` form, plus the group offsets, for the backward.
+
+    Returns:
+        ``A``'s ``dim=-1`` and ``B``'s ``dim=-2`` form, for the forward grouped matmul.
+
+    Raises:
+        AssertionError: If ``A`` is a quantized tensor.
+    """
+    assert not isinstance(A, BaseQuantizedTensor), f"A must be a plain high precision tensor, got {type(A).__name__}."
+
+    # A's contracting-dim form, for the forward grouped matmul.
+    mx_A = MXTensor.from_hp(A, config_A, -1)
+
+    # A's M-dim form, for the wgrad: a grouped quant with zero-boundary padding.
+    # A [M, K] → A_s2 (M-dim scale) [M//64 + E, K, 2]
+    grouped_mx_A = GroupedMXTensor.from_hp(A, offs, config_A)
+
+    block_mx_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis=-2)
+
+    ctx.save_for_backward(grouped_mx_A, block_mx_B.to_mx_tensor(-1), offs)
+
+    return mx_A, block_mx_B.to_mx_tensor(-2)
+
+
 class _BlockMXQuantGroupedMM(torch.autograd.Function):
     """Block MX grouped matmul: ``A[M,K] @ B[E,K,N] = Y[M,N]``.
 
     Rows of ``A`` are partitioned into ``E`` groups via ``group_list``
     (cumsum offsets, length ``E``).  Each slice ``A[group_list[i-1]:group_list[i]]``
     is multiplied by ``B[i]``.
+
+    - A must be a high precision tensor
+    - B can be either a high precision tensor or a BlockMXTensor
+
+    If B is in high precision, it will be quantized first then multiplied.
 
     Quantization:
     - A's K-dim (contraction):  ``npu_dynamic_mx_quant(axis=-1)`` (params from ``config_A``)
@@ -206,33 +271,17 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
                                 (params from ``config_B``)
 
     Forward:
-      1. ``A_q1, A_s1 = npu_dynamic_mx_quant(A, axis=-1, **config_A)``
-         -- quantize A along K.  A_s1 = K-dim scale ``[M, ceil(K/64), 2]``.
-      2. ``A_q2, A_s2 = npu_grouped_dynamic_mx_quant(A, group_list, **config_A)``
-         -- quantize A along M with zero-boundary padding.
-            A_s2 = M-dim scale ``[M//64+E, K, 2]``.
-      3. ``B_q, B_s1, B_s2 = npu_dynamic_block_mx_quant(B, **config_B)``
-         -- quantize B in 32×32 blocks.
-            B_s2 = K-dim scale ``[E, ceil(K/64), N, 2]``.
-      4. ``Y = npu_grouped_matmul([A_q1], [B_q], group_type=0,
-             per_token_scale=[A_s1], scale=[B_s2])``
-         -- grouped low-precision matmul contracting over K.
+        - Low-precision grouped matmul contracting over K.
+        - Quantized version of A and B are saved in ctx for backward.
+        - A's M-dim form is quantized by a group-aware op, so it is a
+          :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor`.
 
-    Backward (dY = grad_output):
-      1. ``dY_q1, dY_s1 = npu_dynamic_mx_quant(dY, axis=-1, **config_A)``
-         -- quantize dY along N.  dY_s1 = N-dim scale ``[M, ceil(N/64), 2]``.
-      2. ``dY_q2, dY_s2 = npu_grouped_dynamic_mx_quant(dY, group_list, **config_A)``
-         -- quantize dY along M with zero-boundary padding.
-            dY_s2 = M-dim scale ``[M//64+E, N, 2]``.
-      3. dgrad: ``dA = dY @ B^T`` (group_type=0, contract over N)
-         x = dY_q1, weight = B_q.transpose(-1,-2)
-         per_token_scale = dY_s1  ``[M, ceil(N/64), 2]``
-         scale           = B_s1.transpose(1,2)  ``[E, ceil(N/64), K, 2]``
-      4. wgrad: ``dB = A^T @ dY`` (group_type=2, contract over M)
-         x = A_q2.t(), weight = dY_q2
-         per_token_scale = A_s2  ``[M//64+E, K, 2]``  (untransposed — group_type=2
-                                          puts the contracting-block dim first)
-         scale           = dY_s2 ``[M//64+E, N, 2]``
+
+    Backward (``dY = grad_output``):
+        - dY is quantized using A's config.
+        - dgrad ``dA = dY @ B^T`` (contract over N)
+        - wgrad ``dB = A^T @ dY`` (contract over M, ``group_type=2``)
+        - All multiplications are done in low precision.
     """
 
     @staticmethod
@@ -248,117 +297,42 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
         assert B.ndim == 3, f"B must be 3D, got {B.ndim}D"
         assert A.shape[-1] == B.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B[-2]={B.shape[-2]}"
 
-        # --- Step 1: quantize A along K-dim (contracting dim for forward) ---
-        # A [M, K] → A_s1 (K-dim scale) [M, ceil(ceil(K/32)/2), 2]
-        A_q1, A_s1 = mx_quantize(A, -1, config_A)
+        mx_A, mx_B = _maybe_quantize_gmm_operands_then_save_for_backward(ctx, A, B, group_list, config_A, config_B)
 
-        # --- Step 2: quantize A along M-dim with grouped quant (zero boundaries) ---
-        # A [M, K] → A_s2 (M-dim scale) [M//64 + E, K, 2]
-        A_q2, A_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
-            A,
-            group_list.to(torch.int32),
-            round_mode=config_A.round_mode,
-            dst_type=config_A.npu_elem_dtype,
-            blocksize=config_A.block_size,
-            scale_alg=config_A.scale_alg,
-        )
-
-        # --- Step 3: block MX quantize B (with optional mxfp4 fake-quant pre-pass) ---
-        # B [E, K, N] → B_s1 (N-dim scale) [E, K, ceil(ceil(N/32)/2), 2]
-        #              → B_s2 (K-dim scale) [E, ceil(ceil(K/32)/2), N, 2]
-        B_q, B_s1, B_s2 = block_mx_quantize(B, config=config_B, axis=-2)
-
-        # --- Step 4: grouped low-precision matmul, group_type=0 (contract over K) ---
-        # x = A_q1 [M, K]    → per_token_scale = A_s1 [M, ceil(K/64), 2]
-        # weight = B_q [E, K, N] → scale = B_s2 [E, ceil(K/64), N, 2]
-        Y = torch_npu.npu_grouped_matmul(
-            [A_q1],
-            [B_q],
-            scale=[B_s2],
-            per_token_scale=[A_s1],
-            group_list=group_list.to(torch.int64),
-            group_type=0,
-            output_dtype=A.dtype,
-            group_list_type=0,
-            scale_dtype=config_B.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_B.npu_matmul_dtype,
-            split_item=3,
-        )[0]
-
-        Y.requires_grad_(A.requires_grad or B.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1, group_list)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        ctx.config_B = config_B
-        return Y
+        return torch.nn.functional.grouped_mm(mx_A, mx_B, offs=group_list)
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1, group_list = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-        config_B = ctx.config_B
         assert dY.ndim == 2, f"dY must be 2D, got {dY.ndim}D"
 
-        # --- Step 1: quantize dY along N-dim (for dgrad) ---
-        # dY [M, N] → dY_s1 (N-dim scale) [M, ceil(ceil(N/32)/2), 2]
-        dY_q1, dY_s1 = mx_quantize(dY, -1, config_A)
+        grouped_mx_A: GroupedMXTensor
+        mx_B: MXTensor
+        grouped_mx_A, mx_B, offs = ctx.saved_tensors
 
-        # --- Step 2: quantize dY along M-dim with grouped quant (zero boundaries) ---
+        # dY is quantized along both axes with the same config as A's, providing both
+        # GEMMs' dY operands below: the N-dim form for the dgrad, the group-aware M-dim
+        # form for the wgrad.
+        # dY [M, N] → dY_s1 (N-dim scale) [M, ceil(ceil(N/32)/2), 2]
+        mx_dY = MXTensor.from_hp(dY, grouped_mx_A.quant_config, axis=-1)
+
         # dY [M, N] → dY_s2 (M-dim scale) [M//64 + E, N, 2]
-        dY_q2, dY_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
-            dY,
-            group_list.to(torch.int32),
-            round_mode=config_A.round_mode,
-            dst_type=config_A.npu_elem_dtype,
-            blocksize=config_A.block_size,
-            scale_alg=config_A.scale_alg,
+        grouped_mx_dY = GroupedMXTensor.from_hp(dY, offs, grouped_mx_A.quant_config)
+
+        # dgrad: dA = dY @ B^T (contract over N)
+        # - dY's N-dim form against the saved B form transposed.
+        dA = torch.nn.functional.grouped_mm(
+            mx_dY,
+            mx_B.transpose(-1, -2),
+            offs=offs,
         )
 
-        # --- Step 3: dgrad  dA = dY @ B^T  (group_type=0, contract over N) ---
-        # x = dY_q1 [M, N]    → per_token_scale = dY_s1 [M, ceil(N/64), 2]
-        # weight = B_q.t() [E, N, K] → scale = B_s1.transpose(1,2) [E, ceil(N/64), K, 2]
-        dA = torch_npu.npu_grouped_matmul(
-            [dY_q1],
-            [B_q.transpose(-1, -2)],
-            scale=[B_s1.transpose(1, 2)],
-            per_token_scale=[dY_s1],
-            group_list=group_list.to(torch.int64),
-            group_type=0,
-            output_dtype=A_dtype,
-            group_list_type=0,
-            scale_dtype=config_B.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_B.npu_matmul_dtype,
-            split_item=3,
-        )[0]
-
-        # --- Step 4: wgrad  dB = A^T @ dY  (group_type=2, contract over M) ---
-        # x = A_q2.t() [K, M]            → per_token_scale = A_s2.transpose(0,1) [K, M//64+E, 2]
-        # weight = dY_q2 [M, N]           → scale = dY_s2 [M//64+E, N, 2]
-        #
-        # Note: A_s2 must be transposed to match A_q2.t()'s transposition,
-        # otherwise the kernel errors: "transposition of perTokenScale/x should be equal".
-        dB = torch_npu.npu_grouped_matmul(
-            [A_q2.t()],
-            [dY_q2],
-            scale=[dY_s2],
-            per_token_scale=[A_s2.transpose(0, 1)],
-            group_list=group_list.to(torch.int64),
-            group_type=2,
-            output_dtype=A_dtype,
-            group_list_type=0,
-            # wgrad: the weight operand is dY_q2, quantized with config_A
-            scale_dtype=config_A.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_A.npu_matmul_dtype,
-            split_item=3,
-        )[0]
+        # wgrad: dB = A^T @ dY (contract over M, group_type=2)
+        # the saved A form transposed against dY's M-dim form.
+        dB = torch.nn.functional.grouped_mm(
+            grouped_mx_A.t(),
+            grouped_mx_dY,
+            offs=offs,
+        )
 
         return dA, dB, None, None, None
 
@@ -378,12 +352,12 @@ def to_block_mx_then_grouped_mm(
     ``A @ B`` where each group's assigned rows are multiplied by its
     corresponding slice of ``B``.
 
-    Quantization scheme:
-    - A along K-dim: ``npu_dynamic_mx_quant(axis=-1)`` (params from ``config_A``)
-    - A along M-dim: ``npu_grouped_dynamic_mx_quant`` (params from ``config_A``)
-    - B:             ``npu_dynamic_block_mx_quant``, 32×32 blocks (params from ``config_B``)
+    ``A`` must be a high precision tensor. ``B`` may already be a ``BlockMXTensor``
+    quantized with ``config_B``, validated against the config here; a high-precision
+    ``B`` is quantized before multiplied.
 
-    See ``_BlockMXQuantGroupedMM`` for details of the three GEMMs.
+    See ``_BlockMXQuantGroupedMM`` for the quantization scheme and details of the
+    three GEMMs.
 
     Args:
         A: Input tensor, shape ``(M, K)``.
@@ -402,12 +376,21 @@ def to_block_mx_then_grouped_mm(
 class _BlockMXQuantBMM(torch.autograd.Function):
     """Block MX batched matmul: ``A[B,M,K] @ B[B,K,N] = Y[B,M,N]``.
 
-    Both operands are 3D and share the leading batch dimension. The forward
-    dual-axis quantizes ``A`` (params from ``config_A``) and block quantizes
-    ``B`` in 32×32 blocks (params from ``config_B``, via
-    ``block_mx_quantize``), then performs the low-precision matmul
-    contracting over K. The backward reuses the forward-quantized ``A_q2/A_s2``
-    and ``B_q/B_s1`` transposed and only quantizes ``dY`` fresh.
+    - A can be either a high precision tensor or a DualAxisMXTensor
+    - B can be either a high precision tensor or a BlockMXTensor
+
+    If either A or B is in high precision, it will be quantized first then multiplied.
+
+    Forward:
+        - Low-precision batched matmul contracting over K.
+        - Quantized version of A and B are saved in ctx for backward.
+
+
+    Backward (``dY = grad_output``):
+        - dY is quantized using A's config.
+        - dgrad ``dA = dY @ B^T`` (contract over N)
+        - wgrad ``dB = A^T @ dY`` (contract over M)
+        - All multiplications are done in low precision.
     """
 
     @staticmethod
@@ -423,69 +406,27 @@ class _BlockMXQuantBMM(torch.autograd.Function):
         assert A.shape[0] == B.shape[0], f"batch dim mismatch: A[0]={A.shape[0]} != B[0]={B.shape[0]}"
         assert A.shape[-1] == B.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B[-2]={B.shape[-2]}"
 
-        # --- Step 1: dual-axis MX quantize A (left operand) ---
-        A_q1, A_s1, A_q2, A_s2 = mx_quantize_dual_axis(A, config_A)
+        mx_A, mx_B = _maybe_quantize_operands_then_save_for_backward(ctx, A, B, config_A, config_B, axis=-2)
 
-        # --- Step 2: block MX quantize B (right operand, optional mxfp4 pre-pass) ---
-        B_q, B_s1, B_s2 = block_mx_quantize(B, config=config_B, axis=-2)
-
-        # --- Step 3: low-precision batched matmul, contracting over K ---
-        Y = torch_npu.npu_quant_matmul(
-            A_q1,
-            B_q,
-            B_s2,
-            pertoken_scale=A_s1,
-            output_dtype=A.dtype,
-            scale_dtype=config_B.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_B.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
-        )
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        ctx.config_B = config_B
-        return Y
+        return torch.bmm(mx_A, mx_B)
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1 = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-        config_B = ctx.config_B
+        mx_A: MXTensor
+        mx_B: MXTensor
+        mx_A, mx_B = ctx.saved_tensors
 
-        # --- Step 1: dual-axis MX quantize dY ---
-        dY_q1, dY_s1, dY_q2, dY_s2 = mx_quantize_dual_axis(dY, config_A)
+        # dY is quantized along both axes with the same config as A's, providing
+        # both GEMMs' dY operands below.
+        dual_axis_mx_Y = DualAxisMXTensor.from_hp(dY, mx_A.quant_config, act_quant_config=mx_A.quant_config)
 
-        # --- Step 2: dgrad  dA = dY @ B^T  (contract over N) ---
-        dA = torch_npu.npu_quant_matmul(
-            dY_q1,
-            B_q.transpose(-1, -2),
-            B_s1.transpose(-2, -3),
-            pertoken_scale=dY_s1,
-            output_dtype=A_dtype,
-            scale_dtype=config_B.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_B.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
-        )
+        # dgrad: dA = dY @ B^T (contract over N)
+        # - dY's -1 form against the saved B form transposed.
+        dA = torch.bmm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-1), mx_B.transpose(-1, -2))
 
-        # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
-        dB = torch_npu.npu_quant_matmul(
-            A_q2.transpose(-1, -2),
-            dY_q2,
-            dY_s2,
-            pertoken_scale=A_s2.transpose(-2, -3),
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, config_B.block_size],
-        )
+        # wgrad: dB = A^T @ dY (contract over M)
+        # - the saved A form transposed against dY's -2 form.
+        dB = torch.bmm(mx_A.transpose(-1, -2), dual_axis_mx_Y.to_mx_tensor(quant_axis=-2))
 
         return dA, dB, None, None
 
@@ -499,464 +440,21 @@ def to_block_mx_then_bmm(
     """Block MX batched matmul: ``A[B,M,K] @ B[B,K,N] = Y[B,M,N]``.
 
     Both operands are 3D and must share the leading batch dimension.
-    Quantization configs are drawn from ``config_A`` (MX, for A and dY) and
-    ``config_B`` (Block MX, for B).
+
+    Neither operand has to be high precision: ``A`` may already be a
+    ``DualAxisMXTensor`` quantized with ``config_A``, ``B`` a ``BlockMXTensor``
+    quantized with ``config_B``, both validated against the configs here.
+    High-precision operands are quantized before multiplied.
+
+    See ``_BlockMXQuantBMM`` for details of the three GEMMs.
 
     Args:
         A: Shape ``(B, M, K)``.
         B: Shape ``(B, K, N)``.
-        config_A: MX config for A's quantization.
-        config_B: Block MX config for B's quantization.
+        config_A: Config for A's quantization.
+        config_B: Config for B's quantization.
 
     Returns:
         Output tensor, shape ``(B, M, N)``, dtype matching ``A``.
     """
     return _BlockMXQuantBMM.apply(A, B, config_A, config_B)
-
-
-# =========================================================================
-# Pre-quantized Block MX matmul ops (weight already quantized in
-# ``fsdp_pre_all_gather``). These skip the on-the-fly ``block_mx_quantize``
-# and consume the pre-quantized ``B_q/B_s1/B_s2`` stored on the wrapper.
-#
-# The wrapper is passed as the weight input so the backward returns a BF16
-# gradient routed to the local shard by FSDP (the wrapper's logical dtype is
-# BF16 even though ``_data`` holds FP8).
-# =========================================================================
-
-
-@torch._dynamo.allow_in_graph
-class _BlockMXQuantMMFromPreQuantized(torch.autograd.Function):
-    """Block MX matmul with a pre-quantized weight (dense ``A @ B``).
-
-    ``wrapper._data`` is the FP8 weight ``B_q`` in ``[K, N]`` layout, with
-    ``_scale_s1`` (N-dim) and ``_scale_s2`` (K-dim) scales. Forward uses
-    ``B_q + B_s2``, backward uses ``B_q + B_s1``.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        A: torch.Tensor,
-        wrapper: torch.Tensor,
-        config_A: MXQuantizeConfig,
-    ):
-        B_q = wrapper._data  # pyrefly: ignore [missing-attribute]
-        B_s1 = wrapper._scale_s1  # pyrefly: ignore [missing-attribute]
-        B_s2 = wrapper._scale_s2  # pyrefly: ignore [missing-attribute]
-        assert A.ndim >= 2, f"A must be >=2D, got {A.ndim}D"
-        assert B_q.ndim == 2, f"B_q must be 2D, got {B_q.ndim}D"
-        assert A.shape[-1] == B_q.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B_q[-2]={B_q.shape[-2]}"
-
-        # --- Step 1: quantize A with dual-axis MX quant ---
-        A_q1, A_s1, A_q2, A_s2 = mx_quantize_dual_axis(A.reshape(-1, A.shape[-1]), config_A)
-
-        # --- Step 2: low-precision matmul, contracting over K (use B_s2) ---
-        Y = torch_npu.npu_quant_matmul(
-            A_q1,
-            B_q,
-            B_s2,
-            pertoken_scale=A_s1,
-            output_dtype=A.dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        if A.ndim != 2:
-            Y = Y.reshape(*A.shape[:-1], *Y.shape[1:])
-
-        Y.requires_grad_(A.requires_grad or wrapper.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        return Y
-
-    @staticmethod
-    def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1 = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-
-        # --- Step 1: quantize dY with dual-axis MX quant ---
-        dY_q1, dY_s1, dY_q2, dY_s2 = mx_quantize_dual_axis(dY.reshape(-1, dY.shape[-1]), config_A)
-
-        # --- Step 2: dgrad  dA = dY @ B^T  (contract over N, use B_s1) ---
-        dA = torch_npu.npu_quant_matmul(
-            dY_q1,
-            B_q.t(),
-            B_s1.transpose(0, 1),
-            pertoken_scale=dY_s1,
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-        if dY.ndim != 2:
-            dA = dA.reshape(*dY.shape[:-1], *dA.shape[1:])
-
-        # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
-        dB = torch_npu.npu_quant_matmul(
-            A_q2.t(),
-            dY_q2,
-            dY_s2,
-            pertoken_scale=A_s2.transpose(0, 1),
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        return dA, dB, None
-
-
-def to_block_mx_then_mm_from_prequantized(
-    A: torch.Tensor,
-    wrapper: torch.Tensor,
-    config_A: MXQuantizeConfig,
-) -> torch.Tensor:
-    """Block MX matmul with a pre-quantized weight (dense ``A @ B``).
-
-    ``wrapper`` must be a ``BlockMXTrainingWeightWrapperTensor`` carrying
-    pre-quantized FP8 data (``_data`` = ``B_q``, ``_scale_s1``, ``_scale_s2``).
-    """
-    return _BlockMXQuantMMFromPreQuantized.apply(A, wrapper, config_A)
-
-
-@torch._dynamo.allow_in_graph
-class _BlockMXQuantLinearFromPreQuantized(torch.autograd.Function):
-    """Block MX linear with a pre-quantized weight (``A @ W.T + bias``).
-
-    ``wrapper._data`` is the FP8 weight ``B_q`` in ``[N, K]`` layout (the
-    ``nn.Linear`` weight), with ``_scale_s1`` (K-dim) and ``_scale_s2`` (N-dim)
-    scales. Forward uses ``B_q.t() + B_s1.transpose(0,1)`` (K-dim scale),
-    backward uses ``B_q + B_s2`` (N-dim scale).
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        A: torch.Tensor,
-        wrapper: torch.Tensor,
-        config_A: MXQuantizeConfig,
-    ):
-        B_q = wrapper._data  # pyrefly: ignore [missing-attribute]
-        B_s1 = wrapper._scale_s1  # pyrefly: ignore [missing-attribute]
-        B_s2 = wrapper._scale_s2  # pyrefly: ignore [missing-attribute]
-        assert A.ndim >= 2, f"A must be >=2D, got {A.ndim}D"
-        assert B_q.ndim == 2, f"B_q must be 2D, got {B_q.ndim}D"
-        assert A.shape[-1] == B_q.shape[-1], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B_q[-1]={B_q.shape[-1]}"
-
-        # --- Step 1: quantize A with dual-axis MX quant ---
-        A_q1, A_s1, A_q2, A_s2 = mx_quantize_dual_axis(A.reshape(-1, A.shape[-1]), config_A)
-
-        # --- Step 2: low-precision matmul A @ B_q.T, contract over K (use B_s1) ---
-        Y = torch_npu.npu_quant_matmul(
-            A_q1,
-            B_q.t(),
-            B_s1.transpose(0, 1),
-            pertoken_scale=A_s1,
-            output_dtype=A.dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        if A.ndim != 2:
-            Y = Y.reshape(*A.shape[:-1], *Y.shape[1:])
-
-        Y.requires_grad_(A.requires_grad or wrapper.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s2)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        return Y
-
-    @staticmethod
-    def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s2 = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-
-        # --- Step 1: quantize dY with dual-axis MX quant ---
-        dY_q1, dY_s1, dY_q2, dY_s2 = mx_quantize_dual_axis(dY.reshape(-1, dY.shape[-1]), config_A)
-
-        # --- Step 2: dgrad  dA = dY @ B_q  (contract over N, use B_s2) ---
-        dA = torch_npu.npu_quant_matmul(
-            dY_q1,
-            B_q,
-            B_s2,
-            pertoken_scale=dY_s1,
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-        if dY.ndim != 2:
-            dA = dA.reshape(*dY.shape[:-1], *dA.shape[1:])
-
-        # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
-        # ``A_q2.t() @ dY_q2`` yields ``[K, N]``, but the pre-quantized weight
-        # ``B_q`` is stored in the ``nn.Linear`` layout ``[N, K]``, so the
-        # gradient must be transposed to match (``Y = A @ B_q.T``).
-        dB = torch_npu.npu_quant_matmul(
-            A_q2.t(),
-            dY_q2,
-            dY_s2,
-            pertoken_scale=A_s2.transpose(0, 1),
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        ).t()
-
-        return dA, dB, None
-
-
-def to_block_mx_then_linear_from_prequantized(
-    A: torch.Tensor,
-    wrapper: torch.Tensor,
-    config_A: MXQuantizeConfig,
-) -> torch.Tensor:
-    """Block MX linear with a pre-quantized weight (``A @ W.T``).
-
-    ``wrapper`` must be a ``BlockMXTrainingWeightWrapperTensor`` carrying
-    pre-quantized FP8 data in the ``[N, K]`` (``nn.Linear`` weight) layout.
-    """
-    return _BlockMXQuantLinearFromPreQuantized.apply(A, wrapper, config_A)
-
-
-@torch._dynamo.allow_in_graph
-class _BlockMXQuantBMMFromPreQuantized(torch.autograd.Function):
-    """Block MX batched matmul with a pre-quantized weight (``A[B,M,K] @ B[B,K,N]``).
-
-    ``wrapper._data`` is the FP8 weight ``B_q`` in ``[B, K, N]`` layout, with
-    ``_scale_s1`` (N-dim) and ``_scale_s2`` (K-dim) scales.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        A: torch.Tensor,
-        wrapper: torch.Tensor,
-        config_A: MXQuantizeConfig,
-    ):
-        B_q = wrapper._data  # pyrefly: ignore [missing-attribute]
-        B_s1 = wrapper._scale_s1  # pyrefly: ignore [missing-attribute]
-        B_s2 = wrapper._scale_s2  # pyrefly: ignore [missing-attribute]
-        assert A.ndim == 3, f"A must be 3D, got {A.ndim}D"
-        assert B_q.ndim == 3, f"B_q must be 3D, got {B_q.ndim}D"
-        assert A.shape[0] == B_q.shape[0], f"batch dim mismatch: A[0]={A.shape[0]} != B_q[0]={B_q.shape[0]}"
-        assert A.shape[-1] == B_q.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B_q[-2]={B_q.shape[-2]}"
-
-        # --- Step 1: dual-axis MX quantize A ---
-        A_q1, A_s1, A_q2, A_s2 = mx_quantize_dual_axis(A, config_A)
-
-        # --- Step 2: low-precision batched matmul, contract over K (use B_s2) ---
-        Y = torch_npu.npu_quant_matmul(
-            A_q1,
-            B_q,
-            B_s2,
-            pertoken_scale=A_s1,
-            output_dtype=A.dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        Y.requires_grad_(A.requires_grad or wrapper.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        return Y
-
-    @staticmethod
-    def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1 = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-
-        # --- Step 1: dual-axis MX quantize dY ---
-        dY_q1, dY_s1, dY_q2, dY_s2 = mx_quantize_dual_axis(dY, config_A)
-
-        # --- Step 2: dgrad  dA = dY @ B^T  (contract over N, use B_s1) ---
-        dA = torch_npu.npu_quant_matmul(
-            dY_q1,
-            B_q.transpose(-1, -2),
-            B_s1.transpose(-2, -3),
-            pertoken_scale=dY_s1,
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
-        dB = torch_npu.npu_quant_matmul(
-            A_q2.transpose(-1, -2),
-            dY_q2,
-            dY_s2,
-            pertoken_scale=A_s2.transpose(-2, -3),
-            output_dtype=A_dtype,
-            scale_dtype=config_A.npu_scale_dtype,
-            pertoken_scale_dtype=config_A.npu_scale_dtype,
-            x1_dtype=config_A.npu_matmul_dtype,
-            x2_dtype=config_A.npu_matmul_dtype,
-            group_sizes=[1, 1, 32],
-        )
-
-        return dA, dB, None
-
-
-def to_block_mx_then_bmm_from_prequantized(
-    A: torch.Tensor,
-    wrapper: torch.Tensor,
-    config_A: MXQuantizeConfig,
-) -> torch.Tensor:
-    """Block MX batched matmul with a pre-quantized weight (``A[B,M,K] @ B[B,K,N]``)."""
-    return _BlockMXQuantBMMFromPreQuantized.apply(A, wrapper, config_A)
-
-
-@torch._dynamo.allow_in_graph
-class _BlockMXQuantGroupedMMFromPreQuantized(torch.autograd.Function):
-    """Block MX grouped matmul with a pre-quantized weight (``A[M,K] @ B[E,K,N]``).
-
-    ``wrapper._data`` is the FP8 weight ``B_q`` in ``[E, K, N]`` layout, with
-    ``_scale_s1`` (N-dim) and ``_scale_s2`` (K-dim) scales.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        A: torch.Tensor,
-        wrapper: torch.Tensor,
-        group_list: torch.Tensor,
-        config_A: MXQuantizeConfig,
-    ):
-        B_q = wrapper._data  # pyrefly: ignore [missing-attribute]
-        B_s1 = wrapper._scale_s1  # pyrefly: ignore [missing-attribute]
-        B_s2 = wrapper._scale_s2  # pyrefly: ignore [missing-attribute]
-        assert A.ndim == 2, f"A must be 2D, got {A.ndim}D"
-        assert B_q.ndim == 3, f"B_q must be 3D, got {B_q.ndim}D"
-        assert A.shape[-1] == B_q.shape[-2], f"contracting dim mismatch: A[-1]={A.shape[-1]} != B_q[-2]={B_q.shape[-2]}"
-
-        # --- Step 1: quantize A along K-dim (contracting dim for forward) ---
-        A_q1, A_s1 = mx_quantize(A, -1, config_A)
-
-        # --- Step 2: quantize A along M-dim with grouped quant (zero boundaries) ---
-        A_q2, A_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
-            A,
-            group_list.to(torch.int32),
-            round_mode=config_A.round_mode,
-            dst_type=config_A.npu_elem_dtype,
-            blocksize=config_A.block_size,
-            scale_alg=config_A.scale_alg,
-        )
-
-        # --- Step 3: grouped low-precision matmul, group_type=0 (contract over K) ---
-        Y = torch_npu.npu_grouped_matmul(
-            [A_q1],
-            [B_q],
-            scale=[B_s2],
-            per_token_scale=[A_s1],
-            group_list=group_list.to(torch.int64),
-            group_type=0,
-            output_dtype=A.dtype,
-            group_list_type=0,
-            scale_dtype=config_A.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_A.npu_matmul_dtype,
-            split_item=3,
-        )[0]
-
-        Y.requires_grad_(A.requires_grad or wrapper.requires_grad)
-
-        ctx.save_for_backward(A_q2, A_s2, B_q, B_s1, group_list)
-        ctx.A_dtype = A.dtype
-        ctx.config_A = config_A
-        return Y
-
-    @staticmethod
-    def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        A_q2, A_s2, B_q, B_s1, group_list = ctx.saved_tensors
-        A_dtype = ctx.A_dtype
-        config_A = ctx.config_A
-        assert dY.ndim == 2, f"dY must be 2D, got {dY.ndim}D"
-
-        # --- Step 1: quantize dY along N-dim (for dgrad) ---
-        dY_q1, dY_s1 = mx_quantize(dY, -1, config_A)
-
-        # --- Step 2: quantize dY along M-dim with grouped quant (zero boundaries) ---
-        dY_q2, dY_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
-            dY,
-            group_list.to(torch.int32),
-            round_mode=config_A.round_mode,
-            dst_type=config_A.npu_elem_dtype,
-            blocksize=config_A.block_size,
-            scale_alg=config_A.scale_alg,
-        )
-
-        # --- Step 3: dgrad  dA = dY @ B^T  (group_type=0, contract over N) ---
-        dA = torch_npu.npu_grouped_matmul(
-            [dY_q1],
-            [B_q.transpose(-1, -2)],
-            scale=[B_s1.transpose(1, 2)],
-            per_token_scale=[dY_s1],
-            group_list=group_list.to(torch.int64),
-            group_type=0,
-            output_dtype=A_dtype,
-            group_list_type=0,
-            scale_dtype=config_A.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_A.npu_matmul_dtype,
-            split_item=3,
-        )[0]
-
-        # --- Step 4: wgrad  dB = A^T @ dY  (group_type=2, contract over M) ---
-        dB = torch_npu.npu_grouped_matmul(
-            [A_q2.t()],
-            [dY_q2],
-            scale=[dY_s2],
-            per_token_scale=[A_s2.transpose(0, 1)],
-            group_list=group_list.to(torch.int64),
-            group_type=2,
-            output_dtype=A_dtype,
-            group_list_type=0,
-            scale_dtype=config_A.npu_scale_dtype,
-            per_token_scale_dtype=config_A.npu_scale_dtype,
-            x_dtype=config_A.npu_matmul_dtype,
-            weight_dtype=config_A.npu_matmul_dtype,
-            split_item=3,
-        )[0]
-
-        return dA, dB, None, None
-
-
-def to_block_mx_then_grouped_mm_from_prequantized(
-    A: torch.Tensor,
-    wrapper: torch.Tensor,
-    group_list: torch.Tensor,
-    config_A: MXQuantizeConfig,
-) -> torch.Tensor:
-    """Block MX grouped matmul with a pre-quantized weight (``A[M,K] @ B[E,K,N]``)."""
-    return _BlockMXQuantGroupedMMFromPreQuantized.apply(A, wrapper, group_list, config_A)

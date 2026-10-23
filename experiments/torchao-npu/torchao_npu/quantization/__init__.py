@@ -26,4 +26,6 @@ _FP4_DTYPES = (torch.float4_e2m1fn_x2,)
 _SUPPORTED_MX_ELEM_DTYPES = (*_FP8_DTYPES, *_FP4_DTYPES)
 
 # High precision dtypes
-_SUPPORTED_HP_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
+_FP32_DTYPES = (torch.float32,)
+_FP16_DTYPES = (torch.bfloat16, torch.float16)
+_SUPPORTED_HP_DTYPES = (*_FP32_DTYPES, *_FP16_DTYPES)

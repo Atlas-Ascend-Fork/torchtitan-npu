@@ -127,7 +127,7 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
 
     Carries decoupled weight/activation configs (either may be absent) and
     provides deferred-op infrastructure (subclass-preserving slicing/indexing,
-    FSDP2 hooks, ``__deepcopy__``, ``to_tensor``, ``requires_grad_`` sync)
+    FSDP2 hooks, ``__deepcopy__``, ``to_tensor``)
     usable by both fake-quantize and real-low-precision subclasses.
 
     Supports FSDP2 via :meth:`fsdp_pre_all_gather` and :meth:`fsdp_post_all_gather`,
@@ -172,7 +172,8 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
         weight_config: FakeQuantizeConfigBase | None = None,
         activation_config: FakeQuantizeConfigBase | None = None,
     ):
-        self._data = tensor
+        # ``_data`` is pure storage: autograd tracks the wrapper.
+        self._data = tensor.detach()
         self.weight_config = weight_config
         self.activation_config = activation_config
 
@@ -279,11 +280,7 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
             weight_config=copy.deepcopy(self.weight_config),
         )
 
-        # self.requires_grad triggers __torch_function__ of self, use `DisableTorchFunctionSubclass`
-        # to avoid the NotImplementedError error if BaseTrainingWeightWrapperTensor is used.
-        with torch._C.DisableTorchFunctionSubclass():
-            result.requires_grad = self.requires_grad  # pyrefly: ignore [missing-attribute]
-
+        result.requires_grad_(self.requires_grad)  # pyrefly: ignore [missing-attribute]
         return result
 
     def __repr__(self):
@@ -308,15 +305,6 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
             activation_config=tensor_attributes["activation_config"],
             weight_config=tensor_attributes["weight_config"],
         )
-
-    def requires_grad_(self, requires_grad: bool = True):
-        # requires_grad_ bypasses both __torch_function__ and __torch_dispatch__,
-        # so it only sets the flag on the wrapper. Need to keep _data in sync, otherwise
-        # Dynamo sees _data.requires_grad=False and may drop custom autograd.Function
-        # backward during tracing, causing eager/compile gradient mismatches.
-        super().requires_grad_(requires_grad)
-        self._data.requires_grad_(requires_grad)
-        return self
 
     def to_tensor(self) -> torch.Tensor:
         """Return the underlying raw tensor, unwrapping the subclass."""
