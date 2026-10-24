@@ -113,13 +113,14 @@ class VisionAttention(Module):
             v = v.view(p, self.num_heads, self.head_dim)
             q = self.rotary(q, cos, sin)
             k = self.rotary(k, cos, sin)
+            # Keep the batch dimension so SDPA can select a fused attention backend.
             out = F.scaled_dot_product_attention(
-                q.transpose(0, 1),
-                k.transpose(0, 1),
-                v.transpose(0, 1),
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
                 dropout_p=0.0,
             )
-            return self.wo(out.transpose(0, 1).reshape(p, dim))
+            return self.wo(out.squeeze(0).transpose(0, 1).reshape(p, dim))
 
         n, p, dim = x.shape
         qkv = self.wqkv(x)
@@ -132,15 +133,6 @@ class VisionAttention(Module):
         k = self.rotary(k, cos, sin).transpose(1, 2)
         v = v.transpose(1, 2)
         mask = valid[:, None, :, None] & valid[:, None, None, :]
-        # The reference's tensor contract is [heads, patches, dim] with no batch
-        # dimension: passing an extra batch dimension or an all-true mask can
-        # select a different SDPA kernel and change BF16 rounding even though the
-        # result is mathematically the same.
-        if n == 1 and bool(valid[0].all()):
-            out = F.scaled_dot_product_attention(q[0], k[0], v[0], dropout_p=0.0)
-            return self.wo(out.transpose(0, 1).reshape(p, dim)).unsqueeze(0)
-        # On this backend F.scaled_dot_product_attention already dispatches to the
-        # Ascend fused attention kernel, so there is no separate fused call to make.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         return self.wo(out.transpose(1, 2).reshape(n, p, dim))
 
