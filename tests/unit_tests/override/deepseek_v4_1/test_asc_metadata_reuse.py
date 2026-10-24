@@ -32,12 +32,12 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
+from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AicpuMetadata,
-    KernelFrame,
 )
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
     AscV41Metadata,
@@ -73,7 +73,9 @@ def _fake_metadata_ops(monkeypatch):
 
         return _call
 
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _metadata_op("smla_fwd"), raising=False)
+    monkeypatch.setattr(
+        torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _metadata_op("smla_fwd"), raising=False
+    )
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _metadata_op("smla_bwd"), raising=False
     )
@@ -189,13 +191,14 @@ def test_a_geometry_builds_its_own_ratios_frames_and_metadata(monkeypatch, ratio
         assert (indexer_kwargs["num_heads_q"], indexer_kwargs["head_dim"], indexer_kwargs["topk"]) == (2, 4, 3)
 
 
-def test_the_reference_row_carries_no_metadata_and_the_port_always_builds(monkeypatch):
-    """Two builders, two products: the row contract, and the row plus this geometry's metadata.
+def test_the_reference_row_carries_frames_and_the_port_adds_only_records(monkeypatch):
+    """Two builders, two products: the row with its frames, and the row plus the records.
 
-    The reference core reads the row's boundaries and its own ratio, so its builder produces
-    that and nothing else -- no kernel geometry anywhere on its config.  The port's builder
-    always adds metadata: its config states all five numbers, so an entry is always sized for
-    *some* geometry, and the geometry it was sized with rides the entry.
+    The reference core reads the row's boundaries and its own ratio, and the row's frames
+    describe the tensors it addresses -- they are model metadata, not any kernel's records.
+    The port's builder adds only the operator outputs: its config states all five geometry
+    numbers, so an entry is always sized for *some* geometry, and the geometry it was sized
+    with rides the entry.
     """
     reference = CompressedSparseInnerAttention2.Config(window_size=2, softmax_scale=0.5, compress_ratio=2)
     # The reference builder is geometry-free -- that its config cannot even state one is
@@ -204,8 +207,12 @@ def test_the_reference_row_carries_no_metadata_and_the_port_always_builds(monkey
     assert type(row) is DeepSeekV41Metadata
     assert row.cu_seq_q.tolist() == [0, 4]
     assert row.cu_seq_k.tolist() == [0, 2]
-    # No frames and no metadata: a row is not a fused entry, and nothing pretends otherwise.
-    assert not hasattr(row, "q")
+    assert row.ratio == 2
+    assert row.q.cu_seqlens.tolist() == [0, 4] and row.q.seqused.tolist() == [4]
+    assert row.swa_k.cu_seqlens.tolist() == [0, 4] and row.swa_k.seqused.tolist() == [4]
+    assert row.cmp_k is not None
+    assert row.cmp_k.cu_seqlens.tolist() == [0, 2] and row.cmp_k.seqused.tolist() == [2]
+    # Frames, but no operator outputs: a row is not a fused entry, and nothing pretends otherwise.
     assert not hasattr(row, "aicpu_metadata")
 
     state = _fake_metadata_ops(monkeypatch)
@@ -213,9 +220,9 @@ def test_the_reference_row_carries_no_metadata_and_the_port_always_builds(monkey
 
     built = port.build_attention_metadata(_positions([0, 4]))
 
-    # The numbers the metadata were sized with are the port's own, stated once on its config.
+    # The numbers the records were sized with are the port's own, stated once on its config.
     assert built.aicpu_metadata.geometry == port.geometry
-    assert built.cmp_k is not None
+    assert built.cmp_k is not None and built.cmp_k.seqused.tolist() == [2]
     assert len(state["smla_fwd"]) == len(state["smla_bwd"]) == len(state["li"]) == len(state["slig"]) == 1
 
 
@@ -323,12 +330,11 @@ def test_the_attention_reads_the_metadata_and_never_launches(monkeypatch):
 
 
 def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
-    """The metadata are the only source of the kernels' metadata: there is no inline fallback.
+    """The records are the only source of the kernels' metadata: there is no inline fallback.
 
-    The AscendC attention reads this geometry's frames and metadata off the entry it is handed.  A
-    caller holding the reference row -- what the reference backend builds, with no geometry on
-    it -- is holding the wrong metadata for the AscendC attention, and the forward fails on the missing
-    field rather than paying for an AI_CPU call on the side.
+    The reference row carries the frames (they describe the tensors) but no operator outputs.  A
+    caller holding it is holding the wrong entry for the AscendC attention, and the forward fails
+    on the missing records rather than paying for an AI_CPU call on the side.
     """
     state = _fake_metadata_ops(monkeypatch)
     attention = build_cpu_model(
@@ -337,7 +343,7 @@ def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
     row = _reference_row([0, 4], ratio=2)
     q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16)
 
-    with pytest.raises(AttributeError, match="'DeepSeekV41Metadata' object has no attribute 'q'"):
+    with pytest.raises(AttributeError, match="aicpu_metadata"):
         attention(
             q,
             q.squeeze(2),
@@ -524,7 +530,7 @@ def test_the_cp_alignment_is_this_geometries_own_factor(monkeypatch):
     ragged = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
         _positions([0, 6, 12])
     )
-    with pytest.raises(ValueError, match=r"cp_size \* compress_ratio = 8"):
+    with pytest.raises(ValueError, match=r"positive multiples of 8"):
         shard_asc_v41_metadata(ragged, cp_size=4, cp_rank=0, batch_size=1, seq_len=3)
 
 

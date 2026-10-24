@@ -77,12 +77,15 @@ def _model_config(ratios: tuple[int, ...], *, ascendc: bool, geometry: dict | No
                 attr,
                 asc(
                     inner,
-                    **(geometry or {
-                        "num_heads": _HEADS,
-                        "head_dim": _HEAD_DIM,
-                        "index_num_heads": _INDEX_N_HEADS,
-                        "index_head_dim": _INDEX_HEAD_DIM,
-                    }),
+                    **(
+                        geometry
+                        or {
+                            "num_heads": _HEADS,
+                            "head_dim": _HEAD_DIM,
+                            "index_num_heads": _INDEX_N_HEADS,
+                            "index_head_dim": _INDEX_HEAD_DIM,
+                        }
+                    ),
                 ),
             )
     return config
@@ -104,10 +107,11 @@ def test_entries_are_built_per_geometry():
     assert {ratio for _, ratio in metadata} == {1, 4, 128}
     entry = metadata[(CompressedSparseInnerAttention.Config, 4)]
     assert type(entry) is DeepSeekV4Metadata and entry.ratio == 4
-    assert entry.varlen.cu_seq_q.tolist() == [0, 128, 256]
-    # Only the pooled geometries carry a compressed plan.
-    assert entry.plan.cu_seqlens_cmp_k is not None
-    assert metadata[(CompressedSparseInnerAttention.Config, 1)].plan.cu_seqlens_cmp_k is None
+    assert entry.cu_seq_q.tolist() == [0, 128, 256]
+    # The pool grid is this entry's own fold of the row; an unpooled geometry keeps the row.
+    assert entry.cu_seq_k.tolist() == [0, 32, 64]
+    assert metadata[(CompressedSparseInnerAttention.Config, 1)].cu_seq_k.tolist() == [0, 128, 256]
+    assert entry.positions_q.tolist() == [[*range(128), *range(128)]]
     keys = {layer.attention.attention_metadata_key for layer in model.layers.values()}
     assert {key[1] for key in keys} == {1, 4, 128}
     assert all(metadata[key].ratio == key[1] for key in keys)
@@ -131,15 +135,38 @@ def test_the_fused_entry_carries_its_geometry_and_records(dsv4):
     for (cls, ratio), entry in metadata.items():
         assert cls is AscCompressedSparseInnerAttention.Config and entry.ratio == ratio
         assert isinstance(entry, AscV4Metadata)
-        assert entry.asc is not None and entry.asc.geometry == geometry
-        assert entry.asc.sparse_attn.fwd is not None and entry.asc.sparse_attn.bwd is not None
+        assert entry.aicpu_metadata.geometry == geometry
+        assert entry.aicpu_metadata.sparse_attn.fwd is not None
+        assert entry.aicpu_metadata.sparse_attn.bwd is not None
+        assert entry.q is not None and entry.swa_k is not None
+        assert entry.cmp_k is None if ratio == 1 else entry.cmp_k is not None
+        # The fused core never reads ``slots``: its builder skips the reference-only
+        # S x (S / ratio) HCA matrix even for the ratio-128 geometry.
+        assert entry.slots is None
         if ratio == 4:
-            assert entry.asc.lightning_indexer.fwd is not None
+            assert entry.aicpu_metadata.lightning_indexer.fwd is not None
         else:
-            assert entry.asc.lightning_indexer.fwd is None
+            assert entry.aicpu_metadata.lightning_indexer.fwd is None
     smla = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_flash_mla_metadata"]
     assert len(smla) == 3
     assert {call[2]["cmp_ratio"] for call in smla} == {1, 4, 128}
+
+
+def test_only_the_reference_builds_the_hca_selection():
+    """``slots`` is the reference core's precomputed selection, not the fused core's.
+
+    The reference forward reads it (``kv_indices`` for a geometry without a selector); the
+    fused core's HCA branch runs full-causal on the compressed pool and never touches it, so
+    its builder passes ``build_slots=False`` and the ``S x (S / ratio)`` int64 matrix -- 64 GiB
+    at S=1M, ratio=128 -- is never materialised on the fused path.
+    """
+    positions = _positions_for((128, 128))
+    reference = _entry(_model_config((128,), ascendc=False).build(), 128, positions)
+    assert reference.slots is not None
+    assert reference.slots.shape == (1, 256, 2)
+
+    fused = _entry(_model_config((128,), ascendc=True).build(), 128, positions)
+    assert fused.slots is None
 
 
 class _FakeCPMesh:
@@ -168,8 +195,8 @@ def _prepare_for_rank(attention_metadata, positions, *, rank: int, cp_size: int 
         return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=None)
 
 
-def test_the_fused_cp_transform_rebuilds_rank_local_metadata(dsv4, monkeypatch):
-    """The CP half rebuilds this rank's plan and records from its own frames."""
+def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
+    """The CP half rebuilds this rank's frames and records from the global row."""
     from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 
     built: list[torch.Tensor] = []
@@ -183,12 +210,49 @@ def test_the_fused_cp_transform_rebuilds_rank_local_metadata(dsv4, monkeypatch):
     model = _model_config((1, 4), ascendc=True).build()
 
     global_metadata = _entry(model, 4, positions)
+    row = torch.tensor([0, _WINDOW, _WINDOW + _WINDOW // 2], dtype=torch.int32)
+    chunk = torch.diff(row) // 2
 
     rank_metadata = [_prepare_for_rank(global_metadata, positions, rank=rank) for rank in range(2)]
-    for metadata in rank_metadata:
-        assert int(metadata.varlen.cu_seq_q[-1]) == (_WINDOW + _WINDOW // 2) // 2
+    for rank, metadata in enumerate(rank_metadata):
+        # The row stays the whole row; the queries are this rank's chunks.
+        assert torch.equal(metadata.cu_seq_q, row)
+        assert torch.equal(metadata.cu_seq_k, (row // 4).to(torch.int32))
+        assert metadata.cmp_k is not None
+        assert torch.equal(metadata.q.cu_seqlens, (row // 2).to(torch.int32))
+        assert torch.equal(metadata.q.seqused, chunk)
+        assert torch.equal(metadata.swa_k.cu_seqlens, row)
+        assert torch.equal(metadata.swa_k.seqused, (rank + 1) * chunk)
+        assert torch.equal(metadata.cmp_k.cu_seqlens, (row // 4).to(torch.int32))
+        assert torch.equal(metadata.cmp_k.seqused, ((rank + 1) * chunk) // 4)
         assert metadata.ratio == 4
-        assert metadata.asc.sparse_attn.fwd is not global_metadata.asc.sparse_attn.fwd
-        assert metadata.asc.geometry == global_metadata.asc.geometry
-        assert metadata.plan.cu_seqlens_cmp_k is not global_metadata.plan.cu_seqlens_cmp_k
-    assert rank_metadata[0].plan.gather_indices.tolist() != rank_metadata[1].plan.gather_indices.tolist()
+        assert metadata.aicpu_metadata.sparse_attn.fwd is not global_metadata.aicpu_metadata.sparse_attn.fwd
+        assert metadata.aicpu_metadata.geometry == global_metadata.aicpu_metadata.geometry
+        assert metadata.exchange is not None
+    # The movement is rank-dependent even though the row is not.
+    assert rank_metadata[0].positions_q.tolist() != rank_metadata[1].positions_q.tolist()
+
+
+def test_the_inner_attention_and_selector_own_the_cp_boundary():
+    """The core gathers its KV streams; the selector gathers the index keys it scores.
+
+    Both conversions are the V4.1 ``S(1) -> R`` pattern, declared by the modules the layer
+    calls directly (there is no wrapper between them any more).
+    """
+    config = _model_config((4,), ascendc=True)
+    attention = config.layers[0].attention
+    core_sharding = attention.inner_attention.sharding_config
+    assert core_sharding is not None
+    names = set(core_sharding.in_src_shardings)
+    assert not names & {"idx_q", "idx_k", "idx_w"}
+    assert {"q", "swa_k", "cmp_k", "topk_indices", "topk_scores", "attn_sink"} <= names
+    # Positional forward args are (q, swa_k, attn_sink): the KV streams are gathered on the
+    # way in, so their destination placement is the whole row.
+    core_row = core_sharding.in_dst_shardings
+    assert core_row["swa_k"] != core_sharding.in_src_shardings["swa_k"]
+    assert core_row["cmp_k"] != core_sharding.in_src_shardings["cmp_k"]
+
+    selector_sharding = attention.lightning_indexer.sharding_config
+    assert selector_sharding is not None
+    assert set(selector_sharding.in_src_shardings) == {"idx_q", "idx_k", "idx_w"}
+    assert selector_sharding.in_dst_shardings["idx_k"] != selector_sharding.in_src_shardings["idx_k"]

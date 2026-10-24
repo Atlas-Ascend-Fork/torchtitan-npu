@@ -53,7 +53,7 @@ def test_every_layer_pins_the_core_config_the_overrides_target():
     from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 
     model_config = model_registry("debugmodel").model
-    cores = [layer.attention.compressed_sparse_attention.inner_attention for layer in model_config.layers]
+    cores = [layer.attention.inner_attention for layer in model_config.layers]
 
     assert len(cores) == len(model_config.compress_ratios) == 4
     for core in cores:

@@ -484,6 +484,13 @@ def run_single_test(
         env.update(test_flavor.env_vars)
     env["NGPU"] = str(test_flavor.ngpu)
     env["LOG_RANK"] = all_ranks
+    if test_flavor.ngpu >= 4:
+        # The only 4-NPU model case shares the host with concurrent 2-NPU cases; give it a
+        # distinct host side base port so it cannot collide with their default 60000.  Do not
+        # inherit a platform-set value: an out-of-range port fails every rank at HCCL init.
+        env["HCCL_IF_BASE_PORT"] = "61000"
+    else:
+        env.pop("HCCL_IF_BASE_PORT", None)
 
     golden_losses = None
     if test_flavor.check_loss:

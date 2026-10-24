@@ -36,7 +36,7 @@ CKPT_INIT_LOAD_PATH="${CKPT_INIT_LOAD_PATH:-/path/to/init_load_ckpt}" # your mod
 TP=1
 PP=1
 EP=128
-CP=1
+CP="${CP:-1}"
 DP_SHARD=128
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
@@ -62,6 +62,7 @@ HF_ASSETS_ARGS="
 # Dataloader
 DATALOADER_ARGS="
     --dataloader.dataset ${DATASET}
+    --dataloader.per_doc_alignment $((128 * CP))
     --dataloader.dataset-path ${DATASET_PATH}
 "
 
@@ -148,7 +149,7 @@ else
         # Attention / DSA
         torchtitan_npu.override.common.rms_norm.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 
         torchtitan_npu.override.deepseek_v4.sparse_attn.asc
         # MHC

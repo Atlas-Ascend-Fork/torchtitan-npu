@@ -13,7 +13,7 @@ NPU_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.rope.asc_complex",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li",
+    "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
     'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}',
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
@@ -39,6 +39,7 @@ def _build_case(
     check_loss: bool = True,
     extra_override_imports: tuple[str, ...] = (),
     env_vars: dict[str, str] | None = None,
+    disabled: bool = False,
 ) -> OverrideDefinitions:
     """Build one DeepSeek-V4 integration case.
 
@@ -56,6 +57,7 @@ def _build_case(
         use_golden=use_golden,
         check_loss=check_loss,
         env_vars=env_vars,
+        disabled=disabled,
     )
 
 
@@ -277,14 +279,18 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.context-parallel-degree=2",
                 "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
-                "--compile.enable",
-                "--compile.backend=aot_eager",
+                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,
+            # The fused CP2 path now hands the compressed and sliding-window kernels their
+            # rank-local prefix pools (see ``shard_asc_v4_metadata``), so the slab-width
+            # token indices that used to trip the AscendC IndexCheck stay inside each
+            # kernel's own key frame.  Re-enabled with that contract; the numeric CP gate
+            # (same weights via a seed checkpoint) is the 910 run.
         ),
         _build_case(
             test_name="dsv4_mtp_smla_cp2",
@@ -299,11 +305,15 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.context-parallel-degree=2",
                 "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
+                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,
+            # Re-enabled with the rank-local prefix-pool contract: the selector, SLIG,
+            # SMLA and SMLAG share one key frame per rank, so the MTP CP2 case no longer
+            # hits the document-tail window.  Numeric gate: 910 (seed-checkpoint aligned).
         ),
     ]

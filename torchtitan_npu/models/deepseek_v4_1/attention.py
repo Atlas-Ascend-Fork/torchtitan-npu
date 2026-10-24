@@ -46,12 +46,12 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.common.query_exchange import QueryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
-from .context_parallel import QueryExchange
 from .indexer import HierarchicalIndexer
-from .model import DeepSeekV41Metadata
+from .model import DeepSeekV41Metadata, build_v41_frames
 
 
 class CompressedSparseInnerAttention2(Module):
@@ -111,7 +111,16 @@ class CompressedSparseInnerAttention2(Module):
             del padding_mask, max_num_documents, max_context_length
             bounds = create_varlen_metadata_for_document(positions).cu_seq_q
             pooled = bounds if self.compress_ratio <= 1 else (bounds // self.compress_ratio).to(torch.int32)
-            return DeepSeekV41Metadata(cu_seq_q=bounds, cu_seq_k=pooled, positions_q=positions)
+            q, swa_k, cmp_k = build_v41_frames(bounds, pooled, self.compress_ratio)
+            return DeepSeekV41Metadata(
+                cu_seq_q=bounds,
+                cu_seq_k=pooled,
+                positions_q=positions,
+                ratio=self.compress_ratio,
+                q=q,
+                swa_k=swa_k,
+                cmp_k=cmp_k,
+            )
 
     def __init__(self, config: Config):
         super().__init__()

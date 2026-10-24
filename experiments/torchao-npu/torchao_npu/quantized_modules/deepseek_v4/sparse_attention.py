@@ -19,9 +19,6 @@ __all__ = ["QuantizedV4SparseAttention"]
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import spmd_types as spmd
-from torchtitan.models.common.decoder_sharding import dense_param_placement
-
 if TYPE_CHECKING:
     import torch
 
@@ -40,20 +37,6 @@ class QuantizedV4SparseAttention(AscCompressedSparseInnerAttention):
     class Config(AscCompressedSparseInnerAttention.Config):
         quant_mode: int
         """The selector's quantization ABI (``quant_mode`` of the CANN operator pair)."""
-
-        def build(self, **kwargs):
-            """Build the fused module, with its accumulator's placement declared.
-
-            The fused factory states this entry when it installs the port; this backend replaces
-            that factory, so it states the same entry itself.  By build time the sharding pass has
-            already put the sharding config on this node.
-            """
-            sharding = self.sharding_config
-            if sharding is not None:
-                sharding.state_shardings["_indexer_loss_acc"] = dense_param_placement(tp=spmd.R)
-            # The parent is named explicitly: ``slots=True`` recreates this dataclass, so a
-            # zero-argument ``super()`` would bind to the decorated-away class.
-            return AscCompressedSparseInnerAttention.Config.build(self, **kwargs)
 
         def build_attention_metadata(
             self,

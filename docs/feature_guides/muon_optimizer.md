@@ -67,6 +67,7 @@ bash scripts/run_train.sh \
     torchtitan_npu.override.common.rms_norm.asc \
     torchtitan_npu.override.common.rope.asc_complex \
     torchtitan_npu.override.deepseek_v4.sparse_attn.asc \
+    torchtitan_npu.override.deepseek_v4.lightning_indexer.asc \
     torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \
     torchtitan_npu.override.common.token_dispatcher.asc \
     torchtitan_npu.override.common.optimizer.swap_optimizer

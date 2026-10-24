@@ -37,7 +37,7 @@ config = graph_trainer_deepseek_v4_flash_43layers_16experts
 如果通过 CLI 整体替换 `--override.imports`，须保留以下实验依赖：
 
 ```text
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_token_dispatcher.asc_dispatcher
 ```
 

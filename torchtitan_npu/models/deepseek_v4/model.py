@@ -95,9 +95,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
             # Context parallel is supported on the AscendC fused path only: the
             # core's own metadata (its records depend on the frames) derives the
-            # per-rank dispatch plan when the model's preprocessing hands the CP
-            # mesh to the seam, and only the fused kernels take those frames
-            # through their own metadata.
+            # rank-local frames when the model's preprocessing hands the CP mesh
+            # to the seam, and only the fused kernels take those frames through
+            # their own metadata.  The compressor is CP-agnostic either way: its
+            # carry is applied by ``CarryExchange`` outside it.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -129,7 +130,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             for layers in (self.layers, self.mtp_layers):
                 for layer in layers:
                     attention = layer.attention
-                    inner_attention = attention.compressed_sparse_attention.inner_attention
+                    inner_attention = attention.inner_attention
                     num_flops_per_token += (
                         6 * attention.n_heads * (2 * attention.head_dim) * min(seq_len, inner_attention.window_size)
                     )

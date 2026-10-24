@@ -529,17 +529,17 @@ _ROUTED_EXPERT_SCOPE_SUFFIXES = (".moe.routed_experts.inner_experts",)
 _DSV4_CONFIG_FILTERS = {
     "dense": match_config_fqn_suffix(*_DENSE_SCOPE_SUFFIXES),
     "routed_expert": match_config_fqn_suffix(*_ROUTED_EXPERT_SCOPE_SUFFIXES),
-    "lightning_indexer": match_config_fqn_suffix(".attention.compressed_sparse_attention.lightning_indexer"),
+    "lightning_indexer": match_config_fqn_suffix(".attention.lightning_indexer"),
 }
 
 # The V4 inner attention, at both places the stack carries it: the decoder builds the metadata
 # map from `attention.inner_attention`, while `Attention` reads its key and builds the module from
-# `attention.compressed_sparse_attention.inner_attention`.  The quantized backend replaces the
+# `attention.inner_attention`.  The quantized backend replaces the
 # whole node, so both copies have to become its config -- otherwise the map is keyed by the
 # quantized class while every layer asks for the fused one and reads no metadata at all.
 _v4_inner_attention_filter = match_config_fqn_suffix(
     ".attention.inner_attention",
-    ".compressed_sparse_attention.inner_attention",
+    ".attention.inner_attention",
 )
 
 _v41_compressor_fqn_filter = match_config_fqn_suffix(".attention.compressor")
@@ -677,42 +677,26 @@ def _prepare_quant_lightning_indexer_inputs(
             f"{type(attention_metadata).__name__}; build the stack with the quantized "
             "sparse-attention selector (quantized_attention) instead of the BF16 record."
         )
-    plan = attention_metadata.plan
-    asc = attention_metadata.asc
+    asc = attention_metadata.aicpu_metadata
     li_metadata = None if asc is None else asc.lightning_indexer.fwd
     if li_metadata is None:
         raise RuntimeError("Quantized LI requires the quantized selector record provider")
+    cmp_k = attention_metadata.cmp_k
+    if cmp_k is None or cmp_k.residual is None:
+        raise ValueError("Quantized LI requires the geometry's compressed frame.")
     key = idx_k.flatten(0, 1)
-    if plan.cmp_k_global_gather_indices is not None:
-        key = key[plan.cmp_k_global_gather_indices]
-    else:
-        if plan.block_positions is None:
-            raise ValueError("Quantized LI requires plan.block_positions.")
-        key = key[: plan.block_positions.numel()]
+    # The quantized selector is the unsharded backend (its CP hook refuses a re-cut), and the
+    # compressor emits exactly the row's compressed blocks -- there is no container to strip.
     return DeepSeekV4QuantizedLightningIndexerInputs(
         query=idx_q.flatten(0, 1),
         key=key.unsqueeze(1).contiguous(),
         weights=idx_w.flatten(0, 1).float(),
         topk=module.index_topk,
         metadata=li_metadata,
-        cu_seqlens_q=attention_metadata.varlen.cu_seq_q,
-        cu_seqlens_k=plan.cu_seqlens_cmp_k,
-        cmp_residual_k=plan.block_remainder,
+        cu_seqlens_q=attention_metadata.cu_seq_q,
+        cu_seqlens_k=cmp_k.cu_seqlens,
+        cmp_residual_k=cmp_k.residual,
     )
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class _V41KernelFrame:
-    """One tensor's coordinate frame, as the AI_CPU metadata operators read it.
-
-    The same three fields as the unquantized entry's ``KernelFrame``, restated rather than imported:
-    that class lives in ``torchtitan_npu.override``, which this package may not depend on (see
-    ``docs/architecture.md``), and the quantized entry is this package's own.
-    """
-
-    cu_seqlens: torch.Tensor
-    seqused: torch.Tensor
-    residual: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -721,13 +705,10 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
 
     Same interface as the unquantized stack's entry (``aicpu_metadata.sparse_attn`` /
     ``.lightning_indexer``), built by this package because the quantized attention is its own
-    backend: it is the fused attention's copy with the sliding-window KV fake-quantized.
+    backend: it is the fused attention's copy with the sliding-window KV fake-quantized.  The
+    row and its frames are the model metadata's; this entry adds only the operator outputs.
     """
 
-    ratio: int
-    q: _V41KernelFrame
-    swa_k: _V41KernelFrame
-    cmp_k: _V41KernelFrame | None
     aicpu_metadata: Any
 
     @staticmethod
@@ -742,42 +723,6 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
             "the quantized sparse attention does not rebuild its metadata per rank yet: run it "
             "with --parallelism.context-parallel-degree 1."
         )
-
-
-def _v41_frames(
-    row: _DeepSeekV41Metadata, ratio: int
-) -> tuple[_V41KernelFrame, _V41KernelFrame, _V41KernelFrame | None]:
-    """This geometry's three frames, read off the row the reference builder produced.
-
-    ``cu_seq_k`` is already folded at this ratio by the backend that built the row, so the
-    compressed frame needs nothing but the per-document lengths for ``seqused``/``residual``.
-    """
-    cu_seqlens = row.cu_seq_q
-    expected = cu_seqlens if ratio <= 1 else (cu_seqlens // ratio).to(torch.int32)
-    if not torch.equal(row.cu_seq_k, expected):
-        raise ValueError(
-            f"the row's cu_seq_k was not folded at compress_ratio {ratio}: build the metadata "
-            "through the attention backend that owns this layer's ratio."
-        )
-    seqused = torch.diff(cu_seqlens).to(torch.int32)
-    q = _V41KernelFrame(cu_seqlens=cu_seqlens, seqused=seqused)
-    swa_k = _V41KernelFrame(cu_seqlens=cu_seqlens, seqused=seqused)
-    cmp_k = None
-    if ratio > 0:
-        cmp_k = _V41KernelFrame(
-            cu_seqlens=row.cu_seq_k,
-            seqused=(seqused // ratio).to(torch.int32),
-            # Ratio one addresses the row itself: the axis is not folded, so the kernels reject a
-            # trailing-group value for it.
-            residual=None if ratio == 1 else (seqused % ratio).to(torch.int32),
-        )
-        if cmp_k.residual is not None and bool(cmp_k.residual.any()):
-            raise ValueError(
-                f"compress_ratio {ratio} has a partial trailing group: a document length is not a "
-                f"multiple of the pooling ratio ({cmp_k.residual.tolist()}). The dataloader's "
-                "document alignment must be a multiple of every ratio the stack pools at."
-            )
-    return q, swa_k, cmp_k
 
 
 class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
@@ -823,7 +768,7 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
             )
-            q, swa_k, cmp_k = _v41_frames(row, self.compress_ratio)
+            q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
             return _V41QuantAttentionMetadata(
                 cu_seq_q=row.cu_seq_q,
                 cu_seq_k=row.cu_seq_k,
@@ -1320,7 +1265,7 @@ def _recipe_converters(
             if asc_kwargs is None:
                 raise ValueError(
                     "V4 LightningIndexer quantization requires the fused stack: add "
-                    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc (and .asc_li) to "
+                    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc (and .lightning_indexer.asc) to "
                     "--override.imports."
                 )
             geometry = _v4_attention_numbers(model_config)
@@ -1339,7 +1284,6 @@ def _recipe_converters(
                     replacement_config_type=QuantizedV4SparseAttention.Config,
                     replacement_kwargs={
                         **geometry,
-                        "indexer_loss_coeff": asc_kwargs.get("indexer_loss_coeff", 1.0),
                         "quant_mode": cast("DeepSeekV4QuantLightningIndexerConfig", li_config).quant_mode,
                     },
                     target_config_types=(Module.Config,),

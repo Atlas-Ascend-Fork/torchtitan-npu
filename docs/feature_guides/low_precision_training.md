@@ -88,6 +88,10 @@ LI 各模式的实现细节不同：`fp8` 使用 8 bit E4M3 数据，按 token-h
 
 `li-quantization` 默认值为 `None`，即不启用 LI 量化。本节表中的四种格式适用于 DeepSeek-V4；DeepSeek-V4.1 当前仅支持 `mxfp4`，并使用下一节说明的独立 QLI/QSLI 实现。
 
+> DeepSeek-V4 的 indexer 训练现在走独立的 `sparse_attn.asc` + `lightning_indexer.asc`
+> 教师边；量化 LI（`torchao_npu` 的 `QuantizedV4SparseAttention` 路径）尚未提供这条边的
+> 量化反向，因此该路径只做选分、不训练 indexer。BF16 融合路径不受影响。
+
 ### DeepSeek-V4.1 LI 与稀疏 attention 量化
 
 QLI（Quantized Lightning Indexer，量化索引器）与 QSLI（Quantized Sparse Lightning Indexer，量化稀疏索引器）负责为每个 query 选择参与稀疏 attention 的 Top-K key。在当前 V4.1 实现中，两者都将 indexer 的 Q/K 量化为 MXFP4，主要区别是选分的搜索范围及是否生产候选池：

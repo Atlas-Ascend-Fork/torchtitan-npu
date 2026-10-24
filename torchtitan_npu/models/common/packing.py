@@ -17,6 +17,8 @@ each ratio inside one document.
 import math
 from collections.abc import Sequence
 
+import torch
+
 
 def compression_alignment(compress_ratios: Sequence[int]) -> int:
     """The ``A`` a packed document length must be a multiple of, ``1`` when none.
@@ -31,3 +33,68 @@ def compression_alignment(compress_ratios: Sequence[int]) -> int:
         if ratio > 0:
             alignment = math.lcm(alignment, ratio)
     return alignment
+
+
+def require_document_alignment(
+    cu_seqlens: torch.Tensor,
+    *,
+    cp_size: int = 1,
+    ratio: int = 1,
+) -> int:
+    """Validate one packed row's document lengths against the packing grid.
+
+    The required multiple is ``cp_size * max(ratio, 1)``: ``ratio`` keeps every pooling group
+    inside one document, and ``cp_size`` keeps every rank's chunk of that document
+    ratio-aligned -- each rank owns ``length / cp_size`` tokens, so a length that is only a
+    multiple of ``ratio`` can leave a chunk with a partial compressed block.  That strict form
+    is the contract (intentional, do not relax it): the fused compressors grid whole groups
+    only.
+
+    The loader satisfies it by padding through ``--dataloader.per_doc_alignment``, which must
+    be a multiple of the returned value.  The check runs on the boundaries tensor (no host
+    round-trip).  Returns the required multiple.
+    """
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    required = max(cp_size, 1) * max(ratio, 1)
+    if bool((lengths <= 0).any()) or bool((lengths % required).any()):
+        factors = []
+        if cp_size > 1:
+            factors.append(f"cp_size={cp_size}")
+        if ratio > 1:
+            factors.append(f"compress_ratio={ratio}")
+        what = " x ".join(factors) if factors else "the packing grid"
+        raise ValueError(
+            f"document lengths must be positive multiples of {required} ({what}), got "
+            f"{lengths.tolist()}. Pad every document through `--dataloader.per_doc_alignment` "
+            f"(a multiple of {required}): under context parallel each rank's chunk must stay "
+            "ratio-aligned, and partial compression blocks are not supported."
+        )
+    return required
+
+
+def require_per_doc_alignment(
+    per_doc_alignment: int,
+    compress_ratios: Sequence[int],
+    cp_degree: int,
+) -> int:
+    """Validate the loader's per-document padding against the model's packing grid.
+
+    ``required = compression_alignment(ratios) * cp_degree``: every document is padded to the
+    stack-wide lcm (each ratio's groups stay inside one document) and, under context parallel,
+    to a multiple of the degree as well -- each document is split into ``cp_degree`` equal
+    chunks and every chunk must keep a whole number of groups.  That is intentional: partial
+    compressed blocks are not part of the validated kernel contract.
+
+    Raises a CLI-pointed error when the loader would produce a row the compressor cannot grid;
+    returns ``required`` so a caller can log it or derive a default.
+    """
+    required = compression_alignment(compress_ratios) * max(cp_degree, 1)
+    if per_doc_alignment < 1 or per_doc_alignment % required:
+        raise ValueError(
+            f"`--dataloader.per_doc_alignment={per_doc_alignment}` is not a multiple of "
+            f"{required} (= compression_alignment({tuple(compress_ratios)}) * "
+            f"cp_degree={cp_degree}). A context-parallel run splits every document into "
+            f"{cp_degree} chunks and each chunk must stay ratio-aligned; set "
+            f"--dataloader.per_doc_alignment to a multiple of {required}."
+        )
+    return required

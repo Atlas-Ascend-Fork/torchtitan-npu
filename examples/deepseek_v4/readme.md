@@ -79,13 +79,11 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
 128K 场景不新增 launcher，只通过 CLI 改变并行和训练配置：
 
 ```sh
-NODE_IPS="${NODE_IPS}" \
+CP=32 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
   --compile.enable \
   --compile.components model \
   --compile.backend inductor \
-  --parallelism.context-parallel-degree 32 \
-  --parallelism.context-parallel-load-balancer None \
   --parallelism.data-parallel-shard-degree 1 \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.seq-len 131072 \
@@ -151,13 +149,11 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
 64K 不需要新增 launcher，直接在 A5 4K 入口上覆盖训练和并行参数：
 
 ```sh
-NODE_IPS="${NODE_IPS}" \
+CP=8 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --compile.enable \
   --compile.components model \
   --compile.backend inductor \
-  --parallelism.context-parallel-degree 8 \
-  --parallelism.context-parallel-load-balancer None \
   --parallelism.data-parallel-shard-degree 16 \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.seq-len 65536 \
@@ -183,8 +179,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
 等价的主要差异参数为：
 
 ```sh
---parallelism.context-parallel-degree 128 \
---parallelism.context-parallel-load-balancer None \
+CP=128 \
 --parallelism.data-parallel-shard-degree 1 \
 --parallelism.data-parallel-replicate-degree 1 \
 --training.seq-len 1048576 \

@@ -21,12 +21,12 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4_1.context_parallel import (
+from torchtitan_npu.models.common.query_exchange import (
     ExchangeMetadata,
     QueryExchange,
     cp_plan,
 )
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import (
     DeepSeekV41Metadata,
     DeepSeekV41Model,
@@ -197,7 +197,7 @@ def test_the_plan_rejects_a_row_it_cannot_grid(cu, cp_size, why):
     ``// cp_size`` on a ragged length is silent, and a zero-length chunk turns the receive
     side's interval arithmetic into an out-of-range index, so both are checked up front.
     """
-    with pytest.raises(ValueError, match="positive multiple of cp_size"):
+    with pytest.raises(ValueError, match="positive multiples of"):
         cp_plan(_bounds(list(cu)), cp_size, 0, max(1, list(cu)[-1] // cp_size))
 
 
@@ -218,7 +218,7 @@ def test_the_sharded_path_checks_the_launcher_contract(documents, cp_size):
     prefix is a partial group (the kernels grid an axis the pooling did not produce).  Both failures
     are silent downstream, so the check is a precondition rather than a diagnostic.
     """
-    with pytest.raises(ValueError, match="document alignment"):
+    with pytest.raises(ValueError, match="per_doc_alignment"):
         _masks(_positions(*documents), cp_size, cp_size - 1)
 
 

@@ -77,6 +77,7 @@ HF_ASSETS_ARGS="
 # Dataloader
 DATALOADER_ARGS="
     --dataloader.dataset ${DATASET}
+    --dataloader.per_doc_alignment $((128 * CP))
     --dataloader.dataset-path ${DATASET_PATH}
 "
 
@@ -158,7 +159,7 @@ else
         torchtitan_npu.override.common.rope.asc_partial
         torchtitan_npu.override.deepseek_v4.compressor.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 
         'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":128}'
         # MHC

@@ -32,6 +32,8 @@ import torch
 from torch.distributed._functional_collectives import all_to_all_single
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.common.packing import require_document_alignment
+
 __all__ = [
     "ExchangeMetadata",
     "QueryExchange",
@@ -136,12 +138,12 @@ def cp_plan(cu_seqlens: torch.Tensor, cp_size: int, rank: int, seq_len: int) -> 
     """Derive one rank's plan, locally, from the global document boundaries.
 
     ``seq_len`` is the slab width ``C``.  Every document length must be a positive multiple of
-    ``cp_size`` so that a chunk is a whole number of rows; it is checked here because a
-    violation would otherwise come back as a silently wrong split rather than an error.
+    ``cp_size`` so that a chunk is a whole number of rows; the shared packing check
+    (``require_document_alignment``) enforces it here, and a caller that pools additionally
+    enforces ``cp_size * ratio`` at its own entry.
     """
+    require_document_alignment(cu_seqlens, cp_size=cp_size)
     lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    if bool((lengths % cp_size).any()) or bool((lengths <= 0).any()):
-        raise ValueError(f"every document must be a positive multiple of cp_size={cp_size}, got {lengths.tolist()}")
     chunk = lengths // cp_size
     device = cu_seqlens.device
 

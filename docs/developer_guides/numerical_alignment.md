@@ -89,7 +89,7 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 
 示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较参考实现（模型默认 attention）和融合实现的 `loss`、`grad_norm`。
 
-注意：参考组合（模型默认 attention）不训练 `r=4` 层的 indexer——TopK 选择不可导，KL 蒸馏目标只在融合组合（`asc_li` / SLIG）中——对比 `indexer` 相关参数或依赖其梯度的 `grad_norm` 时不要把参考组合当作训练对照。参考组合因此只能配 AdamW；`DistMuon` 要求所有参数都有梯度，会报 `missing gradients`。
+注意：参考组合（模型默认 attention）不训练 `r=4` 层的 indexer——TopK 选择不可导，KL 蒸馏目标只在融合组合（`sparse_attn.asc` + `lightning_indexer.asc`，SMLAG → SLIKG）中——对比 `indexer` 相关参数或依赖其梯度的 `grad_norm` 时不要把参考组合当作训练对照。参考组合因此只能配 AdamW；`DistMuon` 要求所有参数都有梯度，会报 `missing gradients`。
 
 训练对比默认使用 `seq_len=4096`；其他长度通过 `--seq-len` 统一指定。
 

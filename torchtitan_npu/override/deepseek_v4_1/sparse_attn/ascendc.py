@@ -9,8 +9,10 @@ from dataclasses import dataclass
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
+from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.common.packing import require_document_alignment
+from torchtitan_npu.models.common.query_exchange import cp_plan
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4_1.context_parallel import cp_plan
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
@@ -21,7 +23,6 @@ from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuMetadata,
     AscLightningIndexerMetadata,
     AscSparseAttentionMetadata,
-    KernelFrame,
 )
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
@@ -100,14 +101,14 @@ def kernel_options(
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class AscV41Metadata(DeepSeekV41Metadata):
-    """The row, this geometry's kernel frames, and the AI_CPU metadata its kernels read.
+    """The model row with this geometry's AscendC records attached.
 
     One entry per ``(port, ratio)``: the map key is this port's own config plus the layer's
     compression ratio, so every layer reads an entry built for its own geometry and no builder
-    has to know the stack's ratio table.  The frames are this geometry's own -- the query's, the
-    sliding window's and the compressed axis's -- and ``aicpu_metadata`` holds the operator
-    outputs for exactly those frames, computed at the eager boundary once per microbatch and
-    rebuilt per rank under context parallelism from the rank-local frames.
+    has to know the stack's ratio table.  The row and its frames are the model's -- they
+    describe the tensors -- and this entry adds exactly what the fused kernels read on top of
+    them: ``aicpu_metadata``, the operator outputs computed for those frames at the eager
+    boundary once per microbatch and rebuilt per rank under context parallelism.
 
     Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``):
     one model runs one selection width, so there is nothing to look up.  Nothing here compares the
@@ -117,10 +118,6 @@ class AscV41Metadata(DeepSeekV41Metadata):
     node (see the registration below).
     """
 
-    ratio: int
-    q: KernelFrame
-    swa_k: KernelFrame
-    cmp_k: KernelFrame | None
     aicpu_metadata: AicpuMetadata
 
     @staticmethod
@@ -189,19 +186,10 @@ def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: Aicp
             "through the attention backend that owns this layer's ratio, not from a row built "
             "for another geometry."
         )
-    seqused = torch.diff(cu_seqlens).to(torch.int32)
-    cmp_k = None
-    if ratio > 0:
-        cmp_k = KernelFrame(
-            cu_seqlens=row.cu_seq_k,
-            seqused=(seqused // ratio).to(torch.int32),
-            # A ratio of one addresses the row itself: the axis is not folded, so there is no
-            # trailing group and the kernels reject a value for one.
-            residual=None if ratio == 1 else (seqused % ratio).to(torch.int32),
-        )
+    # The frames are the row's: the model metadata already built them for exactly this
+    # geometry, so the port only attaches the operator outputs sized by them.
+    q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
     validate_compressed_frame(ratio, cmp_k)
-    q = KernelFrame(cu_seqlens=cu_seqlens, seqused=seqused)
-    swa_k = KernelFrame(cu_seqlens=cu_seqlens, seqused=seqused)
     return AscV41Metadata(
         cu_seq_q=cu_seqlens,
         cu_seq_k=row.cu_seq_k,
@@ -253,13 +241,7 @@ def shard_asc_v41_metadata(
     # This check subsumes ``validate_compressed_frame``: a document that is a whole multiple of
     # ``cp_size * ratio`` leaves no partial group either, and the build that produced this entry
     # already ran that check at ``cp_size = 1``.
-    alignment = cp_size * max(ratio, 1)
-    if bool((seqused % alignment).any()):
-        raise ValueError(
-            f"a document length is not a multiple of cp_size * compress_ratio = {alignment}: "
-            f"got {seqused.tolist()}. The dataloader's document alignment must be a multiple "
-            "of that value, the same one at every context-parallel degree being compared."
-        )
+    require_document_alignment(cu_seqlens, cp_size=cp_size, ratio=ratio)
     chunk = (seqused // cp_size).to(torch.int32)
     # The slab is what the chunk grid has to reproduce: the row is cut into ``cp_size`` slabs and
     # the chunks are this rank's share of every document, so the two must size the same.

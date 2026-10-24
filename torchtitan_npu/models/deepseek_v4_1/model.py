@@ -46,6 +46,8 @@ import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
+from torchtitan_npu.models.common.metadata import KernelFrame
+
 from .engram import Engram  # noqa: TC001
 from .indexer import IndexerMode
 from .mhc import HcPost, HcPre
@@ -53,10 +55,10 @@ from .mhc import HcPost, HcPre
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE
 
+    from torchtitan_npu.models.common.query_exchange import ExchangeMetadata
     from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import AttentionMetadataMap
 
     from .attention import Attention
-    from .context_parallel import ExchangeMetadata
     from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
 
@@ -65,11 +67,17 @@ class DeepSeekV41Metadata:
     """The packed row's frames, built by the attention backends' config.
 
     Upstream's pair of cumulative boundaries -- ``cu_seq_q`` for the queries and ``cu_seq_k`` for
-    the keys this entry addresses -- plus the query side's own positions and, under context
-    parallelism, its movement.  ``cu_seq_k`` is the **pool grid**: an entry belongs to one
-    compression ratio (the metadata map key carries it), so the backend that builds the entry
-    pools the row there and no consumer divides by its ratio at call time.  A layer that pools at
-    all but addresses the row itself (ratio 0 or 1) gets ``cu_seq_k == cu_seq_q``.
+    the keys this entry addresses -- plus one :class:`KernelFrame` per addressed tensor (the
+    queries, the sliding-window keys and, for a geometry that pools, the compressed keys), the
+    query side's own positions and, under context parallelism, its movement.  ``cu_seq_k`` is the
+    **pool grid**: an entry belongs to one compression ratio (the metadata map key carries it), so
+    the backend that builds the entry pools the row there and no consumer divides by its ratio at
+    call time.  A layer that pools at all but addresses the row itself (ratio 0 or 1) gets
+    ``cu_seq_k == cu_seq_q`` and still declares the two key frames.
+
+    A vendor backend extends this entry with the records its own kernels launch (the AscendC
+    entry adds ``aicpu_metadata``); the frames belong here, because they describe the tensors
+    rather than any kernel's operator outputs.
     """
 
     cu_seq_q: torch.Tensor
@@ -85,6 +93,19 @@ class DeepSeekV41Metadata:
     """The **query** frame's own positions.  The positions carried beside the input describe the
     keys -- under CP the queries are a permuted copy of the rows that carry them -- so every
     consumer that rotates a query reads them here, at every degree, without a fallback."""
+
+    ratio: int
+    """The compression ratio this entry describes; every consumer grids this ratio."""
+
+    q: KernelFrame
+    """The query frame: the row's boundaries at one degree, this rank's chunks under CP."""
+
+    swa_k: KernelFrame
+    """The sliding-window keys' frame: the whole row at every degree, with ``seqused`` the
+    per-document reach."""
+
+    cmp_k: KernelFrame | None
+    """The compressed pool's frame (``None`` for a geometry that does not pool)."""
 
     exchange: ExchangeMetadata | None = None
     """Under context parallelism the query side's movement: the query frame is this rank's
@@ -111,6 +132,27 @@ class DeepSeekV41Metadata:
             "override.deepseek_v4_1.lightning_indexer.asc) to run with "
             "--parallelism.context-parallel-degree."
         )
+
+
+def build_v41_frames(
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    ratio: int,
+) -> tuple[KernelFrame, KernelFrame, KernelFrame | None]:
+    """The row's frames: boundary differences as the prefixes, the pool folded at this ratio."""
+    seqused = torch.diff(cu_seq_q).to(torch.int32)
+    q = KernelFrame(cu_seqlens=cu_seq_q, seqused=seqused)
+    swa_k = KernelFrame(cu_seqlens=cu_seq_q, seqused=seqused)
+    cmp_k = None
+    if ratio > 0:
+        cmp_k = KernelFrame(
+            cu_seqlens=cu_seq_k,
+            seqused=(seqused // ratio).to(torch.int32),
+            # A ratio of one addresses the row itself: the axis is not folded, so there is no
+            # trailing group and the kernels reject a value for one.
+            residual=None if ratio == 1 else (seqused % ratio).to(torch.int32),
+        )
+    return q, swa_k, cmp_k
 
 
 class DeepSeekV41TransformerBlock(TransformerBlock):

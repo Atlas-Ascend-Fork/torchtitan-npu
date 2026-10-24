@@ -163,8 +163,14 @@ class _FirstRowPositionsMixin:
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if positions is not None and positions.size(0) > 1:
-            positions = positions[0].unsqueeze(0)
+        if positions is not None:
+            # ``positions`` is per batch row, and the fused cosine/sine table is row-invariant,
+            # so one row is enough.  Take it with a slice rather than a ``size(0) > 1`` branch:
+            # the leading dim is marked dynamic (``_mark_dynamic``), and Dynamo cannot guard on
+            # a data-dependent ``size(0) > 1`` once that symbol loses its hint ("Could not
+            # guard on data-dependent expression u0 > 1").  ``[:1]`` is shape-stable and
+            # returns the same tensor for the single-row case the branch used to pass through.
+            positions = positions[:1]
         return super()._reshape_cache(  # pyrefly: ignore [missing-attribute]
             query, positions
         )

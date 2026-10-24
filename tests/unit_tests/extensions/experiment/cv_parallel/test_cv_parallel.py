@@ -13,7 +13,7 @@ import torch
 import torch_npu
 from torch import fx
 from torchtitan.experiments.graph_trainer import passes as graph_passes
-from torchtitan.experiments.graph_trainer.registry import PASS_PIPELINE_REGISTRY, POST_INIT_HOOKS
+from torchtitan.experiments.graph_trainer.registry import PASS_PIPELINE_REGISTRY
 
 from torchtitan_npu.extensions.experiment.cv_parallel import (
     batch_chunk,
@@ -22,21 +22,21 @@ from torchtitan_npu.extensions.experiment.cv_parallel import (
     schedule_search,
     schedule_simulation,
 )
+from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
+    chunk_attention_metadata,
+)
 from torchtitan_npu.extensions.experiment.cv_parallel.cv_parallel import (
     dependency_only_schedule,
     event_frontiers,
     materialize,
 )
-from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
-    chunk_attention_metadata,
-)
 from torchtitan_npu.extensions.experiment.cv_parallel.schedule_calibration import build_profile_schedule
-from torchtitan_npu.override.deepseek_v4.metadata import AscV4Metadata
 from torchtitan_npu.extensions.experiment.cv_parallel.whole_graph_runtime_profile import (
     RankLocalProfileCosts,
     assign_stable_node_tags,
     node_id,
 )
+from torchtitan_npu.override.deepseek_v4.metadata import AscV4Metadata
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
@@ -888,18 +888,9 @@ def test_npu_reorder_retains_window_and_effect_boundaries(rms_reorder_window, co
     assert schedule.order.index(norm) < schedule.order.index(v0)
 
 
-@pytest.mark.parametrize(
-    "shared_qk,chunk_only_metadata",
-    [(False, False), (True, True)],
-    ids=["separate_qk", "shared_qk_extra_roles"],
-)
-def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
-    dsv4, shared_qk, chunk_only_metadata, monkeypatch
-):
-    import dataclasses
-
+@pytest.mark.parametrize("chunk_only_metadata", [False, True], ids=["full_roles", "chunk_only_extra_roles"])
+def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_metadata, monkeypatch):
     from torchtitan.config.override import apply_overrides
-    from torchtitan.models.common.attention import VarlenMetadata
 
     from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
         _batch_chunk_metadata,
@@ -941,32 +932,19 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
     # the ratio-4 layer's own entry: that is the geometry the LI record belongs to.
     positions = torch.cat([torch.arange(128), torch.arange(128)]).unsqueeze(0)
     core_config = next(
-        layer.attention.compressed_sparse_attention.inner_attention
+        layer.attention.inner_attention
         for layer in config.model_spec.model.layers
-        if layer.attention.compressed_sparse_attention.inner_attention.compress_ratio == 4
+        if layer.attention.inner_attention.compress_ratio == 4
     )
     metadata = core_config.build_attention_metadata(positions)
     assert metadata.ratio == 4
-    if not shared_qk:
-        # A stack whose q/k boundaries are distinct (but equal) tensors: the
-        # local re-cut has to keep both roles apart.
-        varlen = metadata.varlen
-        metadata = dataclasses.replace(
-            metadata,
-            varlen=VarlenMetadata(
-                cu_seq_q=varlen.cu_seq_q,
-                cu_seq_k=varlen.cu_seq_q.clone(),
-                max_q=varlen.max_q,
-                max_k=varlen.max_k,
-                cu_seq_q_host=varlen.cu_seq_q_host,
-            ),
-        )
     metadata = _batch_chunk_metadata(metadata)
 
-    assert metadata.varlen.cu_seq_q.tolist() == [0, 128, 256]
-    assert (metadata.varlen.cu_seq_k is metadata.varlen.cu_seq_q) == shared_qk
+    # The row stays the row; ``cu_seq_k`` is this entry's own fold of it.
+    assert metadata.cu_seq_q.tolist() == [0, 128, 256]
+    assert metadata.cu_seq_k.tolist() == [0, 32, 64]
     assert metadata.batch_chunk_tensors is not None
-    assert metadata.varlen.cu_seq_q._npu_chunk_cv_metadata_pair == ("varlen.cu_seq_q", -1)
+    assert metadata.cu_seq_q._npu_chunk_cv_metadata_pair == ("cu_seq_q", -1)
     assert len(li_calls) == 3
     for (_, call), q_bounds, k_bounds in zip(
         li_calls, ([0, 128, 256], [0, 128], [0, 128]), ([0, 32, 64], [0, 32], [0, 32]), strict=True
@@ -974,19 +952,17 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
         assert call["cu_seqlens_q"].tolist() == q_bounds
         assert call["cu_seqlens_k"].tolist() == k_bounds
         assert (call["layout_q"], call["layout_k"], call["mask_mode"], call["cmp_ratio"]) == ("TND", "TND", 3, 4)
-    assert metadata.asc.lightning_indexer.fwd.tolist() == [0, 256]
+    assert metadata.aicpu_metadata.lightning_indexer.fwd.tolist() == [0, 256]
     for chunk_id, tensors in enumerate(metadata.batch_chunk_tensors):
         fields = {value._npu_chunk_cv_metadata_pair: value for value in tensors}
-        assert fields["varlen.cu_seq_q", chunk_id].tolist() == [0, 128]
-        assert (("varlen.cu_seq_k", chunk_id) in fields) != shared_qk
-        if not shared_qk:
-            assert fields["varlen.cu_seq_k", chunk_id].tolist() == [0, 128]
+        assert fields["cu_seq_q", chunk_id].tolist() == [0, 128]
+        assert fields["cu_seq_k", chunk_id].tolist() == [0, 32]
         # One entry is one geometry: the chunk re-cut carries this geometry's record set, and
         # the role names are geometry-free because the ratio is part of the metadata.
-        assert (("asc.sparse_attn.fwd", chunk_id) in fields) != chunk_only_metadata
-        assert ("asc.sparse_attn.bwd", chunk_id) in fields
-        assert ("asc.lightning_indexer.fwd", chunk_id) in fields
-        assert fields["asc.lightning_indexer.fwd", chunk_id].tolist() == [0, 128]
+        assert (("aicpu.sparse_attn.fwd", chunk_id) in fields) != chunk_only_metadata
+        assert ("aicpu.sparse_attn.bwd", chunk_id) in fields
+        assert ("aicpu.lightning_indexer.fwd", chunk_id) in fields
+        assert fields["aicpu.lightning_indexer.fwd", chunk_id].tolist() == [0, 128]
 
 
 def test_chunk_attention_metadata_refuses_other_record_tiers():

@@ -25,7 +25,7 @@
 - MTP：新增 `patches/torchtitan/models/deepseek_v3/mtp.py`（#4897 的 `MTPDecoder.forward` 回移）。`DeepSeekV3Model(MTPDecoder)`，V3.2 继承它，map 以 keyword-only `attention_metadata` 进入，逐层（含 MTP 深度）分发。
 - **暂不在基类装 builder**：上游把通用 builder 装在 `VarlenInnerAttention.Config` 上，但本仓 `override/qwen3_5/parallelize.py` 在 parallelize 钩子里改写 `kwargs["attention_masks"]`（CP 下转 `QwenCPMetadata`）。若给基类 `VarlenAttention.Config` 加 builder，qwen3.5 会自动切到 map 路径而丢掉这个变换。因此本阶段 builder 按栈声明，等 qwen3.5 一起迁（或明确排除）后再回移基类版本。
 - 验证：`tests/unit_tests/models/deepseek_v3_2/test_metadata_seam.py`（新增 5 例：一次构建/全层共享、`preprocess_inputs` 交 map、Asc 条目含 host 列表、CP 逐 rank 重建、参考核拒绝）、`tests/unit_tests/patches/.../test_context_parallel_metadata.py`（+2 例）、`mtp_test_utils` 改走 `preprocess_inputs`；`patches/models/override/extensions` 四目录失败集合与基线逐条一致（models 27、extensions 2、override 3 全是既有环境失败）。
-- 顺带修掉随本步失效的引用：`tests/integration_tests/deepseek_v3_2.py` 的 override 列表、`torchtitan_npu/override/README.md` 的 V3.2 表、`docs/feature_guides/fused_ops.md`、`docs/feature_guides/deepseek_v4_cp.md`。
+- 顺带修掉随本步失效的引用：`tests/integration_tests/deepseek_v3_2.py` 的 override 列表、`torchtitan_npu/override/README.md` 的 V3.2 表、`docs/feature_guides/fused_ops.md`、`docs/feature_guides/context_parallel.md`。
 
 ### 2b. V4.1
 - `models/deepseek_v4_1/model.py`：`DeepSeekV41Metadata` 增 `cu_seq_k`（后端按自己的 `compress_ratio` 折好的池化轴，`build_row_attention_metadata` 随之下线、改由后端直接调 `create_varlen_metadata_for_document`）；`KernelFrame` 组装搬进 `AscV41SparseAttention.Config.build_attention_metadata`；`prepare_cp_metadata` 承担现在的 `_sharded_attention_masks`（含 engram halo、`exchange.positions_q`）。
@@ -47,7 +47,7 @@
 - `extensions/adaptor/torchao/converter.py`：量化 LI provider 改为**注册 record builder**，不再 subclass `LightningIndexerMetadata`。
 - `extensions/experiment/cv_parallel/batch_chunk_metadata.py` + `batch_chunk.py`：删 `_chunk_li_metadata` 反手接线，改按 records 切分。
 - `patches/torchtitan/components/validate.py` 与 trainer 的 `preprocess_inputs` 调用保持（Step 1 已成形）；确认无模型再需要 `build_attention_masks`。
-- 删除 `models/common/metadata_extension.py` 与 `.ci` 两条债务边；更新 `docs/feature_guides/deepseek_v4_tnd.md`、`deepseek_v4_cp.md`（决策 1 表述）、`override/README.md` 的 override 表。
+- 删除 `models/common/metadata_extension.py` 与 `.ci` 两条债务边；更新 `docs/feature_guides/deepseek_v4_tnd.md`、`context_parallel.md`（决策 1 表述）、`override/README.md` 的 override 表。
 
 ## 每步的完成标准
 

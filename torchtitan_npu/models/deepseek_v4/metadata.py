@@ -3,176 +3,139 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Document-packed compression metadata for DeepSeek-V4.
+"""Document-packed attention metadata for DeepSeek-V4.
 
-One entry describes **one compression ratio**: the plan its kernels grid, over the row this
-builder derives from ``positions``.  The decoder builds the entry once per microbatch for every
-distinct ``(backend, ratio)`` key and hands each layer the one its own attention named, exactly as
-upstream #4897's seam does.  Nothing here is a stack-wide ratio table, and no entry carries more
-than the geometry it was built for.
+The contract is the V4.1 one: **one** dataclass with **one** set of fields describes a geometry at
+every context-parallel degree, and only the values differ.  An entry is built once per microbatch
+per geometry by the attention backend's config (the map key is that backend's class plus the
+layer's compression ratio) and handed to every layer of the geometry, exactly as upstream #4897's
+seam does.
 
 The container grid is ``[1, S]`` (the packed scenario runs with ``local_batch_size == 1``; raise
 ``seq_len`` instead), so ``batch_size == 1`` and ``seq_len`` is the total token count
 ``cu_seq_q[-1]`` -- both derived from the row, neither stored.
 
-The **vendor records** (the AscendC AI_CPU metadata, for one) are the port's own: they extend
-this contract in the backend that consumes them (``override/deepseek_v4``), and this module
-carries none.
+``cu_seq_q`` is the **row's** document boundaries: under context parallelism the KV side stays the
+whole row and is gathered declaratively at the kernel boundary, so the row's grid never becomes a
+rank-local one.  ``cu_seq_k`` is the same boundaries folded at this entry's ratio (they *are* the
+row's for a geometry that does not pool), which is the compressed pool the queries address.
 
-The **context-parallel layer** lives in ``token_dispatcher.py``: a ratio-independent ``WindowPlan``
-(``window``) and the geometry's own block plan (``plan``).  :meth:`DeepSeekV4Metadata.prepare_cp_metadata`
-(upstream #4617's hook) **refuses** context parallel: this contract describes one contiguous
-document stream.  The fused backend's entry overrides the hook and rebuilds itself for this rank
-(``override/deepseek_v4``).
+The row is described by one :class:`~torchtitan_npu.models.common.metadata.KernelFrame` per
+addressed tensor -- the queries, the sliding-window keys and, for a geometry that pools, the
+compressed keys.  ``build_v4_metadata`` derives them from the boundaries above, so the reference
+core and a fused port grid the same frames; a vendor backend attaches only the AI_CPU records its
+kernels launch.  Under context parallelism the fused entry's ``prepare_cp_metadata`` rebuilds the
+frames for the rank's chunks (``shard_asc_v4_metadata``); the reference entry refuses CP, because
+it hands one grid to both sides of the attention.
 
-The kernel-layout derivation is the **plain-stream** contract: documents are aligned to the
-compression grid (the loader pads each document to ``lcm(compress_ratios)``,
-``dataloader.per_doc_alignment``), so a document is always a whole number of blocks and a block
-never straddles a document edge.  ``_build_plan`` therefore derives the plan as the row divided by
-its ratio -- no per-document scan, no partial trailing block, no empty plain pool -- and refuses a
-stream that breaks the contract.  Context-parallel-shaped streams are refused too: those plans
-come from ``build_cp_plan`` (``token_dispatcher.py``), where a rank's slab may cut a block and the
-borrow machinery applies.
+Nothing here describes the compressor's *internal* stream: under the ratio-4 overlap the carry
+block a rank prepends lives in ``models/common/carry_exchange.CarryExchange``, which builds the
+augmented boundaries at the call site and hands them to the compressor as an argument.  A
+compressor is therefore CP-agnostic: it sees one local stream, one set of positions and, for the
+overlap, one set of ``cu_seqlens``.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 import torch
-from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.common.attention import create_varlen_metadata_for_document
+
+from torchtitan_npu.models.common.document_intervals import document_intervals
+from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.common.packing import require_document_alignment
 
 if TYPE_CHECKING:
-    from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
-        CPVarlenMetadata,
-    )
-
-    from .token_dispatcher import ExchangePlan, WindowPlan
+    from torchtitan_npu.models.common.query_exchange import ExchangeMetadata
 
 __all__ = [
-    "CompressedBlockLayout",
-    "CompressedKernelContract",
     "DeepSeekV4Metadata",
-    "build_compressed_varlen_metadata",
+    "KernelFrame",
+    "build_v4_metadata",
 ]
 
 
 @dataclass(kw_only=True, slots=True)
-class CompressedBlockLayout:
-    """Kernel contract for one compression ratio (one metadata entry's ``plan``).
-
-    All tensors are built once per batch by the plan build.  Their leading
-    dimensions are marked dynamic by the fused path so ``torch.compile``
-    does not specialize on batch contents.
-
-    The plan has two parts:
-
-    - **part 1 — the unified contract** (CP and non-CP): the kernel tensors and the compressor
-      contract (``gather_indices`` / ``block_positions`` / ``first_indices``), consumed
-      identically by the Compressor's dispatcher and the kernels regardless of context parallel;
-    - **part 2 — the dispatcher fields** (CP only, ``None`` without): the block exchange routing
-      (``exchange``), the container packing (``compressed_rows`` / ``out_width``) and the
-      compressed-level gather (``cmp_k_global_gather_indices``).
-    """
-
-    # ---- part 1: the unified contract (CP and non-CP) ----
-    cu_seqlens_cmp_k: torch.Tensor | None = None
-    """Cumulative compressed-block lengths over the packed stream (int32),
-    ``[n_seqs + 1]``.  Entry ``i`` is the global start index of sequence
-    ``i``'s compressed blocks.  ``None`` for ratio-1 plans."""
-
-    is_empty_host: bool = False
-    """Host-side empty-plan flag for paths whose fused kernel rejects empty input.
-    A Python branch cannot inspect the unbacked ``gather_indices`` length."""
-
-    block_remainder: torch.Tensor | None
-    """Per-sequence block remainder (int32), ``[n_seqs]``.  The aligned document
-    contract makes it zero throughout; the kernels still take it."""
-
-    gather_indices: torch.Tensor | None
-    """The pooled block-row indices (int64) the dispatcher's ``gather``
-    applies.  Without context parallel they are the identity over the row;
-    under context parallel they are the assembly into
-    ``cat([x_local, exchange_recv_rows])`` in pooled order — the remote gather
-    + permute.  ``None`` for ratio-1 plans."""
-
-    block_positions: torch.Tensor | None = None
-    """Document-relative block starts (int32) ``[n_blocks]`` — the RoPE
-    positions of the pooled keys (block ``b`` of a document sits at
-    ``b * ratio``).  The compressor contract: precomputed once per batch so
-    no per-layer derivation is needed.  ``None`` for ratio-1 plans."""
-
-    first_indices: torch.Tensor | None = None
-    """Document-first block ids (int64) ``[n_segs]`` — the positions of the
-    first block of every segment in the ``gather_indices`` block order.  The
-    overlap validity mask: the borrowed (previous-block) rows of these blocks
-    are masked to zero weight.  ``None`` for ratio-1 plans."""
-
-    compressor_state_block_table: torch.Tensor | None = None
-    """Optional backend state table, prebuilt outside the graph.  The fused
-    attention entry fills it at the eager metadata boundary (the compressor is
-    selected with the fused core)."""
-
-    # ---- part 2: the dispatcher fields (CP only) ----
-    exchange: "ExchangePlan | None" = None
-    """The block exchange routing (alltoallv input/output splits) of the
-    projected ``kv``/``score`` rows completing the plan blocks'
-    ``[A, B)`` sub-range.  ``None`` without context parallel."""
-
-    compressed_rows: torch.Tensor | None = None
-    """Container-packing selection (int64 ``[n_kept]``): the positions of
-    the kept blocks in the pooled key stream (the borrow-source blocks are
-    dropped).  ``None`` without context parallel (all blocks are kept)."""
-
-    out_width: int | None = None
-    """The container grid width: ``seq_len // ratio`` without context
-    parallel, the uniform ``max_kept`` shard width under CP (every rank's
-    container is a valid ``S(1)`` shard).  ``None`` for ratio-1 plans."""
-
-    cmp_k_global_gather_indices: torch.Tensor | None = None
-    """The compressed-K global gather (int64) — the compressed analogue of
-    ``k_global_gather_indices``: per-segment full-prefix blocks as offsets into
-    the all-gathered ``[cp * out_width, D]`` container.  ``None`` without
-    context parallel."""
-
-
-@dataclass(kw_only=True, slots=True)
 class DeepSeekV4Metadata:
-    """One geometry's DeepSeek-V4 varlen attention contract.
+    """One geometry's DeepSeek-V4 attention contract (the V4.1 shape).
 
     Handed to each DSA layer through the decoder's metadata map, **one entry per geometry**: the
     map key is the attention config's own class plus the layer's compression ratio, so a layer
-    reads the entry built for the axis its kernels grid.  Built by the attention backend's config
-    from a ``VarlenMetadata`` stream: this geometry's kernel contract (``plan``) over its own row
-    (``varlen`` / ``window``).  A vendor backend extends it with its own records (the AscendC
-    ``asc``, for one); the reference path consumes this object as it is.
-
-    The container grid is ``[1, S]`` with ``S`` equal to the total token count
-    (``local_batch_size == 1``): ``batch_size`` is always ``1`` and ``seq_len`` is
-    ``cu_seq_q[-1]`` — both derived as properties, not stored.
+    reads the entry built for the axis its kernels grid.  A vendor backend extends it with its own
+    records (the AscendC entry adds the AI_CPU metadata).
     """
 
-    varlen: "VarlenMetadata | CPVarlenMetadata"
-    """Token-stream boundaries (``cu_seq_q`` / ``cu_seq_k``).  Under context
-    parallel the rank-local ``CPVarlenMetadata`` (the shard path's own
-    builder output)."""
+    cu_seq_q: torch.Tensor
+    """The row's packed document boundaries (``int32``, ``n_documents + 1``): the offsets
+    ``gather_attn`` takes as ``cu_seqlens`` and the kernels as ``cu_seqlens_*``.  They are the
+    **row's** at every degree; under context parallelism this rank's queries are chunk ``r`` of
+    every document, which the keyword frames describe, not this tensor."""
+
+    cu_seq_k: torch.Tensor
+    """The key side's boundaries: the row's own for a geometry that does not pool, its
+    ``ratio``-folded grid for one that does.  Folded by the backend that knows the ratio, so no
+    consumer divides a boundary set per layer."""
 
     ratio: int
-    """The compression ratio this entry describes.  Every consumer grids this ratio: a
-    layer reads the entry built for its own, so no consumer checks another geometry's plan."""
+    """The compression ratio this entry describes.  Every consumer grids this ratio: a layer reads
+    the entry built for its own, so no consumer checks another geometry's plan."""
 
-    plan: CompressedBlockLayout
-    """This geometry's kernel contract.  A ratio-1 plan describes no compressed region."""
+    positions_q: torch.Tensor
+    """The **query** frame's own positions.  The positions carried beside the input describe the
+    row this rank holds; under context parallelism the queries are a permuted copy of those rows,
+    so every consumer that rotates a query reads them here, at every degree, with no fallback."""
 
-    window: "WindowPlan | None" = None
-    """The sliding-window plan (CP only, ``None`` without): the ratio-
-    independent window exchange + ori-stream assembly the Attention's
-    ``swa_k`` gather consumes (``token_dispatcher.WindowPlan``)."""
+    q: KernelFrame
+    """The query frame: the row's boundaries at one degree, this rank's chunks under context
+    parallelism, with ``seqused`` the per-document query count."""
 
-    window_size: int | None = None
-    """The sliding window the plans were built for (the layer's own config
-    constant), set by ``build_compressed_varlen_metadata``.  The CP transform
-    needs it to re-derive the window plan, and the metadata object is all it
-    is handed."""
+    swa_k: KernelFrame
+    """The sliding-window keys' frame: the whole row at every degree, with ``seqused`` how far
+    these queries reach into each document."""
+
+    cmp_k: KernelFrame | None
+    """The compressed pool's frame (``None`` for a geometry that does not pool): the
+    ``ratio``-folded row, with ``seqused`` the reach on the compressed grid and ``residual`` its
+    trailing partial group."""
+
+    slots: torch.Tensor | None = None
+    """The reference selection for a geometry that does not run a selector.
+
+    A geometry that does not select (any ratio but four) reaches every causally complete
+    compressed group of the query's own document, and that set is a function of the row's boundaries
+    and this entry's ratio alone -- no operand, no layer.  It is therefore built with the entry
+    (``[1, seq_len, n_cmp]``, document-local numbering with ``-1`` for an unreachable slot), so
+    the reference forward reads it instead of deriving it per layer.  A ratio-4 geometry's
+    selection is the selector's, and a fused entry never reads this field."""
+
+    exchange: "ExchangeMetadata | None" = None
+    """Under context parallelism the query side's movement (``cp_plan``).  ``None`` at one degree,
+    where the slab is the frame."""
+
+    selector_k: KernelFrame | None = None
+    """The fused path's rank-local compressed pool, or ``None`` when the whole pool is reached.
+
+    Every fused kernel right-aligns its mask at the end of the key frame it is given (the selector
+    reads no ``seqused`` at all), so a rank whose queries reach only a document prefix is handed
+    that prefix rather than the gathered row.  Built by ``shard_asc_v4_metadata``; every reference
+    build leaves it ``None``."""
+
+    selector_k_gather: torch.Tensor | None = None
+    """The ``index_select`` that compacts the gathered compressed row into ``selector_k``'s
+    layout.  Differentiable, so the teacher's gradient scatters back onto the gathered row."""
+
+    swa_k_prefix: KernelFrame | None = None
+    """The same rank-local treatment for the sliding window: the token prefix each fused kernel's
+    end-aligned window must be anchored on.  ``None`` whenever the reach is the whole document."""
+
+    swa_k_gather: torch.Tensor | None = None
+    """The ``index_select`` that compacts the gathered sliding-window row into
+    ``swa_k_prefix``'s layout."""
+
+    @property
+    def batch_size(self) -> int:
+        """Container batch size (``1`` for the current packed scenario)."""
+        return 1
 
     @staticmethod
     def prepare_cp_metadata(
@@ -182,11 +145,11 @@ class DeepSeekV4Metadata:
     ) -> "DeepSeekV4Metadata":
         """Refuse context parallel: only the fused stack has a rank-local form.
 
-        This contract addresses the pool the whole row built, and its offsets are the row's own,
-        so a rank that holds a chunk has no metadata a reference consumer could read.  A CP run
-        therefore stops here, before any layer runs, and the fused entry
-        (``AscV4Metadata``) overrides this with the plan, window and records rebuilt from the
-        rank's own chunks.
+        The row is the whole packed sequence and this entry hands one grid to both sides of the
+        attention, so a rank that holds a chunk has no metadata a reference consumer could read.
+        A CP run therefore stops here, before any layer runs, and the fused entry
+        (``AscV4Metadata``) overrides this with the frames and records rebuilt from the rank's own
+        chunks.
         """
         del attention_metadata, permutation
         raise ValueError(
@@ -196,175 +159,102 @@ class DeepSeekV4Metadata:
             "--parallelism.context-parallel-degree."
         )
 
-    @property
-    def batch_size(self) -> int:
-        """Container batch size (``1`` for the current packed scenario)."""
-        return 1
 
+def _hca_slots(cu_seq_q: torch.Tensor, cu_seq_k: torch.Tensor, ratio: int) -> torch.Tensor:
+    """The HCA selection: every causally complete compressed group of the query's document.
 
-@runtime_checkable
-class CompressedKernelContract(Protocol):
-    """The per-ratio plan shape shared by the model-dir metadata and the NPU type.
-
-    Consumers that read only the plan (e.g. the Compressor) accept this protocol instead of the
-    concrete metadata type.
+    The reference counterpart of a selector's picks: a geometry without a selector does not
+    search, it reaches its whole visible prefix, so the slots follow from the two grids and
+    the ratio.
+    Numbering is document-local with ``-1`` for an unreachable slot, the coordinate system
+    ``gather_attn`` reads.
     """
-
-    ratio: int
-    plan: CompressedBlockLayout
-
-
-def _host_boundaries(varlen: VarlenMetadata) -> tuple[int, ...]:
-    """The document boundaries on the host: cached on the stream, or read back once.
-
-    One row's boundaries are read once per microbatch -- at the eager build, never inside a
-    compiled layer -- and the layout then works off that tuple.
-    """
-    cached = varlen.cu_seq_q_host
-    if cached is not None:
-        return tuple(cached)
-    return tuple(varlen.cu_seq_q.cpu().tolist())
+    seqlen = int(cu_seq_q[-1])
+    n_cmp = int(cu_seq_k[-1])
+    pool_start_L1, pool_end_L1, local_L1 = document_intervals(cu_seq_q, cu_seq_k, num_tokens=seqlen)
+    ends_L1 = torch.minimum(pool_end_L1, pool_start_L1 + (local_L1 + 1) // ratio)
+    slots_1N = torch.arange(n_cmp, device=cu_seq_q.device).unsqueeze(0)
+    local_LN = slots_1N.expand(seqlen, -1) - pool_start_L1
+    visible_LN = (slots_1N >= pool_start_L1) & (slots_1N < ends_L1)
+    return torch.where(visible_LN, local_LN, -1).unsqueeze(0)
 
 
-def _build_plan(
-    varlen: VarlenMetadata,
+def _frames_from_row(
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    ratio: int,
+) -> tuple[KernelFrame, KernelFrame, KernelFrame | None]:
+    """The frames of a plain row: boundary differences as the prefixes."""
+    lengths = torch.diff(cu_seq_q).to(torch.int32)
+    q = KernelFrame(cu_seqlens=cu_seq_q, seqused=lengths)
+    swa_k = KernelFrame(cu_seqlens=cu_seq_q, seqused=lengths)
+    cmp_k = None
+    if ratio > 1:
+        # ``cu_seq_k`` was folded at this entry's own ratio by the backend that built it.
+        cmp_k = KernelFrame(
+            cu_seqlens=cu_seq_k.to(torch.int32),
+            seqused=torch.diff(cu_seq_k).to(torch.int32),
+            residual=(lengths % ratio).to(torch.int32),
+        )
+    return q, swa_k, cmp_k
+
+
+def build_v4_metadata(
+    positions: torch.Tensor,
     ratio: int,
     *,
-    boundaries: tuple[int, ...],
-    require_aligned: bool,
-) -> CompressedBlockLayout:
-    """One ratio's kernel contract over a plain, aligned stream.
-
-    Called once per batch by ``build_compressed_varlen_metadata``: the plan is derived purely
-    from the document boundaries and this layer's ratio.  Context-parallel streams must use
-    ``build_cp_plan`` instead (guarded below).
-    """
-    if not hasattr(varlen, "cu_seq_q"):
-        raise TypeError(f"build_compressed_varlen_metadata expects a varlen stream, got {type(varlen)}.")
-
-    cu_seq_q = varlen.cu_seq_q
-    cu = boundaries
-    if not cu or cu[0] != 0:
-        raise ValueError(f"varlen stream must start at token 0, got cu_seq_q[0]={cu[0] if cu else None}.")
-    if not torch.equal(cu_seq_q, varlen.cu_seq_k):
-        raise ValueError(
-            "build_compressed_varlen_metadata requires a plain stream (cu_seq_q == "
-            "cu_seq_k); context-parallel plans come from build_cp_plan."
-        )
-    if ratio == 1:
-        # A window-only geometry: no compressed pool, so nothing to derive.
-        return CompressedBlockLayout(
-            cu_seqlens_cmp_k=None,
-            block_remainder=None,
-            gather_indices=None,
-        )
-    if ratio not in (4, 128):
-        raise NotImplementedError(f"CompressedBlockLayout does not support ratio={ratio}; expected 1, 4, or 128.")
-
-    lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
-    if any(length <= 0 for length in lengths):
-        raise ValueError(f"documents must be non-empty, got lengths {lengths}.")
-    seq_len = cu[-1]
-    n_seqs = len(lengths)
-    device = cu_seq_q.device
-    aligned = all(length % ratio == 0 for length in lengths)
-    if not aligned and require_aligned:
-        raise ValueError(
-            "document lengths are not multiples of the compression ratio "
-            f"{ratio}: {lengths}. The dataloader must pad each document to "
-            "`per_doc_alignment` (the lcm of the stack's compress_ratios); an "
-            "unaligned stream is an input bug. Pass require_aligned=False only for "
-            "tests and numerics probes that need the partial-block contract."
-        )
-    if aligned:
-        # The aligned contract the loader guarantees: every document is a whole number of blocks,
-        # so the compressed pool is the row itself -- the boundaries are the row's divided by the
-        # ratio, the gather keeps every token (in order), and the remainder is zero.  The block
-        # positions stay document-relative (the compressor's RoPE restarts at every document),
-        # which is the one field that still needs one entry per document.
-        n_blocks = seq_len // ratio
-        return CompressedBlockLayout(
-            cu_seqlens_cmp_k=(cu_seq_q // ratio).to(torch.int32),
-            is_empty_host=False,
-            block_remainder=torch.zeros(n_seqs, dtype=torch.int32, device=device),
-            gather_indices=torch.arange(seq_len, dtype=torch.int64, device=device),
-            block_positions=torch.cat(
-                [torch.arange(0, length, ratio, dtype=torch.int32, device=device) for length in lengths]
-            ),
-            first_indices=(cu_seq_q[:-1] // ratio).to(torch.int64),
-            compressed_rows=None,
-            out_width=n_blocks,
-        )
-
-    # The unaligned derivation: a document contributes its complete leading blocks only; the
-    # ``len % ratio`` tail produces no compressed entry.  The loader never produces such a stream
-    # (``dataloader.per_doc_alignment``), but callers that build metadata from arbitrary token
-    # streams (the unit tests, numerics probes) still get the partial-block contract.  That is
-    # also why a zero-length compressed segment is only possible here, never in production: an
-    # aligned stream's every document holds at least one whole block.
-    c_lens = [length // ratio for length in lengths]
-    cu_seqs = torch.cat(
-        [
-            torch.zeros((1,), dtype=torch.int32, device=device),
-            torch.tensor(c_lens, dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32),
-        ]
-    )
-    pieces = [
-        torch.arange(k_start, k_start + ratio * cnt, dtype=torch.int64, device=device)
-        for k_start, cnt in zip(cu[:-1], c_lens, strict=True)
-        if cnt
-    ]
-    positions = [torch.arange(0, ratio * cnt, ratio, dtype=torch.int32, device=device) for cnt in c_lens if cnt]
-    gather = torch.cat(pieces, dim=0) if pieces else torch.empty((0,), dtype=torch.int64, device=device)
-    block_positions = torch.cat(positions, dim=0) if positions else torch.empty((0,), dtype=torch.int32, device=device)
-    first_indices = cu_seqs[:-1][torch.diff(cu_seqs) > 0].to(torch.int64)
-    return CompressedBlockLayout(
-        cu_seqlens_cmp_k=cu_seqs,
-        is_empty_host=not pieces,
-        block_remainder=torch.tensor(
-            [length % ratio for length in lengths],
-            dtype=torch.int32,
-            device=device,
-        ),
-        gather_indices=gather,
-        block_positions=block_positions,
-        first_indices=first_indices,
-        compressed_rows=None,
-        # The container width is the *kept* block count, not the row's floor: a
-        # document's tail group contributes no block.
-        out_width=sum(c_lens),
-    )
-
-
-def build_compressed_varlen_metadata(
-    varlen: VarlenMetadata,
-    ratio: int,
-    *,
-    window_size: int | None = None,
-    require_aligned: bool = True,
+    cu_seq_q: torch.Tensor | None = None,
+    build_slots: bool = True,
 ) -> DeepSeekV4Metadata:
-    """Build one geometry's DSV4 varlen contract from a plain varlen stream.
+    """Build one geometry's entry from the pre-shard row positions.
 
-    Called once per microbatch per geometry by the attention backend's config: the kernel
-    contract for *this layer's ratio* (``_build_plan`` over one ratio).  The vendor records (the
-    AscendC kernel tensors, for one) are added by that backend's own builder.
+    Called once per microbatch per geometry by the attention backend's config: the row's
+    boundaries, this layer's ratio (the only per-geometry part of the grid) and the frames that
+    address them.  The vendor records (the AscendC kernel tensors) are added by that backend's own
+    builder.
 
     Args:
-        varlen: The plain (unsharded) stream; ``cu_seq_q`` is authoritative for the document
-            boundaries.  Under context parallel the CP transform re-derives this object per
-            rank, so a CP-shaped stream never reaches here.
-        ratio: The compression ratio this entry describes — the layer's own.
-        window_size: The sliding window the plan belongs to; the CP transform re-derives the
-            window plan from it.
-        require_aligned: Refuse a document stream whose lengths are not multiples of ``ratio``.
-            The loader's ``per_doc_alignment`` guarantees this in production; tests and numerics
-            probes that deliberately build unaligned streams pass ``False`` to get the
-            partial-block contract.
+        positions: The row's per-token positions (``[1, S]``, document-relative: they reset at
+            every document start), the convention upstream's
+            ``create_varlen_metadata_for_document`` reads the boundaries from.
+        ratio: The compression ratio this entry describes -- the layer's own.
+        cu_seq_q: The row's boundaries, when the caller already has them.  ``None`` derives them
+            from ``positions``.
+        build_slots: Whether to precompute the HCA selection for a geometry without a selector
+            (``ratio`` above four).  The reference core reads it, so its builder keeps the
+            default ``True``; the fused core never reads it and passes ``False``, which keeps
+            the ``S x (S / ratio)`` int64 matrix off the fused path.
     """
-    boundaries = _host_boundaries(varlen)
+    if ratio < 1:
+        raise ValueError(f"a compression ratio must be positive, got {ratio}.")
+    if positions.dim() != 2:
+        raise ValueError(f"the row's positions must be [1, S], got shape {tuple(positions.shape)}.")
+    if cu_seq_q is None:
+        cu_seq_q = create_varlen_metadata_for_document(positions).cu_seq_q
+    cu_seq_q = cu_seq_q.to(torch.int32)
+    require_document_alignment(cu_seq_q, ratio=ratio)
+    lengths = torch.diff(cu_seq_q)
+    if int(cu_seq_q[0]) != 0 or int(cu_seq_q[-1]) != positions.numel():
+        raise ValueError(
+            f"the boundaries describe a different row than the positions: cu_seq_q spans "
+            f"[{int(cu_seq_q[0])}, {int(cu_seq_q[-1])}) but the positions hold {positions.numel()} tokens."
+        )
+    cu_seq_k = cu_seq_q if ratio == 1 else (cu_seq_q // ratio).to(torch.int32)
+    q, swa_k, cmp_k = _frames_from_row(cu_seq_q, cu_seq_k, ratio)
+    # A geometry without a selector (ratio above four) has a fixed selection: the reference
+    # builds it here, once per microbatch and geometry, so its forward only reads it.  The
+    # fused core never reads ``slots`` (its HCA branch runs full-causal on the compressed pool),
+    # so its builder passes ``build_slots=False`` and keeps this matrix off the fused path.
+    slots = None
+    if build_slots and ratio not in (1, 4):
+        slots = _hca_slots(cu_seq_q, cu_seq_k, ratio)
     return DeepSeekV4Metadata(
-        varlen=varlen,
+        cu_seq_q=cu_seq_q,
+        cu_seq_k=cu_seq_k,
         ratio=ratio,
-        plan=_build_plan(varlen, ratio, boundaries=boundaries, require_aligned=require_aligned),
-        window_size=window_size,
+        positions_q=positions,
+        q=q,
+        swa_k=swa_k,
+        cmp_k=cmp_k,
+        slots=slots,
     )

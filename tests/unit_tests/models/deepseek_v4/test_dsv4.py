@@ -23,20 +23,20 @@ distribution rather than a number, and that distribution crosses this file's
 """
 
 from dataclasses import dataclass
+from itertools import pairwise
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchtitan.models.common.attention import VarlenMetadata
 
 pytestmark = pytest.mark.usefixtures("dsv4")
 
 DIM, HD, RD = 8, 16, 4
 _GRAD_ULPS = 4
-# Two documents longer than one compression block, with different tails (at
-# ratio 128 neither is a whole number of blocks).
-_GRADIENT_DOCS = (200, 133)
+# Two documents of whole 128-blocks: the loader aligns every document to the stack's
+# compression grid, so a document is never a partial block at any ratio (1, 4 or 128).
+_GRADIENT_DOCS = (256, 128)
 _EPS32 = 1.1920929e-7  # fp32 machine epsilon
 
 
@@ -126,28 +126,19 @@ def make_linear(n, m):
     return lin
 
 
-# B=1, S=64; docs A(10) B(17) C(20) D(17)
-_CU = torch.tensor([0, 10, 27, 47, 64], dtype=torch.int32)
+# B=1, S=512; four whole 128-block documents A/B/C/D.
+_CU = torch.tensor([0, 128, 256, 384, 512], dtype=torch.int32)
 
 
-def _metadata_for(dsv4, varlen, ratios, **kwargs):
+def _metadata_for(dsv4, cu, ratios):
     """One entry per geometry, the way each layer's own config builds it."""
-    # The four-document fixture below is deliberately off the 128-block grid: these are
-    # the partial-block probes, not the loader's aligned stream.
-    kwargs.setdefault("require_aligned", False)
-    return {ratio: dsv4.metadata.build_compressed_varlen_metadata(varlen, ratio, **kwargs) for ratio in ratios}
+    positions = _positions_from(cu)
+    return {ratio: dsv4.metadata.build_v4_metadata(positions, ratio, cu_seq_q=cu) for ratio in ratios}
 
 
 def _build_metadata(dsv4):
-    """The 64-token four-document layout (ratios 1/4/128) as the model builds it."""
-    v = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=17, max_k=17)
-    return _metadata_for(dsv4, v, (1, 4, 128))
-
-
-def _pack_container(dsv4, pooled, plan):
-    """The plan-driven container pack (the dispatcher's ``select``)."""
-    disp = dsv4.token_dispatcher.CPTokenDispatcher(dsv4.token_dispatcher.CPTokenDispatcher.Config())
-    return disp.select(pooled, plan)
+    """The 512-token four-document layout (ratios 1/4/128) as the model builds it."""
+    return _metadata_for(dsv4, _CU, (1, 4, 128))
 
 
 def build_compressor(dsv4, ratio):
@@ -170,30 +161,22 @@ def build_compressor(dsv4, ratio):
 def manual_compress(x, md, comp, ratio):
     """Independent per-document pooling reference (no rope).
 
-    ``md`` is the entry of the geometry being pooled: its own plan, its own ratio.
+    ``md`` is the entry of the geometry being pooled: the row's boundaries and this
+    entry's own ratio.  Every document is a whole number of blocks, so the row's flat
+    fold and this per-document pass address the same blocks.
     """
-    plan = md.plan
     flat_x = x.flatten(0, 1).float()
-    out = torch.zeros(md.batch_size * plan.out_width, HD)
-    for doc_id, (qs, qe) in enumerate(
-        zip(
-            md.varlen.cu_seq_q[:-1].tolist(),
-            md.varlen.cu_seq_q[1:].tolist(),
-            strict=True,
-        )
-    ):
-        length = qe - qs
-        c_len = length // ratio
-        if c_len == 0:
-            continue
-        tokens = flat_x[qs : qs + c_len * ratio].view(c_len, ratio, DIM)
+    out = []
+    for qs, qe in pairwise(md.cu_seq_q.tolist()):
+        c_len = (qe - qs) // ratio
+        tokens = flat_x[qs:qe].view(c_len, ratio, DIM)
         kv = F.linear(tokens, comp.wkv.weight.float())
         score = F.linear(tokens, comp.wgate.weight.float()) + comp.ape
         if ratio == 4:
-            c_start = plan.cu_seqlens_cmp_k[doc_id].item()
-            c_end = plan.cu_seqlens_cmp_k[doc_id + 1].item()
-            valid = (torch.arange(c_end - c_start) != 0).view(-1, 1, 1)
-            prev_idx = (torch.arange(c_end - c_start) - 1).clamp_min(0)
+            # The crossing block: block ``j`` borrows block ``j-1``'s a-series; a document's
+            # first block has no predecessor to borrow.
+            valid = (torch.arange(c_len) != 0).view(-1, 1, 1)
+            prev_idx = (torch.arange(c_len) - 1).clamp_min(0)
             kv_prev = torch.where(valid, kv[prev_idx, :, :HD], torch.zeros_like(kv[:, :, :HD]))
             score_prev = torch.where(
                 valid,
@@ -203,10 +186,8 @@ def manual_compress(x, md, comp, ratio):
             kv = torch.cat([kv_prev, kv[:, :, HD:]], dim=1)
             score = torch.cat([score_prev, score[:, :, HD:]], dim=1)
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
-        kv = comp.norm(kv.to(x.dtype))
-        start = plan.cu_seqlens_cmp_k[doc_id].item()
-        out[start : start + c_len] = kv
-    return out.view(md.batch_size, plan.out_width, HD)
+        out.append(comp.norm(kv.to(x.dtype)))
+    return torch.cat(out).view(md.batch_size, -1, HD)
 
 
 def _pool_blocks_where(comp, block_tokens, block_positions, overlap_valid, dtype, ratio):
@@ -240,49 +221,21 @@ def _positions_for(doc_lens):
     return torch.cat([torch.arange(length) for length in doc_lens]).unsqueeze(0)
 
 
-def _build_varlen(doc_lens):
-    cu = torch.tensor([0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32)
-    return VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=17, max_k=17)
+def _positions_from(cu):
+    """A packed row's positions from its boundaries."""
+    return _positions_for([end - start for start, end in pairwise(cu.tolist())])
 
 
-def _asc_core_config(ratio, **shape):
-    """The fused core's own config for one geometry, as the model registry fills it.
-
-    The four widths are stated on the config -- the port config has no defaults -- and the
-    window/top-k come from the layer's own fields, exactly as the ``asc`` override derives them.
-    """
-    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-        AscCompressedSparseInnerAttention,
-    )
-
-    return AscCompressedSparseInnerAttention.Config(
-        window_size=shape.get("window_size", 128),
-        compress_ratio=ratio,
-        softmax_scale=0.1,
-        index_topk=shape.get("index_topk", 512),
-        num_heads=shape.get("num_heads", 16),
-        head_dim=shape.get("head_dim", 512),
-        index_num_heads=shape.get("index_num_heads", 8),
-        index_head_dim=shape.get("index_head_dim", 128),
-    )
-
-
-def _run_extension(dsv4, doc_lens, ratio, **shape):
-    """The core config's own per-microbatch build of one geometry (the seam under test)."""
-    return _asc_core_config(ratio, **shape).build_attention_metadata(_positions_for(doc_lens))
-
-
-def _run_all(dsv4, doc_lens, ratios=(1, 4, 128), **shape):
-    """Every geometry's entry, the way the decoder's map holds them."""
-    return {ratio: _run_extension(dsv4, doc_lens, ratio, **shape) for ratio in ratios}
+def _build_cu(doc_lens):
+    return torch.tensor([0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32)
 
 
 @pytest.fixture
 def inputs(dsv4):
     torch.manual_seed(0)
     md = _build_metadata(dsv4)
-    x = torch.randn(1, 64, DIM)
-    pos = torch.arange(64).unsqueeze(0)
+    x = torch.randn(1, int(_CU[-1]), DIM)
+    pos = _positions_from(_CU)
     return dsv4, md, x, pos
 
 
@@ -315,35 +268,33 @@ def test_compressor_numerics_ratio4(inputs):
     a 2.2x margin over the measured worst (at most 1.8 ulps, single-threaded)
     while still flagging any multi-ulp arithmetic regression.
     """
-    dsv4, md, x, _pos = inputs
+    dsv4, md, x, pos = inputs
     comp4 = build_compressor(dsv4, 4)
-    pooled = comp4(x, md[4])
-    cmp4 = _pack_container(dsv4, pooled, md[4].plan)
-    # 2+4+5+4 complete blocks: the 64-token row has 15 whole blocks, not 64 // 4.
-    assert cmp4.shape == (1, 15, 16)
+    cmp4 = comp4(x, pos, cu_seqlens=md[4].cu_seq_q)
+    # Four 128-token documents: 4 * 128 // 4 whole blocks over the row.
+    assert cmp4.shape == (1, 128, 16)
     ref = manual_compress(x, md[4], comp4, 4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
 
 
 def test_compressor_numerics_ratio128(inputs):
-    """C128A with zero complete blocks — shape/emptiness only (no numerics)."""
-    dsv4, md, x, _pos = inputs
+    """C128A pools every whole 128-block of the row, one per document here."""
+    dsv4, md, x, pos = inputs
     comp128 = build_compressor(dsv4, 128)
-    cmp128 = comp128(x, md[128])
-    assert cmp128.shape == (0, 16)
-    assert cmp128.numel() == 0
+    cmp128 = comp128(x, pos, cu_seqlens=md[128].cu_seq_q)
+    assert cmp128.shape == (1, 4, 16)
+    ref = manual_compress(x, md[128], comp128, 128)
+    _assert_rounding_floor((cmp128 - ref).abs(), ref.abs().max().item())
 
 
-def test_attention_numerics_ratio4_zero_blocks(dsv4):
-    """The ratio-4 reference path with zero complete blocks — shape/finite
-    (no numerics to compare; the golden is not exercised)."""
-    cu = torch.tensor([0, 3, 8], dtype=torch.int32)
-    v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=5, max_k=5)
-    md_s = _metadata_for(dsv4, v, (4,))[4]
+def test_attention_numerics_ratio4_single_block_documents(dsv4):
+    """The ratio-4 reference path over one-block documents — shape/finite (no golden)."""
+    cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+    md_s = _metadata_for(dsv4, cu, (4,))[4]
     comp_s = build_compressor(dsv4, 4)
-    cmp_s = _pack_container(dsv4, comp_s(torch.randn(1, 8, DIM), md_s), md_s.plan)
-    # Three and five tokens: only the second document contributes a complete block.
-    assert cmp_s.shape == (1, 1, 16)
+    cmp_s = comp_s(torch.randn(1, 8, DIM), _positions_from(cu), cu_seqlens=md_s.cu_seq_q)
+    # Two documents of exactly one block each: two compressed entries.
+    assert cmp_s.shape == (1, 2, 16)
     core_s = dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
             window_size=8,
@@ -357,20 +308,20 @@ def test_attention_numerics_ratio4_zero_blocks(dsv4):
             torch.randn(1, 8, 4, 8),
             torch.randn(1, 2, 8),
             torch.randn(1, 8, 4),
-            md_s.varlen.cu_seq_q,
-            md_s.plan.cu_seqlens_cmp_k,
+            md_s.cu_seq_q,
+            md_s.cu_seq_k,
             4,
         )
         out_s = core_s(
             torch.randn(1, 8, 3, HD),
             torch.randn(1, 8, HD),
-            cmp_s,
-            attn_sink=torch.randn(3),
-            sparse_indices=sparse_s,
+            torch.randn(3),
+            cmp_k=cmp_s,
+            topk_indices=sparse_s,
             attention_metadata=md_s,
         )
-    # The first document has no complete group, so all of its picks are padding; the second
-    # has one, and the rest of its width is padding.
+    # A document's block is complete only at its last token, so the first three queries have
+    # nothing to select and the last token of each document is the one that can.
     assert (sparse_s[0, :3] == -1).all()
     assert (sparse_s[0, 3:] >= 0).any()
     assert out_s.shape == (1, 8, 3, HD) and torch.isfinite(out_s).all()
@@ -385,22 +336,23 @@ def _gradient_case(dsv4, ratio=4):
     """
     torch.manual_seed(0)
     docs = _GRADIENT_DOCS
-    mds = _metadata_for(dsv4, _build_varlen(docs), (4, 128))
+    cu = _build_cu(docs)
+    mds = _metadata_for(dsv4, cu, (4, 128))
     md = mds[ratio]
     seqlen = sum(docs)
     sink = torch.randn(3)
-    pool = _pack_container(dsv4, build_compressor(dsv4, ratio)(torch.randn(1, seqlen, DIM), md), md.plan)
+    pool = build_compressor(dsv4, ratio)(torch.randn(1, seqlen, DIM), _positions_from(cu), cu_seqlens=md.cu_seq_q)
     assert pool.shape[1] > 0, "the fixture must exercise a non-empty compressed pool"
 
     sparse = None
     if ratio == 4:
-        n_cmp = int(mds[4].plan.cu_seqlens_cmp_k[-1])
+        n_cmp = int(mds[4].cu_seq_k[-1])
         sparse = dsv4.compressor.select_compressed_slots(
             torch.randn(1, seqlen, 4, 8),
             torch.randn(1, n_cmp, 8),
             torch.randn(1, seqlen, 4),
-            mds[4].varlen.cu_seq_q,
-            mds[4].plan.cu_seqlens_cmp_k,
+            mds[4].cu_seq_q,
+            mds[4].cu_seq_k,
             8,
         )
 
@@ -424,7 +376,7 @@ def _gradient_case(dsv4, ratio=4):
 def _consumer_grads(consumer, sparse, md, base):
     """One differentiated pass; each consumer gets its own differentiable copy."""
     q, swa_k, cmp_k, attn_sink = (t.detach().clone().requires_grad_() for t in base)
-    out = consumer(q, swa_k, cmp_k, attn_sink=attn_sink, sparse_indices=sparse, attention_metadata=md)
+    out = consumer(q, swa_k, attn_sink, cmp_k=cmp_k, topk_indices=sparse, attention_metadata=md)
     upstream = torch.linspace(-1, 1, out.numel()).reshape_as(out)
     (out * upstream).sum().backward()
     return out, (q.grad, swa_k.grad, cmp_k.grad, attn_sink.grad)
@@ -433,6 +385,5 @@ def _consumer_grads(consumer, sparse, md, base):
 def test_unaligned_documents_are_refused(dsv4):
     """A stream off the compression grid is an input bug, not a partial-block plan."""
     cu = torch.tensor([0, 10, 27], dtype=torch.int32)
-    varlen = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=17, max_k=17)
     with pytest.raises(ValueError, match="per_doc_alignment"):
-        dsv4.metadata.build_compressed_varlen_metadata(varlen, 4)
+        dsv4.metadata.build_v4_metadata(_positions_from(cu), 4, cu_seq_q=cu)

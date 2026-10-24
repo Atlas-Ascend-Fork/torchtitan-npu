@@ -10,9 +10,10 @@ trained through have to be recomputed at those picks, in the row-wide numbering 
 are stored in.  These cases pin that mapping and the marking of a padded slot.
 """
 
+from itertools import pairwise
+
 import pytest
 import torch
-from torchtitan.models.common.attention import VarlenMetadata
 
 pytestmark = pytest.mark.usefixtures("dsv4")
 
@@ -25,8 +26,8 @@ _PICKS = torch.tensor([[0, 1]] * _DOC + [[0, -1]] * _DOC + [[1, -1]] * _DOC, dty
 
 
 def _metadata(dsv4):
-    varlen = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=_DOC, max_k=_DOC)
-    return dsv4.metadata.build_compressed_varlen_metadata(varlen, _RATIO)
+    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
+    return dsv4.metadata.build_v4_metadata(positions, _RATIO, cu_seq_q=_CU)
 
 
 def _inputs(seqlen, seed=0):
@@ -39,16 +40,14 @@ def _inputs(seqlen, seed=0):
 
 
 def _rescore(dsv4, metadata, idx_q, idx_k, idx_w, picks):
-    return dsv4.compressor.student_logits_at_picks(
-        idx_q, idx_k, idx_w, picks, metadata.varlen.cu_seq_q, metadata.plan.cu_seqlens_cmp_k
-    )
+    return dsv4.compressor.student_logits_at_picks(idx_q, idx_k, idx_w, picks, metadata.cu_seq_q, metadata.cu_seq_k)
 
 
 def test_student_logits_rescore_a_document_local_selection(dsv4):
     """Each pick is read as its own document's entry, not as a row-wide one."""
     metadata = _metadata(dsv4)
     seqlen = int(_CU[-1])
-    starts = metadata.plan.cu_seqlens_cmp_k
+    starts = metadata.cu_seq_k
     idx_q, idx_k, idx_w = _inputs(seqlen)
 
     scores = _rescore(dsv4, metadata, idx_q, idx_k, idx_w, _PICKS)
@@ -110,3 +109,53 @@ def test_an_unscored_slot_is_marked_with_the_value_softmax_drops(dsv4):
     scores = _rescore(dsv4, metadata, *_inputs(seqlen), _PICKS)
     assert torch.isinf(scores[~(_PICKS >= 0)]).all()
     assert (scores[~(_PICKS >= 0)] < 0).all()
+
+
+def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
+    """The indexer's forward is the selector's two outputs: picks and differentiable scores.
+
+    The reference picks keep the selection operator's order (re-sorting would perturb the
+    reference golden's summation order); they are document-local with ``-1`` for an unused
+    slot.  The scores are the student logits at exactly those picks, ``-inf`` on padding,
+    and they carry gradient to the indexer's projections.
+    """
+    metadata = _metadata(dsv4)
+    seqlen = int(_CU[-1])
+    idx_q, idx_k, idx_w = (tensor.clone().requires_grad_(True) for tensor in _inputs(seqlen))
+    module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
+
+    picks, scores = module(idx_q, idx_k, idx_w, attention_metadata=metadata)
+
+    assert picks.shape == (1, seqlen, 2) and picks.dtype == torch.int32
+    assert scores.shape == picks.shape
+    # The reference emits the selection operator's order; only the set and the ``-1``
+    # marking are part of the shared contract.
+    expected_picks = dsv4.compressor.select_compressed_slots(
+        idx_q.detach(),
+        idx_k.detach(),
+        idx_w.detach(),
+        metadata.cu_seq_q,
+        metadata.cu_seq_k,
+        2,
+    )
+    assert torch.equal(picks, expected_picks)
+    # The scores are the same rescore pass, on exactly the emitted slots.
+    expected = _rescore(dsv4, metadata, idx_q.detach(), idx_k.detach(), idx_w.detach(), picks)
+    torch.testing.assert_close(scores, expected, rtol=1e-12, atol=1e-12)
+    assert torch.isinf(scores[picks < 0]).all()
+    assert (scores[picks < 0] < 0).all()
+
+    # The returned scores are the differentiable edge the indexer is trained through.
+    torch.nan_to_num(scores, neginf=0.0).sum().backward()
+    for tensor in (idx_q, idx_k, idx_w):
+        assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
+    assert float(idx_w.grad.abs().sum()) > 0
+
+
+def test_lightning_indexer_refuses_a_geometry_without_a_compressed_pool(dsv4):
+    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
+    metadata = dsv4.metadata.build_v4_metadata(positions, 1)
+    module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
+    idx_q, idx_k, idx_w = _inputs(int(_CU[-1]))
+    with pytest.raises(ValueError, match="compressed"):
+        module(idx_q, idx_k, idx_w, attention_metadata=metadata)

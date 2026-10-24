@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # Prefetch/pin 1M GA8 batches so queue drain and async H2D can overlap compute.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --parallelism.context-parallel-degree 128 \
+    --dataloader.per_doc_alignment 16384 \
     --parallelism.context-parallel-load-balancer None \
     --parallelism.data-parallel-shard-degree 1 \
     --parallelism.data-parallel-replicate-degree 1 \

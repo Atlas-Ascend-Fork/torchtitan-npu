@@ -98,7 +98,7 @@ def _register(core, trace, *, transformers: bool) -> trace_hooks.TraceHookRegist
                 registry.forward(module, f"{prefix}.attention.{name}")
         registry.pre(_require_attr(attention, "o_b_proj" if transformers else "wo_b"), f"{prefix}.attention.o_a")
         if not transformers:
-            inner_attention = _require_attr(attention, "compressed_sparse_attention.inner_attention")
+            inner_attention = _require_attr(attention, "inner_attention")
 
             def attention_core_pre_hook(_module, args, *, prefix=prefix):
                 trace_hooks.record_trace(trace, f"{prefix}.attention.q", args[0])

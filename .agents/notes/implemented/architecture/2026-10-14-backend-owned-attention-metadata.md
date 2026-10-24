@@ -98,7 +98,7 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
   直接调用 `torch.utils._pytree.register_dataclass`。`MetadataExtension` 与 `CompressorMetadata`
   两个类删除，模型不再有 `metadata_extension` / `lightning_indexer_metadata` 字段；
   `batch_chunk_metadata.chunk_metadata` 改为替换模型 config。
-- `.ci` 的 metadata 债务边全部删除（`metadata_nodes` 两条 + `batch_chunk_metadata → models/deepseek_v4.model`）；`fused_ops.md`、`deepseek_v4_tnd.md`、`deepseek_v4_cp.md`、`deepseek_v4_graph_trainer.md`、
+- `.ci` 的 metadata 债务边全部删除（`metadata_nodes` 两条 + `batch_chunk_metadata → models/deepseek_v4.model`）；`fused_ops.md`、`deepseek_v4_tnd.md`、`context_parallel.md`、`deepseek_v4_graph_trainer.md`、
   `graph_trainer_cv_parallel.md`、`override/README.md` 同步；本 Note 精简后移入 `implemented/architecture/`。
 - 退出条件：pinned `torchtitan` 升到同时含 #4897 / #4116 / #4617 的 release 后，删除 A 引入的四个 patch 模块与 `.ci` 的
   activation 条目；B 叠在 A 的两个 commit 之上（A 被 squash 时 B 需一次 `git rebase --onto`，A 保留 commit 则无需）。

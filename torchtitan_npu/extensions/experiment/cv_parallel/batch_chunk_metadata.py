@@ -6,16 +6,14 @@
 """Prebuild full and half-batch attention metadata for CV chunking."""
 
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import Any, cast
 
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
-from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.deepseek_v4.metadata import (
     DeepSeekV4Metadata,
-    build_compressed_varlen_metadata,
+    build_v4_metadata,
 )
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
     AscV4Metadata,
@@ -40,15 +38,11 @@ if BatchChunkAscV4Metadata not in SUPPORTED_NODES:
 def _plain_batch_chunk_metadata(
     metadata: DeepSeekV4Metadata,
 ) -> tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]:
-    """Build two local plain-stream contracts at an aligned token boundary."""
-    if metadata.window is not None:
+    """Build two local plain-stream contracts at an aligned document boundary."""
+    if metadata.exchange is not None:
         raise ValueError("batch chunk metadata does not support context parallelism")
-    varlen = metadata.varlen
-    if not torch.equal(varlen.cu_seq_q, varlen.cu_seq_k):
-        raise ValueError("batch chunk metadata requires cu_seq_q == cu_seq_k")
-    cu_host = getattr(varlen, "cu_seq_q_host", None)
-    if cu_host is None:
-        cu_host = tuple(int(value) for value in varlen.cu_seq_q.cpu().tolist())
+    cu = metadata.cu_seq_q
+    cu_host = tuple(int(value) for value in cu.cpu().tolist())
     total_tokens = cu_host[-1]
     if total_tokens < 2 or total_tokens % 2:
         raise ValueError(f"batch chunk metadata requires an even positive token extent, got {total_tokens}")
@@ -59,35 +53,18 @@ def _plain_batch_chunk_metadata(
             f"batch boundary at token {split_token}; boundaries={cu_host}"
         )
     split_index = cu_host.index(split_token)
-    # One entry is one geometry, so both chunks re-cut the same ratio's plan.
+    # One entry is one geometry, so both chunks re-cut the same ratio's grid; the documents do
+    # not cross the split, so each chunk is a whole number of pooling blocks again.
     ratio = metadata.ratio
-    qk_share_storage = varlen.cu_seq_k is varlen.cu_seq_q
+    positions = metadata.positions_q
     chunks = []
     for start_index, end_index, token_offset in (
         (0, split_index, 0),
         (split_index, len(cu_host) - 1, split_token),
     ):
-        local_host = tuple(boundary - token_offset for boundary in cu_host[start_index : end_index + 1])
-        local_cu = (varlen.cu_seq_q[start_index : end_index + 1] - token_offset).contiguous()
-        local_lengths = tuple(right - left for left, right in pairwise(local_host))
-        local_max = max(local_lengths)
-        local_varlen = VarlenMetadata(
-            cu_seq_q=local_cu,
-            # Preserve the full contract's pytree alias structure. A shared
-            # q/k tensor contributes one runtime role; distinct tensors
-            # contribute two roles and are remapped independently.
-            cu_seq_k=local_cu if qk_share_storage else local_cu.clone(),
-            max_q=local_max,
-            max_k=local_max,
-            cu_seq_q_host=local_host,
-        )
-        # The chunks are derived streams: a document may straddle the equal batch
-        # boundary, so their fragments are not required to be whole compression blocks.
-        chunks.append(
-            build_compressed_varlen_metadata(
-                local_varlen, ratio, window_size=metadata.window_size, require_aligned=False
-            )
-        )
+        local_cu = (cu[start_index : end_index + 1] - token_offset).contiguous()
+        local_positions = positions[..., token_offset : cu_host[end_index]]
+        chunks.append(build_v4_metadata(local_positions, ratio, cu_seq_q=local_cu))
     return cast(
         "tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]",
         tuple(chunks),
@@ -97,35 +74,41 @@ def _plain_batch_chunk_metadata(
 def _metadata_tensor_fields(
     metadata: AscV4Metadata,
 ) -> dict[str, torch.Tensor]:
-    """Return tensor fields whose full/chunk values have identical roles."""
+    """Return tensor fields whose full/chunk values have identical roles.
+
+    A tensor that several roles share (the query frame's boundaries *are* the row's, and the
+    sliding-window frame's too) is tagged once, under the first role that names it: two tags on
+    one object would leave whichever was written last.  The full batch and its chunks derive
+    their frames the same way, so the surviving role is the same on both sides.
+    """
     tensors: dict[str, torch.Tensor] = {}
+    tagged: set[int] = set()
 
     def add(name: str, value: object) -> None:
-        if isinstance(value, torch.Tensor):
+        if isinstance(value, torch.Tensor) and id(value) not in tagged:
             tensors[name] = value
+            tagged.add(id(value))
 
-    add("varlen.cu_seq_q", metadata.varlen.cu_seq_q)
-    if metadata.varlen.cu_seq_k is not metadata.varlen.cu_seq_q:
-        add("varlen.cu_seq_k", metadata.varlen.cu_seq_k)
-    for field_name in (
-        "cu_seqlens_cmp_k",
-        "block_remainder",
-        "gather_indices",
-        "block_positions",
-        "first_indices",
-        "compressed_rows",
-        "cmp_k_global_gather_indices",
-        "compressor_state_block_table",
-    ):
-        add(f"plan.{field_name}", getattr(metadata.plan, field_name))
-    # The role names stay geometry-free on purpose: the full batch and its chunks carry the same
+    add("cu_seq_q", metadata.cu_seq_q)
+    if metadata.cu_seq_k is not metadata.cu_seq_q:
+        add("cu_seq_k", metadata.cu_seq_k)
+    add("positions_q", metadata.positions_q)
+    # The kernel frames: the query's, the sliding window's and the compressed axis's.  Their
+    # role names stay geometry-free on purpose: the full batch and its chunks carry the same
     # geometry, so the pairing is by role, and the ratio is part of the metadata, not the name.
-    assert metadata.asc is not None, "batch chunk metadata requires the AscendC record tier"
+    for frame_name in ("q", "swa_k", "cmp_k"):
+        frame = getattr(metadata, frame_name)
+        if frame is None:
+            continue
+        add(f"{frame_name}.cu_seqlens", frame.cu_seqlens)
+        add(f"{frame_name}.seqused", frame.seqused)
+        add(f"{frame_name}.residual", frame.residual)
+    assert metadata.aicpu_metadata is not None, "batch chunk metadata requires the AscendC record tier"
     # The records are grouped by the kernel that reads them, one field per direction.
     for group_name in ("sparse_attn", "lightning_indexer"):
-        group = getattr(metadata.asc, group_name)
-        add(f"asc.{group_name}.fwd", group.fwd)
-        add(f"asc.{group_name}.bwd", group.bwd)
+        group = getattr(metadata.aicpu_metadata, group_name)
+        add(f"aicpu.{group_name}.fwd", group.fwd)
+        add(f"aicpu.{group_name}.bwd", group.bwd)
     return tensors
 
 
@@ -180,23 +163,30 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
         )
     first, second = _plain_batch_chunk_metadata(metadata)
 
-    asc = metadata.asc
+    asc = metadata.aicpu_metadata
     if asc is None:
         raise ValueError("batch chunk metadata requires the fused entry's AI_CPU records")
     geometry = asc.geometry
 
     def chunk_records(chunk: DeepSeekV4Metadata) -> AscV4Metadata:
-        """This tier's records: the selector's and the attention's, plus the state tables."""
+        """This tier's records: the selector's and the attention's."""
         return build_aicpu_metadata(chunk, geometry=geometry)
 
     chunks = (chunk_records(first), chunk_records(second))
     return BatchChunkAscV4Metadata(
-        varlen=metadata.varlen,
+        cu_seq_q=metadata.cu_seq_q,
+        cu_seq_k=metadata.cu_seq_k,
         ratio=metadata.ratio,
-        plan=metadata.plan,
-        window=metadata.window,
-        window_size=metadata.window_size,
-        asc=metadata.asc,
+        positions_q=metadata.positions_q,
+        exchange=metadata.exchange,
+        q=metadata.q,
+        swa_k=metadata.swa_k,
+        cmp_k=metadata.cmp_k,
+        selector_k=metadata.selector_k,
+        selector_k_gather=metadata.selector_k_gather,
+        swa_k_prefix=metadata.swa_k_prefix,
+        swa_k_gather=metadata.swa_k_gather,
+        aicpu_metadata=metadata.aicpu_metadata,
         batch_chunk_tensors=_tag_batch_chunk_metadata(metadata, chunks),
     )
 

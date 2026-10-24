@@ -14,11 +14,11 @@ from dataclasses import dataclass
 
 import torch
 
+from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AscLightningIndexerMetadata,
-    KernelFrame,
 )
 
 _LAYOUT = "TND"

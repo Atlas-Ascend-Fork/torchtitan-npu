@@ -17,9 +17,8 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.models.common.document_intervals import document_intervals
-
-from .token_dispatcher import CPTokenDispatcher
 
 
 @cache
@@ -42,24 +41,27 @@ class CompressorImplementation(Configurable):
     def __init__(self, config: Config):
         del config
 
-    def forward(self, compressor, x, attention_metadata):
-        return compressor._forward(x, attention_metadata)
+    def forward(
+        self,
+        compressor: "Compressor",
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return compressor._forward(x, positions, cu_seqlens)
 
 
 class Compressor(Module):
-    """Document-packed key compression.
+    """Document-packed key compression -- the **unsharded, CP-agnostic** implementation.
 
-    Consumes the unified compressor contract of this layer's geometry from
-    the metadata's ``plan`` — ``gather_indices`` / ``block_positions`` /
-    ``first_indices`` — and returns the pooled key stream ``[n_blocks, D]``.
-    The contract is provided identically under context parallel and
-    without: the projection (``wkv`` / ``wgate``) is per-token and runs on
-    the local stream, and the compressor's own token dispatcher gathers
-    the plan-block rows — without context parallel a plain local gather
-    (the doc-major ``gather_indices`` over the local stream), under
-    context parallel the remote gather (the exchange plus the
-    pooled-order ``gather_indices``).  The container packing and the CP
-    strip are the call sites' concern.
+    The compressor sees one local token stream, that stream's own document-relative positions and
+    (for the ratio-4 overlap only) that stream's document boundaries.  It knows nothing about
+    context parallelism: pooling is a flat fold of ``ratio`` consecutive tokens, and the overlap's
+    crossing-block state is masked at the first block of every ``cu_seqlens`` segment.  The
+    context-parallel carry -- exchanging the predecessor's last block, prepending it, compressing
+    and trimming it back out -- lives outside, in
+    :class:`~torchtitan_npu.models.common.carry_exchange.CarryExchange`.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -74,9 +76,6 @@ class Compressor(Module):
         implementation: "CompressorImplementation.Config" = field(
             default_factory=lambda: CompressorImplementation.Config()
         )
-        # The CP token dispatcher (the RoutedExperts mirror): owned by the
-        # compressor, wired once by ``Compressor.parallelize``.
-        token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -91,18 +90,10 @@ class Compressor(Module):
         self.wkv = cfg.wkv.build()
         self.wgate = cfg.wgate.build()
         self.norm = cfg.norm.build()
-        self.token_dispatcher = cfg.token_dispatcher.build()
         # ``ape`` is a plain score bias on the compression block, not a
         # projection; own it directly like the upstream implementation.  Its
         # param_init is declared on the Config (registry-side, ``_APE_INIT``).
         self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32))
-
-    def parallelize(self, parallel_dims) -> None:
-        """Wire the compressor's own CP dispatcher (invoked automatically
-        by the framework's ``Module.parallelize`` recursion — the
-        compressor is a Module child of the Attention / Indexer)."""
-        super().parallelize(parallel_dims)
-        self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
 
     @staticmethod
     def _overlap_transform(
@@ -113,96 +104,107 @@ class Compressor(Module):
     ) -> torch.Tensor:
         """The C4A overlap window of one projected state.
 
-        The window's left half is the previous plan block's a-series, rolled
+        The window's left half is the previous block's a-series, rolled
         one block; the right half is the current block's b-series (the
         paper's C^a/C^b halves).  The first-block rows of the left half are
         filled with ``value``: the score state passes ``-inf`` (exactly zero
-        softmax weight — which also annihilates the rolled-in block-0 rows),
+        softmax weight -- which also annihilates the rolled-in block-0 rows),
         the kv state passes ``0`` (defensive, like the reference
         implementations: its masked rows are multiplied by those exact-zero
-        weights anyway).  (The CP borrow exchange is a different mechanism —
-        the token-level augmented stream.)
+        weights anyway).  The first block of every ``cu_seqlens`` segment is
+        such a first block, which is what keeps a document -- or the CP
+        wrapper's carry segment -- from reading across its own start.
         """
         assert state.size(-1) % 2 == 0, "the overlap window needs the 2*head_dim split"
         head_dim = state.size(-1) // 2
-        n_blocks = state.size(0)
+        n_blocks = state.size(1)
         # Functional roll/fill (gather + ``torch.where``) instead of
         # ``torch.roll`` + in-place scatter: the in-place write is dropped by
         # aot_autograd recompute and its data-dependent guard trips make_fx.
         prev_idx = (torch.arange(n_blocks, device=state.device) - 1).clamp_min(0)
-        state_a = state[prev_idx, :, :head_dim]
+        state_a = state[:, prev_idx, :, :head_dim]
         first_mask = torch.zeros(n_blocks, dtype=torch.bool, device=state.device).scatter(0, first_indices, True)
-        state_a = torch.where(first_mask.view(-1, 1, 1), state.new_full((1,), value), state_a)
-        state_b = state[:, :, head_dim:]
-        return torch.cat([state_a, state_b], dim=1)
+        state_a = torch.where(first_mask.view(1, -1, 1, 1), state.new_full((1,), value), state_a)
+        state_b = state[:, :, :, head_dim:]
+        return torch.cat([state_a, state_b], dim=2)
 
-    def forward(self, x, attention_metadata):
-        return self.implementation.forward(self, x, attention_metadata)
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compress one local stream.
 
-    def _forward(self, x, attention_metadata):
-        """Project kv/score locally, gather the plan-block rows through the
-        dispatcher, pool, and RoPE.
+        ``cu_seqlens`` is keyword-only: a module with a sharding config is called through the
+        framework's positional contract, which requires every positional-or-keyword parameter to
+        be passed positionally.
 
-        Returns the pooled key stream ``[n_blocks, head_dim]`` (all plan
-        blocks, borrow-source blocks included — the strip and the container
-        packing happen at the call sites).  ``first_indices`` are the
-        doc/segment-first block positions whose borrowed (previous-block)
-        rows are filled by ``_overlap_transform`` (``-inf`` on the score —
-        exactly zero softmax weight — and ``0`` on the kv).  The projection
-        is per-token, so it commutes with the exchange (bitwise): without
-        context parallel the dispatcher's gather is a plain local gather,
-        under context parallel it exchanges the projected rows of the
-        plan's ``[A, B)`` block region.
+        Args:
+            x: The local stream, ``[1, L, D]`` (the row, one rank's slab, or the slab with the CP
+                exchange's carry block prepended).
+            positions: The stream's own document-relative positions, ``[1, L]``.  They reset at
+                every document start, and the pooled blocks rotate at ``positions[..., ::ratio]``.
+            cu_seqlens: The stream's document boundaries (``[n + 1]``), required by the ratio-4
+                overlap: the first block of every segment has no predecessor block.  The
+                non-overlap pooling ignores it -- a fold of ``ratio`` tokens needs no boundaries.
+
+        Returns:
+            The pooled key stream ``[1, L // ratio, D]``.
         """
-        # The contract is checked by the attribute the compressor reads rather than by
-        # ``isinstance``: this protocol is runtime-checkable, and inside a dynamo region the
-        # static path rejects metadata that carries every member the check is about.
-        if getattr(attention_metadata, "plan", None) is None:
-            raise TypeError(
-                "DSV4 compression requires a CompressedKernelContract (the "
-                "model-dir DeepSeekV4Metadata or the NPU slim type), "
-                f"got {type(attention_metadata)}."
-            )
-        ratio = self.compress_ratio
-        plan = attention_metadata.plan
-        if plan.gather_indices is None:
-            raise ValueError(f"No compressor plan for ratio={ratio}")
-
-        # -- project the local stream (BF16 weights, FP32 compute via
-        #    autocast); the dispatcher's gather then collects the
-        #    plan-block rows --
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            kv_rows = self.token_dispatcher.gather(self.wkv(x), plan).flatten(0, 1)
-            score_rows = self.token_dispatcher.gather(self.wgate(x), plan).flatten(0, 1)
-        # Block count from the plan's (dynamic) gather_indices, not the
-        # gathered rows' runtime shape, which would specialize the trace.
-        # An empty plan flows through reshape(0, ...) without a numel() guard.
-        n_blocks = plan.gather_indices.numel() // ratio
-        # Explicit last dim: a ``-1`` fold trips a data-dependent guard.
-        kv = kv_rows.reshape(n_blocks, ratio, kv_rows.size(-1))
-        score = score_rows.reshape(n_blocks, ratio, score_rows.size(-1)) + self.ape
-        first_indices = plan.first_indices
-        block_positions = plan.block_positions
-        assert first_indices is not None and block_positions is not None, (
-            "the compressor contract requires first_indices and block_positions"
+        return self.implementation.forward(
+            self,
+            x,
+            positions,
+            cu_seqlens=cu_seqlens,
         )
 
-        # -- overlap (ratio=4 only) --
+    def _forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project, fold, softmax-gate, normalize and rotate the local stream.
+
+        This is the **unsharded** reference implementation, and it is also the CP one: the carry
+        that makes a slab compress like the row it came from is applied outside
+        (:class:`~torchtitan_npu.models.common.carry_exchange.CarryExchange`), so the stream
+        handed here is already the one to pool.  Returns the pooled key stream ``[1, L // ratio, D]``.
+        """
+        ratio = self.compress_ratio
+        if x.dim() != 3 or x.size(0) != 1:
+            raise ValueError(f"the compressor addresses one packed row, got shape {tuple(x.shape)}.")
+        length = x.size(1)
+        if length % ratio:
+            raise ValueError(
+                f"the local stream ({length} tokens) is not a whole number of compression blocks "
+                f"of ratio {ratio}: documents are aligned by `dataloader.per_doc_alignment`, and "
+                "the CP wrapper's augmented stream adds whole blocks."
+            )
+        n_blocks = length // ratio
+        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+            kv = self.wkv(x).unflatten(1, (n_blocks, ratio))
+            score = self.wgate(x).unflatten(1, (n_blocks, ratio)) + self.ape
+
+        # -- overlap (ratio=4 only): the crossing block's a-series, masked at every segment start --
         if self.overlap:
+            if cu_seqlens is None:
+                raise ValueError(
+                    "the ratio-4 overlap needs the local stream's cu_seqlens: the first block of "
+                    "every document has no predecessor block to borrow."
+                )
+            first_indices = (cu_seqlens[:-1] // ratio).to(torch.int64)
             score = self._overlap_transform(score, first_indices, value=float("-inf"))
             kv = self._overlap_transform(kv, first_indices, value=0.0)
 
         # -- softmax pool + norm + RoPE (RoPE owns the [nope | rope] split) --
-        kv = (kv * score.softmax(dim=1)).sum(dim=1)
+        # The gate is a softmax over the block's pooled rows: ``ratio`` of them, or ``2 * ratio``
+        # once the overlap prepended the previous block's a-series.
+        kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(x.dtype))
-        return (
-            self.rope(
-                kv.unsqueeze(0).unsqueeze(2),
-                positions=block_positions.unsqueeze(0),
-            )
-            .squeeze(0)
-            .squeeze(1)
-        )
+        return self.rope(kv.unsqueeze(2), positions=positions[..., ::ratio]).squeeze(2)
 
 
 class Indexer(Module):
@@ -212,6 +214,8 @@ class Indexer(Module):
         wq_b: Linear.Config
         weights_proj: Linear.Config
         compressor: "Compressor.Config"
+        # The ratio-4 overlap's cross-rank block, beside the compressor it feeds.
+        carry_exchange: CarryExchange.Config
         num_index_heads: int
         index_head_dim: int
         rope_head_dim: int
@@ -228,20 +232,16 @@ class Indexer(Module):
         self.wq_b = cfg.wq_b.build()
         self.weights_proj = cfg.weights_proj.build()
         self.compressor = cfg.compressor.build()
+        # The exchange wires its own CP group in ``parallelize``; the compressor never sees it.
+        self.carry_exchange = cfg.carry_exchange.build()
 
-    @staticmethod
-    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
-        d = x.size(-1)
-        H = _hadamard(d, dtype=x.dtype, device=x.device)
-        return F.linear(x, H) * (d**-0.5)
-
-    def forward(self, x, qr, *, positions, attention_metadata):
+    def forward(self, x, qr, *, positions, attention_metadata, x_keys=None):
         """Project raw indexer queries, keys, and per-head weights.
 
-        ``x`` is the caller's **local** stream (never the augmented
-        stream): ``idx_q`` / ``idx_w`` derive from the local ``qr`` and
-        the local rows, and the indexer's compressor borrows its own
-        block rows internally.
+        ``x`` is the query frame (this rank's chunks under CP) and ``qr`` its latent, so
+        ``idx_q`` / ``idx_w`` derive from the same rows the queries do.  ``x_keys`` is the
+        local slab the compressor projects its keys from (``x`` when it is not given): under CP
+        the keys stay the slab, exactly as the attention's KV streams do.
 
         Returns:
             idx_q: Indexer queries ``[B, L, num_index_heads, index_head_dim]``
@@ -252,14 +252,35 @@ class Indexer(Module):
                 (the local rows).
         """
         bsz, seqlen, _ = qr.size()
+        positions_q = attention_metadata.positions_q
         idx_q = self.wq_b(qr)
         idx_q = idx_q.view(bsz, seqlen, self.num_index_heads, self.head_dim)
-        idx_q = self.rope(idx_q, positions=positions)
+        idx_q = self.rope(idx_q, positions=positions_q)
         idx_q = self._rotate_activation(idx_q)
-        idx_k = self.compressor(x, attention_metadata)
+        # The carry is a stream transformation, not part of the compressor: the exchange
+        # prepends the predecessor's block (a no-op at one degree) and the same compressor
+        # instance then pools the augmented stream; its carry block is trimmed back off.
+        carry = self.carry_exchange(
+            x if x_keys is None else x_keys,
+            positions,
+            attention_metadata.cu_seq_q,
+        )
+        idx_k = self.compressor(
+            carry.x,
+            carry.positions,
+            cu_seqlens=carry.cu_seqlens,
+        )
+        if carry.trim:
+            idx_k = idx_k.narrow(1, carry.trim, idx_k.size(1) - carry.trim)
         idx_k = self._rotate_activation(idx_k)
         idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
         return idx_q, idx_k, idx_w
+
+    @staticmethod
+    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
+        d = x.size(-1)
+        H = _hadamard(d, dtype=x.dtype, device=x.device)
+        return F.linear(x, H) * (d**-0.5)
 
 
 def select_compressed_slots(
@@ -316,9 +337,9 @@ def student_logits_at_picks(
     score scale (``select_compressed_slots`` cancels the operator's internal division; this
     pass never divides).
 
-    No production call site reads this pass yet: the fused recipe's teacher runs inside its
-    SLIG bridge.  It is the reference teacher pass that the LI/teacher binding is meant to
-    consume, and until that lands it is pinned by the unit tests only.
+    This is the pass ``LightningIndexer`` returns beside the selection, and the fused
+    selector's backward consumes the same quantity: at the picks, the student logits are the
+    only differentiable edge of the selection.
     """
     pool_start_L1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
     picked_BLKDi = idx_k.squeeze(0)[(topk_indices + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
@@ -337,16 +358,48 @@ class LightningIndexer(Module):
         self.index_topk = config.index_topk
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+        """Select the compressed slots and score them differentiably.
+
+        Returns ``(topk_indices, topk_scores)``:
+
+        - ``topk_indices`` ``[B, L, K]`` document-local with ``-1`` for an unused slot.  The
+          reference path keeps the selection operator's order: ``gather_attn`` sums the
+          selected rows in that order, and re-sorting here would perturb the reference
+          numerics (the checked-in golden is exact).  The fused selector canonicalises to
+          descending order inside its Function, because there the saved indices must pair
+          slot-for-slot with the teacher;
+        - ``topk_scores`` ``[B, L, K]``: the student logits at those picks, differentiable in
+          ``idx_q``/``idx_k``/``idx_w`` and ``-inf`` on every ``-1`` slot.  This is the value
+          contract the reference path exposes; the fused override returns an unread carrier
+          on the same edge because its teacher arrives on the gradient.
+        """
         # The selector runs on a layer of its own ratio and reads that layer's entry; a
         # geometry without a compressed pool is the only shape it refuses.
-        plan = attention_metadata.plan
-        if plan.cu_seqlens_cmp_k is None:
-            raise ValueError("LightningIndexer requires a ratio-4 plan carrying a compressed pool.")
-        return select_compressed_slots(
+        if attention_metadata.ratio <= 1:
+            raise ValueError("LightningIndexer requires a compressed geometry (ratio > 1).")
+        cu_seqlens = attention_metadata.q.cu_seqlens
+        cmp_frame = attention_metadata.cmp_k
+        if cmp_frame is None:
+            raise ValueError("a compressed geometry needs the entry's compressed frame")
+        cu_seqlens_k = cmp_frame.cu_seqlens
+        # Selection is discrete: it carries no gradient.  The operator's order is kept as-is
+        # for the reference path; the fused selector emits the canonical descending order
+        # (see the module docstring), so the two paths agree on the *set* and on ``-1``.
+        with torch.no_grad():
+            topk_indices = select_compressed_slots(
+                idx_q,
+                idx_k,
+                idx_w,
+                cu_seqlens,
+                cu_seqlens_k,
+                self.index_topk,
+            )
+        topk_scores = student_logits_at_picks(
             idx_q,
             idx_k,
             idx_w,
-            attention_metadata.varlen.cu_seq_q,
-            plan.cu_seqlens_cmp_k,
-            self.index_topk,
+            topk_indices,
+            cu_seqlens,
+            cu_seqlens_k,
         )
+        return topk_indices, topk_scores

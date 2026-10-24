@@ -30,6 +30,31 @@ original_pp_forward_backward_step = Trainer.pp_forward_backward_step
 
 
 @functools.wraps(original_post_dataloading_process)
+def _require_packing_alignment(self) -> None:
+    """First-batch guard: the loader's document padding must match the model's packing grid.
+
+    Every document is split into ``cp_degree`` equal chunks and each chunk must keep a whole
+    number of pooling groups, so ``--dataloader.per_doc_alignment`` must be a multiple of
+    ``lcm(compress_ratios) * cp_degree``.  Checked here, before the first forward, because the
+    trainer is where the model spec, the parallelism degree and the loader config meet; the
+    flag is cached so the check runs once per trainer.
+    """
+    if getattr(self, "_packing_alignment_checked", False):
+        return
+    self._packing_alignment_checked = True
+    model = getattr(getattr(self.config, "model_spec", None), "model", None)
+    compress_ratios = getattr(model, "compress_ratios", None)
+    if compress_ratios is None:
+        return
+    from torchtitan_npu.models.common.packing import require_per_doc_alignment
+
+    require_per_doc_alignment(
+        getattr(self.config.dataloader, "per_doc_alignment", 1),
+        compress_ratios,
+        self.config.parallelism.context_parallel_degree,
+    )
+
+
 def patched_post_dataloading_process(self, input_dict, labels):
     """Delegate the dataloader-to-forward preprocessing to the model.
 
@@ -39,6 +64,7 @@ def patched_post_dataloading_process(self, input_dict, labels):
     A model-level ``build_attention_masks`` override (transitional, the
     pre-#4116 shape of the same seam) is honored inside ``preprocess_inputs``.
     """
+    _require_packing_alignment(self)
     model = self.model_parts[0]
     preprocess_inputs = getattr(model, "preprocess_inputs", None)
     if preprocess_inputs is None:

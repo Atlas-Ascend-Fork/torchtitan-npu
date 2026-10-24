@@ -30,7 +30,7 @@ A5 使用 `CONFIG=deepseek_v4_flash_lora bash examples/deepseek_v4/deepseek_v4_f
 | `--extension.quantization.no-enable-quantized-training` | 关闭量化训练，使用 BF16 基座 |
 | `--extension.quantization.recipe` | 选择已有量化方案；A5 入口默认 `all_block_fp8` |
 
-未启用量化时，LoRA 沿用原有基座配置。使用已有 TorchAO-NPU 参数量化方案时，LoRA 配置保留所选量化策略，基座参数沿用原策略选择，适配器保持 BF16。替换整个模块且无法保留适配器前向计算的方案会在配置阶段报错。优化器和并行配置详见 [Muon 优化器](muon_optimizer.md)与[上下文并行](deepseek_v4_cp.md)。
+未启用量化时，LoRA 沿用原有基座配置。使用已有 TorchAO-NPU 参数量化方案时，LoRA 配置保留所选量化策略，基座参数沿用原策略选择，适配器保持 BF16。替换整个模块且无法保留适配器前向计算的方案会在配置阶段报错。优化器和并行配置详见 [Muon 优化器](muon_optimizer.md)与[上下文并行](context_parallel.md)。
 
 模型并行化后、创建优化器前冻结非 LoRA 参数，并关闭 MoE 负载均衡更新，保留基座路由偏置。需要只训练部分适配器时，可在并行化回调返回后冻结对应参数，例如冻结全部 `lora_a`、仅训练 B。
 

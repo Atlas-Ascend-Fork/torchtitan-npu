@@ -30,7 +30,7 @@ CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model sa
 TP=1
 PP=1
 EP=8
-CP=1
+CP="${CP:-1}"
 DP_SHARD=8
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
@@ -56,6 +56,7 @@ HF_ASSETS_ARGS="
 # Dataloader
 DATALOADER_ARGS="
     --dataloader.dataset ${DATASET}
+    --dataloader.per_doc_alignment $((128 * CP))
     --dataloader.dataset-path ${DATASET_PATH}
 "
 
@@ -139,7 +140,7 @@ else
         # Attention / DSA
         torchtitan_npu.override.common.rms_norm.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 
         torchtitan_npu.override.deepseek_v4.sparse_attn.asc
         # MHC

@@ -53,9 +53,10 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
 class QuantV4Metadata(AscV4Metadata):
     """The quantized backend's entry.
 
-    Same interface as the fused one (``asc.sparse_attn`` / ``asc.lightning_indexer``), because the
-    forward it feeds is the fused forward.  A context-parallel re-cut is refused: this entry's
-    selector record is this backend's own operator, and the re-cut has no backend to ask.
+    Same interface as the fused one (``aicpu_metadata.sparse_attn`` /
+    ``aicpu_metadata.lightning_indexer``), because the forward it feeds is the fused forward.
+    A context-parallel re-cut is refused: this entry's selector record is this backend's own
+    operator, and the re-cut has no backend to ask.
     """
 
     @staticmethod
@@ -82,9 +83,9 @@ def selector_record(
     quant_mode: int,
 ) -> torch.Tensor:
     """The quantized selector's forward grid for this entry's frames."""
-    plan = metadata.plan
-    if plan.cu_seqlens_cmp_k is None or plan.block_remainder is None:
-        raise ValueError("the quantized selector needs a pooling geometry's plan.")
+    cmp_k = metadata.cmp_k
+    if cmp_k is None or cmp_k.residual is None:
+        raise ValueError("the quantized selector needs a pooling geometry's compressed frame.")
     return torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
         geometry.index_num_heads,
         1,
@@ -95,9 +96,9 @@ def selector_record(
         layout_k=LAYOUT,
         mask_mode=MASK_MODE,
         cmp_ratio=CMP_RATIO,
-        cu_seqlens_q=metadata.varlen.cu_seq_q,
-        cu_seqlens_k=plan.cu_seqlens_cmp_k,
-        cmp_residual_k=plan.block_remainder,
+        cu_seqlens_q=metadata.cu_seq_q,
+        cu_seqlens_k=cmp_k.cu_seqlens,
+        cmp_residual_k=cmp_k.residual,
     )
 
 
@@ -121,14 +122,22 @@ def attach_selector_record(
     torch._dynamo.maybe_mark_dynamic(record, 0)
     # GraphTrainer's tracer reads this annotation for input dimensions.
     setattr(record, "_dynamo_unbacked_indices", {0})  # noqa: B010
-    if metadata.asc is None:
-        raise ValueError("the fused entry must carry its AI_CPU records")
-    asc = replace(metadata.asc, lightning_indexer=replace(metadata.asc.lightning_indexer, fwd=record))
+    asc = replace(
+        metadata.aicpu_metadata,
+        lightning_indexer=replace(metadata.aicpu_metadata.lightning_indexer, fwd=record),
+    )
     return QuantV4Metadata(
-        varlen=metadata.varlen,
+        cu_seq_q=metadata.cu_seq_q,
+        cu_seq_k=metadata.cu_seq_k,
         ratio=metadata.ratio,
-        plan=metadata.plan,
-        window=metadata.window,
-        window_size=metadata.window_size,
-        asc=asc,
+        positions_q=metadata.positions_q,
+        exchange=metadata.exchange,
+        q=metadata.q,
+        swa_k=metadata.swa_k,
+        cmp_k=metadata.cmp_k,
+        selector_k=metadata.selector_k,
+        selector_k_gather=metadata.selector_k_gather,
+        swa_k_prefix=metadata.swa_k_prefix,
+        swa_k_gather=metadata.swa_k_gather,
+        aicpu_metadata=asc,
     )

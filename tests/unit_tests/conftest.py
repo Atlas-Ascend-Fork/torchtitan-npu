@@ -192,7 +192,6 @@ def dsv4():
 
     ns = types.SimpleNamespace()
     ns.metadata = importlib.import_module("torchtitan_npu.models.deepseek_v4.metadata")
-    ns.token_dispatcher = importlib.import_module("torchtitan_npu.models.deepseek_v4.token_dispatcher")
     ns.attention = importlib.import_module("torchtitan_npu.models.deepseek_v4.attention")
     ns.compressor = importlib.import_module("torchtitan_npu.models.deepseek_v4.compressor")
     spec = importlib.util.spec_from_file_location(

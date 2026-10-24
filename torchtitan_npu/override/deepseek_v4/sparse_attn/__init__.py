@@ -1,9 +1,10 @@
-"""DeepSeek-V4 sparse-attention overrides (registry-facing module).
+"""DeepSeek-V4 sparse-attention override (registry-facing module).
 
-The AscendC fused implementation (record tier + kernel) lives in
-``ascendc.py``, the PyPTO variant in ``pypto.py``; the registrations are
-defined here so the override paths stay
-``override.deepseek_v4.sparse_attn.{asc_li, asc, pypto, pypto_li}``.
+The fused implementation (record tier + kernel) lives in ``ascendc.py``; the registration
+is defined here so the override path stays ``override.deepseek_v4.sparse_attn.asc``.
+The selector is not part of this bridge: it is the separate
+``override.deepseek_v4.lightning_indexer.asc`` entry, and a training recipe must select the
+two together (SMLAG emits the teacher, SLIKG consumes it).
 Each fused core's own config builds the metadata it consumes (upstream #4897):
 ``AscCompressedSparseInnerAttention.Config.build_attention_metadata`` fills the
 AscendC records and the LI record contract its config node names, so a recipe
@@ -23,37 +24,21 @@ default, so an unstated geometry cannot size a record.
 
 from typing import TYPE_CHECKING
 
-import spmd_types as spmd
 from torchtitan.config import derive, override
-from torchtitan.models.common.decoder_sharding import dense_param_placement
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
 
 if TYPE_CHECKING:
     from .ascendc import AscCompressedSparseInnerAttention
-    from .pypto import PyPTOCompressedSparseInnerAttention
-
-
-@override(
-    target=LightningIndexer.Config,
-    exact=True,
-    description="Use AscendC TND LightningIndexer",
-)
-def asc_li(cfg: LightningIndexer.Config):
-    from .ascendc import AscLightningIndexer
-
-    return derive(cfg, AscLightningIndexer.Config)
 
 
 @override(
     target=CompressedSparseInnerAttention.Config,
     exact=True,
-    description=("Use cann_ops_transformer TND LightningIndexer and SparseFlashMLA with fused SASG/SLIG backward"),
+    description="Use cann_ops_transformer TND SparseFlashMLA with fused SMLAG backward",
 )
 def asc(
     cfg: CompressedSparseInnerAttention.Config,
-    indexer_loss_coeff: float = 1.0,
     *,
     num_heads: int = 64,
     head_dim: int = 512,
@@ -69,6 +54,10 @@ def asc(
     so every record is sized from a value some entry stated.  The window and the selection width
     are not stated here -- they are the layer's own config fields (``window_size`` /
     ``index_topk``), which the model states once.
+
+    The teacher this core emits on ``topk_scores``' gradient is the raw SMLAG marginal scaled by
+    ``softmax_scale``; the selector's own entry (``lightning_indexer.asc``) consumes that edge
+    with SLIKG.  Select both entries together when training the indexer.
     """
     # Imported lazily so the reference path does not require cann_ops_transformer.
     from .ascendc import AscCompressedSparseInnerAttention
@@ -79,60 +68,9 @@ def asc(
     result = derive(
         cfg,
         AscCompressedSparseInnerAttention.Config,
-        indexer_loss_coeff=indexer_loss_coeff,
         num_heads=num_heads,
         head_dim=head_dim,
         index_num_heads=index_num_heads,
         index_head_dim=index_head_dim,
     )
-    # The AscendC core's own ``_indexer_loss_acc`` accumulator buffer needs its
-    # placement declared (a replicated scalar) for the state-distribution
-    # pass.
-    sharding_config = result.sharding_config
-    assert sharding_config is not None, "the asc override requires the sharding config"
-    sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(tp=spmd.R)
     return result
-
-
-@override(
-    target=CompressedSparseInnerAttention.Config,
-    exact=True,
-    description="Use PyPTO LI/LIG with AscendC TND SMLA/SMLAG",
-)
-def pypto(
-    cfg: CompressedSparseInnerAttention.Config,
-    indexer_loss_coeff: float = 1.0,
-    *,
-    num_heads: int = 64,
-    head_dim: int = 512,
-    index_num_heads: int = 64,
-    index_head_dim: int = 128,
-) -> "PyPTOCompressedSparseInnerAttention.Config":
-    """PyPTO LI/LIG with the AscendC SMLA/SMLAG kernels and their records.
-
-    It reuses the AscendC record tier, so it states the same geometry, with the same released
-    defaults.
-    """
-    # Imported lazily so the reference path does not require cann_ops_transformer.
-    from .pypto import PyPTOCompressedSparseInnerAttention
-
-    return derive(
-        cfg,
-        PyPTOCompressedSparseInnerAttention.Config,
-        indexer_loss_coeff=indexer_loss_coeff,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        index_num_heads=index_num_heads,
-        index_head_dim=index_head_dim,
-    )
-
-
-@override(
-    target=LightningIndexer.Config,
-    exact=True,
-    description="Use PyPTO LightningIndexer",
-)
-def pypto_li(cfg: LightningIndexer.Config):
-    from .pypto import PyPTOLightningIndexer
-
-    return derive(cfg, PyPTOLightningIndexer.Config)

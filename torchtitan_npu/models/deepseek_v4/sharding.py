@@ -59,76 +59,52 @@ def dense_token_ids_sequence_parallel_placement() -> SpmdLayout:
     )
 
 
-def set_compressed_sparse_attention_sharding(wrapper_cfg) -> None:
+def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
+    """The CP boundary of the sparse core and its selector (the V4.1 pattern).
+
+    ``replicated_activation`` is TP-replicated and CP-sharded at the producer side; ``row`` is
+    the gathered whole row the consumer addresses.  The core's ``ShardingConfig`` turns the
+    former into the latter for both KV streams, and the selector gathers the index keys the
+    same way; both are the ``S(1) -> R`` conversion V4.1 declares at its own call sites.
+    """
     q = dense_activation_placement(tp=spmd.S(2))
     replicated_activation = dense_activation_placement(tp=spmd.R)
+    row = dense_activation_placement(tp=spmd.R, cp=spmd.R)
+    sink = _attn_sink_placement
 
-    input_shardings = {
+    placements = {
         "q": q,
         "swa_k": replicated_activation,
         "cmp_k": replicated_activation,
-        "attn_sink": _attn_sink_placement,
-        "idx_q": replicated_activation,
-        "idx_k": replicated_activation,
-        "idx_w": replicated_activation,
+        "topk_indices": replicated_activation,
+        "topk_scores": replicated_activation,
+        "attn_sink": sink,
     }
-    # Under context parallel the compressed containers are CP-sharded
-    # (``cp = S(1)``, the ``dense_activation_placement`` default) and the
-    # core consumes them replicated: the ShardingConfig emits the all-gather
-    # at the core boundary (the DeepSeek-V3.2 ``S(1) -> R`` pattern).
-    output_shardings = dict(input_shardings)
-    for name in ("cmp_k", "idx_k"):
-        output_shardings[name] = dense_activation_placement(tp=spmd.R, cp=spmd.R)
-    grad_placements = [
-        q,
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        _attn_sink_placement,
-    ]
-
-    wrapper_cfg.sharding_config = ShardingConfig(
-        in_src_shardings=input_shardings,
-        in_dst_shardings=output_shardings,
+    # The core consumes the gathered KV streams, the local query chunks and the sink, while
+    # the selection arrives from the selector already in the model's document-local numbering.
+    consumed = {**placements, "swa_k": row, "cmp_k": row}
+    attention_cfg.inner_attention.sharding_config = ShardingConfig(
+        in_src_shardings=placements,
+        in_dst_shardings=consumed,
         out_src_shardings=q,
         out_dst_shardings=q,
     )
 
-    # The core keeps only its private state placement and backward map.  The
-    # CP all-gather for LI/core inputs belongs exclusively to the wrapper.
-    wrapper_cfg.inner_attention.sharding_config = ShardingConfig(
-        in_src_shardings={
-            "q": q,
-            "swa_k": replicated_activation,
-            "cmp_k": replicated_activation,
-            "idx_q": replicated_activation,
-            "idx_k": replicated_activation,
-            "idx_w": replicated_activation,
-            "attn_sink": _attn_sink_placement,
-        },
-        in_dst_shardings={
-            "q": q,
-            "swa_k": replicated_activation,
-            "cmp_k": replicated_activation,
-            "idx_q": replicated_activation,
-            "idx_k": replicated_activation,
-            "idx_w": replicated_activation,
-            "attn_sink": _attn_sink_placement,
-        },
-        # local_map requires the core output placement even though its input
-        # CP conversion is owned by the enclosing wrapper.
-        out_src_shardings=q,
-        out_dst_shardings=q,
-        # The AscendC indexer-loss accumulator is a per-rank fp32 scalar buffer;
-        # replicate it (like the v3.2 ``_acc``) so the loss logger reads a
-        # consistent value.
-        state_shardings={
-            "_indexer_loss_acc": dense_param_placement(tp=spmd.I),
-        },
-        local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
-    )
+    if attention_cfg.lightning_indexer is not None:
+        # The selector scores the whole row's index keys against this rank's chunks: the query
+        # side stays replicated, the keys get the same ``S(1) -> R`` gather as the KV streams.
+        attention_cfg.lightning_indexer.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "idx_q": replicated_activation,
+                "idx_k": replicated_activation,
+                "idx_w": replicated_activation,
+            },
+            in_dst_shardings={
+                "idx_q": replicated_activation,
+                "idx_k": row,
+                "idx_w": replicated_activation,
+            },
+        )
 
 
 def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
@@ -147,8 +123,8 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         state_shardings={"attn_sink": _attn_sink_placement},
     )
 
-    # The wrapper is the CP boundary for both LI and sparse attention.
-    set_compressed_sparse_attention_sharding(at.compressed_sparse_attention)
+    # The core and the selector are the CP boundary for the KV/index streams.
+    set_compressed_sparse_attention_sharding(at)
 
     # Attention submodule configs are explicit fields, so their parameter
     # layouts can be assigned before construction.
@@ -189,8 +165,17 @@ def set_compressor_sharding(compressor_cfg):
     compressor_cfg.wkv.sharding_config = _replicate_weight
     compressor_cfg.wgate.sharding_config = _replicate_weight
     compressor_cfg.norm.sharding_config = _replicate_weight
-    # ``ape`` is a plain parameter on the Compressor module itself.
-    compressor_cfg.sharding_config = ShardingConfig(state_shardings={"ape": _dense_param_rep})
+    # ``ape`` is a plain parameter on the Compressor module itself.  The output is the local
+    # compressed chunk (CP-sharded); state it explicitly so the wrapper's ``S(1) -> R`` gather
+    # has a source placement to convert from rather than inferring one.
+    local_chunk = dense_activation_placement(tp=spmd.R)
+    compressor_cfg.sharding_config = ShardingConfig(
+        state_shardings={"ape": _dense_param_rep},
+        in_src_shardings={"x": local_chunk},
+        in_dst_shardings={"x": local_chunk},
+        out_src_shardings=local_chunk,
+        out_dst_shardings=local_chunk,
+    )
 
 
 def set_indexer_sharding(indexer_cfg):

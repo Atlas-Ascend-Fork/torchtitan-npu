@@ -38,7 +38,7 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
         torchtitan_npu.override.common.rope.asc_partial \
         torchtitan_npu.override.common.swiglu_group.asc \
         torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li \
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc \
         torchtitan_npu.override.deepseek_v4.sparse_attn.asc \
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre \
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \

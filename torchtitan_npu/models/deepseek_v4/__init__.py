@@ -23,9 +23,10 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
+from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention, UnitScaleRMSNorm
+from .attention import Attention, CompressedSparseInnerAttention, UnitScaleRMSNorm
 from .compressor import Compressor, Indexer, LightningIndexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
@@ -170,6 +171,7 @@ def _make_indexer_config(
             coff=coff,
             rope=rope,
         ),
+        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
     )
 
 
@@ -237,11 +239,6 @@ def _make_v4_attn_config(
         softmax_scale=softmax_scale,
         index_topk=index_topk,
     )
-    compressed_sparse_attention_cfg = CompressedSparseAttention.Config(
-        lightning_indexer=lightning_indexer_cfg,
-        inner_attention=inner_attention_cfg,
-    )
-
     return Attention.Config(
         n_heads=n_heads,
         head_dim=head_dim,
@@ -250,8 +247,9 @@ def _make_v4_attn_config(
         n_groups=n_groups,
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
+        lightning_indexer=lightning_indexer_cfg,
         inner_attention=inner_attention_cfg,
-        compressed_sparse_attention=compressed_sparse_attention_cfg,
+        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
         # Attention sites are head_dim wide; the base rope may be reused by
         # the indexer (index_head_dim wide), so split is pinned per site.
         rope=dataclasses.replace(rope, split=head_dim - rope_head_dim),
@@ -499,14 +497,13 @@ def _build_mtp_layers(
         attention.compress_ratio = 1
         attention.compressor = None
         attention.indexer = None
-        # MTP attention is dense; disable the prebuilt LI wrapper branch too.
-        attention.compressed_sparse_attention.lightning_indexer = None
+        # MTP attention is dense; disable the prebuilt selector branch too.
+        attention.lightning_indexer = None
         # Swap the plain rope in (the main layer may carry the compress-theta
         # variant) while keeping the per-site split pin: rope receives the
         # full-width head_dim tensor and rotates only its trailing channels.
         attention.rope = copy.deepcopy(dataclasses.replace(rope, split=attention.head_dim - attention.rope_head_dim))
-        inner_attention = attention.compressed_sparse_attention.inner_attention
-        inner_attention.compress_ratio = 1
+        cast("CompressedSparseInnerAttention.Config", attention.inner_attention).compress_ratio = 1
 
         moe = copy.deepcopy(inner_cfg.moe)
         moe.router.gate.param_init = _depth_init(layer_id)

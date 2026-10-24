@@ -7,22 +7,18 @@ from dataclasses import dataclass, field
 
 import torch
 from attn_gym.sparse import AuxRequest, gather_attn
-from torchtitan.models.common.attention import (
-    BaseAttention,
-    VarlenAttention,
-    create_varlen_metadata_for_document,
-)
+from torchtitan.models.common.attention import BaseAttention, VarlenAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.document_intervals import document_intervals
+from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.models.common.query_exchange import QueryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
-from .metadata import DeepSeekV4Metadata, build_compressed_varlen_metadata
-from .token_dispatcher import CPTokenDispatcher
+from .metadata import DeepSeekV4Metadata, build_v4_metadata
 
 
 class UnitScaleRMSNorm(RMSNorm):
@@ -90,9 +86,9 @@ class CompressedSparseInnerAttention(Module):
         def attention_metadata_key(self):
             """This layer's own entry: the core's class plus its compression ratio.
 
-            One entry per geometry is what lets the builder derive exactly the plan this layer
-            grids -- no stack-wide ratio table on any config, and no entry shared by layers whose
-            kernels address different pools.
+            One entry per geometry is what lets the builder derive exactly the grid this layer
+            addresses -- no stack-wide ratio table on any config, and no entry shared by layers
+            whose kernels address different pools.
             """
             return (type(self), self.compress_ratio)
 
@@ -106,19 +102,18 @@ class CompressedSparseInnerAttention(Module):
         ) -> DeepSeekV4Metadata:
             """This geometry's per-microbatch contract (upstream #4897).
 
-            Built from the pre-shard ``positions`` alone: the entry carries its own ratio's plan
-            over the row this builder derives, so one build serves every layer of this geometry --
+            Built from the pre-shard ``positions`` alone: the entry carries the row's boundaries
+            and its own ratio's fold of them, so one build serves every layer of this geometry --
             the decoder keys the map by this config's :attr:`attention_metadata_key`.  This
             builder's contract refuses context parallel; the fused core's config builds an entry
             whose hook rebuilds it for this rank.
             """
             del padding_mask, max_num_documents, max_context_length
-            # A document starts where ``positions`` resets to 0; the window size is the core's
-            # own field, so it is part of what this entry's plan was derived for.
-            varlen = create_varlen_metadata_for_document(positions)
-            # The selector's record is the selector port's business: this builder produces the
-            # packed contract only, and a fused selector backend attaches its own record.
-            return build_compressed_varlen_metadata(varlen, self.compress_ratio, window_size=self.window_size)
+            # A document starts where ``positions`` resets to 0; this layer's ratio folds the row
+            # into the pool grid its kernels address.  The selector's records are the selector
+            # port's business: this builder produces the row's frames only, and a fused selector
+            # backend attaches its own records.
+            return build_v4_metadata(positions, self.compress_ratio)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -133,39 +128,46 @@ class CompressedSparseInnerAttention(Module):
         self,
         q,
         swa_k,
-        cmp_k=None,
-        idx_q=None,
-        idx_k=None,
-        idx_w=None,
+        attn_sink: torch.Tensor,
         *,
-        attn_sink: torch.Tensor | None = None,
-        sparse_indices=None,
-        attention_metadata: DeepSeekV4Metadata | None = None,
+        cmp_k=None,
+        topk_indices=None,
+        topk_scores=None,
+        attention_metadata: DeepSeekV4Metadata,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # The indexer's projections are the selector's business, not the core's.
-        del idx_q, idx_k, idx_w
-        if attn_sink is None:
-            raise ValueError("CompressedSparseInnerAttention requires attn_sink")
+        # ``topk_scores`` is the selector's student-logit edge (or a fused port's teacher
+        # carrier).  The reference core only gathers by ``topk_indices``, so it accepts the
+        # tensor for the shared forward contract and never reads it.
+        del topk_scores
         if not isinstance(attention_metadata, DeepSeekV4Metadata):
             raise TypeError(
                 "CompressedSparseInnerAttention requires DeepSeekV4Metadata "
                 f"attention metadata, got {type(attention_metadata).__name__}."
             )
+        if self.compress_ratio == 4 and (cmp_k is None) != (topk_indices is None):
+            raise ValueError("ratio-4 attention requires cmp_k and topk_indices together.")
         bsz, seqlen, _, head_dim = q.size()
         n_cmp = 0 if cmp_k is None else cmp_k.size(1)
-        cu_seqlens = attention_metadata.varlen.cu_seq_q
+        # The frames the kernels grid: the query's and, for a pooling geometry, the compressed
+        # pool's.  The reference path and a fused port read the same ones.
+        cu_seqlens = attention_metadata.q.cu_seqlens
         if n_cmp == 0:
             # A window-only layer: the pool is empty, and the operator wants both offsets.
             cu_seqlens_k = cu_seqlens
             kv_indices = q.new_empty((bsz, seqlen, 0), dtype=torch.long)
             sparse_kv = q.new_zeros((bsz, 1, 0, head_dim))
         else:
-            # ``n_cmp`` is this tensor's width, so it is present here.
+            # ``n_cmp`` is this tensor's width, so the frame is present here.
             assert cmp_k is not None
-            cu_seqlens_k = attention_metadata.plan.cu_seqlens_cmp_k
-            if cu_seqlens_k is None:
-                raise ValueError(f"No compressed pool layout for ratio={self.compress_ratio}.")
-            kv_indices = self._slots(sparse_indices, cu_seqlens, cu_seqlens_k, seqlen, n_cmp)
+            cmp_frame = attention_metadata.cmp_k
+            if cmp_frame is None:
+                raise ValueError("a compressed KV needs the entry's compressed frame")
+            cu_seqlens_k = cmp_frame.cu_seqlens
+            # The selection is an input: the selector's picks at ratio four, and the entry's
+            # precomputed reference selection for a geometry without a selector.
+            kv_indices = topk_indices if self.compress_ratio == 4 else attention_metadata.slots
+            if kv_indices is None:
+                raise ValueError("the entry carries no selection for this geometry")
             sparse_kv = cmp_k.reshape(bsz, 1, n_cmp, head_dim)
 
         aux = AuxRequest(lse=True) if self.return_lse else None
@@ -188,69 +190,11 @@ class CompressedSparseInnerAttention(Module):
         output, gathered = result
         return output.transpose(1, 2), gathered.lse
 
-    def _slots(
-        self,
-        sparse_indices: torch.Tensor | None,
-        cu_seqlens: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        seqlen: int,
-        n_cmp: int,
-    ) -> torch.Tensor:
-        """The selection, in the per-document numbering ``gather_attn`` reads."""
-        if self.compress_ratio == 4:
-            if sparse_indices is None:
-                raise ValueError("CompressedSparseInnerAttention requires sparse_indices at ratio 4")
-            if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
-                sparse_indices = sparse_indices.squeeze(2)
-            if sparse_indices.ndim != 3:
-                raise ValueError("sparse_indices must be [B, L, K] or [B, L, 1, K]")
-            return sparse_indices
-        # HCA: every causally reachable slot, numbered inside the query's own document.
-        pool_start_L1, pool_end_L1, local_L1 = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=seqlen)
-        ends_L1 = torch.minimum(pool_end_L1, pool_start_L1 + (local_L1 + 1) // self.compress_ratio)
-        slots_1N = torch.arange(n_cmp, device=cu_seqlens.device).unsqueeze(0)
-        local_LN = slots_1N.expand(seqlen, -1) - pool_start_L1
-        visible_LN = (slots_1N >= pool_start_L1) & (slots_1N < ends_L1)
-        return torch.where(visible_LN, local_LN, -1).unsqueeze(0)
-
-
-class CompressedSparseAttention(Module):
-    """Thin CP boundary containing LI and the sparse attention core."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        lightning_indexer: LightningIndexer.Config | None
-        inner_attention: CompressedSparseInnerAttention.Config
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.lightning_indexer = config.lightning_indexer.build() if config.lightning_indexer is not None else None
-        self.inner_attention = config.inner_attention.build()
-
-    def forward(
-        self, q, swa_k, cmp_k=None, *, idx_q=None, idx_k=None, idx_w=None, attn_sink=None, attention_metadata=None
-    ):
-        sparse_indices = None
-        if self.lightning_indexer is not None:
-            sparse_indices = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=attention_metadata)
-        return self.inner_attention(
-            q,
-            swa_k,
-            cmp_k,
-            idx_q=idx_q,
-            idx_k=idx_k,
-            idx_w=idx_w,
-            sparse_indices=sparse_indices,
-            attn_sink=attn_sink,
-            attention_metadata=attention_metadata,
-        )
-
 
 class Attention(BaseAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         n_heads: int
-        inner_attention: Module.Config
         rope: RoPE.Config
         head_dim: int
         rope_head_dim: int
@@ -270,15 +214,21 @@ class Attention(BaseAttention):
         wo_a: BatchedLinear.Config
         wo_b: Linear.Config
 
-        # Built only for ``compress_ratio > 1`` layers (``indexer`` only for
-        # ratio-4 CSA layers); the registry passes ``None`` otherwise.
+        # Built only for ``compress_ratio > 1`` layers (``indexer``/``lightning_indexer``
+        # only for ratio-4 CSA layers); the registry passes ``None`` otherwise.
         compressor: Compressor.Config | None
         indexer: Indexer.Config | None
-        compressed_sparse_attention: CompressedSparseAttention.Config
+        lightning_indexer: LightningIndexer.Config | None
+        # The ratio-4 overlap's cross-rank block, beside the compressor it feeds.
+        carry_exchange: CarryExchange.Config
+        # The sparse core the decoder replaces wholesale with ``sparse_attn.asc``.  It is the
+        # layer's only metadata backend and the CP boundary for its KV streams; the annotation
+        # stays the base type because a port's config is a replacement of this node.
+        inner_attention: Module.Config
 
-        # The CP token dispatcher (the RoutedExperts mirror): a submodule of
-        # the attention, wired once by ``Attention.parallelize``.
-        token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
+        # The query side's context-parallel movement (the V4.1 contract): a module only
+        # because the process group it runs on is run-level state, wired by ``parallelize``.
+        query_exchange: QueryExchange.Config = field(default_factory=QueryExchange.Config)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -291,7 +241,7 @@ class Attention(BaseAttention):
         self.norm_eps = cfg.norm_eps
         self.rope = cfg.rope.build()
 
-        self.token_dispatcher = cfg.token_dispatcher.build()
+        self.query_exchange = cfg.query_exchange.build()
 
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
@@ -307,56 +257,49 @@ class Attention(BaseAttention):
 
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
-        self.compressed_sparse_attention = cfg.compressed_sparse_attention.build()
+        self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
+        self.inner_attention = cfg.inner_attention.build()
+        # The exchange wires its own CP group in ``parallelize``; the compressor itself never
+        # learns about context parallel and is the same instance at every degree.
+        self.carry_exchange = cfg.carry_exchange.build()
 
     def parallelize(self, parallel_dims) -> None:
-        """Parallelize the attention, then wire the CP mesh on the
-        attention's own token dispatcher (the ``RoutedExperts.parallelize``
-        mirror).  The compressors' dispatchers are wired by their owners'
-        ``parallelize`` through the framework's ``Module.parallelize``
-        recursion."""
-        super().parallelize(parallel_dims)
-        self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
+        """Parallelize the attention and the modules that own a CP group.
 
-    @property
-    def attention_metadata_key(self):
-        """The map key of the metadata this layer reads (upstream #4897).
-
-        ``BaseAttention``'s default forwards to the built ``inner_attention``;
-        this wrapper builds a ``compressed_sparse_attention`` around the DSA
-        core instead (the same config node sits at ``inner_attention`` for the
-        decoder's traversal), so the key comes from the core one level down.
+        The query exchange and the carry exchanges take the CP mesh through their own
+        ``parallelize`` (the framework recurses into every child module); nothing wraps the
+        compressor, whose module path, sharding and checkpoint entries stay as they are.
         """
-        return self.compressed_sparse_attention.inner_attention.attention_metadata_key
+        super().parallelize(parallel_dims)
 
     def forward(self, x, attention_metadata, positions):
         """The unified attention forward (CP and non-CP).
 
-        The Q side and the swa projection run on the local stream; the
-        token dispatcher's ops serve every consumer with no context-
-        parallel special-casing: ``gather`` exchanges the post-RoPE
-        ``swa_k`` rows (the window plan) into the packed ori stream, the
-        compressors gather their own block rows internally, and ``select``
-        packs the pooled streams into the padded containers.  The
-        containers' all-gather is declarative — the wrapper's
-        ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the wrapper
-        boundary.
+        The query side moves onto this rank's chunks of every document (the V4.1 query
+        exchange); the KV streams stay the slab this rank holds and are gathered at the fused
+        core's boundary.  Only the projections move -- never the hidden states -- so the keys
+        keep the rows and positions they always had, and the queries rotate at the positions
+        the metadata carries.
         """
-        window = attention_metadata.window
         bsz, seqlen, _ = x.size()
+        metadata = attention_metadata
+        # The query frame: at one degree the exchange has no movement and hands the slab back;
+        # under CP it permutes the slab onto chunk ``r`` of every document.
+        x_q = self.query_exchange.permute(x.squeeze(0), metadata.exchange).unsqueeze(0)
+        positions_q = metadata.positions_q
 
-        qr = self.q_norm(self.wq_a(x))
+        qr = self.q_norm(self.wq_a(x_q))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, -1, self.head_dim)
         q = self.q_head_norm(q)
         # RoPE owns the [nope | rope] split: it receives the full-width
         # tensor and rotates only the trailing rope_head_dim channels.
-        q = self.rope(q, positions=positions)
+        q = self.rope(q, positions=positions_q)
 
         # The swa projection + RoPE run on the local rows (the sender's own
-        # doc-relative positions — the attention's positions convention
-        # resets per document); the window gather exchanges the post-RoPE
-        # rows into the packed ori stream.
+        # doc-relative positions -- the attention's positions convention
+        # resets per document); the core's sharding gathers the rows to the
+        # whole row under CP.
         swa_k = self.kv_norm(self.wkv(x))
         # Flatten only for a singleton batch; otherwise preserve per-batch
         # positions so the RoPE cache matches the query's sequence length.
@@ -365,43 +308,56 @@ class Attention(BaseAttention):
             swa_k.unsqueeze(2),
             positions=rope_positions,
         ).squeeze(2)
-        swa_k = self.token_dispatcher.gather(swa_k, window)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None
 
         if self.compress_ratio > 1 and self.indexer is not None:
             idx_q, idx_k, idx_w = self.indexer(
-                x.detach(),
+                x_q.detach(),
                 qr.detach(),
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_metadata=metadata,
+                x_keys=x.detach(),
             )
-            # The indexer's outputs: idx_q / idx_w (local), idx_k (the
-            # pooled stream — packed into the container).
-            idx_k = self.token_dispatcher.select(idx_k, attention_metadata.plan)
-
         if self.compress_ratio > 1:
             assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
-            plan = attention_metadata.plan
-            pooled = self.compressor(x, attention_metadata)
-            cmp_k = self.token_dispatcher.select(pooled, plan)
+            # The carry exchange prepends the overlap block under CP (a no-op at one degree);
+            # the same compressor pools the augmented stream and the carry block is trimmed
+            # back off, so the compressor itself never sees the CP axis.
+            carry = self.carry_exchange(x, positions, metadata.cu_seq_q)
+            cmp_k = self.compressor(
+                carry.x,
+                carry.positions,
+                cu_seqlens=carry.cu_seqlens,
+            )
+            if carry.trim:
+                cmp_k = cmp_k.narrow(1, carry.trim, cmp_k.size(1) - carry.trim)
 
-        # Inner-attention positional contract: absent components are None.
-        #   sink + swa_k always; + cmp_k when compress_ratio > 1;
-        #   + idx_q/idx_k/idx_w when compress_ratio == 4 (indexer layer).
-        o = self.compressed_sparse_attention(
+        # The selector (the separate ``lightning_indexer.asc`` override) emits the selection
+        # and its teacher carrier; the core consumes both.  An external selector (the quantized
+        # backend) may return indices alone, and then the core gets no carrier.
+        topk_indices = topk_scores = None
+        if self.lightning_indexer is not None:
+            selection = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
+            if isinstance(selection, tuple):
+                topk_indices, topk_scores = selection
+            else:
+                topk_indices, topk_scores = selection, None
+
+        # Inner-attention positional contract: sink + swa_k always; the compressed pool and
+        # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
+        o = self.inner_attention(
             q,
             swa_k,
-            cmp_k,
-            idx_q=idx_q,
-            idx_k=idx_k,
-            idx_w=idx_w,
-            attn_sink=self.attn_sink,
-            attention_metadata=attention_metadata,
+            self.attn_sink,
+            cmp_k=cmp_k,
+            topk_indices=topk_indices,
+            topk_scores=topk_scores,
+            attention_metadata=metadata,
         )
 
-        o = self.rope(o, positions=positions, inverse=True)
+        o = self.rope(o, positions=positions_q, inverse=True)
 
         # ``wo_a`` is a BatchedLinear over the head groups; group the heads
         # before the per-group matmul.
@@ -409,4 +365,6 @@ class Attention(BaseAttention):
         o = o.view(bsz, seqlen, n_local_groups, -1)
         o = self.wo_a(o)
         o = o.reshape(bsz, seqlen, -1)
-        return self.wo_b(o)
+        o = self.wo_b(o)
+        # The projection is per token, so ``wo_b``'s output is what takes the movement back.
+        return self.query_exchange.unpermute(o.squeeze(0), metadata.exchange).unsqueeze(0)

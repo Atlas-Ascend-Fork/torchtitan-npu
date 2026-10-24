@@ -3,10 +3,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The DeepSeek-V4 fused attention's metadata hierarchy.
+"""The DeepSeek-V4 fused attention's metadata: the AI_CPU records only.
 
-Each level is named for what it is, and the AI_CPU metadata is grouped by the consumer that
-launches it -- one group per pair of kernels, one field per direction::
+The model-dir entry (``models/deepseek_v4/metadata.py``) owns the row and its frames; this
+module owns exactly what the AscendC kernels add to it, grouped by the consumer that launches
+it -- one group per pair of kernels, one field per direction::
 
     aicpu_metadata
     + sparse_attn
@@ -18,17 +19,24 @@ launches it -- one group per pair of kernels, one field per direction::
 
 ``AicpuGeometry``
     the static numbers the AI_CPU operators are called with (heads, head dim, window, and the
-    selector's widths).  It lives beside them because the context-parallel transform is handed
-    the metadata alone and must rebuild it for this rank's frames; nothing in the forward or the
+    selector's widths).  It lives beside them because the context-parallel transform is handed the
+    metadata alone and must rebuild it for this rank's frames; nothing in the forward or the
     backward reads it.
 
-``AscV4Metadata``
-    one geometry's entry: the model row (``DeepSeekV4Metadata``) plus the operator outputs of
-    exactly those frames, computed at the eager boundary and rebuilt per rank under context
-    parallelism.
+``AicpuMetadata``
+    the AI_CPU operator outputs of one geometry, grouped by consumer, plus the geometry they were
+    sized with.
 
-The quantized selector is another backend: it owns an entry of its own (a subclass of this one)
-and rebuilds the selector group with its own contract.  Nothing here knows about quantization.
+``AscV4Metadata``
+    the model row with this geometry's records attached; it adds ``aicpu_metadata`` and nothing
+    else.  Under context parallelism its ``prepare_cp_metadata`` rebuilds both the frames and the
+    records for this rank.
+
+The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
+(``models/common/carry_exchange.CarryExchange``), which builds the augmented
+boundaries and the kernel's state table at the call site and passes them as arguments.  The
+quantized selector is another backend: it owns an entry of its own (a subclass of this one) and
+rebuilds the selector group with its own contract.  Nothing here knows about quantization.
 """
 
 from dataclasses import dataclass
@@ -36,13 +44,12 @@ from dataclasses import dataclass
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.deepseek_v4.metadata import CompressedBlockLayout, DeepSeekV4Metadata
-from torchtitan_npu.models.deepseek_v4.token_dispatcher import ExchangePlan, WindowPlan
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
 __all__ = [
     "AicpuGeometry",
-    "AscAicpuMetadata",
+    "AicpuMetadata",
     "AscLightningIndexerMetadata",
     "AscSparseAttentionMetadata",
     "AscV4Metadata",
@@ -80,6 +87,25 @@ LI_MASK_MODE = 3
 LI_CMP_RATIO = 4
 
 
+def lightning_indexer_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame) -> dict:
+    """The options the selector's metadata calls and its kernels must agree on.
+
+    They are read off this geometry's frames, so the metadata call, the LightningIndexer
+    forward and the SLIKG backward cannot drift option-for-option.
+    """
+    return dict(
+        cu_seqlens_q=q.cu_seqlens,
+        cu_seqlens_k=cmp_k.cu_seqlens,
+        seqused_q=q.seqused,
+        seqused_k=cmp_k.seqused,
+        cmp_residual_k=cmp_k.residual,
+        layout_q=LI_LAYOUT,
+        layout_k=LI_LAYOUT,
+        mask_mode=LI_MASK_MODE,
+        cmp_ratio=ratio,
+    )
+
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class AicpuGeometry:
     """The static numbers the AI_CPU operators of one geometry are called with."""
@@ -93,14 +119,14 @@ class AicpuGeometry:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class AscAicpuMetadata:
+class AicpuMetadata:
     """This geometry's AI_CPU operator outputs, grouped by the kernel that launches them.
 
     They depend only on the frames of one forward and the layer's static geometry -- never on
     the operands -- so they are computed once per microbatch (per rank under context parallelism)
     at the eager boundary and read by every layer of the geometry instead of being re-run per
     layer inside the compiled region.  A record describes the frames it was computed for, which
-    is why a re-cut frame (the CP transform's rank-local plan, a batch chunk) rebuilds them.
+    is why a re-cut frame (the CP transform's rank-local chunks) rebuilds them.
     """
 
     geometry: AicpuGeometry
@@ -110,9 +136,18 @@ class AscAicpuMetadata:
 
 @dataclass(kw_only=True, slots=True)
 class AscV4Metadata(DeepSeekV4Metadata):
-    """The fused path's entry: the model row plus the AscendC records of its frames."""
+    """The fused entry: the model row and frames, plus this geometry's AscendC records.
 
-    asc: AscAicpuMetadata | None = None
+    The row, the frames and the query movement are the model's (they describe the tensors, not
+    the kernels); this entry adds only what the fused kernels need on top of them:
+    ``aicpu_metadata``, the operator outputs computed for exactly these frames at the eager
+    boundary and rebuilt per rank under context parallelism.
+
+    Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``);
+    one model runs one selection width, so there is nothing to look up.
+    """
+
+    aicpu_metadata: AicpuMetadata
     """This geometry's AI_CPU records, grouped by the kernel that reads them."""
 
     @staticmethod
@@ -123,52 +158,37 @@ class AscV4Metadata(DeepSeekV4Metadata):
         *,
         permutation: torch.Tensor | None,
     ) -> "AscV4Metadata":
-        """This rank's plan *and* its AscendC records (upstream #4617).
+        """This rank's frames *and* its AscendC records (upstream #4617).
 
-        The rank-local plan comes from the pre-shard documents
-        (``shard_compressed_varlen_metadata``); the records do not carry over, because a record
-        describes the frames it was computed for (block tables, host offsets, kernel layouts).
-        So every record is rebuilt for the rank-local frames by the same builder that built the
-        global ones -- a quantized selector's entry overrides this hook, because its record
-        contract is its own backend's.
+        The rank-local frames come from the pre-shard documents with the same
+        ``models/common/query_exchange.cp_plan`` the V4.1 stack uses.  The records do not carry
+        over, because a record describes the frames it was computed for, so every record is
+        rebuilt for the rank-local frames by the same builder that built the global ones.
         """
         del permutation
         # Lazy: the builder imports this module's classes, so the two cannot import each other
         # eagerly; the hook runs at the eager metadata boundary, never inside a graph.
-        from .sparse_attn.ascendc import build_aicpu_metadata, shard_compressed_varlen_metadata
+        from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import shard_asc_v4_metadata
+        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
-        asc = attention_metadata.asc
-        if asc is None:
-            raise ValueError("the fused entry must carry its AI_CPU records")
-        common = shard_compressed_varlen_metadata(attention_metadata)
-        return build_aicpu_metadata(common, geometry=asc.geometry)
+        context = cp_shard_context()
+        if context.cp_mesh is None or context.positions is None:
+            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
+        if context.load_balancer_type is not None:
+            raise ValueError(
+                f"the DeepSeek-V4 fused stack shards contiguous slabs, but the context-parallel "
+                f"load balancer is {context.load_balancer_type!r}: run with "
+                "--parallelism.context-parallel-load-balancer None."
+            )
+        batch_size, row_len = context.positions.shape[0], context.positions.shape[-1]
+        return shard_asc_v4_metadata(
+            attention_metadata,
+            cp_size=context.cp_mesh.size(),
+            cp_rank=context.cp_mesh.get_local_rank(),
+            batch_size=batch_size,
+            seq_len=row_len // context.cp_mesh.size(),
+        )
 
-
-# The entry is a traced input (the decoder hands it to every layer), so the plan it carries --
-# and the plans' own exchange routes -- flatten into tensors and primitives as well.
-# These registrations run only when the fused tier is imported.  The reference entry stays
-# opaque by design: the graph trainer is a fused-kernel path (its tracer needs every leaf to
-# be a tensor/primitive, and an unregistered dataclass is one non-primitive leaf).  A stack
-# that runs the reference core under the graph trainer would have to register its own entry.
-# ``register_dataclass`` registers *all* fields: a future eager-only host cache on these
-# dataclasses must be added to ``drop_field_names`` (or it silently becomes a graph input).
-if CPVarlenMetadata not in SUPPORTED_NODES:
-    register_dataclass(
-        CPVarlenMetadata, serialized_type_name=f"{CPVarlenMetadata.__module__}.{CPVarlenMetadata.__name__}"
-    )
-
-"""A CP-local entry carries the rank's own varlen stream; it is a traced leaf too."""
-if CompressedBlockLayout not in SUPPORTED_NODES:
-    register_dataclass(
-        CompressedBlockLayout,
-        serialized_type_name=f"{CompressedBlockLayout.__module__}.{CompressedBlockLayout.__name__}",
-    )
-
-if ExchangePlan not in SUPPORTED_NODES:
-    register_dataclass(ExchangePlan, serialized_type_name=f"{ExchangePlan.__module__}.{ExchangePlan.__name__}")
-
-if WindowPlan not in SUPPORTED_NODES:
-    register_dataclass(WindowPlan, serialized_type_name=f"{WindowPlan.__module__}.{WindowPlan.__name__}")
 
 if AscSparseAttentionMetadata not in SUPPORTED_NODES:
     register_dataclass(
@@ -185,10 +205,8 @@ if AscLightningIndexerMetadata not in SUPPORTED_NODES:
 if AicpuGeometry not in SUPPORTED_NODES:
     register_dataclass(AicpuGeometry, serialized_type_name=f"{AicpuGeometry.__module__}.{AicpuGeometry.__name__}")
 
-if AscAicpuMetadata not in SUPPORTED_NODES:
-    register_dataclass(
-        AscAicpuMetadata, serialized_type_name=f"{AscAicpuMetadata.__module__}.{AscAicpuMetadata.__name__}"
-    )
+if AicpuMetadata not in SUPPORTED_NODES:
+    register_dataclass(AicpuMetadata, serialized_type_name=f"{AicpuMetadata.__module__}.{AicpuMetadata.__name__}")
 
 if AscV4Metadata not in SUPPORTED_NODES:
     register_dataclass(AscV4Metadata, serialized_type_name=f"{AscV4Metadata.__module__}.{AscV4Metadata.__name__}")

@@ -27,7 +27,7 @@ python -m torchtitan_npu.train \
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff": 2.0,"num_heads":128}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":128}'
 ```
 
 NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模型配置选择
@@ -274,7 +274,6 @@ Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DC
 `AscComplexRoPE` 和 `AscCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
 并使用第一行位置构造 batch 共享的 cosine/sine 表。
 
-
 ### Common SwiGLU
 
 入口前缀为 `torchtitan_npu.override.common.swiglu_group.`，适用于采用公共专家配置和下述 FQN 布局的模型。
@@ -341,8 +340,8 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | — |
-| `sparse_attn.pypto` (replaces `sparse_attn.asc`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` | — |
+| `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | SMLA/SMLAG；SMLAG 反向在 `topk_scores` 梯度上产出 indexer teacher |
+| `lightning_indexer.asc` | `LightningIndexer.Config` | `AscLightningIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -355,17 +354,22 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `TilelangFeedForward.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
 | `moe_router.tilelang` | `HashRouter.Config`（精确匹配） | `TilelangHashRouter.Config` | 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
 
-`sparse_attn.asc` 支持可选的 `indexer_loss_coeff`（默认 `1.0`）与记录几何
-（`num_heads`/`head_dim`/`index_num_heads`/`index_head_dim` 默认 `64`/`512`/`64`/`128`，
-即 V4-Flash 的发布形状；debug/pro 等其它宽度在同一个入口上给出，例如
+`sparse_attn.asc` 支持记录几何参数（`num_heads`/`head_dim`/`index_num_heads`/`index_head_dim`
+默认 `64`/`512`/`64`/`128`，即 V4-Flash 的发布形状；debug/pro 等其它宽度在同一个入口上给出，例如
 `sparse_attn.asc={"num_heads":16,"index_num_heads":8}`）。四者是 port config 自己的必需
 字段、无默认值——记录由它们定尺寸，未声明就无法构建；`head_dim` 恒为 `512`，因此任何
 recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它们是层自己的 model config
-字段，由模型声明一次，port 读取即可。
+字段，由模型声明一次，port 读取即可。teacher 的强度固定：SMLAG 反向把 raw marginal `p`
+写到 `topk_scores` 的梯度上（`-1` 槽位清零，并乘一次 `softmax_scale`），没有关闭开关。
+
+`sparse_attn.asc` 与 `lightning_indexer.asc` / `lightning_indexer.pypto` 是两组独立的配置节点，
+训练 indexer 时必须成对启用（CANN 侧配 CANN，PyPTO 侧配 PyPTO）：前者产出 teacher，
+后者在 `_LightningIndexerTND.backward` 用 `sparse_lightning_indexer_kl_loss_grad` 消费这条边。
 
 metadata 不再是独立入口：每个 microbatch、每个几何一份 entry，由被替换的
 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 直接构建
-（upstream PR #4897 的 backend-owned 接缝）：参考后端在这一步给出该 ratio 的 plan，
+（upstream PR #4897 的 backend-owned 接缝）：模型目录的 `build_v4_metadata` 给出整行的
+document 边界、按 ratio 折好的池网格与三个 kernel frame（`q`/`swa_k`/`cmp_k`），
 port 在其上补四个算子的记录。map key 是 `(端口类, compress_ratio)`，每层只读自己 ratio 的
 entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI record 属于 selector：BF16 的
 由 port 在同一入口按 `AicpuGeometry` 构建；量化的 selector 是**另一个 backend**
@@ -401,6 +405,7 @@ USE_GOLDEN=1 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 torchtitan_npu.override.common.rms_norm.asc
 torchtitan_npu.override.common.rope.asc_complex
 torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 torchtitan_npu.override.common.swiglu_group.asc
 torchtitan_npu.override.common.swiglu_group.asc_shared_experts
 ```
@@ -416,20 +421,18 @@ torchtitan_npu.override.common.rope.workaround
 （Attention Gym 的 `gather_attn`，逐文档 FP32），不再有独立的 attention 数值基线
 入口。
 
-`sparse_attn.asc` 与 `sparse_attn.pypto` 声明同一 target，不能同时启用。
-
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
 token 数时应调整 `seq_len`。参考 recipe（模型目录默认内核）使用公共的
-`DeepSeekV4Metadata`（每个几何一份：kernel contract、packed 偏移与 window plan），当前仅支持无
-context parallel 的连续文档布局。AscendC 路径的 entry（`AscV4Metadata`）在它之上携带按 kernel
-分组的预计算记录。
+`DeepSeekV4Metadata`（每个几何一份：整行边界、该 ratio 的池网格、三个 kernel frame 与查询
+位置），当前仅支持无 context parallel 的连续文档布局。AscendC 路径的 entry（`AscV4Metadata`）
+在它之上只加按 kernel 分组的预计算记录。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 
-若使用 PyPTO 的 LI/LIG 算子，`torchtitan_npu.override.deepseek_v4.sparse_attn.pypto` 替换
-`torchtitan_npu.override.deepseek_v4.sparse_attn.asc`，未覆盖的 sparse-attention
-能力继续复用已验证的实现。使用该入口需要额外安装与当前 CANN 匹配的 `pypto`
-runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto/blob/master/docs/zh/install/build_and_install.md)，
+PyPTO selector（`torchtitan_npu.override.deepseek_v4.lightning_indexer.pypto`）是同一契约的
+独立实现：输入准备、排序、teacher 边与反向都在它自己的模块里，只使用 PyPTO 的 LI/SLIKG 两个
+kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，安装方法参见
+[PyPTO 安装文档](https://gitcode.com/cann/pypto/blob/master/docs/zh/install/build_and_install.md)，
 安装后可用 `python3 -c "import pypto"` 检查。
 
 ### DeepSeek-V4.1

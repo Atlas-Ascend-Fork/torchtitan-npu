@@ -35,9 +35,11 @@ hierarchy: it builds its own entry, of its own classes, in its own package.
     table.
 
 ``KernelFrame``
-    one tensor's coordinate frame: its ragged document boundaries, the per-document prefix this
-    consumer addresses, and the trailing partial group of a compressed axis.  An entry is three of
-    them (queries, sliding-window keys, compressed keys) plus the row.
+    the model-dir primitive (``models/common/metadata.py``) describing one tensor's coordinate
+    frame: its ragged document boundaries, the per-document prefix this consumer addresses, and
+    the trailing partial group of a compressed axis.  An entry is three of them (queries,
+    sliding-window keys, compressed keys) plus the row; the class is shared with the V4 stack, so
+    the two hierarchies cannot drift apart.
 
 Consumers read the fields: ``attention_metadata.cmp_k.seqused``,
 ``attention_metadata.aicpu_metadata.sparse_attn.bwd``.  There are no lookup helpers: the entry
@@ -60,24 +62,7 @@ __all__ = [
     "AicpuMetadata",
     "AscLightningIndexerMetadata",
     "AscSparseAttentionMetadata",
-    "KernelFrame",
 ]
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class KernelFrame:
-    """One tensor's coordinate frame: the boundaries needed to address it.
-
-    ``cu_seqlens`` are the ragged document boundaries (``int32``, ``n_documents + 1``), the form
-    the kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix this frame's
-    consumer addresses -- how an operator is told to read a prefix of its operand -- and
-    ``residual`` the trailing partial group of a compressed axis (``None`` where the axis is not
-    compressed, which the kernels reject a value for).
-    """
-
-    cu_seqlens: torch.Tensor
-    seqused: torch.Tensor
-    residual: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -136,9 +121,6 @@ class AicpuMetadata:
     sparse_attn: AscSparseAttentionMetadata
     lightning_indexer: AscLightningIndexerMetadata
 
-
-if KernelFrame not in SUPPORTED_NODES:
-    register_dataclass(KernelFrame, serialized_type_name=f"{KernelFrame.__module__}.{KernelFrame.__name__}")
 
 if AicpuGeometry not in SUPPORTED_NODES:
     register_dataclass(AicpuGeometry, serialized_type_name=f"{AicpuGeometry.__module__}.{AicpuGeometry.__name__}")
