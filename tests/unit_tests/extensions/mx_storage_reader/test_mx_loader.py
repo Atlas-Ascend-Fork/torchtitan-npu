@@ -5,6 +5,7 @@
 
 import importlib.util
 import json
+import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -27,12 +28,17 @@ def reader_module(monkeypatch):
     package = ModuleType("_mx_test_components")
     package.__path__ = [str(root)]
     monkeypatch.setitem(sys.modules, package.__name__, package)
-    for name in ("mx_dequant_backend", "hf_storage"):
+    for name in ("mx_dequant_backend", "hf_storage", "ao_hf_storage"):
         spec = importlib.util.spec_from_file_location(f"{package.__name__}.{name}", root / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
-    return module
+    return sys.modules[f"{package.__name__}.hf_storage"]
+
+
+@pytest.fixture
+def ao_module(reader_module):
+    return sys.modules["_mx_test_components.ao_hf_storage"]
 
 
 @pytest.fixture
@@ -102,7 +108,8 @@ def test_dcp_load_sharded_mx_weights(reader_module, cpu_npu_boundary, tmp_path, 
 
     values = torch.tensor([1., -4.]).repeat(2, 48) if fp4 else torch.ones(2, 96)
     expected = values * torch.tensor([[.5, 1., 2.], [4., 2., 1.]]).repeat_interleave(32, -1)
-    torch.testing.assert_close(target["linear.weight"], expected[:, 7:].bfloat16() if sliced else expected.bfloat16(), rtol=0, atol=0)
+    expected_loaded = expected[:, 7:] if sliced else expected
+    torch.testing.assert_close(target["linear.weight"], expected_loaded.bfloat16(), rtol=0, atol=0)
     if not sliced:
         torch.testing.assert_close(target["norm.weight"], torch.tensor([1., 2.]))
     assert all(call[2:4] == (-1, torch.float32) for call in cpu_npu_boundary)
@@ -114,7 +121,8 @@ def test_dcp_load_sharded_mx_weights(reader_module, cpu_npu_boundary, tmp_path, 
 def test_mx_scale_validation(reader_module, tmp_path, invalid):
     tensors = {"linear.weight": torch.ones((2, 32), dtype=torch.uint8)}
     if invalid != "missing":
-        tensors["linear.scale"] = torch.ones((2, 1 if invalid == "shape" else 2), dtype=torch.float32 if invalid == "dtype" else torch.uint8)
+        scale_dtype = torch.float32 if invalid == "dtype" else torch.uint8
+        tensors["linear.scale"] = torch.ones((2, 1 if invalid == "shape" else 2), dtype=scale_dtype)
     save_file(tensors, tmp_path / "model.safetensors")
     with pytest.raises(ValueError, match="scale"):
         reader_module.MXHuggingFaceStorageReader(str(tmp_path)).read_metadata()
@@ -144,6 +152,126 @@ def test_dcp_load_mixed_mx_formats(reader_module, cpu_npu_boundary, tmp_path):
     torch.testing.assert_close(target["fp4.weight"], torch.tensor([1., -4.]).repeat(1, 16), rtol=0, atol=0)
     torch.testing.assert_close(target["fp8.weight"], torch.ones(1, 32), rtol=0, atol=0)
     assert target["buffer"].item() == 7
+
+
+_EXPORT_SCRIPT = (
+    Path(__file__).resolve().parents[4] / "torchtitan_npu/tools/checkpoint_conversion/export_quantized_hf.py"
+)
+
+
+@pytest.fixture(scope="module")
+def export_module():
+    """Execute the export script for its tables, leaving global import state untouched.
+
+    Loading the script runs ``_bootstrap_sys_path``, which appends the repo's
+    ``experiments/torchao-npu`` tree to ``sys.path``; leaked, that flips other
+    tests' ``importorskip("torchao_npu")`` from skip to fail depending on order.
+    ``MonkeyPatch.context`` is the module-scope stand-in for the function fixture.
+    """
+    root = _EXPORT_SCRIPT.parent
+    with pytest.MonkeyPatch.context() as mpatch:
+        mpatch.setattr(sys, "path", list(sys.path))
+        monkey = ModuleType("_export_tables_under_test")
+        monkey.__path__ = [str(root)]
+        spec = importlib.util.spec_from_file_location(f"{monkey.__name__}.export_quantized_hf", _EXPORT_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        mpatch.setitem(sys.modules, monkey.__name__, monkey)
+        mpatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        yield module
+
+
+def _sample(pattern: str) -> str:
+    """A concrete FQN a regex pattern like ``^model\\.layers\\.(\\d+)\\.x$`` matches."""
+    return pattern.strip("^$").replace(r"\d+", "7").replace("\\", "").replace("(", "").replace(")", "")
+
+
+def test_export_reader_rename_tables_are_inverses(ao_module, export_module):
+    """The hand-written export/reader rename tables must stay exact inverses; drift strands weights silently."""
+    assert len(export_module._LOGICAL_TO_HF) == len(ao_module._HF_TO_LOGICAL)
+    for pattern, replacement in export_module._LOGICAL_TO_HF:
+        logical = _sample(pattern)
+        hf = re.sub(pattern, replacement, logical, count=1)
+        assert hf != logical, f"{pattern!r} does not rename its sample"
+        back = [p.sub(t, hf) for p, t in ao_module._HF_TO_LOGICAL if p.match(hf)]
+        assert back == [logical], f"{hf!r} maps back through {len(back)} reader rules, expected exactly {logical!r}"
+    for pattern, replacement in ao_module._HF_TO_LOGICAL:
+        hf = _sample(pattern.pattern)
+        logical = pattern.sub(replacement, hf)
+        assert logical != hf, f"{pattern.pattern!r} does not rename its sample"
+        back = [re.sub(p, t, logical, count=1) for p, t in export_module._LOGICAL_TO_HF if re.match(p, logical)]
+        assert back == [hf]
+    # the dense-quant recipe filter names exactly the logical side of the table
+    suffixes = {_sample(p).removeprefix("layers.7") for p, _ in export_module._LOGICAL_TO_HF}
+    assert suffixes == set(export_module._DENSE_WEIGHT_SUFFIXES)
+
+
+_AO_FQN = "model.layers.0.self_attn.q_a_proj.weight"
+
+
+def _write_ao_shard(tmp_path, *, data_names=("qdata", "scale"), block_size=32, quant_axis=1, pack_axis=None):
+    """One dense fp8 MX tensor (2x64, all 1.0, scale 2^0) plus a plain tensor, in AO protocol."""
+    prefix = f"{_AO_FQN.rsplit('.', 1)[0]}._weight_"
+    qdata = torch.ones((2, 64), dtype=torch.float8_e4m3fn)
+    scale = torch.full((2, 1, 2), 127, dtype=torch.uint8)  # (rows, ceil(2 blocks / 2), 2)
+    record = {
+        "_type": "MXTensor",
+        "_tensor_data_names": list(data_names),
+        "_data": {
+            "quant_axis": quant_axis,
+            "pack_axis": pack_axis,
+            "quant_config": {
+                "_type": "MXQuantizeConfig",
+                "_data": {"elem_dtype": "float8_e4m3fn", "block_size": block_size},
+            },
+            "act_quant_config": None,
+        },
+    }
+    save_file(
+        {
+            f"{prefix}{data_names[0]}": qdata,
+            f"{prefix}{data_names[1]}": scale,
+            "norm.weight": torch.ones(2),
+        },
+        tmp_path / "model.safetensors",
+        metadata={
+            "format": "pt",
+            "tensor_names": json.dumps([_AO_FQN]),
+            _AO_FQN: json.dumps(record),
+        },
+    )
+
+
+def test_ao_block_size_must_match_kernel(ao_module, tmp_path):
+    """Unsupported ``block_size`` fails closed."""
+    _write_ao_shard(tmp_path, block_size=64)
+    reader = ao_module.MxAOHuggingFaceStorageReader(str(tmp_path))
+    with pytest.raises(ValueError, match=r"block_size.*32"):
+        reader.read_metadata()
+
+
+@pytest.mark.parametrize("bad_axis", ["quant", "pack"])
+def test_ao_axes_must_point_at_last_dim(ao_module, tmp_path, bad_axis):
+    """Non-last-dim quant/pack layouts would dequantize silently wrong; fail closed by name."""
+    _write_ao_shard(tmp_path, **{f"{bad_axis}_axis": 0})
+    reader = ao_module.MxAOHuggingFaceStorageReader(str(tmp_path))
+    with pytest.raises(ValueError, match=f"{bad_axis}_axis"):
+        reader.read_metadata()
+
+
+def test_ao_components_resolved_by_dtype(ao_module, cpu_npu_boundary, tmp_path):
+    """Components named by ``tensor_data_names`` load by dtype role, not literal names."""
+    _write_ao_shard(tmp_path, data_names=("payload", "scales"))
+    reader = ao_module.MxAOHuggingFaceStorageReader(str(tmp_path))
+    metadata = reader.read_metadata()
+    assert metadata.state_dict_metadata["layers.0.attn.wq_a.weight"].size == (2, 64)
+    region = reader._regions["layers.0.attn.wq_a.weight"]
+    assert region.qdata.key.endswith("_weight_payload") and region.scale.key.endswith("_weight_scales")
+
+    target = {"layers.0.attn.wq_a.weight": torch.empty((2, 64), dtype=torch.bfloat16), "norm.weight": torch.empty(2)}
+    dcp.load(target, storage_reader=reader)
+    torch.testing.assert_close(target["layers.0.attn.wq_a.weight"], torch.ones(2, 64).bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(target["norm.weight"], torch.ones(2))
 
 
 @pytest.mark.parametrize("weight_format", ["mxfp4", "mxfp8", "bf16", "block-fp8"])
@@ -179,11 +307,17 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
     ))
     monkeypatch.setitem(sys.modules,
                         "torchtitan_npu.extensions.mx_storage_reader.hf_storage", reader_module)
+    # The V4 adapter probes the AO reader before the fixed-format MX reader.
+    monkeypatch.setitem(sys.modules,
+                        "torchtitan_npu.extensions.mx_storage_reader.ao_hf_storage",
+                        sys.modules["_mx_test_components.ao_hf_storage"])
     root = Path(__file__).resolve().parents[4] / "torchtitan_npu/models"
     classes = []
     for model, class_name in (("deepseek_v4", "DeepSeekV4StateDictAdapter"),
                               ("deepseek_v3_2", "DeepSeekV32StateDictAdapter")):
-        spec = importlib.util.spec_from_file_location(f"_mx_test_components.{model}", root / model / "state_dict_adapter.py")
+        spec = importlib.util.spec_from_file_location(
+            f"_mx_test_components.{model}", root / model / "state_dict_adapter.py"
+        )
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)

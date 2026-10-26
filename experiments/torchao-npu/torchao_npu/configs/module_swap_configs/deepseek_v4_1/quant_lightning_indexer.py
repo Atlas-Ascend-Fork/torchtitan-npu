@@ -16,7 +16,7 @@ from torchao.quantization.transform_module import register_quantize_module_handl
 from torchao_npu.configs.module_swap import ModuleSwapConfig
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True)
 class DeepSeekV41QuantLightningIndexerConfig(ModuleSwapConfig):
     """Install the ds41 MXFP4 QLI/QSLI selector with its SLIKG backward."""
 

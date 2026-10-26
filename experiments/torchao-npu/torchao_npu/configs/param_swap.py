@@ -67,8 +67,19 @@ class ParamSwapConfig(QATConfig):
         step: QATStep = QATStep.PREPARE,
         params_filter_fn: ParameterFilterFn = _is_parameter,
     ):
-        self.params_filter_fn = params_filter_fn
+        # Private: ConfigJSONEncoder iterates ``__dict__`` and skips ``_``
+        # keys, so a public function attribute breaks checkpoint export.
+        self._params_filter_fn = params_filter_fn
         super().__init__(base_config, activation_config, weight_config, step=step)
+
+    @property
+    def params_filter_fn(self) -> ParameterFilterFn:
+        return self._params_filter_fn
+
+    @params_filter_fn.setter
+    def params_filter_fn(self, fn: ParameterFilterFn) -> None:
+        # lora rebinds after construction; decode restores ``_is_parameter``.
+        self._params_filter_fn = fn
 
     def __post_init__(self):
         torch._C._log_api_usage_once("torchao.prototype.param_swap.ParamSwapConfig")

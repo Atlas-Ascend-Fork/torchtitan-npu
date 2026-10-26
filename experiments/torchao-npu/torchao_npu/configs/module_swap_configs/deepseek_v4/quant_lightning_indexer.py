@@ -47,7 +47,7 @@ def quant_mode_for_config(config: MXQuantizeConfig | HiF8QuantizeConfig | FP8Qua
     raise TypeError(f"Unsupported LI quantization config: {type(config).__name__}")
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True)
 class DeepSeekV4QuantLightningIndexerConfig(ModuleSwapConfig):
     """Q/K quantization strategy for QuantLightningIndexerV2.
 
@@ -66,8 +66,6 @@ class DeepSeekV4QuantLightningIndexerConfig(ModuleSwapConfig):
     input_adapter: Annotated[Callable | None, tyro.conf.Suppress] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        # ``slots=True`` recreates the dataclass class, so use an explicit
-        # base call instead of zero-argument ``super()``.
         ModuleSwapConfig.__post_init__(self)
         if type(self.query_config) is not type(self.key_config):
             raise ValueError("query_config and key_config must use the same config type")

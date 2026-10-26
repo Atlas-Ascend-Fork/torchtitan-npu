@@ -36,6 +36,8 @@ from torch.distributed.checkpoint.planner_helpers import create_read_items_for_c
 def get_safetensors_dtype(dtype: str) -> torch.dtype:
     if dtype == "F8_E8M0":
         return torch.float8_e8m0fnu
+    if dtype == "F4":
+        return torch.float4_e2m1fn_x2
     return _getdtype(dtype)
 
 

@@ -61,7 +61,7 @@ Hugging Face 权重通常包含 `model.safetensors` 或
 | `initial_load_path` | 当前输出目录没有 checkpoint 时使用的初始 checkpoint 路径，必须是绝对路径或远程 URI。 |
 | `initial_load_model_only` | 初始加载是否只加载模型权重，默认 `True`。设为 `False` 才会尝试加载完整训练状态。 |
 | `initial_load_in_hf` | 将初始路径按 Hugging Face safetensors 读取。HF 加载只能加载模型权重。 |
-| `initial_load_in_hf_quantized` | 从 HF 量化权重加载；使用前必须启用 `initial_load_in_hf`。 |
+| `initial_load_in_hf_quantized` | 从 HF 量化权重加载；使用前必须启用 `initial_load_in_hf`。支持的格式与适用范围见下文「加载量化 HF 权重」。 |
 | `last_save_model_only` | 最后一步是否只保存模型权重，默认 `True`。设为 `False` 才保存完整训练状态。 |
 | `last_save_in_hf` | 最后一步是否以 Hugging Face safetensors 格式保存。必须同时使用模型权重保存模式。 |
 | `export_dtype` | 保存时模型权重导出的 dtype，可用 `float16`、`bfloat16`、`float32`。 |
@@ -193,6 +193,19 @@ bash scripts/run_train.sh \
 如果不传 `--checkpoint.initial-load-path`，checkpoint 管理器会尝试使用模型配置中的
 `hf_assets_path`。`initial_load_path` 优先级高于 `hf_assets_path`。HF 权重不能加载
 优化器或训练步数。
+
+### 加载量化 HF 权重
+
+`initial_load_in_hf_quantized` 目前只对 `deepseek_v4` 生效：其 state-dict adapter 会按目录内容
+自动探测两种 MX 量化格式，无需额外的格式开关：
+
+- 固定格式 MX：`.weight`（mxfp8 为 `float8_e4m3fn`，mxfp4 为打包的 `uint8`）与 e8m0 `.scale`
+  成对存放的目录。
+- torchao 协议：`torchtitan_npu/tools/checkpoint_conversion/export_quantized_hf.py` 导出的目录，
+  量化元数据写在 safetensors 的 `__metadata__` 中。探测时优先于固定格式 MX。
+
+其他模型（含 `deepseek_v4_1`）的 adapter 不会选择这两个 MX reader，对这类目录启用该标志只会
+报出与量化无关的错误；此类模型请先使用反量化后的 bf16 权重。
 
 ## 保存 Hugging Face 权重
 

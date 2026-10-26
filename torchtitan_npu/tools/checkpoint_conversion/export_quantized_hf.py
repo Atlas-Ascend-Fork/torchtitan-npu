@@ -9,8 +9,11 @@ The applied recipe is also recorded in ``config.json`` as an ``FqnToConfig``
 plan (``quantization_config.quant_type``): a machine-readable source of
 quantization info for downstream tooling, never applied at load time (loaders
 rebuild tensors from the per-instance shard-header records) and not
-necessarily executable as-is. The export fails closed unless the plan matches
-the shard headers (``_validate_plan_against_shards``).
+necessarily executable as-is. Decoding the record (torchao
+``config_from_dict``) needs ``import torchao_npu.configs`` for its
+``ALLOWED_AO_MODULES`` registration; plain JSON reads are unaffected. The
+export fails closed unless the plan matches the shard headers
+(``_validate_plan_against_shards``).
 """
 
 import argparse
@@ -59,7 +62,7 @@ _bootstrap_sys_path()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-# HF-side weight filters (post-``to_hf`` names; see
+# Logical-side weight filters (``to_hf`` output names; see
 # ``DeepSeekV4StateDictAdapter.from_hf_map``).
 _DENSE_WEIGHT_SUFFIXES = (
     ".attn.wq_a.weight",
@@ -164,9 +167,9 @@ def quantize_state_dict(hf_state_dict, plan, *, device: str):
     return out, quantized
 
 
-# HF-name -> in-memory (transformers) name for the recipe-quantized dense weights;
-# the routed experts are merged separately (``_to_in_memory_layout``).
-_QUANT_HF_TO_MODEL = (
+# Dense renames logical ``layers.N.*`` -> HF ``model.layers.N.*``; inverse of ``_HF_TO_LOGICAL`` (``ao_hf_storage.py``).
+# Routed experts merge separately (``_to_in_memory_layout``).
+_LOGICAL_TO_HF = (
     (r"^(layers\.\d+)\.attn\.wq_a\.weight$", r"model.\1.self_attn.q_a_proj.weight"),
     (r"^(layers\.\d+)\.attn\.wq_b\.weight$", r"model.\1.self_attn.q_b_proj.weight"),
     (r"^(layers\.\d+)\.attn\.wkv\.weight$", r"model.\1.self_attn.kv_proj.weight"),
@@ -295,7 +298,7 @@ def _to_in_memory_layout(hf_state_dict, quantized_fqns):
     for fqn, idx in sorted(quantized_fqns.items()):
         if _EXPERT_FQN_RE.match(fqn):
             continue  # merged below
-        for pattern, replacement in _QUANT_HF_TO_MODEL:
+        for pattern, replacement in _LOGICAL_TO_HF:
             new_key = re.sub(pattern, replacement, fqn, count=1)
             if new_key != fqn:
                 out[new_key] = hf_state_dict[fqn]
@@ -565,8 +568,8 @@ def _generalized_fqn_pattern(fqn: str) -> str:
 
 
 def _drop_callable_fields(config):
-    # torchao's ConfigJSONEncoder walks __dict__ verbatim and chokes on callables
-    # (base torchao-npu stores ParamSwapConfig.params_filter_fn as a public attr).
+    # torchao's ConfigJSONEncoder walks __dict__ verbatim and chokes on callables;
+    # the filter still lands there as ParamSwapConfig's ``_params_filter_fn`` attr.
     names = [k for k, v in vars(config).items() if callable(v)]
     if not names:
         return config

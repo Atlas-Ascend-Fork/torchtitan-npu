@@ -218,3 +218,16 @@ def test_non_contiguous_tensor_is_materialized_contiguous(tmp_path):
     loaded = load_file(str(tmp_path / "model.safetensors"))
     assert loaded["model.weight"].is_contiguous()
     assert torch.equal(loaded["model.weight"], t)
+
+
+def test_shard_headers_declare_pt_format(tmp_path):
+    # Without the stamp, transformers <5 load_state_dict rejects the export.
+    mx = make_mx_tensor()
+    plain = torch.randn(4, 4, dtype=torch.bfloat16)
+
+    save_hf_safetensors({"model.layers.0.attn.q_proj.weight": mx, "model.norm.weight": plain}, tmp_path)
+
+    with safe_open(str(tmp_path / "model.safetensors"), framework="pt", device="cpu") as f:
+        metadata = f.metadata()
+    assert metadata["format"] == "pt"
+    assert is_metadata_torchao(metadata)

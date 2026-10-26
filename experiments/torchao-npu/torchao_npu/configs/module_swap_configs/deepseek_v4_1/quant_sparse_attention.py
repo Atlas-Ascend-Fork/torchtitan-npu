@@ -16,7 +16,7 @@ from torchao.quantization.transform_module import register_quantize_module_handl
 from torchao_npu.configs.module_swap import ModuleSwapConfig
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True)
 class DeepSeekV41QuantSparseAttentionConfig(ModuleSwapConfig):
     """Install FP8 SWA fake quantization; main KV is supplied by QuantCompressor."""
 

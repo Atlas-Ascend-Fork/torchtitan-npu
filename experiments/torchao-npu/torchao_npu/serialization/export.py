@@ -140,6 +140,9 @@ def save_hf_safetensors(
 
     # MXTensor -> qdata/scale + metadata; plain tensors pass through.
     tensors_data, metadata = flatten_tensor_state_dict(normalized)
+    # transformers <5 rejects a non-empty __metadata__ (flatten always fills it)
+    # lacking a "format" tag; save_pretrained stamps it, so we mirror that here.
+    metadata["format"] = "pt"
     # save_file rejects non-contiguous tensors.
     tensors_data = {name: (t if t.is_contiguous() else t.contiguous()) for name, t in tensors_data.items()}
 

@@ -308,3 +308,86 @@ def test_config_custom_params_filter_fn():
         params_filter_fn=custom_filter,
     )
     assert qat_config.params_filter_fn is custom_filter
+
+
+# =========================================================================
+# config.json serialization roundtrip (torchao ConfigJSONEncoder)
+# =========================================================================
+
+
+def test_param_swap_config_roundtrip_through_json():
+    """``params_filter_fn`` stays out of the record; decode restores the default filter."""
+    from torchao.core.config import config_from_dict, config_to_dict
+    from torchao_npu.quantization.filters import _is_parameter
+
+    config = ParamSwapConfig(weight_config=MXQuantizeConfig(), step="prepare")
+    record = config_to_dict(config)
+
+    assert "params_filter_fn" not in record["_data"]
+    assert "_params_filter_fn" not in record["_data"]
+
+    decoded = config_from_dict(record)
+    assert isinstance(decoded, ParamSwapConfig)
+    assert isinstance(decoded.weight_config, MXQuantizeConfig)
+    assert decoded.weight_config.block_size == 32
+    assert decoded.step == QATStep.PREPARE
+    assert decoded.params_filter_fn is _is_parameter
+
+
+def test_param_swap_config_filter_rebind_stays_out_of_record():
+    """lora rebinds the filter through the public attribute after construction."""
+    from torchao.core.config import config_to_dict
+
+    def custom_filter(param, fqn):
+        return True
+
+    config = ParamSwapConfig(weight_config=MXQuantizeConfig(), step="prepare")
+    config.params_filter_fn = custom_filter
+    assert config.params_filter_fn is custom_filter
+    assert "params_filter_fn" not in config_to_dict(config)["_data"]
+
+
+def test_module_swap_config_fields_survive_encoding():
+    """ModuleSwapConfig fields must land in ``__dict__`` for the encoder to see them."""
+    from torchao.core.config import config_to_dict
+    from torchao_npu.configs import ModuleSwapConfig
+
+    record = config_to_dict(ModuleSwapConfig(step="convert"))
+    assert record["_data"].get("step", {}).get("_data") == "CONVERT"
+
+
+def test_module_swap_subclasses_stay_slot_free():
+    """ConfigJSONEncoder reads ``__dict__``; a ``slots=True`` subclass hides its
+    own fields from the encoded record, so the whole tree must stay slot-free."""
+    from torchao.core.config import config_to_dict
+    from torchao_npu.configs import DeepSeekV41QuantCompressorConfig, ModuleSwapConfig
+
+    def walk(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from walk(sub)
+
+    seen = list(walk(ModuleSwapConfig))
+    assert seen, "config modules must be imported for the subclass walk to cover them"
+    offenders = [cls.__name__ for cls in seen if "__slots__" in cls.__dict__]
+    assert not offenders, f"@dataclass(slots=True) drops fields from __dict__ encoding: {offenders}"
+
+    encoded = config_to_dict(DeepSeekV41QuantCompressorConfig(group_size=32))["_data"]
+    assert encoded["group_size"] == 32 and "step" in encoded
+
+
+def test_fqn_to_config_record_decodes_with_npu_configs():
+    """Mirrors ``export_quantized_hf._build_fqn_to_config_record``."""
+    from torchao.core.config import config_from_dict, config_to_dict
+    from torchao.quantization import FqnToConfig
+
+    pattern = r"re:^model\.\d+\.experts\.\d+\.gate_proj$"
+    fqn_to_config = {pattern: ParamSwapConfig(weight_config=MXQuantizeConfig(), step="prepare")}
+    record = config_to_dict(FqnToConfig(fqn_to_config=fqn_to_config))
+    record["_data"].pop("module_fqn_to_config", None)
+
+    decoded = config_from_dict(record)
+    (config,) = decoded.fqn_to_config.values()
+    assert isinstance(config, ParamSwapConfig)
+    assert isinstance(config.weight_config, MXQuantizeConfig)
+    assert list(decoded.fqn_to_config) == [pattern]

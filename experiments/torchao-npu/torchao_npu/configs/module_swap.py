@@ -13,7 +13,9 @@ from typing import ClassVar
 from torchao.quantization.qat import QATConfig, QATStep
 
 
-@dataclass(kw_only=True, slots=True)
+# ``slots=True`` must not come back: ConfigJSONEncoder serializes AOBaseConfig
+# subclasses via ``__dict__``, so slot-stored fields silently encode as ``{}``.
+@dataclass(kw_only=True)
 class ModuleSwapConfig(QATConfig):
     """Base config for transforms which replace a module's forward behavior."""
 
