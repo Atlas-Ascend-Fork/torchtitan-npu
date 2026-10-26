@@ -56,9 +56,24 @@ def _prepare_tensors(
 
     candidate_values = candidate.double().flatten()
     reference_values = reference.double().flatten()
-    if not torch.isfinite(candidate_values).all() or not torch.isfinite(reference_values).all():
-        raise ValueError("tensors contain NaN or Inf")
     return candidate_values, reference_values
+
+
+def _non_finite_stats(values: torch.Tensor) -> dict[str, int]:
+    """Count NaN/Inf occurrences and return the index of the first one."""
+    nan_mask = torch.isnan(values)
+    inf_mask = torch.isinf(values) & ~nan_mask
+    first_idx = -1
+    bad = nan_mask | inf_mask
+    if bad.any():
+        # argmax over the 0/1 mask locates the first bad element without
+        # materializing every index (whole-tensor NaN is the common case).
+        first_idx = int(bad.view(-1).to(torch.uint8).argmax().item())
+    return {
+        "nan_count": int(nan_mask.sum().item()),
+        "inf_count": int(inf_mask.sum().item()),
+        "first_non_finite_index": first_idx,
+    }
 
 
 def compare_tensors(
@@ -81,6 +96,22 @@ def compare_tensors(
         }
 
     candidate, reference = _prepare_tensors(candidate, reference)
+
+    cand_bad = _non_finite_stats(candidate)
+    ref_bad = _non_finite_stats(reference)
+    if cand_bad["nan_count"] or cand_bad["inf_count"] or ref_bad["nan_count"] or ref_bad["inf_count"]:
+        return {
+            "non_finite": 1,
+            "candidate_nan_count": cand_bad["nan_count"],
+            "candidate_inf_count": cand_bad["inf_count"],
+            "reference_nan_count": ref_bad["nan_count"],
+            "reference_inf_count": ref_bad["inf_count"],
+            "first_non_finite_index": (
+                cand_bad["first_non_finite_index"]
+                if cand_bad["first_non_finite_index"] >= 0
+                else ref_bad["first_non_finite_index"]
+            ),
+        }
 
     diff = candidate - reference
     abs_diff = diff.abs()
@@ -118,6 +149,8 @@ def failed_logits_metrics(
         "mean_ae": thresholds.mean_ae,
         "mean_re": thresholds.mean_re,
     }
+    if result.get("non_finite"):
+        return ("non_finite",)
     failed = [name for name, limit in upper_bounds.items() if result[name] > limit]
     if result["cos"] < thresholds.cos:
         failed.append("cos")
@@ -154,6 +187,15 @@ def print_trace_metrics(
             )
             continue
         result = compare_tensors(candidate[key], reference[key])
+        if result.get("non_finite"):
+            print(
+                f"{key:<{key_width}} NON-FINITE: "
+                f"candidate NaN={result['candidate_nan_count']} Inf={result['candidate_inf_count']}, "
+                f"{reference_label} NaN={result['reference_nan_count']} Inf={result['reference_inf_count']}, "
+                f"first index={result['first_non_finite_index']}",
+                file=file,
+            )
+            continue
         if "exact_match" in result:
             print(
                 f"{key:<{key_width}} exact_match={bool(result['exact_match'])} "

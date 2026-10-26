@@ -231,6 +231,14 @@ def main() -> int:
     print(f"attention   : {args.attention}")
     print(f"TF patch    : {'enabled' if args.apply_transformers_patch else 'disabled'}")
     print(f"logits      : {tuple(candidate.shape)}")
+    if result.get("non_finite"):
+        print(
+            f"non_finite        : candidate NaN={result['candidate_nan_count']} Inf={result['candidate_inf_count']}, "
+            f"reference NaN={result['reference_nan_count']} Inf={result['reference_inf_count']}"
+        )
+        print(f"first_non_finite_index : {result['first_non_finite_index']}")
+        print("gate        : NaN/Inf detected; metrics not computable and not usable for precision judgment")
+        return 1
     print(f"mean_ae           : {result['mean_ae']:.8e}")
     print(f"max_re            : {result['max_re']:.8e}")
     print(f"mean_re           : {result['mean_re']:.8e}")

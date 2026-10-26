@@ -75,6 +75,13 @@ def _run(
 
 
 def _print_metrics(result: Mapping[str, float | int]) -> None:
+    if result.get("non_finite"):
+        print(
+            f"non_finite        : candidate NaN={result['candidate_nan_count']} Inf={result['candidate_inf_count']}, "
+            f"reference NaN={result['reference_nan_count']} Inf={result['reference_inf_count']}"
+        )
+        print(f"first_non_finite_index : {result['first_non_finite_index']}")
+        return
     print(f"mean_ae           : {result['mean_ae']:.8e}")
     print(f"max_re            : {result['max_re']:.8e}")
     print(f"mean_re           : {result['mean_re']:.8e}")

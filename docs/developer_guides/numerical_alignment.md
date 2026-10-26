@@ -31,7 +31,7 @@
 
 #### 精度指标
 
-比较前先确认两组张量的 `shape` 相同、张量非空，且有效元素不包含 NaN 或 Inf。使用平均绝对误差（Mean Absolute Error，MEAN_AE）、最大相对误差（Max Relative Error，MAX_RE）、平均相对误差（Mean Relative Error，MEAN_RE）和余弦相似度（Cosine Similarity，COS）作为精度指标。
+比较前先确认两组张量的 `shape` 相同、张量非空，且有效元素不包含 NaN 或 Inf。对齐工具会把含 NaN/Inf 的比较判为失败并输出非有限统计（各侧 NaN/Inf 计数与首个非有限下标，失败原因名 `non_finite`）；含 NaN/Inf 的比较结果不可用于精度判定。使用平均绝对误差（Mean Absolute Error，MEAN_AE）、最大相对误差（Max Relative Error，MAX_RE）、平均相对误差（Mean Relative Error，MEAN_RE）和余弦相似度（Cosine Similarity，COS）作为精度指标。
 
 MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_norm` 等标量；MEAN_RE 提供相对误差约束，COS 反映整体方向一致性。
 

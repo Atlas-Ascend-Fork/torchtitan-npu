@@ -30,6 +30,8 @@ python -m scripts.numerical_alignment.compare_module_example
 默认 shape `(2, 17, 4096)`、`bfloat16`、seed `1234`；`--dtype` 支持 `bfloat16` / `float16` / `float32`，`--device` 仅支持 NPU。
 三项检查均须满足 `mean_ae <= 0.02`、`mean_re <= 0.02`、`cos >= 0.9999`（`max_re` 仅用于诊断）。全部通过返回 `0`，否则返回 `1`。
 
+两侧任一张量含 NaN/Inf 时，工具打印各侧 NaN/Inf 计数与首个非有限下标，并把该项判为 `FAIL`（失败原因名 `non_finite`），不再抛出异常。
+
 ## 整网精度对比
 
 推理基线对齐使用 DSV4 Flash 的前 1～4 层，保留前 4 个 routed experts、top-3，关闭 MTP。
