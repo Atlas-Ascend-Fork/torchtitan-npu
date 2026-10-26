@@ -20,13 +20,13 @@ from torchtitan_npu.models.deepseek_v4_1 import model_registry
 from torchtitan_npu.models.deepseek_v4_1.config_registry import (
     _v41_muon_profile,
     deepseek_v4_1_debugmodel_multimodal,
-    deepseek_v4_1_flash_40layers_16experts_multimodal,
+    deepseek_v4_1_flash_40layers_24experts_multimodal,
 )
 
 
 @pytest.fixture(scope="module")
 def spec():
-    return model_registry("deepseek_v4_1_flash_40layers_16experts_vision")
+    return model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +41,7 @@ def layouts(profile):
 
 class TestDefaultRecipe:
     def test_default_is_adamw(self):
-        cfg = deepseek_v4_1_flash_40layers_16experts_multimodal()
+        cfg = deepseek_v4_1_flash_40layers_24experts_multimodal()
         assert cfg.optimizer.name == "AdamW"
         assert [group.optimizer_name for group in cfg.optimizer.param_groups] == ["SparseAdam", "AdamW"]
 

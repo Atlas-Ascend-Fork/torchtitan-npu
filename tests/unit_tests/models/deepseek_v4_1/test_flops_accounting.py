@@ -61,7 +61,7 @@ class _NoEngramLayer:
         # At 4K the published Flash candidate pool (2048 x 8) is wider than
         # the sequence, so hierarchical Reindex has not reached its cap yet.
         (
-            "deepseek_v4_1_flash_40layers_16experts_text",
+            "deepseek_v4_1_flash_40layers_24experts_text",
             4096,
             2_013_265_920 + 7_650_410_496 + 654_311_424,
         ),

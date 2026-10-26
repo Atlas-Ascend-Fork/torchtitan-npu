@@ -121,6 +121,8 @@ def test_text_recipe_builds_the_text_stack_and_loader(recipes):
         ("deepseek_v4_1_debugmodel_text", False),
         ("deepseek_v4_1_flash_40layers_16experts_vision", True),
         ("deepseek_v4_1_flash_40layers_16experts_text", False),
+        ("deepseek_v4_1_flash_40layers_24experts_multimodal", True),
+        ("deepseek_v4_1_flash_40layers_24experts_text", False),
     ],
 )
 def test_every_registered_flavor_declares_its_modality(registry, flavor, multimodal):
@@ -129,6 +131,22 @@ def test_every_registered_flavor_declares_its_modality(registry, flavor, multimo
     config = registry.deepseek_v4_1_configs[flavor](non_blocking_capacity_factor=None)
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is multimodal, flavor
     assert ("_text" in flavor) is not multimodal, flavor
+
+
+@pytest.mark.parametrize("num_experts", [16, 24], ids=["16experts", "24experts"])
+@pytest.mark.parametrize("modality", ["multimodal", "text"])
+def test_flash_recipe_sets_expert_count_in_every_layer(recipes, num_experts, modality):
+    recipe = getattr(recipes, f"deepseek_v4_1_flash_40layers_{num_experts}experts_{modality}")
+
+    config = recipe().model_spec.model
+
+    assert len(config.layers) == 40
+    assert isinstance(config, DeepSeekV41MultimodalModel.Config) is (modality == "multimodal")
+    for layer in config.layers:
+        assert layer.moe.num_experts == num_experts
+        assert layer.moe.router.num_experts == num_experts
+        assert layer.moe.router.gate.out_features == num_experts
+        assert layer.moe.routed_experts.inner_experts.num_experts == num_experts
 
 
 class _RecordedHooks(nn.Module):

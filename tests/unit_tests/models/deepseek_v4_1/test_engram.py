@@ -228,7 +228,7 @@ def test_debug_flavor_enables_engram_and_selects_sparse_adam():
 
 def test_released_v41_geometry_builds_published_logical_tables():
     """Official row totals exercise prime allocation across both complete layers."""
-    full = model_registry("deepseek_v4_1_flash_40layers_16experts_vision")
+    full = model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
     layers = [(i, layer.engram) for i, layer in enumerate(full.model.layers) if layer.engram is not None]
     # Source: deepseek-ai/DeepSeek-V4.1-Flash, revision 2bc89ac, text_config.
     assert [i for i, _ in layers] == [1, 14]

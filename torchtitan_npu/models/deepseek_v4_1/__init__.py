@@ -978,6 +978,15 @@ deepseek_v4_1_configs = {
         num_experts=16,
         vision=False,
     ),
+    "deepseek_v4_1_flash_40layers_24experts_multimodal": partial(
+        _deepseek_v4_1_flash,
+        num_experts=24,
+    ),
+    "deepseek_v4_1_flash_40layers_24experts_text": partial(
+        _deepseek_v4_1_flash,
+        num_experts=24,
+        vision=False,
+    ),
     "deepseek_v4_1_debugmodel": _debugmodel,
     "deepseek_v4_1_debugmodel_text": partial(_debugmodel, vision=False),
     "deepseek_v4_1_stripped": _stripped,

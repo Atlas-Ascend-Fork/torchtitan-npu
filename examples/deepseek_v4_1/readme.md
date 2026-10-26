@@ -40,7 +40,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
 ```
 
-默认实验为 40 层 / 16 专家、seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
+单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家；均使用 seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
 关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
 

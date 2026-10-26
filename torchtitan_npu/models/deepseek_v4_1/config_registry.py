@@ -332,6 +332,14 @@ def deepseek_v4_1_flash_40layers_16experts_text() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_text")
 
 
+def deepseek_v4_1_flash_40layers_24experts_multimodal() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_multimodal")
+
+
+def deepseek_v4_1_flash_40layers_24experts_text() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_text")
+
+
 def deepseek_v4_1_debugmodel_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_debugmodel")
 

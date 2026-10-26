@@ -5,14 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 # A5 wrapper around the common DeepSeek-V4.1 Flash CPT launcher. Keep the shared
-# model, training, and parallelism defaults in the A3 script; this entrypoint
-# only supplies A5-specific runtime and fused-operator settings.
+# training and parallelism defaults in the A3 script; this entrypoint selects
+# 24 experts and supplies A5-specific runtime and fused-operator settings.
 # Append CLI arguments to override the defaults below:
 #   ./examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh --training.steps 5
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal}"
 
 # Use the command line `npu-smi info -t topo` to query the CPU affinity of the
 # NPU cards for configuration.
