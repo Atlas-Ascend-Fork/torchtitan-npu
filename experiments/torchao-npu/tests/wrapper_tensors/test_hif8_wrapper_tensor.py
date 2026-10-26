@@ -45,7 +45,9 @@ def test_init_stores_data_and_configs(device):
         activation_config=activation_config,
     )
 
-    assert getattr(wrapper, "_data") is data  # noqa: B009
+    assert wrapper._data is not data
+    assert wrapper._data.data_ptr() == data.data_ptr()
+    assert torch.equal(wrapper._data, data)
     assert wrapper.weight_config is weight_config
     assert wrapper.activation_config is activation_config
 
@@ -91,7 +93,7 @@ def test_non_quantized_operation_preserves_plain_tensor_result(device):
     wrapped = _wrapper((64, 128), device)
 
     actual = torch.add(plain, wrapped)
-    expected = torch.add(plain, getattr(wrapped, "_data"))  # noqa: B009
+    expected = torch.add(plain, wrapped._data)
 
     assert isinstance(actual, torch.Tensor)
     assert not isinstance(actual, HiF8TrainingWeightWrapperTensor)
@@ -105,21 +107,21 @@ def test_metadata_operations_preserve_wrapper(operation):
     with torch._C.DisableTorchFunctionSubclass():
         if operation == "select":
             actual = weight[0]
-            expected = getattr(weight, "_data")[0]  # noqa: B009
+            expected = weight._data[0]
         elif operation == "transpose":
             actual = weight.transpose(0, 1)
-            expected = getattr(weight, "_data").transpose(0, 1)  # noqa: B009
+            expected = weight._data.transpose(0, 1)
         elif operation == "detach":
             actual = weight.detach()
-            expected = getattr(weight, "_data").detach()  # noqa: B009
+            expected = weight._data.detach()
         else:
             actual = weight.clone()
-            expected = getattr(weight, "_data").clone()  # noqa: B009
+            expected = weight._data.clone()
 
     assert isinstance(actual, HiF8TrainingWeightWrapperTensor)
     assert actual.weight_config is weight.weight_config
     assert actual.activation_config is weight.activation_config
-    torch.testing.assert_close(getattr(actual, "_data"), expected)  # noqa: B009
+    torch.testing.assert_close(actual._data, expected)
 
 
 @pytest.mark.parametrize("operation", [torch.mm, F.linear])
@@ -229,7 +231,9 @@ def test_grouped_mm_dispatch_matches_dense_reference():
     activation_ref = activation.detach().clone().requires_grad_()
     weight_ref = weight_data.detach().clone().requires_grad_()
     expected = torch._grouped_mm(activation_ref, weight_ref.transpose(-2, -1), offs=offsets)
-    expected.sum().backward()
+    # Materialize the grad: ``sum()`` yields a zero-stride tensor that the NPU
+    # grouped-mm backward rejects.
+    expected.backward(torch.ones_like(expected))
 
     assert actual.shape == (num_tokens, N)
     assert compute_error(actual, expected) > _SQNR_THRESHOLD
@@ -243,7 +247,7 @@ def test_deepcopy_preserves_wrapper_contract(device):
     copied = copy.deepcopy(wrapper)
 
     assert isinstance(copied, HiF8TrainingWeightWrapperTensor)
-    assert getattr(copied, "_data") is not getattr(wrapper, "_data")  # noqa: B009
+    assert copied._data is not wrapper._data
     assert copied.weight_config == wrapper.weight_config
     assert copied.activation_config == wrapper.activation_config
-    torch.testing.assert_close(getattr(copied, "_data"), getattr(wrapper, "_data"))  # noqa: B009
+    torch.testing.assert_close(copied._data, wrapper._data)

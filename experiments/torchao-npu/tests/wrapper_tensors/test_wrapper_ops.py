@@ -17,6 +17,7 @@ from torchao_npu.quantization.quant_configs import (
     BlockMXQuantizeConfig,
     MXQuantizeConfig,
 )
+from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.wrapper_tensors import (
     BaseTrainingWeightWrapperTensor,
     BlockMXTrainingWeightWrapperTensor,
@@ -862,3 +863,107 @@ def test_spmd_replicate_to_varying_preserves_subclass(wrapper_cls, weight_config
     assert result.weight_config is weight_config
     assert result.activation_config is act_config
     assert torch.equal(result.to_tensor(), torch.chunk(weight, 2, dim=0)[rank])
+
+
+# =========================================================================
+# Dispatch with a pre-quantized _data (what FSDP post-all-gather leaves)
+# =========================================================================
+
+
+def _prequantized_wrapper(shape=(4, 64, 128)):
+    """Wrap a hand-built ``BlockMXTensor`` without running a quantization kernel."""
+    config = BlockMXQuantizeConfig()
+    act_config = MXQuantizeConfig()
+    quant_block_size = config.block_size * 2
+    rows, cols = shape[-2], shape[-1]
+    qdata = torch.randint(0, 256, shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    scale1 = torch.ones((*shape[:-2], rows, cols // quant_block_size, 2), dtype=torch.float8_e8m0fnu)
+    scale2 = torch.ones((*shape[:-2], rows // quant_block_size, cols, 2), dtype=torch.float8_e8m0fnu)
+    data = BlockMXTensor(qdata, scale1, scale2, torch.bfloat16, config, act_config)
+    wrapper = BlockMXTrainingWeightWrapperTensor(data, weight_config=config, activation_config=act_config)
+    return wrapper, data
+
+
+@pytest.mark.parametrize(
+    "shape, op_func",
+    [
+        ((4, 64, 128), lambda x: x.clone()),
+        ((4, 64, 128), lambda x: x.detach()),
+        ((4, 64, 128), lambda x: x.view(2, 2, 64, 128)),
+        ((4, 64, 128), lambda x: x.transpose(-1, -2)),
+        ((2, 2, 64, 128), lambda x: x.permute(1, 0, 2, 3)),
+        ((4, 64, 128), lambda x: x.to(torch.float16)),
+        ((64, 128), lambda x: x.t()),
+        ((4, 64, 128), lambda x: x.as_strided((4, 64, 128), (8192, 128, 1))),
+    ],
+    ids=["clone", "detach", "view", "transpose_trailing", "permute_leading", "to_fp16", "t", "as_strided"],
+)
+def test_wrapper_preserves_subclass_with_prequantized_data(shape, op_func):
+    """The preserved ops re-wrap a quantized ``_data`` and keep its payload."""
+    wrapper, data = _prequantized_wrapper(shape)
+
+    with torch._C.DisableTorchFunctionSubclass():
+        result = op_func(wrapper)
+        reference = op_func(data)
+
+    assert isinstance(result, BlockMXTrainingWeightWrapperTensor)
+    assert isinstance(result._data, BlockMXTensor)
+    assert result.weight_config is wrapper.weight_config
+    assert result.activation_config is wrapper.activation_config
+    for name in BlockMXTensor.tensor_data_names:
+        assert torch.equal(getattr(result._data, name).view(torch.uint8), getattr(reference, name).view(torch.uint8)), (
+            f"{name} changed"
+        )
+
+
+def test_wrapper_copy_in_place_with_prequantized_data():
+    """``copy_`` writes the components into the target wrapper and returns it."""
+    target, target_data = _prequantized_wrapper()
+    source, source_data = _prequantized_wrapper()
+
+    result = target.copy_(source)
+
+    assert result is target
+    for name in BlockMXTensor.tensor_data_names:
+        assert torch.equal(
+            getattr(target_data, name).view(torch.uint8), getattr(source_data, name).view(torch.uint8)
+        ), f"{name} was not copied"
+
+
+@pytest.mark.parametrize(
+    "shape, op_func",
+    [
+        ((4, 64, 128), lambda x: x[0]),
+        ((4, 64, 128), lambda x: x[0:2]),
+        ((4, 64, 128), lambda x: x[torch.tensor([0, 2])]),
+        ((4, 64, 128), lambda x: x.unsqueeze(0)),
+        ((4, 64, 128), lambda x: x.new_zeros(2, 64, 128)),
+        ((4, 64, 128), lambda x: torch.split(x, 2)),
+        ((4, 64, 128), lambda x: x.pin_memory()),
+    ],
+    ids=["select", "slice", "index", "unsqueeze", "new_zeros", "split", "pin_memory"],
+)
+def test_wrapper_prequantized_dispatch_rejections(shape, op_func):
+    """Ops outside ``BlockMXTensor``'s whitelist raise, naming the quantized class."""
+    wrapper, _ = _prequantized_wrapper(shape)
+
+    with pytest.raises(NotImplementedError, match="BlockMXTensor"), torch._C.DisableTorchFunctionSubclass():
+        op_func(wrapper)
+
+
+@pytest.mark.parametrize(
+    "shape, op_func, error",
+    [
+        ((4, 64, 128), lambda x: x.transpose(0, 1), ValueError),
+        ((4, 64, 128), lambda x: x.view(4, 2, 32, 128), ValueError),
+        ((4, 64, 128), lambda x: x.as_strided((2, 64, 128), (8192, 128, 1)), NotImplementedError),
+        ((4, 64, 128), lambda x: x.to(torch.float8_e4m3fn), ValueError),
+    ],
+    ids=["transpose_crosses_boundary", "view_moves_block_boundary", "as_strided_changes_layout", "to_low_precision"],
+)
+def test_wrapper_prequantized_dispatch_rejects_invalid_arguments(shape, op_func, error):
+    """Argument combinations ``BlockMXTensor`` cannot represent are rejected."""
+    wrapper, _ = _prequantized_wrapper(shape)
+
+    with pytest.raises(error), torch._C.DisableTorchFunctionSubclass():
+        op_func(wrapper)

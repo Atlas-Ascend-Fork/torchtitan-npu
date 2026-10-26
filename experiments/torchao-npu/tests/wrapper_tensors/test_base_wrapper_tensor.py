@@ -8,6 +8,7 @@ import re
 
 import pytest
 import torch
+from torch import nn
 from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -28,7 +29,7 @@ from torchao_npu.wrapper_tensors import (
 )
 from torchao_npu.wrapper_tensors.base_wrapper_tensor import _pad_uneven_shard_dim0
 
-from ..testing_utils import target_devices
+from ..testing_utils import _SizeOnlyMesh, target_devices
 
 # (wrapper_cls, weight_config, act_config) cases shared by the wrapper tests;
 # _NON_BASE_WRAPPER_CASES drops the Base entries, which the dtensor tests skip.
@@ -85,7 +86,7 @@ def test_wrapper_init_accepts_none_weight_config(wrapper_cls, device):
     w = torch.randn(64, 128, device=device)
     wrapper = wrapper_cls(w, weight_config=None)
     assert wrapper.weight_config is None
-    assert torch.equal(getattr(wrapper, "_data"), w)  # noqa: B009
+    assert torch.equal(wrapper._data, w)
 
 
 @pytest.mark.parametrize("device", target_devices)
@@ -94,9 +95,40 @@ def test_wrapper_init_stores_attrs(wrapper_cls, weight_config, act_config, devic
     """__init__ stores _data, weight_config, and activation_config."""
     w = torch.randn(64, 128, device=device)
     wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
-    assert getattr(wrapper, "_data") is w  # noqa: B009
+    assert wrapper._data is not w
+    assert wrapper._data.data_ptr() == w.data_ptr()
+    assert torch.equal(wrapper._data, w)
     assert wrapper.weight_config is weight_config
     assert wrapper.activation_config is act_config
+
+
+@pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
+def test_wrapper_init_detaches_data_and_shares_storage(wrapper_cls, weight_config, act_config):
+    """``_data`` is a detached alias: a new object sharing the input's storage."""
+    w = torch.randn(64, 128, requires_grad=True)
+    wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
+
+    assert wrapper.requires_grad is True
+    assert wrapper._data.requires_grad is False
+    assert wrapper._data is not w
+    assert wrapper._data.data_ptr() == w.data_ptr()
+    assert torch.equal(wrapper._data, w)
+
+
+def test_nn_parameter_wrapper_keeps_grad_on_wrapper_only():
+    """Autograd tracks the wrapper; ``_data`` stays a detached storage tensor."""
+    wrapper = BaseTrainingWeightWrapperTensor(torch.randn(8, 16))
+
+    param = nn.Parameter(wrapper)
+
+    assert isinstance(param, BaseTrainingWeightWrapperTensor)
+    assert param.requires_grad is True
+    assert param._data.requires_grad is False
+
+    param.requires_grad_(False)
+
+    assert param.requires_grad is False
+    assert param._data.requires_grad is False
 
 
 @pytest.mark.parametrize("device", target_devices)
@@ -244,8 +276,8 @@ def test_wrapper_deepcopy(wrapper_cls, weight_config, act_config, device):
     assert isinstance(wrapper, wrapper_cls)
     assert isinstance(wrapper_copy, wrapper_cls)
 
-    assert getattr(wrapper_copy, "_data") is not getattr(wrapper, "_data")  # noqa: B009
-    assert torch.equal(getattr(wrapper_copy, "_data"), getattr(wrapper, "_data"))  # noqa: B009
+    assert wrapper_copy._data is not wrapper._data
+    assert torch.equal(wrapper_copy._data, wrapper._data)
 
     assert wrapper_copy.weight_config == wrapper.weight_config
     assert wrapper_copy.weight_config is not wrapper.weight_config
@@ -260,8 +292,20 @@ def test_wrapper_deepcopy(wrapper_cls, weight_config, act_config, device):
     assert torch.equal(out, out_copy), "The cloned tensor should yield identical results."
     if wrapper_cls is BaseTrainingWeightWrapperTensor:
         # Base class passes through without fake quantization.
-        ref = torch.mm(activation, getattr(wrapper, "_data").T)  # noqa: B009
+        ref = torch.mm(activation, wrapper._data.T)
         assert torch.equal(out, ref), "Base class __torch_function__ should pass through without fake quantization."
+
+
+@pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
+def test_wrapper_deepcopy_preserves_requires_grad(wrapper_cls, weight_config, act_config):
+    """``__deepcopy__`` restores the wrapper's flag without giving ``_data`` one."""
+    w = torch.randn(16, 32, requires_grad=True)
+    wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
+
+    wrapper_copy = copy.deepcopy(wrapper)
+
+    assert wrapper_copy.requires_grad is True
+    assert wrapper_copy._data.requires_grad is False
 
 
 # =========================================================================
@@ -277,7 +321,9 @@ def test_wrapper_to_tensor(wrapper_cls, weight_config, act_config, device):
     wrapper = wrapper_cls(w, weight_config=weight_config, activation_config=act_config)
     result = wrapper.to_tensor()
     assert isinstance(result, torch.Tensor)
-    assert result is w
+    assert result is wrapper._data
+    assert result is not w
+    assert result.data_ptr() == w.data_ptr()
 
 
 # =========================================================================
@@ -365,13 +411,13 @@ def test_wrapper_tensor_unflatten(wrapper_cls, weight_config, act_config, device
 
     # simulate PyTorch: record size/stride during flatten, pass back during unflatten
     tensor_names, metadata = wrapper.__tensor_flatten__()
-    outer_size = getattr(wrapper, "_data").size()  # noqa: B009
-    outer_stride = getattr(wrapper, "_data").stride()  # noqa: B009
+    outer_size = wrapper._data.size()
+    outer_stride = wrapper._data.stride()
     tensor_data_dict = {name: getattr(wrapper, name) for name in tensor_names}
 
     reconstructed = wrapper_cls.__tensor_unflatten__(tensor_data_dict, metadata, outer_size, outer_stride)
     assert isinstance(reconstructed, wrapper_cls)
-    assert torch.equal(getattr(reconstructed, "_data"), w)  # noqa: B009
+    assert torch.equal(reconstructed._data, w)
     assert reconstructed.weight_config is weight_config
     assert reconstructed.activation_config is act_config
 
@@ -381,7 +427,7 @@ def test_meta_weights(wrapper_cls, weight_config, act_config):
     """Wrapper can be constructed on meta device."""
     with torch.device("meta"):
         wrapper = wrapper_cls(torch.randn(64, 128), weight_config=weight_config, activation_config=act_config)
-    assert getattr(wrapper, "_data").is_meta  # noqa: B009
+    assert wrapper._data.is_meta
 
 
 # =========================================================================
@@ -414,16 +460,6 @@ def test_fsdp_pre_all_gather(wrapper_cls, weight_config, act_config, dtypes, moc
     assert data.dtype == param_dtype
     assert data.shape == w.shape
     assert torch.equal(data, w.to(param_dtype))
-
-
-class _SizeOnlyMesh:
-    """Minimal DeviceMesh stand-in: the base hook only reads ``mesh.size()``."""
-
-    def __init__(self, size):
-        self._size = size
-
-    def size(self):
-        return self._size
 
 
 @pytest.mark.parametrize(
@@ -507,7 +543,8 @@ def test_fsdp_post_all_gather_first_step(wrapper_cls, weight_config, act_config,
 
     result, inner_tensors = wrapper.fsdp_post_all_gather((gathered,), None, torch.float32, out=None)
     assert isinstance(result, wrapper_cls)
-    assert getattr(result, "_data") is gathered  # noqa: B009
+    assert result._data is not gathered
+    assert result._data.untyped_storage().data_ptr() == gathered.untyped_storage().data_ptr()
     assert isinstance(inner_tensors, tuple)
     assert len(inner_tensors) == 1
     assert inner_tensors[0] is gathered
@@ -530,10 +567,10 @@ def test_fsdp_post_all_gather_existing_out_same_dtype(wrapper_cls, weight_config
     out.activation_config = None
     out.weight_config = None
 
-    data = getattr(out, "_data")  # noqa: B009
+    data = out._data
     result = wrapper.fsdp_post_all_gather((data,), None, dtype, out=out)
     assert result is None
-    assert getattr(out, "_data") is data  # storage-sharing: same pointer reused  # noqa: B009
+    assert out._data is data  # storage-sharing: same pointer reused
     assert out.weight_config is weight_config
     assert out.activation_config is act_config
 
@@ -557,15 +594,15 @@ def test_fsdp_post_all_gather_existing_out_same_dtype_dtensor(wrapper_spec, dtyp
     out_data = torch.randn(4, 64, 128, dtype=dtype, device=device)
     out_local = wrapper_cls(out_data, weight_config=weight_config, activation_config=act_config)
     out = DTensor.from_local(out_local, mesh, [Shard(0)])
-    local_tensor = getattr(out, "_local_tensor")  # noqa: B009
+    local_tensor = out._local_tensor
     local_tensor.activation_config = None
     local_tensor.weight_config = None
 
-    data = getattr(local_tensor, "_data")  # noqa: B009
+    data = local_tensor._data
     result = wrapper.fsdp_post_all_gather((data,), None, dtype, out=out)
 
     assert result is None
-    assert getattr(local_tensor, "_data") is data  # noqa: B009
+    assert local_tensor._data is data
     assert local_tensor.weight_config is weight_config
     assert local_tensor.activation_config is act_config
 
@@ -597,14 +634,14 @@ def test_fsdp_post_all_gather_existing_out_cross_dtype(wrapper_cls, weight_confi
     out.weight_config = None
 
     data = torch.randn(4, 64, 128, dtype=in_dtype)
-    out_data_before = getattr(out, "_data")  # noqa: B009
+    out_data_before = out._data
     result = wrapper.fsdp_post_all_gather((data,), None, out_dtype, out=out)
 
     assert result is None
-    assert getattr(out, "_data") is out_data_before  # in-place copy_: same object  # noqa: B009
+    assert out._data is out_data_before  # in-place copy_: same object
     assert out.weight_config is weight_config
     assert out.activation_config is act_config
-    assert torch.equal(getattr(out, "_data"), data.to(out_dtype))  # noqa: B009
+    assert torch.equal(out._data, data.to(out_dtype))
 
     # If param_dtype doesn't match out_data.dtype, the assertion should fire
     bad_param_dtype = torch.float64
@@ -637,19 +674,19 @@ def test_fsdp_post_all_gather_existing_out_cross_dtype_dtensor(
     out_data = torch.randn(4, 64, 128, dtype=out_dtype, device=device)
     out_local = wrapper_cls(out_data, weight_config=weight_config, activation_config=act_config)
     out = DTensor.from_local(out_local, mesh, [Shard(0)])
-    local_tensor = getattr(out, "_local_tensor")  # noqa: B009
+    local_tensor = out._local_tensor
     local_tensor.activation_config = None
     local_tensor.weight_config = None
 
     data = torch.randn(4, 64, 128, dtype=in_dtype, device=device)
-    out_local_tensor_data_before = getattr(local_tensor, "_data")  # noqa: B009
+    out_local_tensor_data_before = local_tensor._data
     result = wrapper.fsdp_post_all_gather((data,), None, out_dtype, out=out)
 
     assert result is None
-    assert getattr(local_tensor, "_data") is out_local_tensor_data_before  # in-place copy_: same object  # noqa: B009
+    assert local_tensor._data is out_local_tensor_data_before  # in-place copy_: same object
     assert local_tensor.weight_config is weight_config
     assert local_tensor.activation_config is act_config
-    assert torch.equal(getattr(local_tensor, "_data"), data.to(out_dtype))  # noqa: B009
+    assert torch.equal(local_tensor._data, data.to(out_dtype))
 
     # If param_dtype doesn't match out_data.dtype, the assertion should fire
     bad_param_dtype = torch.float64

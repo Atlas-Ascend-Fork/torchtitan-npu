@@ -21,6 +21,16 @@ if _npu_is_available():
     target_devices.append("npu")
 
 
+class _SizeOnlyMesh:
+    """Minimal DeviceMesh stand-in: FSDP hooks only read ``mesh.size()``."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
 def create_moe_model(device, use_grouped_mm, dtype=torch.float32):
     dim, hidden_dim = 1024, 2048
     args = MoEArgs(
