@@ -247,6 +247,56 @@ def test_config_manager_parses_quantization_extension(
     assert quantization.kv_norm_quantization.block_size == 64
 
 
+def test_config_manager_splits_comma_joined_fsdp_prequantize_fqns(monkeypatch, tmp_path):
+    """The A5 launch scripts pass the whitelist as one comma-joined argument."""
+    module_name = "_torchtitan_npu_prequantize_fqns_config_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module_name,
+            "--config",
+            "test_config",
+            "--extension.quantization.enable-fsdp-prequantize",
+            "--extension.quantization.fsdp-prequantize-fqns",
+            ".attention.wq_b,.attention.wo_a",
+        ]
+    )
+
+    assert config.extension.quantization.fsdp_prequantize_fqns == [".attention.wq_b", ".attention.wo_a"]
+
+
+def test_config_manager_rejects_space_separated_fsdp_prequantize_fqns(monkeypatch, tmp_path):
+    """The old space-separated multi-value form leaves a stray token and must not parse."""
+    module_name = "_torchtitan_npu_prequantize_fqns_space_config_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    with pytest.raises(SystemExit) as exit_info:
+        ConfigManager().parse_args(
+            [
+                "--module",
+                module_name,
+                "--config",
+                "test_config",
+                "--extension.quantization.enable-fsdp-prequantize",
+                "--extension.quantization.fsdp-prequantize-fqns",
+                ".attention.wq_b",
+                ".attention.wo_a",
+            ]
+        )
+
+    assert exit_info.value.code != 0
+
+
 def test_kv_norm_quantization_config_validates_its_format():
     """
     Only the format is checked here; the block size is validated by the MX

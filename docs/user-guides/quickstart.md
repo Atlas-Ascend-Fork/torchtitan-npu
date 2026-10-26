@@ -146,7 +146,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 | `li-quantization` | `fp8`、`mxfp8`、`mxfp4`、`hif8` | 选择 LI Q/K 的量化类型，默认不启用；DeepSeek-V4.1 仅支持 `mxfp4`。 |
 | `kv-norm-quantization.format` | `mxfp8` | 启用 DeepSeek-V4 KV Cache 的 MXFP8 量化。 |
 | `enable-fsdp-prequantize` | `--enable-fsdp-prequantize` / `--no-enable-fsdp-prequantize` | 在 FSDP all-gather 前预量化 Block FP8 权重，减少通信量，默认关闭。 |
-| `fsdp-prequantize-fqns` | FQN 后缀模式列表（默认 `None`） | 仅在 `enable-fsdp-prequantize` 下生效。白名单内的权重保留预量化、其余显式关闭；`None` 用 recipe 默认白名单，显式空表与开关开启冲突会报 `ValueError`。命中权重的分片若不满足对齐约束，运行时立即报错终止（不静默回退），并给出移除该 FQN 或调整并行度的提示。 |
+| `fsdp-prequantize-fqns` | FQN 后缀模式列表（默认 `None`） | 仅在 `enable-fsdp-prequantize` 下生效。白名单内的权重保留预量化、其余显式关闭；`None` 用 recipe 默认白名单，显式空表与开关开启冲突会报 `ValueError`。多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）。命中权重的分片若不满足对齐约束，运行时立即报错终止（不静默回退），并给出移除该 FQN 或调整并行度的提示。 |
 | `enable-hif8-save-quant-codes` | `--enable-hif8-save-quant-codes` / `--no-enable-hif8-save-quant-codes` | 把 HiF8 量化矩乘算子（`npu_quantize`/`npu_dynamic_quant`/`npu_grouped_matmul`/`npu_quant_matmul`）结果保留在 selective activation checkpointing 保存边界内，backward 不再重新推导；仅在 `recipe=all_hif8` 时生效，默认关闭。 |
 | `save-block-ops-level` | `0`-`3`（默认 `0`） | 把 attention / mHC / MoE-routing 相关 NPU 自定义算子加入 selective activation checkpointing 的 MUST_SAVE 列表，用显存换取 backward 更少重复计算。 |
 

@@ -226,7 +226,7 @@ attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K �
 | `dst-type-max` | `0.0` | 用于 MXFP4 量化的目标类型最大值，可取值 0.0, 6.0-12.0 |
 | `enable-fsdp-prequantize` | `False` | 启用 FSDP 参数 all-gather 前预量化 |
 | `fsdp-prequantize-dtype` | `fp8` | Routed experts 的预量化通信格式；`mxfp4` 要求专家启用 MXFP4 QAT。`all_block_fp8` 下 attention 等 dense 权重仍使用 FP8 通信，启用范围由白名单决定 |
-| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
+| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单，多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
 | `kv-norm-quantization.format` | 未设置 | V4 nope KV Cache 量化格式，目前为 `mxfp8`（8 bit E4M3） |
 | `kv-norm-quantization.fqns` | 空列表 | V4 的量化插入位置，脚本使用 `.attention.kv_norm,.attention.compressor.norm` |
 | `kv-norm-quantization.block-size` | `32` | V4 KV Cache MXFP8 的 block size；A5 脚本使用 `64` |

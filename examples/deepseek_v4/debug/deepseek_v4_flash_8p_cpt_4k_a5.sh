@@ -36,8 +36,9 @@ fi
 # rows/rank). At degrees where an entry breaks alignment (e.g. DP_SHARD=16:
 # wkv shards to 32 rows) training fails fast at startup with a fix hint;
 # narrow the whitelist by appending the default patterns minus the offending
-# one, e.g. excluding wkv (space-separated, matching the 4K entry below):
-#   --extension.quantization.fsdp-prequantize-fqns .attention.wq_a .attention.wq_b .attention.wo_a .attention.wo_b .attention.indexer.wq_b .moe.shared_experts.w1 .moe.shared_experts.w2 .moe.shared_experts.w3 .moe.routed_experts.inner_experts
+# one, e.g. excluding wkv (comma-separated in a single argument, matching the
+# 4K entry):
+#   --extension.quantization.fsdp-prequantize-fqns .attention.wq_a,.attention.wq_b,.attention.wo_a,.attention.wo_b,.attention.indexer.wq_b,.moe.shared_experts.w1,.moe.shared_experts.w2,.moe.shared_experts.w3,.moe.routed_experts.inner_experts
 # A user whitelist fails fast on any pattern absent from the model, so drop
 # the .moe.shared_experts.* entries on a model without shared experts.
 QUANTIZATION_ARGS=(
