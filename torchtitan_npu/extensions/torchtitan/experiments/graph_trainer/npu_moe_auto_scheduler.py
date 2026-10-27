@@ -41,6 +41,9 @@ from .compute_benchmark import (
     _is_npu_benchmark_compute_node,
 )
 from .utils import (
+    assign_stable_node_tags,
+    collective_group,
+    cross_rank_semantic_keys,
     is_metadata_only_compute_node,
     node_id,
     resolve_collective_process_group,
@@ -169,18 +172,17 @@ class NpuMoeAutoOverlapScheduler:
         self._cost_fallback_nodes: set[fx.Node] = set()
         self._has_run = False
         self.costs_by_node_id: dict[int, float] = {}
+        self._benchmark_semantic_keys: dict[int, tuple[Any, ...]] | None = None
 
     def _original_communication_ids(self) -> dict[fx.Node, tuple[int, int]]:
         """Identify launches by original group/communication order, not FX IDs."""
-        from .whole_graph_benchmark import _collective_group
-
         groups: dict[str, int] = {}
         counts: dict[int, int] = defaultdict(int)
         result = {}
         for node in sorted(self.graph.nodes, key=self.original_order.__getitem__):
             if _exchange_label(node) is None:
                 continue
-            group = _collective_group(node)
+            group = collective_group(node)
             group_id = groups.setdefault(group, len(groups))
             result[node] = (group_id, counts[group_id])
             counts[group_id] += 1
@@ -215,23 +217,43 @@ class NpuMoeAutoOverlapScheduler:
         if any(item != manifest for item in manifests):
             raise RuntimeError("NPU auto-overlap original communication manifests differ across ranks")
 
-    def _validate_world_communication_groups(self) -> None:
-        """Reject subgroup communication until scheduling is group-aware."""
+    def _validate_communication_groups(self) -> None:
+        """Require each logical group slot to form consistent WORLD partitions.
+
+        Disjoint EP subgroups may occupy the same rank-local group slot. Keep
+        WORLD-wide manifests and swap votes so all partitions choose a shared,
+        conservative launch order, including when other groups overlap them.
+        """
         import torch.distributed as dist
 
         if not dist.is_available() or not dist.is_initialized():
             return
-        world_size = dist.get_world_size()
-        for node in self._communication_ids:
+        groups: dict[int, tuple[int, ...]] = {}
+        for node, (group_id, _) in self._communication_ids.items():
+            if group_id in groups:
+                continue
             process_group = resolve_collective_process_group(node)
-            group_size = dist.get_world_size(process_group)
-            if group_size != world_size:
+            groups[group_id] = tuple(dist.get_process_group_ranks(process_group))
+        gathered = self._gather_order_values(groups)
+        for rank, rank_groups in enumerate(gathered):
+            if rank_groups.keys() != groups.keys():
                 raise RuntimeError(
-                    "NPU auto-overlap currently requires every graph "
-                    "communication group used for scheduling to span WORLD: "
-                    f"node={node.name} group_size={group_size} "
-                    f"world_size={world_size}"
+                    "NPU auto-overlap logical communication group slots differ across ranks: "
+                    f"rank={rank} slots={sorted(rank_groups)} expected_slots={sorted(groups)}"
                 )
+            for group_id, members in rank_groups.items():
+                if (
+                    rank not in members
+                    or len(set(members)) != len(members)
+                    or any(
+                        member < 0 or member >= len(gathered) or gathered[member].get(group_id) != members
+                        for member in members
+                    )
+                ):
+                    raise RuntimeError(
+                        "NPU auto-overlap inconsistent communication group membership: "
+                        f"rank={rank} group_slot={group_id} members={members}"
+                    )
 
     def _agree_communication_swap(
         self,
@@ -531,19 +553,41 @@ class NpuMoeAutoOverlapScheduler:
             for node in gmm_nodes:
                 self._uniform_gmm_token_assumptions[node] = rows
 
-    @staticmethod
-    def _align_values(values: list[float]) -> list[float]:
-        """Take cross-rank medians for one shared positional node order."""
+    def _align_values(self, nodes: tuple[fx.Node, ...], values: list[float]) -> list[float]:
+        """Align matching workloads; retain local costs for rank-only work."""
         import torch.distributed as dist
 
         if not dist.is_available() or not dist.is_initialized():
             return values
-        gathered: list[list[float] | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, values)
-        if any(item is None or len(item) != len(values) for item in gathered):
-            raise RuntimeError("NPU MoE benchmark node lists differ across ranks")
-        concrete_values = cast("list[list[float]]", gathered)
-        return [float(statistics.median(item[index] for item in concrete_values)) for index in range(len(values))]
+        if self._benchmark_semantic_keys is None:
+            assign_stable_node_tags(self.gm)
+            self._benchmark_semantic_keys = cross_rank_semantic_keys(self.gm, None)
+        keys = [
+            self._benchmark_semantic_keys.get(stable_id) if (stable_id := node_id(node)) is not None else None
+            for node in nodes
+        ]
+        local = {key: value for key, value in zip(keys, values, strict=True) if key is not None}
+        gathered = self._gather_order_values(local)
+        if any(item is None for item in gathered):
+            raise RuntimeError("NPU MoE failed to gather benchmark costs")
+        if self.debug:
+            sample_counts = [sum(key in item for item in gathered) if key is not None else 0 for key in keys]
+            rank_only = sum(count == 1 for count in sample_counts) if len(gathered) > 1 else 0
+            logger.info(
+                "NPU auto-overlap semantic-key alignment: nodes=%d world_size=%d "
+                "fully_matched=%d partial=%d rank_only=%d rank_only_ratio=%.6f unkeyed=%d",
+                len(keys),
+                len(gathered),
+                sum(count == len(gathered) for count in sample_counts),
+                sum(0 < count < len(gathered) for count in sample_counts),
+                rank_only,
+                rank_only / len(keys) if keys else 0.0,
+                sample_counts.count(0),
+            )
+        return [
+            float(statistics.median(item[key] for item in gathered if key in item)) if key is not None else value
+            for key, value in zip(keys, values, strict=True)
+        ]
 
     def _debug_benchmark_costs(
         self,
@@ -609,11 +653,10 @@ class NpuMoeAutoOverlapScheduler:
         local_collective_values = [self.collective_cost_fn(exchange.launch) for exchange in exchanges]
         collective_values = local_collective_values
         if self.align_across_ranks:
-            # The first standalone round benchmarks the original, unscheduled
-            # graph. Matched MoE regions have the same canonical node order
-            # across ranks, so their costs can be aligned positionally.
-            compute_values = self._align_values(compute_values)
-            collective_values = self._align_values(collective_values)
+            # EFSDP sharding and uneven splitting can add rank-local work.
+            # Match semantic workloads rather than positional node lists.
+            compute_values = self._align_values(compute_cost_nodes, compute_values)
+            collective_values = self._align_values(tuple(exchange.launch for exchange in exchanges), collective_values)
         if self._uses_default_compute_benchmark:
             self._debug_benchmark_costs(
                 region,
@@ -1254,7 +1297,7 @@ class NpuMoeAutoOverlapScheduler:
         self._has_run = True
         if not self.regions:
             raise ValueError(f"NPU auto-overlap found no chunked regions matching {self.module_pattern!r}")
-        self._validate_world_communication_groups()
+        self._validate_communication_groups()
         self._validate_communication_manifest()
 
         def measure_and_schedule() -> list[MoeRegionSchedule]:

@@ -11,12 +11,12 @@ import torch
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import whole_graph_benchmark as benchmark_module
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import (
     assign_stable_node_tags,
+    cross_rank_semantic_keys,
     node_id,
 )
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.whole_graph_benchmark import (
     _align_costs,
     _collective_count_manifest,
-    _cross_rank_semantic_keys,
     _extract_cann_node_costs,
     _host_op_names,
     _is_host_only_scalar_node,
@@ -399,7 +399,7 @@ def test_align_costs_uses_rank_minimum(monkeypatch, collective):
     gm = torch.fx.GraphModule({}, graph)
     assign_stable_node_tags(gm)
     work_id, missing_id = node_id(work), node_id(missing)
-    semantic_keys = _cross_rank_semantic_keys(gm, None)
+    semantic_keys = cross_rank_semantic_keys(gm, None)
     work_key, missing_key = semantic_keys[work_id], semantic_keys[missing_id]
     gathered = [{work_key: value, missing_key: 2.0} for value in [9.0, 3.0, 7.0, 5.0]]
     del gathered[-1][missing_key]
@@ -444,7 +444,7 @@ def test_align_costs_batches_layers_with_shared_rank_order(monkeypatch):
     graph.output(tuple(nodes))
     gm = torch.fx.GraphModule({}, graph)
     assign_stable_node_tags(gm)
-    keys = _cross_rank_semantic_keys(gm, None)
+    keys = cross_rank_semantic_keys(gm, None)
     ids = [node_id(node) for node in nodes]
     local = dict.fromkeys(ids, 9.0)
     calls = []
@@ -514,48 +514,6 @@ def test_collective_count_validation_only_compares_group_type_counts(monkeypatch
     )
     with pytest.raises(RuntimeError, match="collective counts differ"):
         benchmark_module._validate_collective_counts_across_ranks(gm)
-
-
-def test_compute_semantic_key_ignores_unrelated_metadata_node():
-    def make_graph(*, extra_metadata):
-        graph = torch.fx.Graph()
-        x = graph.placeholder("x")
-        x.meta["val"] = torch.empty((4, 8), device="meta")
-        if extra_metadata:
-            metadata = graph.call_function(operator.getitem, ((x, x), 0))
-            metadata.meta["val"] = x.meta["val"]
-        work = graph.call_function(torch.ops.aten.neg.default, (x,))
-        work.meta["val"] = torch.empty((4, 8), device="meta")
-        graph.output(work)
-        gm = torch.fx.GraphModule({}, graph)
-        assign_stable_node_tags(gm)
-        stable_id = node_id(work)
-        return gm, stable_id
-
-    plain, plain_id = make_graph(extra_metadata=False)
-    changed, changed_id = make_graph(extra_metadata=True)
-    plain_key = _cross_rank_semantic_keys(plain, frozenset({plain_id}))[plain_id]
-    changed_key = _cross_rank_semantic_keys(changed, frozenset({changed_id}))[changed_id]
-    assert plain_id != changed_id
-    assert plain_key == changed_key
-
-
-def test_compute_semantic_key_numbers_duplicate_signatures():
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    x.meta["val"] = torch.empty((4, 8), device="meta")
-    first = graph.call_function(torch.ops.aten.neg.default, (x,))
-    first.meta["val"] = torch.empty((4, 8), device="meta")
-    second = graph.call_function(torch.ops.aten.neg.default, (first,))
-    second.meta["val"] = torch.empty((4, 8), device="meta")
-    graph.output(second)
-    gm = torch.fx.GraphModule({}, graph)
-    assign_stable_node_tags(gm)
-    keys = _cross_rank_semantic_keys(gm, frozenset({node_id(first), node_id(second)}))
-
-    assert keys[node_id(first)][:-1] == keys[node_id(second)][:-1]
-    assert keys[node_id(first)][-1] == 0
-    assert keys[node_id(second)][-1] == 1
 
 
 def _profile_fixture(target=None):

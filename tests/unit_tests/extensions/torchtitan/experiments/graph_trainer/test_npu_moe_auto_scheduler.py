@@ -36,21 +36,33 @@ def test_operator_getitem_is_metadata_only():
     assert is_metadata_only_compute_node(node)
 
 
-@pytest.mark.parametrize("group_size", [4, 8])
-def test_scheduler_requires_world_communication_groups(monkeypatch, group_size):
-    gm, _ = _build_two_chunk_graph()
+@pytest.mark.parametrize("group_size", [4, 8], ids=["ep4-subgroups", "ep8-world"])
+def test_scheduler_schedules_consistent_communication_partitions(monkeypatch, group_size):
+    gm, refs = _build_two_chunk_graph()
     scheduler = NpuMoeAutoOverlapScheduler(
         gm,
         module_pattern="layers.*.moe",
+        compute_cost_fn=lambda _node: 8.0,
+        collective_cost_fn=lambda _node: 10.0,
         align_across_ranks=False,
     )
     process_group = object()
+    partitions = [
+        tuple(range(rank // group_size * group_size, (rank // group_size + 1) * group_size)) for rank in range(8)
+    ]
+
+    def gather(result, value):
+        # Only emulate the control plane; no NPU collective is executed.
+        result[:] = [{0: members} for members in partitions] if isinstance(value, dict) else [value] * 8
+
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 8)
     monkeypatch.setattr(
         torch.distributed,
-        "get_world_size",
-        lambda group=None: group_size if group is process_group else 8,
+        "get_process_group_ranks",
+        lambda group: list(partitions[0]),
     )
     monkeypatch.setattr(
         scheduler_module,
@@ -58,11 +70,78 @@ def test_scheduler_requires_world_communication_groups(monkeypatch, group_size):
         lambda _node: process_group,
     )
 
-    if group_size == 8:
-        scheduler._validate_world_communication_groups()
-    else:
-        with pytest.raises(RuntimeError, match="span WORLD"):
-            scheduler._validate_world_communication_groups()
+    scheduler.run()
+
+    order = {node: index for index, node in enumerate(gm.graph.nodes)}
+    assert order[refs["launch0"]] < order[refs["launch1"]] < order[refs["wait0"]]
+    assert order[refs["wait0"]] < order[refs["compute0"]] < order[refs["wait1"]]
+
+
+@pytest.mark.parametrize(
+    ("gathered", "message"),
+    [
+        (
+            [{0: (0,)}, {1: (1,)}],
+            r"logical communication group slots differ across ranks: rank=1 slots=\[1\] expected_slots=\[0\]",
+        ),
+        ([{0: (1,)}, {0: (1,)}], "inconsistent communication group membership"),
+        ([{0: (0, 1)}, {0: (1, 0)}], "inconsistent communication group membership"),
+    ],
+    ids=["different-slots", "self-missing", "asymmetric-members"],
+)
+def test_scheduler_rejects_inconsistent_communication_groups(monkeypatch, gathered, message):
+    gm, _ = _build_two_chunk_graph()
+    scheduler = NpuMoeAutoOverlapScheduler(gm, module_pattern="layers.*.moe")
+    process_group = object()
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: list(gathered[0][0]))
+    monkeypatch.setattr(scheduler_module, "resolve_collective_process_group", lambda _node: process_group)
+    monkeypatch.setattr(scheduler, "_gather_order_values", lambda value: gathered)
+
+    with pytest.raises(RuntimeError, match=message):
+        scheduler._validate_communication_groups()
+
+
+@pytest.mark.parametrize("other_partition_eligible", [True, False], ids=["world-agrees", "other-ep-group-vetoes"])
+def test_communication_swap_requires_agreement_from_other_partitions(monkeypatch, other_partition_eligible):
+    gm, refs = _build_two_chunk_graph()
+    scheduler = NpuMoeAutoOverlapScheduler(gm, module_pattern="layers.*.moe")
+
+    def gather(value):
+        identity, _eligible, delta, has_gain = value
+        return [value] * 4 + [(identity, other_partition_eligible, delta, has_gain)] * 4
+
+    monkeypatch.setattr(scheduler, "_gather_order_values", gather)
+
+    accepted = scheduler._agree_communication_swap(
+        (refs["launch0"], refs["launch1"]), eligible=True, delta=1.0, has_gain=True
+    )
+
+    assert accepted is other_partition_eligible
+
+
+def test_standalone_cost_alignment_matches_workloads_with_rank_only_nodes(monkeypatch, caplog):
+    gm, refs = _build_two_chunk_graph()
+    scheduler = NpuMoeAutoOverlapScheduler(gm, module_pattern="layers.*.moe", debug=True)
+
+    def gather(output, local):
+        setup0, _compute0, setup1 = local
+        # Peer has no compute0 measurement and reports the setups in reverse order.
+        output[:] = [local, {setup1: 15.0, setup0: 9.0}]
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+
+    with caplog.at_level("INFO", logger=scheduler_module.logger.name):
+        aligned = scheduler._align_values((refs["setup0"], refs["compute0"], refs["setup1"]), [1.0, 2.0, 3.0])
+
+    assert aligned == [5.0, 2.0, 9.0]
+    assert (
+        "nodes=3 world_size=2 fully_matched=2 partial=1 rank_only=1 rank_only_ratio=0.333333 unkeyed=0" in caplog.text
+    )
 
 
 @pytest.mark.parametrize("profile_costs", [False, True])

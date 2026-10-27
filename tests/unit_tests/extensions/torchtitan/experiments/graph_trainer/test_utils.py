@@ -1,5 +1,6 @@
 """Tests for graph metadata and profiling/debug utilities."""
 
+import operator
 import os
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import torch
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import (
     assign_stable_node_tags,
     canonical_order,
+    cross_rank_semantic_keys,
     dump_fx_graph,
     is_metadata_only_compute_node,
     isolated_cann_profiler_work_path,
@@ -121,3 +123,50 @@ def test_dump_fx_graph_is_self_contained(monkeypatch, tmp_path):
     assert output == tmp_path / "fx_graphs/auto_overlap_before_rank0.py"
     assert output.is_file()
     assert "def forward" in output.read_text(encoding="utf-8")
+
+
+def test_compute_semantic_key_ignores_unrelated_metadata_node():
+    def make_graph(*, extra_metadata):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.empty((4, 8), device="meta")
+        if extra_metadata:
+            metadata = graph.call_function(operator.getitem, ((x, x), 0))
+            metadata.meta["val"] = x.meta["val"]
+        work = graph.call_function(torch.ops.aten.neg.default, (x,))
+        work.meta["val"] = torch.empty((4, 8), device="meta")
+        graph.output(work)
+        gm = torch.fx.GraphModule({}, graph)
+        assign_stable_node_tags(gm)
+        stable_id = node_id(work)
+        return gm, stable_id
+
+    plain, plain_id = make_graph(extra_metadata=False)
+    changed, changed_id = make_graph(extra_metadata=True)
+    plain_key = cross_rank_semantic_keys(plain, frozenset({plain_id}))[plain_id]
+    changed_key = cross_rank_semantic_keys(changed, frozenset({changed_id}))[changed_id]
+    assert plain_id != changed_id
+    assert plain_key == changed_key
+
+
+def test_compute_semantic_key_numbers_duplicate_signatures():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty((4, 8), device="meta")
+    first = graph.call_function(torch.ops.aten.neg.default, (x,))
+    first.meta["val"] = torch.empty((4, 8), device="meta")
+    second = graph.call_function(torch.ops.aten.neg.default, (first,))
+    second.meta["val"] = torch.empty((4, 8), device="meta")
+    graph.output(second)
+    gm = torch.fx.GraphModule({}, graph)
+    assign_stable_node_tags(gm)
+    keys = cross_rank_semantic_keys(gm, frozenset({node_id(first), node_id(second)}))
+
+    assert keys[node_id(first)][:-1] == keys[node_id(second)][:-1]
+    assert keys[node_id(first)][-1] == 0
+    assert keys[node_id(second)][-1] == 1
+
+    filtered_keys = cross_rank_semantic_keys(gm, frozenset({node_id(second)}))
+
+    assert set(filtered_keys) == {node_id(second)}
+    assert filtered_keys[node_id(second)] == keys[node_id(second)]

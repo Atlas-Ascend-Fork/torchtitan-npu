@@ -19,18 +19,15 @@ import torch
 import torch.fx as fx
 import torch_npu
 from torch.utils import _pytree
-from torchtitan.experiments.graph_trainer.common_utils import (
-    _EP_TOKEN_COUNT_EXCHANGE,
-    _EP_TOKEN_EXCHANGE,
-)
-from torchtitan.experiments.graph_trainer.ep_pass_utils import (
-    is_c10d_functional_node,
-)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import run_traced
 from torchtitan.tools.logging import logger
 
 from .utils import (
-    canonical_order,
+    _collective_group_ordinals,
+    _collective_type,
+    collective_group,
+    cross_rank_semantic_keys,
+    is_collective_launch,
     is_metadata_only_compute_node,
     isolated_cann_profiler_work_path,
     node_id,
@@ -157,58 +154,13 @@ def make_calibration_runner(traced_result, runtime_context):
     return run_candidate
 
 
-def _schema_arguments(node: fx.Node) -> dict[str, Any]:
-    schema = getattr(node.target, "_schema", None)
-    arguments = getattr(schema, "arguments", ())
-    bound = {argument.name: value for argument, value in zip(arguments, node.args, strict=False)}
-    bound.update(node.kwargs)
-    return bound
-
-
-def _collective_type(node: fx.Node) -> str:
-    schema = getattr(node.target, "_schema", None)
-    name = getattr(schema, "name", None)
-    return str(name) if name is not None else str(node.target)
-
-
-def _collective_group(node: fx.Node) -> str:
-    bound = _schema_arguments(node)
-    for name in ("group_name", "group", "tag"):
-        if name in bound:
-            return str(bound[name])
-    return f"unknown:{_collective_type(node)}"
-
-
-def _collective_arguments_without_group(node: fx.Node) -> tuple[tuple[str, Any], ...]:
-    return tuple(
-        (name, _value_descriptor(value))
-        for name, value in _schema_arguments(node).items()
-        if name not in {"group_name", "group", "tag"}
-    )
-
-
-def _is_collective_launch(node: fx.Node) -> bool:
-    return is_c10d_functional_node(node) and node.target != torch.ops._c10d_functional.wait_tensor.default
-
-
-def _collective_group_ordinals(gm: fx.GraphModule) -> dict[str, int]:
-    """Name rank-local groups by first appearance, independent of group hashes."""
-    ordinals: dict[str, int] = {}
-    for node in sorted(gm.graph.nodes, key=canonical_order(gm).__getitem__):
-        if _is_collective_launch(node):
-            group = _collective_group(node)
-            if group not in ordinals:
-                ordinals[group] = len(ordinals)
-    return ordinals
-
-
 def _collective_count_manifest(gm: fx.GraphModule) -> tuple[tuple[int, str, int], ...]:
     """Count FX collective launches by logical local group and collective type."""
     ordinals = _collective_group_ordinals(gm)
     counts: dict[tuple[int, str], int] = defaultdict(int)
     for node in gm.graph.nodes:
-        if _is_collective_launch(node):
-            counts[ordinals[_collective_group(node)], _collective_type(node)] += 1
+        if is_collective_launch(node):
+            counts[ordinals[collective_group(node)], _collective_type(node)] += 1
     return tuple(sorted((group, collective, count) for (group, collective), count in counts.items()))
 
 
@@ -345,18 +297,6 @@ def _match_fx_nodes_to_host_scopes(
         "matched": len(matched),
         "graph_scopes": 1,
     }
-
-
-def _communication_role(node: fx.Node) -> str | None:
-    if not is_c10d_functional_node(node):
-        return None
-    custom = node.meta.get("custom")
-    if not isinstance(custom, dict):
-        custom = {}
-    if custom.get(_EP_TOKEN_COUNT_EXCHANGE) == "dispatch":
-        return "count"
-    role = custom.get(_EP_TOKEN_EXCHANGE)
-    return str(role) if role is not None else "other"
 
 
 def _device_interval_union_us(events: list[dict[str, Any]]) -> float:
@@ -511,7 +451,7 @@ def _extract_cann_node_costs(
                 ]
             associated.extend(candidates)
         associated = list({id(event): event for event in associated}.values())
-        if _is_collective_launch(node):
+        if is_collective_launch(node):
             hcom = [event for event in associated if str(event.get("name", "")).lower().startswith("hcom_")]
             if not hcom:
                 logger.warning(
@@ -629,128 +569,6 @@ def _local_profile_costs(
     return costs, result
 
 
-def _dimension_descriptor(value: Any) -> int | tuple[str, int | None]:
-    if isinstance(value, int):
-        return value
-    hint = getattr(value, "hint", None)
-    if hint is None:
-        hint = getattr(getattr(value, "node", None), "hint", None)
-    return ("sym", int(hint) if hint is not None else None)
-
-
-def _tensor_descriptor(value: torch.Tensor) -> tuple[Any, ...]:
-    device = getattr(value, "device", None)
-    device_type = getattr(device, "type", str(device))
-    return (
-        tuple(_dimension_descriptor(dim) for dim in value.shape),
-        tuple(_dimension_descriptor(dim) for dim in value.stride()),
-        str(value.dtype),
-        str(device_type),
-    )
-
-
-def _value_descriptor(value: Any) -> Any:
-    """Return a rank-independent, hashable FX value/argument description."""
-    if isinstance(value, fx.Node):
-        return ("fx", _value_descriptor(value.meta.get("val")))
-    if isinstance(value, torch.Tensor):
-        return ("tensor", *_tensor_descriptor(value))
-    if isinstance(value, torch.SymInt):
-        return _dimension_descriptor(value)
-    if isinstance(value, tuple):
-        return ("tuple", tuple(_value_descriptor(item) for item in value))
-    if isinstance(value, list):
-        return ("list", tuple(_value_descriptor(item) for item in value))
-    if isinstance(value, dict):
-        return (
-            "dict",
-            tuple(
-                sorted(
-                    ((str(key), _value_descriptor(item)) for key, item in value.items()),
-                    key=lambda item: item[0],
-                )
-            ),
-        )
-    if isinstance(value, (str, int, float, bool, type(None))):
-        return value
-    # Use stable strings for immutable arguments; repr may contain addresses.
-    return (type(value).__qualname__, str(value))
-
-
-def _module_scope(node: fx.Node) -> tuple[str, ...]:
-    stack = node.meta.get("nn_module_stack")
-    if not isinstance(stack, dict):
-        return ()
-    result = []
-    for key, value in stack.items():
-        fqn = value[0] if isinstance(value, tuple) and value and isinstance(value[0], str) else key
-        result.append(str(fqn))
-    return tuple(result)
-
-
-def _node_scope(node: fx.Node) -> tuple[Any, ...]:
-    return (
-        node.meta.get("chunked_region_fqn"),
-        node.meta.get("chunked_region_is_backward"),
-        node.meta.get("chunk_id"),
-        _module_scope(node),
-    )
-
-
-def _cross_rank_semantic_keys(
-    gm: fx.GraphModule,
-    profile_node_ids: frozenset[int] | None,
-) -> dict[int, tuple[Any, ...]]:
-    """Map rank-local IDs to semantic keys, numbering duplicate signatures."""
-    group_ordinals = _collective_group_ordinals(gm)
-    communication_counts: dict[tuple[int, str], int] = defaultdict(int)
-    compute_counts: dict[tuple[Any, ...], int] = defaultdict(int)
-    result: dict[int, tuple[Any, ...]] = {}
-
-    for node in sorted(gm.graph.nodes, key=canonical_order(gm).__getitem__):
-        stable_id = node_id(node)
-        if stable_id is None:
-            continue
-
-        if _is_collective_launch(node):
-            group = group_ordinals[_collective_group(node)]
-            collective = _collective_type(node)
-            counter_key = (group, collective)
-            occurrence = communication_counts[counter_key]
-            communication_counts[counter_key] += 1
-            if profile_node_ids is None or stable_id in profile_node_ids:
-                result[stable_id] = (
-                    "communication",
-                    group,
-                    collective,
-                    occurrence,
-                    _node_scope(node),
-                    _communication_role(node),
-                    _collective_arguments_without_group(node),
-                    _value_descriptor(node.meta.get("val")),
-                )
-            continue
-
-        if profile_node_ids is not None and stable_id not in profile_node_ids:
-            continue
-        if node.op not in {"call_function", "call_method", "call_module"}:
-            continue
-        if is_metadata_only_compute_node(node):
-            continue
-
-        signature = (
-            _node_scope(node),
-            node.op,
-            str(node.target),
-            _value_descriptor((node.args, node.kwargs)),
-            _value_descriptor(node.meta.get("val")),
-        )
-        occurrence = compute_counts[signature]
-        compute_counts[signature] += 1
-        result[stable_id] = ("compute", signature, occurrence)
-    return result
-
-
 def _align_costs(
     gm: fx.GraphModule,
     local: dict[int, float],
@@ -758,7 +576,7 @@ def _align_costs(
 ) -> dict[int, float]:
     import torch.distributed as dist
 
-    semantic_keys = _cross_rank_semantic_keys(gm, profile_node_ids)
+    semantic_keys = cross_rank_semantic_keys(gm, profile_node_ids)
     # Keep global semantic numbering unchanged, but gather only one MoE layer
     # at a time. Forward/backward and both chunks share the same region FQN.
     # Untagged nodes form a separate batch for callers outside chunked MoE.
