@@ -318,6 +318,18 @@ class _FakeMesh:
         return self._size
 
 
+@pytest.mark.parametrize("ratio", [4, 128], ids=["overlap", "non-overlap"])
+def test_cp_rejects_batched_slabs_before_exchange_or_bounds(ratio):
+    exchange = CarryExchange.Config(ratio=ratio).build()
+    exchange.group = _FakeMesh(0, 2)
+    x = torch.zeros(2, 128, _DIM)
+    positions = torch.arange(128).expand(2, -1)
+    cu_seqlens = torch.tensor([0, 256, 512], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="CP>1 暂不支持 local_batch_size>1"):
+        exchange(x, positions, cu_seqlens)
+
+
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     """A rank's kept blocks are exactly its block range of the whole row's pool.

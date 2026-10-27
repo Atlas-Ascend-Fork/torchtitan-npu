@@ -101,7 +101,7 @@ NGPU=2 \
   路径支持 CP；模型目录的参考 metadata hook 显式拒绝 CP。
 - 量化后端（V4 的 `QuantV4Metadata`、V4.1 的 `_V41QuantAttentionMetadata`）目前不重建 rank-local
   metadata，`prepare_cp_metadata` 直接拒绝：量化路径只能跑 `context-parallel-degree 1`。
-- `local_batch_size == 1` 是打包约定；DSA 路径 TP 固定为 1。
+- DeepSeek-V4 的融合注意力在 CP=1 时支持 `local_batch_size > 1`，QueryExchange 前把 B/S 展平，交换后恢复 `[B, S]`。CP>1 暂不支持 `local_batch_size > 1`，`CarryExchange` 在交换或边界计算前显式报错；DSA 路径 TP 固定为 1。
 
 ## 3. 两栈差异总览
 
@@ -191,6 +191,10 @@ rank 0 只发送、不接收；最后一个 rank 只接收、不发送；其余 
 非 CP 路径把整行 `cu_seqlens` 直接传给压缩器；参考实现与融合实现共用同一接口
 `compressor(x, positions, *, cu_seqlens=None)`（`cu_seqlens` 是 keyword-only：带 sharding
 config 的模块走框架的位置参数契约，位置参数个数必须与签名一致）。
+输入 `x` 为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍，positions 为 `[B, L]`。
+CP=1 时可将整批展平成 `[1, B * L, D]` 打包流执行压缩，再还原为 `[B, L // ratio, D]`；
+每行 positions 从 0 开始，上游 `create_varlen_metadata_for_document` 将这些行首记为文档边界，
+避免 ratio-4 的重叠跨行。CP>1 的 carry/prepend/trim 仍要求 B=1。
 
 ### 4.4 参考路径
 

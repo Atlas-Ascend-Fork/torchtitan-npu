@@ -256,7 +256,8 @@ def _assert_rounding_floor(diff, scale, *, ulps: int = 4):
     assert diff.max().item() <= ulps * _EPS32 * scale, (diff.max().item(), scale)
 
 
-def test_compressor_numerics_ratio4(inputs):
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
+def test_compressor_numerics_ratio4(inputs, batch_size):
     """C4A pooling vs the independent manual reference.
 
     The residual must sit at the fp32 rounding floor: the two paths project
@@ -269,22 +270,71 @@ def test_compressor_numerics_ratio4(inputs):
     while still flagging any multi-ulp arithmetic regression.
     """
     dsv4, md, x, pos = inputs
+    x = x.reshape(batch_size, -1, DIM).requires_grad_()
+    pos = pos.reshape(batch_size, -1)
     comp4 = build_compressor(dsv4, 4)
     cmp4 = comp4(x, pos, cu_seqlens=md[4].cu_seq_q)
     # Four 128-token documents: 4 * 128 // 4 whole blocks over the row.
-    assert cmp4.shape == (1, 128, 16)
-    ref = manual_compress(x, md[4], comp4, 4)
+    assert cmp4.shape == (batch_size, 128 // batch_size, 16)
+    ref = manual_compress(x, md[4], comp4, 4).reshape_as(cmp4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
+    # Reframing the same document stream must preserve its exact backward, including
+    # nonuniform upstream gradients. The independent per-document oracle above checks math.
+    packed = comp4(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[4].cu_seq_q)
+    upstream = torch.linspace(-0.25, 0.75, cmp4.numel()).reshape_as(cmp4)
+    parameters = (x, *comp4.parameters())
+    for actual, expected in zip(
+        torch.autograd.grad((cmp4 * upstream).sum(), parameters),
+        torch.autograd.grad((packed.reshape_as(cmp4) * upstream).sum(), parameters),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_compressor_numerics_ratio128(inputs):
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
+def test_compressor_numerics_ratio128(inputs, batch_size):
     """C128A pools every whole 128-block of the row, one per document here."""
     dsv4, md, x, pos = inputs
+    x = x.reshape(batch_size, -1, DIM).requires_grad_()
+    pos = pos.reshape(batch_size, -1)
     comp128 = build_compressor(dsv4, 128)
     cmp128 = comp128(x, pos, cu_seqlens=md[128].cu_seq_q)
-    assert cmp128.shape == (1, 4, 16)
-    ref = manual_compress(x, md[128], comp128, 128)
+    assert cmp128.shape == (batch_size, 4 // batch_size, 16)
+    ref = manual_compress(x, md[128], comp128, 128).reshape_as(cmp128)
     _assert_rounding_floor((cmp128 - ref).abs(), ref.abs().max().item())
+    # Reframing the same document stream must preserve its exact backward, including
+    # nonuniform upstream gradients. The independent per-document oracle above checks math.
+    packed = comp128(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[128].cu_seq_q)
+    upstream = torch.linspace(-0.25, 0.75, cmp128.numel()).reshape_as(cmp128)
+    parameters = (x, *comp128.parameters())
+    for actual, expected in zip(
+        torch.autograd.grad((cmp128 * upstream).sum(), parameters),
+        torch.autograd.grad((packed.reshape_as(cmp128) * upstream).sum(), parameters),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_compressor_rejects_rows_with_partial_blocks(dsv4):
+    comp = build_compressor(dsv4, 4)
+    with pytest.raises(ValueError, match="each batch row"):
+        comp(torch.randn(2, 2, DIM), torch.arange(2).expand(2, -1))
+
+
+@pytest.mark.parametrize("operation", ["selection", "student-logits"])
+def test_reference_indexer_refuses_mbs_above_one(dsv4, operation):
+    idx_q = torch.randn(2, 8, 2, DIM)
+    idx_k = torch.randn(2, 2, DIM)
+    idx_w = torch.randn(2, 8, 2)
+    cu_seq_q = torch.tensor([0, 8, 16], dtype=torch.int32)
+    cu_seq_k = torch.tensor([0, 2, 4], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="MBS>1 is currently supported only by the fused path"):
+        if operation == "selection":
+            dsv4.compressor.select_compressed_slots(idx_q, idx_k, idx_w, cu_seq_q, cu_seq_k, 1)
+        else:
+            picks = torch.zeros(2, 8, 1, dtype=torch.int64)
+            dsv4.compressor.student_logits_at_picks(idx_q, idx_k, idx_w, picks, cu_seq_q, cu_seq_k)
 
 
 def test_attention_numerics_ratio4_single_block_documents(dsv4):

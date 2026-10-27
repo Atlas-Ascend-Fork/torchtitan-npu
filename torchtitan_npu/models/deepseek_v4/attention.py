@@ -285,7 +285,7 @@ class Attention(BaseAttention):
         metadata = attention_metadata
         # The query frame: at one degree the exchange has no movement and hands the slab back;
         # under CP it permutes the slab onto chunk ``r`` of every document.
-        x_q = self.query_exchange.permute(x.squeeze(0), metadata.exchange).unsqueeze(0)
+        x_q = self.query_exchange.permute(x.flatten(0, 1), metadata.exchange).unflatten(0, (bsz, seqlen))
         positions_q = metadata.positions_q
 
         qr = self.q_norm(self.wq_a(x_q))
@@ -334,16 +334,11 @@ class Attention(BaseAttention):
             if carry.trim:
                 cmp_k = cmp_k.narrow(1, carry.trim, cmp_k.size(1) - carry.trim)
 
-        # The selector (the separate ``lightning_indexer.asc`` override) emits the selection
-        # and its teacher carrier; the core consumes both.  An external selector (the quantized
-        # backend) may return indices alone, and then the core gets no carrier.
+        # Every selector returns indices and scores: the reference exposes student logits,
+        # while the AscendC, PyPTO and quantized backends expose the teacher-gradient carrier.
         topk_indices = topk_scores = None
         if self.lightning_indexer is not None:
-            selection = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
-            if isinstance(selection, tuple):
-                topk_indices, topk_scores = selection
-            else:
-                topk_indices, topk_scores = selection, None
+            topk_indices, topk_scores = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
 
         # Inner-attention positional contract: sink + swa_k always; the compressed pool and
         # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
@@ -367,4 +362,4 @@ class Attention(BaseAttention):
         o = o.reshape(bsz, seqlen, -1)
         o = self.wo_b(o)
         # The projection is per token, so ``wo_b``'s output is what takes the movement back.
-        return self.query_exchange.unpermute(o.squeeze(0), metadata.exchange).unsqueeze(0)
+        return self.query_exchange.unpermute(o.flatten(0, 1), metadata.exchange).unflatten(0, (bsz, seqlen))

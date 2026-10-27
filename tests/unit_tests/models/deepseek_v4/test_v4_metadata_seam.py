@@ -117,6 +117,66 @@ def test_entries_are_built_per_geometry():
     assert all(metadata[key].ratio == key[1] for key in keys)
 
 
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
+def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatch):
+    """No-CP attention must preserve independent batch rows and their gradients."""
+    seq_len = 8
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = _model_config((1,), ascendc=True).build()
+        attention = model.layers["0"].attention
+        attention.init_states(buffer_device=torch.device("cpu"))
+
+    def cpu_window_attention(q, swa_k, attn_sink, *, attention_metadata, **kwargs):
+        # The fused kernel is unavailable on CPU, while attn-gym's packed reference
+        # explicitly rejects B > 1. Isolate only that kernel with dense causal math;
+        # query exchange, RoPE and all input/output projections remain production code.
+        del kwargs
+        assert attention_metadata.exchange is None
+        scores = torch.einsum("bshd,btd->bhst", q, swa_k) * attention.inner_attention.softmax_scale
+        causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+        sink = attn_sink[None, :, None, None].expand(*scores.shape[:-1], 1)
+        probabilities = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
+        return torch.einsum("bhst,btd->bshd", probabilities, swa_k)
+
+    monkeypatch.setattr(attention.inner_attention, "forward", cpu_window_attention)
+    values = torch.linspace(-1.0, 1.0, batch_size * seq_len * _DIM).reshape(batch_size, seq_len, _DIM)
+    x = values.clone().requires_grad_()
+    positions = torch.arange(seq_len).expand(batch_size, -1)
+    entry = model._get_attention_metadata(positions)[attention.attention_metadata_key]
+    assert entry.batch_size == batch_size
+    assert entry.positions_q.shape == (batch_size, seq_len)
+    assert entry.cu_seq_q.tolist() == [row * seq_len for row in range(batch_size + 1)]
+    parameters = tuple(attention.parameters())
+    upstream = torch.linspace(0.25, 1.25, x.numel()).reshape_as(x)
+
+    output = attention(x, entry, positions)
+    assert output.shape == (batch_size, seq_len, _DIM)
+    gradients = torch.autograd.grad((output * upstream).sum(), (x, *parameters))
+
+    # Distinct batch samples have no cross-row attention. Applying the same initialized
+    # layer to each document separately supplies the batch-composition oracle, including
+    # the sum of the individual parameter gradients for the same scalar objective.
+    expected_outputs, expected_input_gradients = [], []
+    expected_parameter_gradients = [torch.zeros_like(parameter) for parameter in parameters]
+    for row in range(batch_size):
+        sample = values[row : row + 1].clone().requires_grad_()
+        sample_positions = positions[row : row + 1]
+        sample_entry = model._get_attention_metadata(sample_positions)[attention.attention_metadata_key]
+        expected = attention(sample, sample_entry, sample_positions)
+        sample_gradients = torch.autograd.grad((expected * upstream[row : row + 1]).sum(), (sample, *parameters))
+        expected_outputs.append(expected)
+        expected_input_gradients.append(sample_gradients[0])
+        for accumulated, gradient in zip(expected_parameter_gradients, sample_gradients[1:], strict=True):
+            accumulated.add_(gradient)
+
+    torch.testing.assert_close(output, torch.cat(expected_outputs), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(gradients[0], torch.cat(expected_input_gradients), rtol=1e-5, atol=1e-6)
+    for actual, expected in zip(gradients[1:], expected_parameter_gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_the_fused_entry_carries_its_geometry_and_records(dsv4):
     """The fused core's config builds the packed contract and its kernel records."""
     dsv4.cann_ops.calls.clear()

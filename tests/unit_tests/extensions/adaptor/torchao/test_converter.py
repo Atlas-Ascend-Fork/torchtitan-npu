@@ -121,8 +121,6 @@ def test_quantization_converter_keeps_linear_forward(converter_module, quantizat
     torch.testing.assert_close(linear(torch.tensor([[2.0, 3.0]])), torch.tensor([[8.0, 18.0]]))
 
 
-
-
 def _v41_attention():
     """One layer's own numbers: the five widths, and the pool its selector declares."""
     return SimpleNamespace(
@@ -499,3 +497,53 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
     ):
         assert parameter.grad is not None
         torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0)
+
+
+def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(converter_module):
+    from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import QuantV4Metadata
+
+    from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
+    from torchtitan_npu.override.deepseek_v4.metadata import (
+        AicpuGeometry,
+        AicpuMetadata,
+        AscLightningIndexerMetadata,
+        AscSparseAttentionMetadata,
+    )
+
+    positions = torch.arange(8).unsqueeze(0)
+    row = build_v4_metadata(positions, ratio=4, build_slots=False)
+    forward_record = torch.tensor([7], dtype=torch.int32)
+    backward_record = torch.tensor([9], dtype=torch.int32)
+    metadata = QuantV4Metadata(
+        cu_seq_q=row.cu_seq_q,
+        cu_seq_k=row.cu_seq_k,
+        ratio=row.ratio,
+        positions_q=row.positions_q,
+        q=row.q,
+        swa_k=row.swa_k,
+        cmp_k=row.cmp_k,
+        aicpu_metadata=AicpuMetadata(
+            geometry=AicpuGeometry(
+                num_heads=2, head_dim=8, window_size=8, index_topk=4, index_num_heads=2, index_head_dim=4
+            ),
+            sparse_attn=AscSparseAttentionMetadata(),
+            lightning_indexer=AscLightningIndexerMetadata(fwd=forward_record, bwd=backward_record),
+        ),
+    )
+    query = torch.zeros(1, 8, 2, 4, dtype=torch.bfloat16)
+    key = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+    weights = torch.zeros(1, 8, 2, dtype=torch.bfloat16)
+
+    inputs = converter_module._prepare_quant_lightning_indexer_inputs(
+        SimpleNamespace(index_topk=4), query, key, weights, metadata
+    )
+
+    assert inputs.query.shape == (8, 2, 4)
+    assert inputs.key.shape == (2, 1, 4)
+    assert inputs.weights.shape == (8, 2) and inputs.weights.dtype == torch.float32
+    assert inputs.metadata is forward_record and inputs.backward_metadata is backward_record
+    assert inputs.seqused_q is metadata.q.seqused
+    assert inputs.seqused_k is metadata.cmp_k.seqused
+    assert inputs.cu_seqlens_q is row.cu_seq_q
+    assert inputs.cu_seqlens_k is row.cmp_k.cu_seqlens
+    assert inputs.cmp_residual_k is row.cmp_k.residual

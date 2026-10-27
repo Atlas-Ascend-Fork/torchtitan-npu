@@ -11,12 +11,13 @@ per geometry by the attention backend's config (the map key is that backend's cl
 layer's compression ratio) and handed to every layer of the geometry, exactly as upstream #4897's
 seam does.
 
-The container grid is ``[1, S]`` (the packed scenario runs with ``local_batch_size == 1``; raise
-``seq_len`` instead), so ``batch_size == 1`` and ``seq_len`` is the total token count
-``cu_seq_q[-1]`` -- both derived from the row, neither stored.
+The container grid is ``[B, S]``: ``batch_size`` is the leading dimension of ``positions_q``,
+and ``S`` is the per-sample sequence length. At CP=1 the flattened microbatch has ``B * S``
+tokens, described by ``cu_seq_q[-1]``. The fused path supports ``B > 1`` at CP=1; CP>1
+currently requires a single batch row.
 
-``cu_seq_q`` is the **row's** document boundaries: under context parallelism the KV side stays the
-whole row and is gathered declaratively at the kernel boundary, so the row's grid never becomes a
+``cu_seq_q`` is the **flattened microbatch's** document boundaries: under context parallelism
+the KV side stays the whole row and is gathered declaratively at the kernel boundary, so its grid never becomes a
 rank-local one.  ``cu_seq_k`` is the same boundaries folded at this entry's ratio (they *are* the
 row's for a geometry that does not pool), which is the compressed pool the queries address.
 
@@ -134,8 +135,8 @@ class DeepSeekV4Metadata:
 
     @property
     def batch_size(self) -> int:
-        """Container batch size (``1`` for the current packed scenario)."""
-        return 1
+        """Batch dimension of the query container, separate from its document count."""
+        return self.positions_q.size(0)
 
     @staticmethod
     def prepare_cp_metadata(
@@ -214,8 +215,8 @@ def build_v4_metadata(
     builder.
 
     Args:
-        positions: The row's per-token positions (``[1, S]``, document-relative: they reset at
-            every document start), the convention upstream's
+        positions: Per-token positions (``[B, S]``, document-relative: each row starts at zero
+            and positions reset at every document start), the convention upstream's
             ``create_varlen_metadata_for_document`` reads the boundaries from.
         ratio: The compression ratio this entry describes -- the layer's own.
         cu_seq_q: The row's boundaries, when the caller already has them.  ``None`` derives them
@@ -228,7 +229,7 @@ def build_v4_metadata(
     if ratio < 1:
         raise ValueError(f"a compression ratio must be positive, got {ratio}.")
     if positions.dim() != 2:
-        raise ValueError(f"the row's positions must be [1, S], got shape {tuple(positions.shape)}.")
+        raise ValueError(f"positions must be [B, S], got shape {tuple(positions.shape)}.")
     if cu_seq_q is None:
         cu_seq_q = create_varlen_metadata_for_document(positions).cu_seq_q
     cu_seq_q = cu_seq_q.to(torch.int32)

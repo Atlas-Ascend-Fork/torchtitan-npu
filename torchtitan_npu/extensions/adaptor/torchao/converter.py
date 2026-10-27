@@ -696,6 +696,9 @@ def _prepare_quant_lightning_indexer_inputs(
         cu_seqlens_q=attention_metadata.cu_seq_q,
         cu_seqlens_k=cmp_k.cu_seqlens,
         cmp_residual_k=cmp_k.residual,
+        backward_metadata=asc.lightning_indexer.bwd,
+        seqused_q=attention_metadata.q.seqused,
+        seqused_k=cmp_k.seqused,
     )
 
 

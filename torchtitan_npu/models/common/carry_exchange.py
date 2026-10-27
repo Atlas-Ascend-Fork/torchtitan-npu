@@ -82,6 +82,8 @@ class CarryExchange(Module):
         group = self.group
         if group is None or group.size() <= 1:
             return CarryStream(x=x, positions=positions, cu_seqlens=cu_seqlens, trim=0)
+        if x.size(0) > 1:
+            raise ValueError("CP>1 暂不支持 local_batch_size>1")
         ratio = self.ratio
         cp_size = group.size()
         cp_rank = group.get_local_rank()

@@ -142,23 +142,36 @@ class Compressor(Module):
         be passed positionally.
 
         Args:
-            x: The local stream, ``[1, L, D]`` (the row, one rank's slab, or the slab with the CP
+            x: The local stream, ``[B, L, D]`` (the row, one rank's slab, or the slab with the CP
                 exchange's carry block prepended).
-            positions: The stream's own document-relative positions, ``[1, L]``.  They reset at
+            positions: The stream's own document-relative positions, ``[B, L]``.  They reset at
                 every document start, and the pooled blocks rotate at ``positions[..., ::ratio]``.
+                With ``B > 1``, each row must start at position zero: each row boundary is a
+                document boundary in the flattened stream. The upstream
+                ``create_varlen_metadata_for_document`` includes these row starts in
+                ``cu_seqlens``, so ratio-4 overlap never borrows tokens from the preceding row.
             cu_seqlens: The stream's document boundaries (``[n + 1]``), required by the ratio-4
                 overlap: the first block of every segment has no predecessor block.  The
                 non-overlap pooling ignores it -- a fold of ``ratio`` tokens needs no boundaries.
 
         Returns:
-            The pooled key stream ``[1, L // ratio, D]``.
+            The pooled key stream ``[B, L // ratio, D]``.
         """
-        return self.implementation.forward(
+        batch_size = x.size(0)
+        if x.size(1) % self.compress_ratio:
+            raise ValueError(
+                f"each batch row ({x.size(1)} tokens) must contain whole compression blocks "
+                f"of ratio {self.compress_ratio}."
+            )
+        # Implementations consume one packed stream whose boundaries already include every
+        # batch row. Restore the container shape only after pooling, including RoPE.
+        pooled = self.implementation.forward(
             self,
-            x,
-            positions,
+            x.flatten(0, 1).unsqueeze(0),
+            positions.reshape(1, -1),
             cu_seqlens=cu_seqlens,
         )
+        return pooled.reshape(batch_size, -1, pooled.size(-1))
 
     def _forward(
         self,
@@ -304,7 +317,10 @@ def select_compressed_slots(
     """
     bsz, _, heads, head_dim = idx_q.shape
     if bsz != 1:
-        raise ValueError(f"the packed selection addresses one row, got batch size {bsz}.")
+        raise ValueError(
+            "MBS>1 is currently supported only by the fused path; "
+            f"the reference selector requires batch size 1 (got {bsz})."
+        )
     return lightning_indexer(
         idx_q.float(),
         idx_k.float(),
@@ -332,15 +348,20 @@ def student_logits_at_picks(
     selection that returns indices alone leaves nothing to gather them from, which is why this
     is a pass of its own rather than a by-product of the selection.  ``topk_indices`` is
     renumbered onto the row-wide entries the pooled keys are stored in; a ``-1`` slot is
-    gathered harmlessly and marked ``-inf``, the value a softmax drops.  The row is the batch,
-    so the key axis is squeezed.  Returns ``[B, L, K]``, head-summed and in the model's own
-    score scale (``select_compressed_slots`` cancels the operator's internal division; this
-    pass never divides).
+    gathered harmlessly and marked ``-inf``, the value a softmax drops. The reference path
+    requires ``B == 1``, so the key axis is squeezed. Returns ``[1, L, K]``, head-summed and in
+    the model's own score scale (``select_compressed_slots`` cancels the operator's internal
+    division; this pass never divides).
 
     This is the pass ``LightningIndexer`` returns beside the selection, and the fused
     selector's backward consumes the same quantity: at the picks, the student logits are the
     only differentiable edge of the selection.
     """
+    if idx_q.size(0) != 1:
+        raise ValueError(
+            "MBS>1 is currently supported only by the fused path; "
+            f"the reference student logits require batch size 1 (got {idx_q.size(0)})."
+        )
     pool_start_L1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
     picked_BLKDi = idx_k.squeeze(0)[(topk_indices + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
     scores_BLHK = torch.einsum("blhd,blkd->blhk", idx_q, picked_BLKDi)

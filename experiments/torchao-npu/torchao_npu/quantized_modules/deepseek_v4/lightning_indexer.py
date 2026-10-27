@@ -29,30 +29,82 @@ class QuantizedLightningIndexerInputs:
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     cmp_residual_k: torch.Tensor
+    backward_metadata: torch.Tensor | None = None
+    seqused_q: torch.Tensor | None = None
+    seqused_k: torch.Tensor | None = None
+
+
+class _QuantLightningIndexerTND(torch.autograd.Function):
+    """Keep quantized selection attached to the BF16 SLIKG teacher edge."""
+
+    @staticmethod
+    def forward(ctx, query, key, weights, inputs, config):  # pyrefly: ignore [bad-override]
+        ctx.set_materialize_grads(False)
+        indices, _ = quant_lightning_indexer(
+            query,
+            key,
+            weights,
+            config.query_config,
+            config.key_config,
+            topk=inputs.topk,
+            quant_mode=config.quant_mode,
+            layout_q=config.layout_q,
+            layout_k=config.layout_k,
+            mask_mode=config.mask_mode,
+            cmp_ratio=config.cmp_ratio,
+            cu_seqlens_q=inputs.cu_seqlens_q,
+            cu_seqlens_k=inputs.cu_seqlens_k,
+            cmp_residual_k=inputs.cmp_residual_k,
+            metadata=inputs.metadata,
+        )
+        # The saved slots must match the order SMLAG uses for its teacher.
+        indices = indices.sort(dim=-1, descending=True).values
+        scores = indices.new_empty(indices.shape, dtype=torch.float32, requires_grad=True)
+        ctx.save_for_backward(query, key, weights, indices)
+        ctx.inputs = inputs
+        ctx.config = config
+        ctx.mark_non_differentiable(indices)
+        return indices, scores
+
+    @staticmethod
+    def backward(ctx, grad_indices, teacher):  # pyrefly: ignore [bad-override]
+        del grad_indices
+        if teacher is None:
+            raise RuntimeError("Quantized LI backward is missing the teacher gradient from sparse attention")
+        query, key, weights, indices = ctx.saved_tensors
+        inputs, config = ctx.inputs, ctx.config
+        if inputs.backward_metadata is None:
+            raise RuntimeError("Quantized LI training requires the SLIKG backward record")
+        # SMLAG already masked padding and applied softmax_scale. Match the BF16
+        # selector's normalization by the whole microbatch's query-token count.
+        teacher = teacher / inputs.cu_seqlens_q[-1].to(torch.float32)
+        dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
+            q=query,
+            k=key,
+            w=weights,
+            sparse_indices=indices,
+            attn_softmax_l1_norm=teacher,
+            metadata=inputs.backward_metadata,
+            cu_seqlens_q=inputs.cu_seqlens_q,
+            cu_seqlens_k=inputs.cu_seqlens_k,
+            seqused_q=inputs.seqused_q,
+            seqused_k=inputs.seqused_k,
+            cmp_residual_k=inputs.cmp_residual_k,
+            layout_q=config.layout_q,
+            layout_k=config.layout_k,
+            mask_mode=config.mask_mode,
+            cmp_ratio=config.cmp_ratio,
+        )
+        return dq.to(query.dtype), dk.to(key.dtype), dw.to(weights.dtype), None, None
 
 
 def quantized_lightning_indexer_forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
-    """Run the quantized LI kernel using a host-provided input adapter."""
+    """Run quantized LI with the fused attention's teacher gradient carrier."""
 
     config = self._torchao_npu_module_swap_config
     if config.input_adapter is None:
         raise RuntimeError("Quantized LI requires a host input adapter")
     inputs = config.input_adapter(self, idx_q, idx_k, idx_w, attention_metadata)
-    sparse_indices, _ = quant_lightning_indexer(
-        inputs.query,
-        inputs.key,
-        inputs.weights,
-        config.query_config,
-        config.key_config,
-        topk=inputs.topk,
-        quant_mode=config.quant_mode,
-        layout_q=config.layout_q,
-        layout_k=config.layout_k,
-        mask_mode=config.mask_mode,
-        cmp_ratio=config.cmp_ratio,
-        cu_seqlens_q=inputs.cu_seqlens_q,
-        cu_seqlens_k=inputs.cu_seqlens_k,
-        cmp_residual_k=inputs.cmp_residual_k,
-        metadata=inputs.metadata,
-    )
-    return sparse_indices.reshape(idx_q.shape[0], idx_q.shape[1], 1, -1)
+    indices, scores = _QuantLightningIndexerTND.apply(inputs.query, inputs.key, inputs.weights, inputs, config)
+    batch, seqlen = idx_q.shape[:2]
+    return indices.reshape(batch, seqlen, -1), scores.reshape(batch, seqlen, -1)

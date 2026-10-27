@@ -22,8 +22,8 @@ import torch
 import torch.nn.functional as F
 from torchtitan.config import OverrideConfig, apply_overrides
 
-from torchtitan_npu.models.deepseek_v4 import _debugmodel, _make_v4_config
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.models.deepseek_v4 import _debugmodel, _make_v4_config
 from torchtitan_npu.models.deepseek_v4.compressor import (
     Compressor,
     CompressorImplementation,
@@ -148,7 +148,7 @@ def _postprocess(module, pooled, positions):
 @pytest.fixture
 def compressor_factory(monkeypatch):
     registry = importlib.import_module("torchtitan.config.override")
-    with monkeypatch.context() as scoped, torch.random.fork_rng():
+    with monkeypatch.context() as scoped, torch.random.fork_rng(devices=[]):
         scoped.setattr(registry, "_REGISTRY", registry._REGISTRY.copy())
         fake_module = types.ModuleType("compressor")
         fake_module.compressor = lambda *args, **kwargs: pytest.fail("unexpected CANN compressor call")
@@ -181,11 +181,12 @@ def compressor_factory(monkeypatch):
 )
 @pytest.mark.parametrize("api", ["torch-op", "python-wrapper"])
 @pytest.mark.parametrize("ape_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
 def test_compressor_cann_schema_document_outputs_and_gradients(
-    compressor_factory, monkeypatch, ratio, indexer, api, ape_dtype
+    compressor_factory, monkeypatch, ratio, indexer, api, ape_dtype, batch_size
 ):
     calls = []
-    lengths = [2 * ratio, ratio, 2 * ratio]
+    lengths = [2 * ratio, ratio, 2 * ratio] * batch_size
 
     def fake_cann(
         x,
@@ -238,18 +239,26 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
     for length in lengths:
         cu.append(cu[-1] + length)
     boundaries = torch.tensor(cu, dtype=torch.int32)
-    positions = _positions(boundaries)
+    positions = _positions(boundaries).reshape(batch_size, -1)
     metadata = _entry(boundaries, ratio)
     generator = torch.Generator().manual_seed(21)
-    x = (torch.randn(1, cu[-1], module.wkv.in_features, generator=generator) * 0.1).half().requires_grad_()
+    x = (
+        (torch.randn(batch_size, cu[-1] // batch_size, module.wkv.in_features, generator=generator) * 0.1)
+        .half()
+        .requires_grad_()
+    )
     reference_x = x.detach().clone().requires_grad_()
     perturbation = torch.linspace(-0.02, 0.03, module.head_dim)
 
     actual = module(x, positions, cu_seqlens=metadata.cu_seq_q)
     # Match the operator boundary: accumulate APE gradients in FP32, then cast
     # once back to the BF16 parameter instead of rounding each sliced contribution.
-    raw = _document_pool(reference_x[0], reference.wkv.weight, reference.wgate.weight, reference.ape.float(), cu, ratio)
-    expected = _postprocess(reference, (2 * raw + perturbation).half(), positions[..., ::ratio]).unsqueeze(0)
+    raw = _document_pool(
+        reference_x.flatten(0, 1), reference.wkv.weight, reference.wgate.weight, reference.ape.float(), cu, ratio
+    )
+    expected = _postprocess(reference, (2 * raw + perturbation).half(), positions.reshape(1, -1)[..., ::ratio]).reshape(
+        batch_size, -1, module.head_dim
+    )
     upstream_grad = torch.randn(actual.shape, generator=generator).half()
     actual.backward(upstream_grad)
     expected.backward(upstream_grad)
@@ -267,7 +276,8 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
 
 
 @pytest.mark.parametrize("api", ["torch-op", "python-wrapper"])
-def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api):
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
+def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api, batch_size):
     def fake_cann(x, wkv, wgate, state_cache, ape, cmp_ratio=4, **kwargs):
         width = wkv.shape[0] // 2
         values = F.linear(x.float(), wkv.float()).reshape(-1, cmp_ratio, 2, width)
@@ -283,10 +293,10 @@ def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api)
         monkeypatch.setattr(sys.modules["cann_ops_transformer.ops.compressor"], "compressor", fake_cann)
     module = compressor_factory(4).float()
     reference = copy.deepcopy(module)
-    boundaries = torch.tensor([0, 8], dtype=torch.int32)
-    positions = _positions(boundaries)
+    boundaries = torch.arange(batch_size + 1, dtype=torch.int32) * 8
+    positions = _positions(boundaries).reshape(batch_size, 8)
     metadata = _entry(boundaries, 4)
-    x = torch.randn(1, 8, module.wkv.in_features, generator=torch.Generator().manual_seed(17)).requires_grad_()
+    x = torch.randn(batch_size, 8, module.wkv.in_features, generator=torch.Generator().manual_seed(17)).requires_grad_()
     reference_x = x.detach().clone().requires_grad_()
 
     actual = torch.compile(module, backend="aot_eager", fullgraph=True, dynamic=True)(

@@ -70,12 +70,14 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 - `cu_seq_q`：整行的文档边界（`int32`，`n_documents + 1`），是行列坐标的唯一权威来源，CP 下也不变。
 - `cu_seq_k`：同一组边界按本 entry 的 ratio 折叠后的 key 网格（`ratio == 1` 时就是 `cu_seq_q`）。由知道 ratio 的 backend 预先折叠，consumer 不再逐层做除法。
 - `ratio`：这个 entry 的压缩比（1、4、128 之一）；每个 consumer 都按它寻址。
-- `batch_size` / `seq_len`：打包场景使用 `local_batch_size == 1`，因此 `batch_size == 1`、`seq_len` 等于总 token 数（`cu_seq_q[-1]`），元数据由行推导。
+- `batch_size`：从 `positions_q` 的真实 batch 维推导，`S` 为每行序列长度；非 CP 时整批 token 数为 `B * S`（`cu_seq_q[-1]`）。融合注意力在 CP=1 时支持 `local_batch_size > 1`，QueryExchange 前先 `flatten(0, 1)`，交换后 `unflatten` 回 `[B, S]`；CP>1 暂不支持多 batch。参考选择器仍仅支持 MBS1。
 - `q` / `swa_k` / `cmp_k`（`AscV4Metadata`）：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk，`swa_k` / `cmp_k` 是整行，`seqused` 是本 rank 的 reach；非 CP 下三者都退化为边界差。
 - `positions_q` / `exchange`：查询帧自己的位置与 `QueryExchange` 计划；CP 下由 `cp_plan` 生成。
 - `aicpu_metadata`（`AscV4Metadata`）：只有融合 entry 才有，按 kernel 分组保存 `sparse_attn.fwd/bwd` 与 `lightning_indexer.fwd/bwd`；模型目录的 `DeepSeekV4Metadata` 不携带这些张量。
 
-压缩器没有自己的 metadata 字段：CP 的重叠 carry 在 `models/common/carry_exchange.CarryExchange` 里，调用点用它拿到增强流（`CarryStream`：`x` / `positions` / `cu_seqlens` / `trim`），把增强流以 keyword 参数 `cu_seqlens` 传给同一个压缩器实例（`compressor(x, positions, *, cu_seqlens=None)`），最后按 `trim` 裁掉 carry 输出块；融合实现的 `_state_inputs` 在内部按流的形状符号构造 kernel 的零 tiling 表。`varlen` / `plan` / `CompressedBlockLayout` / `CompressorFrames` / `window` 字段都已删除。
+压缩器没有自己的 metadata 字段：输入为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍。公共入口把整批展平成一条 `[1, B * L, D]` 打包流，完成压缩和 RoPE 后还原为 `[B, L // ratio, D]`。每行 positions 从 0 开始，`create_varlen_metadata_for_document` 据此把行首加入整批 `cu_seq_q`，使 ratio-4 的重叠不会跨行借 token。
+
+CP 的重叠 carry 在 `models/common/carry_exchange.CarryExchange` 里，调用点用它拿到增强流（`CarryStream`：`x` / `positions` / `cu_seqlens` / `trim`），把增强流以 keyword 参数 `cu_seqlens` 传给同一个压缩器实例（`compressor(x, positions, *, cu_seqlens=None)`），最后按 `trim` 裁掉 carry 输出块；融合实现的 `_state_inputs` 在内部按流的形状符号构造 kernel 的零 tiling 表。`varlen` / `plan` / `CompressedBlockLayout` / `CompressorFrames` / `window` 字段都已删除。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
 
