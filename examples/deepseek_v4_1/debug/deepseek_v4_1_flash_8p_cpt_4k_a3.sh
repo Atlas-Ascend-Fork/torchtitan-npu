@@ -146,13 +146,17 @@ OPTIMIZER_ARGS="
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
 # The text-rope entry is a hardware choice: A3 defaults to asc_complex; the A5
-# wrapper supplies asc_partial through the same CLI_OVERRIDES channel. Set the
-# default in both branches so `set -u` never sees it unbound.
+# wrapper supplies asc_partial through the same CLI_OVERRIDES channel. The fused
+# sparse attention and its selector also ride this channel, so a wrapper that
+# already names them does not add a second copy. Set the defaults in both branches
+# so `set -u` never sees them unbound.
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(torchtitan_npu.override.common.rope.workaround)
     DEFAULT_TEXT_ROPE_OVERRIDE=""
+    DEFAULT_FUSED_OVERRIDES=""
 else
     DEFAULT_TEXT_ROPE_OVERRIDE="torchtitan_npu.override.common.rope.asc_complex"
+    DEFAULT_FUSED_OVERRIDES="torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"
     MHC_POST_OVERRIDE="${MHC_POST_OVERRIDE:-torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post}"
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rms_norm.asc
@@ -163,7 +167,7 @@ else
 fi
 
 # Wrapper defaults extend override.imports after the base targets.
-CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_TEXT_ROPE_OVERRIDE}}"
+CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_TEXT_ROPE_OVERRIDE} ${DEFAULT_FUSED_OVERRIDES}}"
 
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \

@@ -74,7 +74,16 @@ def kernel_options(
         seqused_q=q.seqused,
         seqused_ori_kv=swa_k.seqused,
         seqused_cmp_kv=None if cmp_k is None else cmp_k.seqused,
-        cmp_residual_kv=None if cmp_k is None else cmp_k.residual,
+        # ``None`` here is reserved for a layer with no compressed stream at all.  A ratio-1
+        # layer has a stream but no trailing group (``residual`` is ``None``); with the stream
+        # present the kernel takes a tensor, so zeros spell the empty group.
+        cmp_residual_kv=(
+            None
+            if cmp_k is None
+            else cmp_k.residual
+            if cmp_k.residual is not None
+            else torch.zeros(cmp_k.seqused.shape, dtype=torch.int32, device=cmp_k.seqused.device)
+        ),
         cmp_ratio=max(ratio, 1),
         ori_mask_mode=4,
         cmp_mask_mode=0 if _IS_A5 and cmp_k is None else 3,

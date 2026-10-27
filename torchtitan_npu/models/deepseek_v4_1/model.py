@@ -149,7 +149,8 @@ def build_v41_frames(
             cu_seqlens=cu_seq_k,
             seqused=(seqused // ratio).to(torch.int32),
             # A ratio of one addresses the row itself: the axis is not folded, so there is no
-            # trailing group and the kernels reject a value for one.
+            # trailing group and the frame keeps ``residual`` unset; the AscendC option
+            # builders hand the kernels zeros in its place.
             residual=None if ratio == 1 else (seqused % ratio).to(torch.int32),
         )
     return q, swa_k, cmp_k

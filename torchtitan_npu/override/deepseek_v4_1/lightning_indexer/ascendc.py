@@ -44,7 +44,14 @@ def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame):
         # no-op there rather than a second code path.
         seqused_q=q.seqused,
         seqused_k=cmp_k.seqused,
-        cmp_residual_k=cmp_k.residual,
+        # A ratio-1 layer addresses the row itself: its frame has no trailing group, so
+        # ``residual`` is ``None``.  The kernel takes a tensor there, and zeros are how an
+        # empty trailing group is spelled.
+        cmp_residual_k=(
+            cmp_k.residual
+            if cmp_k.residual is not None
+            else torch.zeros(cmp_k.seqused.shape, dtype=torch.int32, device=cmp_k.seqused.device)
+        ),
         layout_q=_LAYOUT,
         layout_k=_LAYOUT,
         mask_mode=_MASK_MODE,
