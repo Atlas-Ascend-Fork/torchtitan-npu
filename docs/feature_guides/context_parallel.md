@@ -4,10 +4,8 @@ DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）共用同一套上下文并行
 `cp` 份，KV 与压缩 KV 保持整行**。融合内核在边界处把本地 slab 声明式 all-gather 成整行，再用
 frame 的 `seqused = reach` 把可见范围限制在本 rank 的 chunk 之前。两栈共用
 `models/common/query_exchange.py` 的 plan/exchange 与 `models/common/metadata.py` 的
-`KernelFrame`；差异集中在压缩器的 CP 处理、内核如何锚定 mask，以及 frame 由哪一层 metadata 携带。
-
-本文是 V4 与 V4.1 的合并指南（原 V4 CP 指南的内容已并入）。旧的 `build_cp_plan` /
-`CPTokenDispatcher` / `WindowPlan` / `ExchangePlan` / 容器打包 / borrow-strip 路径均已删除。
+`KernelFrame`。两栈的模型 metadata 都自带 `q`/`swa_k`/`cmp_k` 三帧；差异集中在压缩器的 CP
+处理、内核如何锚定 mask，以及由此产生的 rank-local 前缀池。
 
 ## 1. 共同契约
 
@@ -52,12 +50,13 @@ positions_q：              搬过来的查询自己的文档内位置
 
 一行由三个 `KernelFrame` 描述：`q`、`swa_k`、`cmp_k`（不池化的几何没有 `cmp_k`）。CP 下由融合
 entry 的 `prepare_cp_metadata` 用 rank-local chunk 重建这三个 frame 以及按它们算出的 AI_CPU
-记录；参考 entry 的 hook 显式拒绝 CP（它只有一条连续文档流的契约）。frame 的归属两栈不同：
+记录；参考 entry 的 hook 显式拒绝 CP（它只有一条连续文档流的契约）。两栈的 frame 都由模型
+metadata 携带，CP 下再由融合 entry 重算：
 
 | 栈 | 参考 metadata | CP 重建 |
 | --- | --- | --- |
 | V4 | `DeepSeekV4Metadata` 自带 `q`/`swa_k`/`cmp_k`（`build_v4_metadata` 用整行边界构造） | `AscV4Metadata.prepare_cp_metadata` → `shard_asc_v4_metadata` |
-| V4.1 | `DeepSeekV41Metadata` 只有整行边界与位置；frame 由融合 entry `AscV41Metadata` 携带 | `AscV41Metadata.prepare_cp_metadata` → `shard_asc_v41_metadata` |
+| V4.1 | `DeepSeekV41Metadata` 自带 `q`/`swa_k`/`cmp_k`（`build_v41_frames` 用整行边界构造） | `AscV41Metadata.prepare_cp_metadata` → `shard_asc_v41_metadata` |
 
 两栈的重建都从 `cp_shard_context()` 读 pre-shard `positions` 与 CP mesh，都拒绝
 `--parallelism.context-parallel-load-balancer`（除 `None` 外的任何取值）：这些 frame 是每篇文档的
@@ -101,7 +100,8 @@ NGPU=2 \
   路径支持 CP；模型目录的参考 metadata hook 显式拒绝 CP。
 - 量化后端（V4 的 `QuantV4Metadata`、V4.1 的 `_V41QuantAttentionMetadata`）目前不重建 rank-local
   metadata，`prepare_cp_metadata` 直接拒绝：量化路径只能跑 `context-parallel-degree 1`。
-- DeepSeek-V4 的融合注意力在 CP=1 时支持 `local_batch_size > 1`，QueryExchange 前把 B/S 展平，交换后恢复 `[B, S]`。CP>1 暂不支持 `local_batch_size > 1`，`CarryExchange` 在交换或边界计算前显式报错；DSA 路径 TP 固定为 1。
+- DeepSeek-V4 的融合注意力在 CP=1 时支持 `local_batch_size > 1`，QueryExchange 前把 B/S 展平，交换后恢复 `[B, S]`。
+  CP>1 暂不支持 `local_batch_size > 1`，`CarryExchange` 在交换或边界计算前显式报错；DSA 路径 TP 固定为 1。
 
 ## 3. 两栈差异总览
 
@@ -111,7 +111,7 @@ NGPU=2 \
 | 压缩流取得方式 | 本地流（含 carry）池化后，内核边界 `S(1) -> R` gather 成整行 | 本地 slab 池化后同样在核心边界 `S(1) -> R` gather |
 | 内核锚定 | 融合内核把 mask 右对齐到**它拿到的 key frame 末尾**；selector 完全不读 `seqused_k`，因此非末尾 rank 还要把两路 key 流压成 rank-local 前缀池 | 内核读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；不需要前缀池 |
 | rank-local 前缀池 | `selector_k`/`selector_k_gather`（压缩池）与 `swa_k_prefix`/`swa_k_gather`（滑窗） | 无 |
-| frame 归属 | 模型 metadata（`DeepSeekV4Metadata`） | 融合 entry（`AscV41Metadata`） |
+| frame 归属 | 模型 metadata（`DeepSeekV4Metadata`） | 模型 metadata（`DeepSeekV41Metadata`，与 V4 同形） |
 | indexer teacher 归一化 | `_LightningIndexerTND.backward` 除以整行 query 数 `cu_seq_q[-1]` | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
 | 量化 metadata | `QuantV4Metadata` 拒绝 | `_V41QuantAttentionMetadata` 拒绝 |
@@ -137,8 +137,7 @@ inner_attention / lightning_indexer 的 ShardingConfig
 ```
 
 `AscV4Metadata` 的 `q`/`swa_k`/`cmp_k` frame 被 SMLA/SMLAG 与独立的 LI override（前向
-`lightning_indexer`、反向 SLIKG）直接读取；不再有 `_assemble_tnd`、`cmp_k_global_gather_indices`、
-`compressed_rows`、`first_indices` 或容器网格。
+`lightning_indexer`、反向 SLIKG）直接读取。
 
 ### 4.2 rank-local 前缀池
 
@@ -289,6 +288,7 @@ rank-local 分母放大。
 | --- | --- |
 | `models/common/query_exchange.py` | `ExchangeMetadata` / `QueryExchange` / `cp_plan`（V4、V4.1 共用） |
 | `models/common/metadata.py` | `KernelFrame`（两栈共用的 frame 原语） |
+| `models/common/packing.py` | `require_document_alignment` / `require_per_doc_alignment`：文档长度与 `per_doc_alignment` 的严格对齐检查 |
 | `models/deepseek_v4/metadata.py` | `DeepSeekV4Metadata`（整行边界、池网格、q/swa_k/cmp_k frame、查询位置）与 `build_v4_metadata` |
 | `models/deepseek_v4/attention.py` | 查询交换、q/idx_q 在 `positions_q` 上 rope、selector + 内层核心直调（无 wrapper）、输出 `unpermute`；参考内核读 `q` / `cmp_k` frame 与预计算的 HCA 选择 |
 | `models/common/carry_exchange.py` | `CarryExchange` / `CarryStream`：ratio-4 carry 的 ring（tokens + positions）、增强 `cu_seqlens` 与 `trim`；cp=1 为 no-op |
@@ -302,7 +302,8 @@ rank-local 分母放大。
 | `models/deepseek_v4_1/attention.py` | V4.1 查询交换、本地 KV/压缩、输出 `unpermute` |
 | `models/deepseek_v4_1/compressor.py` | V4.1 本地池化压缩器（CP-agnostic，无 carry） |
 | `models/deepseek_v4_1/sharding.py` | V4.1 sparse core / selector 的 `S(1) -> R` 声明 |
-| `models/deepseek_v4_1/model.py` | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 CP；teacher 成对启用检查 |
+| `models/deepseek_v4_1/model.py` | `DeepSeekV41Metadata` 与 `build_v41_frames`（整行边界与三帧）；`prepare_cp_metadata` 拒绝 CP；teacher 成对启用检查 |
+| `override/deepseek_v4_1/metadata.py` | V4.1 的 `AicpuGeometry` / `AicpuMetadata`：按 kernel 分组的 AI_CPU 记录结构 |
 | `override/deepseek_v4_1/sparse_attn/ascendc.py` | `AscV41Metadata` / `shard_asc_v41_metadata` / `build_fused_metadata` |
 | `override/deepseek_v4_1/lightning_indexer/ascendc.py` | V4.1 BF16 selector（整行 index keys × 本 rank chunk） |
 
