@@ -144,10 +144,10 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 
 DeepSeek-V4.1 复用上述 TorchAO-NPU 低精度入口，当前面向 A5（Ascend 950）硬件。Lightning Indexer 与稀疏 attention 量化的配置、组合、依赖和限制见[低精度训练特性指南](../feature_guides/low_precision_training.md#deepseek-v41-li-与稀疏-attention-量化)。
 
-DeepSeek-V4.1 使用 `li-quantization=mxfp4` 启用 Lightning Indexer量化，使用
-`enable-sparse-attention-quantization` 启用 KV source Compressor 与稀疏 attention 量化。两项可在
-标准 A5 融合路径提供 BF16 fallback 的前提下独立选择；`USE_GOLDEN=1` 不提供这些
-fallback。启动日志中出现
+DeepSeek-V4.1 使用 `li-quantization=mxfp4` 启用 Lightning Indexer 量化，使用
+`enable-sparse-attention-quantization` 启用 KV source Compressor 与稀疏 attention 量化。
+稀疏 attention 量化可单独启用；启用 Lightning Indexer 量化时必须同时启用稀疏 attention
+量化。标准 A5 融合路径提供 BF16 fallback，`USE_GOLDEN=1` 不提供这些 fallback。启动日志中出现
 `Applied TorchAO-NPU recipe=...` 表示 recipe 已应用。
 
 DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：
