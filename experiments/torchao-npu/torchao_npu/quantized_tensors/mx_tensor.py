@@ -51,7 +51,7 @@ class MXTensor(BaseQuantizedTensor):
     Matmul: the right operand is the weight and must be an ``MXTensor``
     quantized along ``dim=-2`` (the contracting dim); the left operand is either
     an ``MXTensor`` quantized along ``dim=-1`` (the contracting dim), which must
-    have been quantized with the right operand's ``act_quant_config``, or a
+    match the right operand's ``act_quant_config`` when it is set, or a
     high-precision tensor, which is quantized on the fly along ``dim=-1`` with
     that config -- a ``RuntimeError`` is raised when it is unset. The product is
     computed by the NPU kernels from the stored ``qdata``/``scale``, without
@@ -392,7 +392,7 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
     The right operand is the weight: it must already be an :class:`MXTensor`
     quantized along ``dim=-2`` (the contracting dim). The left operand is either
     an :class:`MXTensor` quantized along ``dim=-1`` (the contracting dim) and
-    with the right operand's ``act_quant_config``, or a high-precision tensor,
+    matching the right operand's ``act_quant_config`` when set, or a high-precision tensor,
     which is quantized here along ``dim=-1`` with that config.
 
     Args:
@@ -408,7 +408,7 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
             - If ``B`` is not an :class:`MXTensor`;
             - If either operand is quantized along the wrong dim;
             - If an :class:`MXTensor` ``A`` was not quantized with
-              ``B.act_quant_config``;
+              ``B.act_quant_config`` when that config is set;
             - If ``A`` is a quantized tensor of another class;
             - If the two operands' ``quant_config.block_size`` differ.
 
@@ -428,7 +428,7 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
         if A.quant_axis != A.ndim - 1:
             raise ValueError(f"The left matmul operand must be quantized along dim=-1, got quant_axis={A.quant_axis}.")
 
-        if A.quant_config != B.act_quant_config:
+        if B.act_quant_config is not None and A.quant_config != B.act_quant_config:
             raise ValueError(
                 f"The left matmul operand must be quantized with the right operand's ``act_quant_config``; "
                 f"got quant_config={A.quant_config} and act_quant_config={B.act_quant_config}."

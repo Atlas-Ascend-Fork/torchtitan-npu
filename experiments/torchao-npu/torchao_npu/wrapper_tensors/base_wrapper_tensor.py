@@ -172,8 +172,8 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
         weight_config: FakeQuantizeConfigBase | None = None,
         activation_config: FakeQuantizeConfigBase | None = None,
     ):
-        # ``_data`` is pure storage: autograd tracks the wrapper.
-        self._data = tensor.detach()
+        # Preserve supplied storage when re-wrapping collective outputs.
+        self._data = tensor
         self.weight_config = weight_config
         self.activation_config = activation_config
 

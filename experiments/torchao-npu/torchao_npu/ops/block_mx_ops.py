@@ -127,7 +127,8 @@ class _BlockMXQuantMM(torch.autograd.Function):
     Backward (``dY = grad_output``):
         - dY is quantized using A's config.
         - dgrad ``dA = dY @ B^T`` (contract over N)
-        - wgrad ``dB = A^T @ dY`` (contract over M)
+        - wgrad ``dB = (dY^T @ A)^T`` (contract over M). The final transpose
+          is a view, exposing contiguous dW after the outer weight transpose backward.
         - All multiplications are done in low precision.
     """
 
@@ -170,9 +171,9 @@ class _BlockMXQuantMM(torch.autograd.Function):
         # B form transposed.
         dA = torch.mm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-1), mx_B.transpose(-1, -2))
 
-        # wgrad: dB = A^T @ dY (contract over M) -- the saved A form transposed
-        # against dY's -2 form.
-        dB = torch.mm(mx_A.transpose(-1, -2), dual_axis_mx_Y.to_mx_tensor(quant_axis=-2))
+        # wgrad: dB = (dY^T @ A)^T, contracting over M.
+        # Match B = W.T so the outer transpose backward exposes contiguous dW.
+        dB = torch.mm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-2).transpose(-1, -2), mx_A).transpose(-1, -2)
 
         # Restore dA to original shape
         if dY.ndim != 2:
@@ -280,7 +281,8 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
     Backward (``dY = grad_output``):
         - dY is quantized using A's config.
         - dgrad ``dA = dY @ B^T`` (contract over N)
-        - wgrad ``dB = A^T @ dY`` (contract over M, ``group_type=2``)
+        - wgrad ``dB = (dY^T @ A)^T`` (contract over M, ``group_type=2``).
+          Group boundaries are unchanged; the final transpose is a view.
         - All multiplications are done in low precision.
     """
 
@@ -326,13 +328,9 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
             offs=offs,
         )
 
-        # wgrad: dB = A^T @ dY (contract over M, group_type=2)
-        # the saved A form transposed against dY's M-dim form.
-        dB = torch.nn.functional.grouped_mm(
-            grouped_mx_A.t(),
-            grouped_mx_dY,
-            offs=offs,
-        )
+        # wgrad: dB = (dY^T @ A)^T, contracting over each group's M dim.
+        # Match B = W.T so the outer transpose backward exposes contiguous dW.
+        dB = torch.nn.functional.grouped_mm(grouped_mx_dY.t(), grouped_mx_A, offs=offs).transpose(-1, -2)
 
         return dA, dB, None, None, None
 
@@ -389,7 +387,8 @@ class _BlockMXQuantBMM(torch.autograd.Function):
     Backward (``dY = grad_output``):
         - dY is quantized using A's config.
         - dgrad ``dA = dY @ B^T`` (contract over N)
-        - wgrad ``dB = A^T @ dY`` (contract over M)
+        - wgrad ``dB = (dY^T @ A)^T`` (contract over M). The final transpose
+          is a view, exposing contiguous dW after the outer weight transpose backward.
         - All multiplications are done in low precision.
     """
 
@@ -424,9 +423,9 @@ class _BlockMXQuantBMM(torch.autograd.Function):
         # - dY's -1 form against the saved B form transposed.
         dA = torch.bmm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-1), mx_B.transpose(-1, -2))
 
-        # wgrad: dB = A^T @ dY (contract over M)
-        # - the saved A form transposed against dY's -2 form.
-        dB = torch.bmm(mx_A.transpose(-1, -2), dual_axis_mx_Y.to_mx_tensor(quant_axis=-2))
+        # wgrad: dB = (dY^T @ A)^T, contracting over M.
+        # Match B = W.T so the outer transpose backward exposes contiguous dW.
+        dB = torch.bmm(dual_axis_mx_Y.to_mx_tensor(quant_axis=-2).transpose(-1, -2), mx_A).transpose(-1, -2)
 
         return dA, dB, None, None
 

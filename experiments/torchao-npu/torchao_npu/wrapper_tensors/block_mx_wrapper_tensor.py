@@ -362,7 +362,7 @@ def _(
 
     return nn.Parameter(
         data=BlockMXTrainingWeightWrapperTensor(
-            param.data,
+            param.data.detach(),
             activation_config=config.activation_config,
             weight_config=config.weight_config,
         ),

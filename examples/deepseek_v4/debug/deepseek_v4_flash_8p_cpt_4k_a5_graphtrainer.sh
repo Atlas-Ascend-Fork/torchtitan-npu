@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # Single-node A5 GraphTrainer debug recipe with sequence-based EP overlap.
+# Save shared/routed MoE W13 activations with the dsv4-mhc-moe-save policy.
 # Append CLI arguments to override defaults, for example --training.steps 5.
 set -euo pipefail
 
@@ -31,6 +32,7 @@ EP_OVERLAP_ARGS=(
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a5.sh" \
     --debug.moe-force-load-balance \
     --parallelism.spmd-backend partial_dtensor \
+    --compile.memory-policy dsv4-mhc-moe-save \
     --training.local-batch-size "${MBS}" \
     --training.global-batch-size "${GBS}" \
     --training.seq-len "${SEQ_LEN}" \
