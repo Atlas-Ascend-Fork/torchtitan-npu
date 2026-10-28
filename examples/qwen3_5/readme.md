@@ -47,7 +47,7 @@ override，用于消融或定位问题。
 
 本目录的入口脚本与仓库通用的 `scripts/run_train.sh` 使用相同的参数透传方式：
 脚本只设置模型、数据和多模态参数默认值，所有训练参数继续交给
-`torchtitan.train`。上游目录按以下优先级解析：
+`torchtitan_npu.train`。上游目录按以下优先级解析：
 
 1. `TORCHTITAN_REPO`；
 2. `TORCHTITAN_DIR`（`.ci/common.sh` 会导出此变量指向 third_party 克隆）；
@@ -95,7 +95,7 @@ parallelizer 可兼容当前主线和旧 NPU 运行环境。当前 Qwen3.5-VL �
 
 ```bash
 python -m tests.integration_tests.run_tests /tmp/qwen3_5-tests \
-  --test_suite qwen3_5 --test_name all --ngpu 2
+  --test_suite qwen3_5 --test_name all --ngpu 1
 ```
 
 ## Qwen3.5 视觉 mask 边界
