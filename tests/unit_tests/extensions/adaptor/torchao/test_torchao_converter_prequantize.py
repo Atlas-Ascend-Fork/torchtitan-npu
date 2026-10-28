@@ -13,19 +13,24 @@ concern (the wrapper tensor's fail-fast guard), not a config-stage one.
 """
 
 import pytest
-from torchtitan.models.common.linear import Linear
 
-# TorchAO-NPU is an optional dependency (see adaptor converter's
-# module docstring): environments without it (e.g. the CI UT runner) must skip
-# this module at collection instead of failing the import below, mirroring the
-# importorskip in the converter_module fixture of test_converter.py.
+# TorchAO and TorchAO-NPU are optional dependencies (see the adaptor converter's
+# module docstring): the adaptor's configs/recipe modules import them at module
+# top, so environments without them (e.g. the CI UT runner) must skip this
+# module at collection *before* the imports below, instead of failing the
+# import.  Mirrors the importorskip in the converter_module fixture of
+# test_converter.py (which defers the heavy import into a fixture).
+pytest.importorskip("torchao")
 pytest.importorskip("torchao_npu")
 
+from torchtitan.models.common.linear import Linear
+
 from torchtitan_npu.config.configs import QuantizationExtensionConfig
+from torchtitan_npu.extensions.adaptor.torchao.configs import get_model_config
 from torchtitan_npu.extensions.adaptor.torchao.converter import (
-    _PREQUANTIZE_DEFAULT_FQNS,
     NpuQuantizedAscGroupedExpertsModule,
     _match_fqn_suffix,
+    _model_type_for_spec,
     apply_quantization_converter,
 )
 from torchtitan_npu.models.deepseek_v4 import model_registry
@@ -120,12 +125,14 @@ def test_default_whitelist_covers_every_quantized_projection():
     quantization = _quantization_config(enable_fsdp_prequantize=True)
     converted = apply_quantization_converter(spec, quantization, model_compile_enabled=False)
 
-    all_patterns = tuple(pattern for scope in _PREQUANTIZE_DEFAULT_FQNS.values() for pattern in scope)
+    defaults = get_model_config(_model_type_for_spec(spec)).prequantize_default_fqns
+    all_patterns = tuple(pattern for scope in defaults.values() for pattern in scope)
     flags = _collect_flags(converted.model)
     assert flags, "debugmodel must expose quantized Linear nodes"
     for fqn in flags:
         assert any(_match_fqn_suffix(fqn, pattern) for pattern in all_patterns), (
-            f"quantized weight {fqn!r} matches no default whitelist entry; update _PREQUANTIZE_DEFAULT_FQNS"
+            f"quantized weight {fqn!r} matches no default whitelist entry; "
+            f"update the model's prequantize_default_fqns"
         )
 
 

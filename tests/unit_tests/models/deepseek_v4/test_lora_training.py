@@ -134,7 +134,11 @@ def ao(monkeypatch):
     monkeypatch.setitem(sys.modules, "cann_ops_nn", ModuleType("cann_ops_nn"))
     pytest.importorskip("torchao_npu")
     module = importlib.import_module("torchtitan_npu.extensions.adaptor.torchao.converter")
-    monkeypatch.setattr(module, "_ensure_cann_ops_loaded", lambda: None)
+    monkeypatch.setattr(
+        importlib.import_module("torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4"),
+        "_ensure_cann_ops_loaded",
+        lambda: None,
+    )
     return module
 
 
@@ -152,7 +156,11 @@ def _block_fp8_policy(ao):
 
 
 def _convert(ao, config, policy=None):
-    return ao.NpuQuantizeConverter.Config(base_config=policy or _block_fp8_policy(ao)).build().convert(config)
+    return ao.NpuQuantizeConverter.Config(
+        base_config=policy or _block_fp8_policy(ao),
+        unified_npu_quant_modules=ao.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=ao.SPECIFIC_NPU_QUANTIZED_MODULES,
+    ).build().convert(config)
 
 
 @pytest.mark.parametrize("kind", ["dense", "batched", "grouped"])
@@ -215,7 +223,13 @@ def test_non_lora_quantization_keeps_original_policy(ao, monkeypatch):
     policy = _block_fp8_policy(ao)
     config = _convert(ao, Linear.Config(in_features=4, out_features=8), policy)
     received = []
-    monkeypatch.setattr(ao, "quantize_", lambda _module, applied_policy, **_kwargs: received.append(applied_policy))
+    for mod in ("torchtitan_npu.extensions.adaptor.torchao.recipes",
+                "torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4"):
+        monkeypatch.setattr(
+            importlib.import_module(mod),
+            "quantize_",
+            lambda _module, applied_policy, **_kwargs: received.append(applied_policy),
+        )
     config.build()
     assert len(received) == 1 and received[0] is policy
 

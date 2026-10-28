@@ -40,7 +40,12 @@ def quantization_calls(monkeypatch, converter_module):
     def quantize(module, config, *, filter_fn):
         calls.append((module, config, filter_fn))
 
-    monkeypatch.setattr(converter_module, "quantize_", quantize)
+    # Patch where the call sites live (generated modules in recipes + the DeepSeek
+    # quantized-expert class in configs.deepseek_v4), not the facade, so the patched
+    # quantize_ is what NpuQuantized*Module.__init__ resolves.
+    for mod in ("torchtitan_npu.extensions.adaptor.torchao.recipes",
+                "torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4"):
+        monkeypatch.setattr(importlib.import_module(mod), "quantize_", quantize)
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     with torch.random.fork_rng(devices=[]):
         yield calls
@@ -53,7 +58,12 @@ def test_quantized_grouped_experts_keep_config_and_skip_reconversion(converter_m
     source_cls = converter_module.GroupedExperts if source_kind == "grouped" else converter_module.AscGroupedExperts
     source = source_cls.Config(dim=2, hidden_dim=4, num_experts=2, swiglu_limit=1.5)
     quant_config = mxfp8_param_swap()
-    converter = converter_module.NpuQuantizeConverter.Config(base_config=quant_config, require_match=False).build()
+    converter = converter_module.NpuQuantizeConverter.Config(
+        base_config=quant_config,
+        require_match=False,
+        unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=converter_module.SPECIFIC_NPU_QUANTIZED_MODULES,
+    ).build()
 
     converted = converter.convert(source)
 
@@ -88,7 +98,10 @@ def test_quantization_converter_preserves_custom_experts(converter_module, quant
 
     source = CustomExperts.Config(dim=2, hidden_dim=4, num_experts=2, output_scale=5.0)
     converter = converter_module.NpuQuantizeConverter.Config(
-        base_config=mxfp8_param_swap(), require_match=False
+        base_config=mxfp8_param_swap(),
+        require_match=False,
+        unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=converter_module.SPECIFIC_NPU_QUANTIZED_MODULES,
     ).build()
 
     converted = converter.convert(source)
@@ -106,7 +119,12 @@ def test_quantization_converter_keeps_linear_forward(converter_module, quantizat
 
     source = converter_module.Linear.Config(in_features=2, out_features=2, bias=False)
     quant_config = mxfp8_param_swap()
-    converter = converter_module.NpuQuantizeConverter.Config(base_config=quant_config, require_match=False).build()
+    converter = converter_module.NpuQuantizeConverter.Config(
+        base_config=quant_config,
+        require_match=False,
+        unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=converter_module.SPECIFIC_NPU_QUANTIZED_MODULES,
+    ).build()
 
     converted = converter.convert(source)
     assert converter.convert(converted) is converted
@@ -144,7 +162,7 @@ def test_recipe_converters_select_filters_for_model_type(
 ):
     converters = converter_module._recipe_converters(
         "mix",
-        model_type=model_type,
+        model_type=converter_module.ModelType(model_type),
         enable_sparse_attention_quantization=True,
         enable_mxfp4_qat=False,
         dst_type_max=0.0,
@@ -168,7 +186,7 @@ def test_recipe_converters_select_filters_for_model_type(
 
 def test_v41_li_quantization_alone_is_refused(converter_module):
     """The quantized selector launches the quantized sparse attention's schedules."""
-    with pytest.raises(ValueError, match="requires .*enable-sparse-attention-quantization"):
+    with pytest.raises(ValueError, match=r"requires .*enable-sparse-attention-quantization"):
         converter_module._recipe_converters(
             "mix",
             model_type="v41",
@@ -181,22 +199,29 @@ def test_v41_li_quantization_alone_is_refused(converter_module):
         )
 
 
-def test_recipe_converters_warn_when_sparse_attention_filter_is_unavailable(converter_module, caplog):
-    with caplog.at_level(logging.WARNING):
-        converters = converter_module._recipe_converters(
-            "mix",
-            model_type="v4",
-            enable_sparse_attention_quantization=True,
-            enable_mxfp4_qat=False,
-            dst_type_max=0.0,
-            enable_fsdp_prequantize=False,
-            model_compile_enabled=False,
-        )
+def test_sparse_attention_component_triggers_on_real_v41_filters(converter_module, caplog):
+    """On the real V4.1 filter set the sparse_attention component must trigger.
 
-    assert "model type v4 has no sparse_attention filter" in caplog.text
-    assert not any(
-        converter.filter_fn is converter_module._DSV41_CONFIG_FILTERS["sparse_attention"] for converter in converters
+    V4.1 always registers a ``sparse_attention`` filter, so ``should_trigger``
+    returns True and never warns. (Passing an empty filter dict -- the only way
+    to reach the warning branch -- is not a real V4.1 model state.)
+    """
+    from torchtitan_npu.extensions.adaptor.torchao.components import instantiate_component_for_model_and_name
+    from torchtitan_npu.extensions.adaptor.torchao.recipes import RecipeContext
+
+    component = instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")
+    ctx = RecipeContext(
+        model_type=converter_module.ModelType.V4_1,
+        model_compile_enabled=False,
+        enable_sparse_attention_quantization=True,
+        fsdp_prequantize_dtype="fp8",
     )
+
+    with caplog.at_level(logging.WARNING):
+        triggered = component.should_trigger(converter_module._DSV41_CONFIG_FILTERS, ctx)
+
+    assert triggered is True
+    assert "has no sparse_attention filter" not in caplog.text
 
 
 def test_model_type_rejects_unknown_model_spec_name(converter_module):
@@ -205,8 +230,90 @@ def test_model_type_rejects_unknown_model_spec_name(converter_module):
 
 
 def test_model_type_comes_from_model_spec_name(converter_module):
-    assert converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v4", model=object())) == "v4"
-    assert converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v4_1", model=object())) == "v41"
+    kinds = {
+        "deepseek_v4": converter_module.ModelType.V4,
+        "deepseek_v4_1": converter_module.ModelType.V4_1,
+    }
+    for spec_name, expected in kinds.items():
+        assert converter_module._model_type_for_spec(SimpleNamespace(name=spec_name, model=object())) is expected
+
+
+def test_family_configs_are_split_and_registered(converter_module):
+    from torchtitan_npu.extensions.adaptor.torchao.components import (
+        component_names_for_model,
+        instantiate_component_for_model_and_name,
+    )
+    from torchtitan_npu.extensions.adaptor.torchao.configs import get_model_config
+
+    v4 = get_model_config(converter_module.ModelType.V4)
+    v41 = get_model_config(converter_module.ModelType.V4_1)
+
+    # Component ownership now comes from the components registry, not configs.
+    assert set(component_names_for_model(converter_module.ModelType.V4)) == {
+        "lightning_indexer",
+        "v4_sparse_attention",
+        "kv_norm",
+    }
+    assert set(component_names_for_model(converter_module.ModelType.V4_1)) == {
+        "lightning_indexer",
+        "compressor",
+        "sparse_attention",
+    }
+
+    # Order is deterministic: component_names_for_model must preserve registration
+    # order (a set would randomize across processes and break reproducible
+    # converter ordering).
+    assert component_names_for_model(converter_module.ModelType.V4) == (
+        "lightning_indexer",
+        "v4_sparse_attention",
+        "kv_norm",
+    )
+    assert component_names_for_model(converter_module.ModelType.V4_1) == (
+        "lightning_indexer",
+        "compressor",
+        "sparse_attention",
+    )
+
+    # The lightning_indexer suffix differs per family; sparse_attention is V4.1-only.
+    assert converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"] is not converter_module._DSV41_CONFIG_FILTERS[
+        "lightning_indexer"
+    ]
+    assert "sparse_attention" not in converter_module._DSV4_CONFIG_FILTERS
+    assert "sparse_attention" in converter_module._DSV41_CONFIG_FILTERS
+
+    # V4.1 owns its own (distinct) recipe matrix object.
+    assert v41.recipe_matrix is not v4.recipe_matrix
+
+    # Per-model components resolve under their feature name for each family.
+    assert (
+        type(
+            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")
+        ).__name__
+        == "DeepSeekV41QuantSparseAttentionComponent"
+    )
+    assert (
+        type(
+            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "compressor")
+        ).__name__
+        == "DeepSeekV41QuantCompressorComponent"
+    )
+    assert (
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "kv_norm")).__name__
+        == "KVNormComponent"
+    )
+    # lightning_indexer is split per model: V4 vs V4.1 have their own class.
+    assert (
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "lightning_indexer")).__name__
+        == "DeepSeekV4QuantLightningIndexerComponent"
+    )
+    assert (
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "lightning_indexer")).__name__
+        == "DeepSeekV41QuantLightningIndexerComponent"
+    )
+    assert (
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "v4_sparse_attention")).__name__
+        == "DeepSeekV4QuantSparseAttentionComponent"
+    )
 
 
 def test_recipe_converters_reject_unknown_model_type(converter_module):
@@ -246,7 +353,7 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
     )
 
     assert converted is not model_spec
-    assert calls[0]["model_type"] == expected_model_type
+    assert calls[0]["model_type"] == converter_module.ModelType(expected_model_type)
 
 
 @pytest.mark.parametrize("quant_format", ["mx", "block_mx"])
@@ -262,7 +369,11 @@ def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, conver
         wrapper_cls = wrapper_module.BlockMXTrainingWeightWrapperTensor
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     source = converter_module.GroupedExperts.Config(dim=32, hidden_dim=32, num_experts=2)
-    converter = converter_module.NpuQuantizeConverter.Config(base_config=quant_config).build()
+    converter = converter_module.NpuQuantizeConverter.Config(
+        base_config=quant_config,
+        unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=converter_module.SPECIFIC_NPU_QUANTIZED_MODULES,
+    ).build()
 
     # Keep real quantize_, parameter wrappers, casts and torch._grouped_mm
     # dispatch. Replace only the NPU grouped-matmul and SwiGLU boundaries.
@@ -432,7 +543,7 @@ def test_v41_recipe_rejects_non_mxfp4_lightning_indexer(converter_module, li_qua
     with pytest.raises(ValueError, match="supports only li_quantization='mxfp4'"):
         converter_module._recipe_converters(
             "mix",
-            model_type="v41",
+            model_type=converter_module.ModelType.V4_1,
             enable_sparse_attention_quantization=True,
             enable_mxfp4_qat=False,
             dst_type_max=0.0,
