@@ -212,6 +212,73 @@ def test_dcp_load_verifies_manifest_before_upstream_load():
     assert events == ["verify manifest", "load checkpoint"]
 
 
+def _run_isolated_patch(script, *args):
+    import subprocess
+
+    module_path = (
+        Path(__file__).resolve().parents[5]
+        / "torchtitan_npu/patches/torchtitan/distributed/checkpoint/filesystem.py"
+    )
+    subprocess.run([sys.executable, "-c", script, str(module_path), *map(str, args)], check=True)
+
+
+def test_bounded_reader_does_not_read_past_blob():
+    script = """
+import importlib.util
+import io
+import sys
+
+spec = importlib.util.spec_from_file_location("dcp_mmap_filesystem_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+base = io.BytesIO(b"prefix" + b"blob" + b"trailing")
+view = module._BoundedReader(base, 6, 4)
+
+view.seek(0)
+assert view.read() == b"blob"
+
+view.seek(5)
+assert view.read() == b""
+
+buffer = bytearray(8)
+assert view.readinto(buffer) == 0
+"""
+    _run_isolated_patch(script)
+
+
+def test_filesystem_reader_mmap_loads_local_dcp(tmp_path):
+    script = """
+import importlib.util
+import sys
+from pathlib import Path
+
+import torch
+import torch.distributed.checkpoint as dcp
+
+spec = importlib.util.spec_from_file_location("dcp_mmap_filesystem_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+source = {
+    "weight": torch.arange(4096, dtype=torch.float32).reshape(64, 64),
+    "bias": torch.arange(257, dtype=torch.bfloat16),
+}
+checkpoint_id = Path(sys.argv[2])
+dcp.save(source, checkpoint_id=checkpoint_id)
+target = {
+    "weight": torch.empty_like(source["weight"]),
+    "bias": torch.empty_like(source["bias"]),
+}
+reader = dcp.FileSystemReader(checkpoint_id, mmap=True)
+assert reader.mmap is True
+dcp.load(target, storage_reader=reader)
+torch.testing.assert_close(target["weight"], source["weight"])
+torch.testing.assert_close(target["bias"], source["bias"])
+del reader
+del target
+"""
+    _run_isolated_patch(script, tmp_path / "checkpoint")
+
+
 def test_checkpoint_manager_uses_synchronous_writer():
     manager = object.__new__(product_checkpoint.CheckpointManager)
     state_dict = {"state": torch.tensor(1)}

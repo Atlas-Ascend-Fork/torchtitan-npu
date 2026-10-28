@@ -11,6 +11,7 @@
 - https://github.com/pytorch/torchtitan/pull/4734
 - https://github.com/pytorch/torchtitan/pull/4708
 - https://github.com/pytorch/torchtitan/pull/4763
+- https://github.com/pytorch/pytorch/pull/201621
 -->
 
 # TorchTitan 临时补丁
@@ -23,6 +24,7 @@
 
   ```python
   # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/NNNN
+  # Pending upstream PR: https://github.com/pytorch/pytorch/pull/NNNN
   ```
 
 - 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR." 结尾。
@@ -56,6 +58,7 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#4664](https://github.com/pytorch/torchtitan/pull/4664) | 为每个 FSDP 参数组注册 TorchFT 梯度平均 hook，对应 `experiments/torchft/manager.py` |
 | [#4708](https://github.com/pytorch/torchtitan/pull/4708) | 修复 functionalize_recompute_mutations_pass 和 EpOverlap 的冲突 |
 | [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
+| [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
 
 上述 6 个 TorchTitan PR（#4534、#4575、#4578、#4598、#4663、#4664）已在上游合入，但 `v0.3.0` 尚未包含这些修复。
 
