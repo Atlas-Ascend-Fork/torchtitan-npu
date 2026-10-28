@@ -12,22 +12,13 @@ tests/assets/deepseek_v3/
 └── tokenizer_config.json
 ```
 
-如需使用其他 Tokenizer，可通过 `HF_ASSETS_PATH` 指定：
-
-```bash
-export HF_ASSETS_PATH=/path/to/tokenizer
-```
+如需使用其他 Tokenizer，修改单卡命令中的 `--hf-assets-path`。
 
 2. 准备数据集。
 
-已在 `tests/assets/c4_test/` 中预置 `c4_test` 测试数据集，示例 wrapper 默认使用该目录，无需额外下载。
+已在 `tests/assets/c4_test/` 中预置 `c4_test` 测试数据集，单卡命令直接使用该目录，无需额外下载。
 
-使用其他数据集时，需同时指定数据集名称和目录：
-
-```bash
-export DATASET=dataset_name
-export DATASET_PATH=/path/to/dataset
-```
+使用其他数据集时，需同时修改单卡命令中的 `--dataloader.dataset` 和 `--dataloader.dataset-path`。
 
 ## 配置 CANN 环境变量
 
@@ -68,13 +59,12 @@ bash scripts/run_train.sh \
 ```
 
 > [!NOTE]
-> 示例 wrapper / 底层 launcher 配置项说明：
+> 通用 launcher 配置项说明：
 > - `ASCEND_SET_ENV_PATH`：可选，自定义 CANN `set_env.sh` 路径；设置后优先加载该文件。
 > - `MODULE`：模型 Python 模块，默认为 `torchtitan.models.deepseek_v3`。
 > - `CONFIG`：`torchtitan/models/deepseek_v3/config_registry.py` 中注册的配置函数，默认为 `deepseek_v3_debugmodel`。
 > - `NGPU`：当前节点参与训练的 NPU 数量，默认为 `1`。
-> - `HF_ASSETS_PATH`：Tokenizer 目录，默认为仓内 `tests/assets/deepseek_v3`。
-> - `DATASET` 和 `DATASET_PATH`：数据集名称和目录，默认使用仓内的 `tests/assets/c4_test/`。
+> - Tokenizer 和数据集由上述命令中的 CLI 参数指定；`scripts/run_train.sh` 不读取 `HF_ASSETS_PATH`、`DATASET` 或 `DATASET_PATH` 环境变量。
 > - 脚本后的其他参数会原样传给 `torchtitan_npu.train`，可用于覆盖配置函数中的训练和并行参数。
 
 
