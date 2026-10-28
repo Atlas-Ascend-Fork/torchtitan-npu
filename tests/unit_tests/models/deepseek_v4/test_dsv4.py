@@ -315,12 +315,6 @@ def test_compressor_numerics_ratio128(inputs, batch_size):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_compressor_rejects_rows_with_partial_blocks(dsv4):
-    comp = build_compressor(dsv4, 4)
-    with pytest.raises(ValueError, match="each batch row"):
-        comp(torch.randn(2, 2, DIM), torch.arange(2).expand(2, -1))
-
-
 @pytest.mark.parametrize("operation", ["selection", "student-logits"])
 def test_reference_indexer_refuses_mbs_above_one(dsv4, operation):
     idx_q = torch.randn(2, 8, 2, DIM)

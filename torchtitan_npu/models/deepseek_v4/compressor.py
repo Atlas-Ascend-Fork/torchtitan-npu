@@ -157,12 +157,8 @@ class Compressor(Module):
         Returns:
             The pooled key stream ``[B, L // ratio, D]``.
         """
+        # The aligned dataloader and trainer validate the grid before model execution.
         batch_size = x.size(0)
-        if x.size(1) % self.compress_ratio:
-            raise ValueError(
-                f"each batch row ({x.size(1)} tokens) must contain whole compression blocks "
-                f"of ratio {self.compress_ratio}."
-            )
         # Implementations consume one packed stream whose boundaries already include every
         # batch row. Restore the container shape only after pooling, including RoPE.
         pooled = self.implementation.forward(
@@ -190,12 +186,6 @@ class Compressor(Module):
         if x.dim() != 3 or x.size(0) != 1:
             raise ValueError(f"the compressor addresses one packed row, got shape {tuple(x.shape)}.")
         length = x.size(1)
-        if length % ratio:
-            raise ValueError(
-                f"the local stream ({length} tokens) is not a whole number of compression blocks "
-                f"of ratio {ratio}: documents are aligned by `dataloader.per_doc_alignment`, and "
-                "the CP wrapper's augmented stream adds whole blocks."
-            )
         n_blocks = length // ratio
         with torch.autocast(device_type=x.device.type, dtype=torch.float32):
             kv = self.wkv(x).unflatten(1, (n_blocks, ratio))

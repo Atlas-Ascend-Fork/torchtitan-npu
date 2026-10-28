@@ -68,10 +68,6 @@ class AscCompressor(CompressorImplementation):
         ratio = compressor.compress_ratio
         if cu_seqlens is None:
             raise ValueError("the CANN compressor requires the local stream's cu_seqlens")
-        if x.size(1) % ratio:
-            raise ValueError(
-                f"the local stream ({x.size(1)} tokens) is not a whole number of compression blocks of ratio {ratio}."
-            )
         state_block_table, state_cache, cu_seqlens, seqused = _state_inputs(
             cu_seqlens,
             x,
