@@ -1,41 +1,38 @@
 # 静默数据损坏检测（SDC）
 
-SDC（Silent Data Corruption，静默数据损坏）用于检测 Ascend NPU 编译训练中的 gradient、
-HCCL 和 matmul checksum 异常，适用于使用 `torch.compile` 与 Inductor 编译模型的标准 NPU Trainer。
-该能力默认关闭，通过 `TrainerEx.Config.sdc` 对应的 CLI 参数按需启用。
+SDC（Silent Data Corruption，静默数据损坏）用于检测 Ascend NPU 训练中的 gradient、HCCL 和 matmul checksum 异常，
+仅支持 Eager 模式或使用 `torch.compile(backend="inductor")` 的 Compile 模式。该能力默认关闭，按需启用。
+Eager 模式通过 torch-npu 原生环境变量启用，Compile 模式通过 `--sdc.*` CLI 参数启用。
 
 ## 启动入口
 
-所有模式都通过 `torchrun -m torchtitan_npu.train` 启动。该入口会在上游配置加载前安装
-NPU 配置转换，使标准配置构造
-`TrainerEx`。直接使用 `torchrun -m torchtitan.train` 可能构造上游 `Trainer`，不支持作为
-NPU SDC 入口。
+首先两种模式都需要通过 `torchrun -m torchtitan_npu.train` 启动训练。
+该入口会在上游配置加载前安装 NPU 配置转换，使标准配置构造 `TrainerEx`
+（torchtitan-npu 对上游 `Trainer` 的扩展类，`sdc` 配置节与 SDC 生命周期均挂在该类上）。
+如果使用 `torchrun -m torchtitan.train` 将会构造上游的原生 `Trainer`，不支持作为 NPU SDC 入口。
 
-`scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh` 默认使用
-`torchtitan_npu.train`，无需把 `scripts/` 加入 `PYTHONPATH`。
-
-## 环境变量
+`scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh` 默认使用 `torchtitan_npu.train`。
 
 ### Eager
 
-Eager 模式使用 torch-npu 原生控制：
+Eager 模式由 torch-npu 原生控制：
 
 ```bash
 NPU_ASD_CONFIG='enable:true,with_checksum:false' \
 torchrun --nproc_per_node=8 -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
-  --config deepseek_v4_flash_43layers_16experts
+         --module torchtitan_npu.models.deepseek_v4 \
+         --config deepseek_v4_flash_43layers_16experts
 ```
 
-`NPU_ASD_CONFIG` 和 `NPU_ASD_ENABLE` 在 Python 进程导入 torch-npu 前生效，可能安装
+环境变量 `NPU_ASD_CONFIG` 和 `NPU_ASD_ENABLE` 在 Python 进程导入 torch-npu 前生效，可能安装
 torch-npu 的 `torch.nn.Module.__call__` wrapper。仅设置原生变量时，`TrainerEx` 不安装
 compiled gradient、checksum 或 typed HCCL 控制。
 
-这两个环境变量由 torch-npu 原生实现负责解释；compiled SDC 仅接受 typed CLI/config。
+这两个环境变量由 torch-npu 原生实现负责，具体参考 torch-npu 的相关文档。
 
 ### Compile
 
-编译模型使用 typed SDC 参数：
+编译模型使用 typed SDC 参数。
 
 ```bash
 torchrun --nproc_per_node=8 -m torchtitan_npu.train \
@@ -49,7 +46,7 @@ torchrun --nproc_per_node=8 -m torchtitan_npu.train \
   --compile.backend inductor
 ```
 
-typed SDC 参数如下：
+typed SDC 参数说明如下：
 
 | CLI 参数 | 默认值 | 约束与作用 |
 | --- | ---: | --- |
@@ -74,7 +71,7 @@ typed compiled SDC 开启时，允许未设置原生变量，或使用关闭配�
 任一原生开关启用或取值非法均报错，不因另一个开关关闭而忽略它。
 CLI 指定非零 HCCL 模式时，在导入 torch-npu 后覆盖原生关闭值 `0`。
 这不支持导入时已启用 Eager 后再修改环境来切换模式。typed SDC 关闭时不会读取或修改
-这两个变量，原生 eager SDC 仍完全由 torch-npu 管理。
+这两个变量，原生 Eager SDC 仍完全由 torch-npu 管理。
 
 `SDC` 直接配置 torch-npu 原生 checker，并调用其 `_startup`、`_detect_grad` 和私有 HCCL
 状态接口，不增加 Adapter 或仅转发调用的管理层。本仓库不重实现检测算法；checksum
@@ -143,5 +140,5 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 
 `tests/unit_tests/test_sdc.py` 覆盖配置校验、运行时初始化、梯度累积提交及 checksum 图插桩的 CPU 可观察契约。
 
-`tests/smoke_tests/sdc/test_sdc_smoke.py` 在独立 NPU worker 中验证 Eager/compiled 控制、gradient/checksum/HCCL
+`tests/smoke_tests/sdc/test_sdc_smoke.py` 在独立 NPU worker 中验证 Eager/Compile 控制、gradient/checksum/HCCL
 联动及 checksum 激活不触发重新编译，不替代 `tests/integration_tests` 中的完整模型训练验证。
