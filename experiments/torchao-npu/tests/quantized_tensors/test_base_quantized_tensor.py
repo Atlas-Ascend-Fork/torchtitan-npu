@@ -22,7 +22,7 @@ def test_torch_function_layer_is_disabled():
 @pytest.mark.parametrize(
     "call",
     [
-        lambda x: x.view(-1),
+        lambda x: x.unsqueeze(0),
         lambda x: x.sum(),
         lambda x: x + 1,
         lambda x: x[0],

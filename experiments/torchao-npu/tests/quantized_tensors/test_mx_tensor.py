@@ -244,6 +244,208 @@ def test_fp4_shape_ops_track_the_pack_axis():
 
 
 # =========================================================================
+# Re-shaping (view / reshape / _unsafe_view)
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [(8, 64), (1, 2, 4, 64), (-1, 64)],
+    ids=["merge", "insert-leading", "infer"],
+)
+def test_view_refactors_the_leading_dims(destination):
+    """Leading dims re-factor freely; the components are re-viewed, never copied."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(2, 4, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    y = x.view(destination)
+
+    expected_qdata = x.qdata.view(destination)
+    expected_scale = x.scale.view(*destination[:-1], *x.scale.shape[-2:])
+    assert y.shape == expected_qdata.shape, f"view gave shape {tuple(y.shape)}, expected {expected_qdata.shape}"
+    assert y.qdata.shape == expected_qdata.shape, (
+        f"view gave qdata shape {tuple(y.qdata.shape)}, expected {expected_qdata.shape}"
+    )
+    assert y.scale.shape == expected_scale.shape, (
+        f"view gave scale shape {tuple(y.scale.shape)}, expected {expected_scale.shape}"
+    )
+    assert y.quant_axis == y.ndim - 1, f"the quant axis must stay last, got {y.quant_axis}"
+    assert y.pack_axis is None, f"an FP8 tensor gained pack_axis {y.pack_axis}"
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "view copied qdata instead of re-viewing it"
+    assert y.scale.data_ptr() == x.scale.data_ptr(), "view copied scale instead of re-viewing it"
+
+
+def test_view_refactors_the_leading_dims_with_an_unaligned_last_dim():
+    """An unchanged last dim needs no pair alignment: its stored block slots are kept."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(2, 3, 96).to(torch.float8_e4m3fn)  # 3 blocks per row: unaligned, odd
+    scale = torch.full((2, 3, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    y = x.view(6, 96)
+
+    assert y.qdata.shape == torch.Size([6, 96]), f"qdata shape {tuple(y.qdata.shape)} != (6, 96)"
+    assert y.scale.shape == torch.Size([6, 2, 2]), (
+        f"scale shape {tuple(y.scale.shape)} != (6, 2, 2); the padded pair slot must be kept"
+    )
+    assert y.quant_axis == 1, f"quant axis {y.quant_axis} != 1"
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "view copied qdata instead of re-viewing it"
+
+
+def test_view_merges_rows_when_the_last_dim_is_pair_aligned():
+    """With whole block pairs per row, merging rows is a reshape of the flat pair sequence."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(4, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    y = x.view(-1)
+
+    assert y.shape == torch.Size([256]), f"view gave shape {tuple(y.shape)}, expected (256,)"
+    assert y.qdata.shape == torch.Size([256]), f"qdata shape {tuple(y.qdata.shape)} != (256,)"
+    assert y.scale.shape == torch.Size([4, 2]), f"scale shape {tuple(y.scale.shape)} != (4, 2)"
+    assert y.quant_axis == 0, f"quant axis {y.quant_axis} != 0"
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "view copied qdata instead of re-viewing it"
+
+
+def test_view_splits_rows_when_the_last_dim_is_pair_aligned():
+    """Splitting rows is the inverse: every new row still holds whole block pairs."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(2, 128).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 2, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    y = x.view(4, 64)
+
+    assert y.qdata.shape == torch.Size([4, 64]), f"qdata shape {tuple(y.qdata.shape)} != (4, 64)"
+    assert y.scale.shape == torch.Size([4, 1, 2]), f"scale shape {tuple(y.scale.shape)} != (4, 1, 2)"
+    assert y.quant_axis == 1, f"quant axis {y.quant_axis} != 1"
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "view copied qdata instead of re-viewing it"
+
+
+def test_fp4_view_keeps_the_pack_axis_on_the_quant_axis():
+    """FP4 halves the stored last dim; the pack axis follows the quant axis."""
+    config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    qdata = torch.randint(0, 256, (4, 32), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config, pack_axis=-1)
+
+    y = x.view(2, 2, 64)
+
+    assert y.shape == torch.Size([2, 2, 64]), f"view gave shape {tuple(y.shape)}, expected (2, 2, 64)"
+    assert y.qdata.shape == torch.Size([2, 2, 32]), f"qdata shape {tuple(y.qdata.shape)} != (2, 2, 32)"
+    assert y.quant_axis == 2 and y.pack_axis == 2, (
+        f"quant_axis/pack_axis are {y.quant_axis}/{y.pack_axis}, expected 2/2"
+    )
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "view copied qdata instead of re-viewing it"
+
+
+def test_fp4_view_flattens_when_the_last_dim_is_pair_aligned():
+    config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
+    qdata = torch.randint(0, 256, (4, 32), dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config, pack_axis=-1)
+
+    y = x.view(-1)
+
+    assert y.shape == torch.Size([256]), f"view gave shape {tuple(y.shape)}, expected (256,)"
+    assert y.qdata.shape == torch.Size([128]), f"qdata shape {tuple(y.qdata.shape)} != (128,)"
+    assert y.scale.shape == torch.Size([4, 2]), f"scale shape {tuple(y.scale.shape)} != (4, 2)"
+    assert y.quant_axis == 0 and y.pack_axis == 0, (
+        f"quant_axis/pack_axis are {y.quant_axis}/{y.pack_axis}, expected 0/0"
+    )
+
+
+def test_unsafe_view_reviews_the_components():
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(4, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    y = torch.ops.aten._unsafe_view.default(x, [2, 2, 64])
+
+    assert type(y) is MXTensor, f"_unsafe_view returned a {type(y).__name__}"
+    assert y.qdata.shape == torch.Size([2, 2, 64]), f"qdata shape {tuple(y.qdata.shape)} != (2, 2, 64)"
+    assert y.scale.shape == torch.Size([2, 2, 1, 2]), f"scale shape {tuple(y.scale.shape)} != (2, 2, 1, 2)"
+    assert y.qdata.data_ptr() == x.qdata.data_ptr(), "_unsafe_view copied qdata instead of re-viewing it"
+
+
+def test_public_reshape_rejects_non_contiguous_components():
+    """``reshape`` decomposes to ``aten.view`` before dispatch, so it cannot copy.
+
+    The wrapper's TensorImpl metadata is dense, so the composite takes the view
+    path even though the components are strided; the view handler then forwards
+    to the components, where torch refuses to merge the strided dims.
+    """
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(2, 3, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((2, 3, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+    y = x.permute(1, 0, 2)  # quant axis stays last; the leading dims are strided
+    assert not y.is_contiguous(), "the fixture should have non-contiguous components"
+
+    with pytest.raises(RuntimeError, match="not compatible with input tensor's size and stride"):
+        y.reshape(6, 64)
+
+    # Re-shapes that do not merge the strided dims still work.
+    assert y.reshape(3, 2, 64).shape == torch.Size([3, 2, 64])
+    assert y.reshape(3, 2, 1, 64).shape == torch.Size([3, 2, 1, 64])
+
+
+def test_view_rejects_a_quant_axis_that_is_not_last():
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(4, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((4, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    with pytest.raises(ValueError, match="quant axis to be the last dim"):
+        x.t().view(-1)
+
+
+def test_view_rejects_a_quant_axis_that_is_not_innermost_contiguous():
+    """A strided quant axis cannot be re-viewed without moving the block boundaries."""
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(4, 64).to(torch.float8_e4m3fn).t()  # [64, 4], stride(-1) == 64
+    scale = torch.full((64, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    assert x.qdata.stride(-1) != 1, "the fixture should keep a strided quant axis"
+    with pytest.raises(ValueError, match="innermost-contiguous quant axis"):
+        x.view(64, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "shape, blocks, destination",
+    [
+        ((4, 32), 1, (-1,)),
+        ((2, 96), 2, (-1,)),
+        ((4, 64), 1, (8, 32)),
+    ],
+    ids=["source-not-pair-aligned", "source-block-count-odd", "destination-not-pair-aligned"],
+)
+def test_view_rejects_a_last_dim_change_that_breaks_block_pairs(shape, blocks, destination):
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(shape).to(torch.float8_e4m3fn)
+    scale = torch.full((*shape[:-1], blocks, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    with pytest.raises(ValueError, match="whole packed block pairs"):
+        x.view(destination)
+
+
+def test_view_rejects_a_zero_dimensional_result():
+    config = MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn)
+    qdata = torch.randn(1, 1).to(torch.float8_e4m3fn)
+    scale = torch.full((1, 1, 2), 2.0, dtype=torch.float8_e8m0fnu)
+    x = MXTensor(qdata, scale, torch.bfloat16, -1, config)
+
+    with pytest.raises(ValueError, match="at least a 1D"):
+        x.view(())
+
+
+# =========================================================================
 # Frozen values
 # =========================================================================
 

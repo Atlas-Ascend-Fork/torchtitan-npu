@@ -20,6 +20,7 @@ from torchao_npu.quantized_tensors import (
     logical_qdata_shape,
     permutation_from_transpose,
     resolve_pack_axis,
+    resolve_view_shape,
 )
 from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
 
@@ -35,12 +36,16 @@ class MXTensor(BaseQuantizedTensor):
     Stores the quantized ``qdata`` and its E8M0 ``scale``, together with the
     configs it was built from and the quantization axis.
 
-    Shape support is limited to the axis-preserving ops -- transpose / t /
-    permute / movedim -- which ``__torch_dispatch__`` translates onto ``qdata``
-    and ``scale``, keeping ``quant_axis`` and ``pack_axis`` in sync; dims may not
-    be merged or split. ``mm`` / ``bmm`` / ``addmm`` / ``_grouped_mm`` / ``linear`` /
-    ``matmul`` are intercepted too (see below). Every other op raises
-    ``NotImplementedError``, except the handlers inherited from
+    Shape support covers the axis-preserving ops -- transpose / t / permute /
+    movedim -- which ``__torch_dispatch__`` translates onto ``qdata`` and
+    ``scale``, keeping ``quant_axis`` and ``pack_axis`` in sync (those ops may
+    not merge or split dims). ``view`` / ``_unsafe_view`` instead re-factor the
+    leading dims, only when the quant axis is the last dim and
+    innermost-contiguous (and, for FP4, the pack axis is that same last dim);
+    the last dim may change only between multiples of ``2 * block_size`` (whole
+    packed block pairs). ``mm`` / ``bmm`` / ``addmm`` / ``_grouped_mm`` /
+    ``linear`` / ``matmul`` are intercepted too (see below). Every other op
+    raises ``NotImplementedError``, except the handlers inherited from
     :class:`~torchao_npu.quantized_tensors.base_quantized_tensor.BaseQuantizedTensor`.
 
     Matmul: the right operand is the weight and must be an ``MXTensor``
@@ -296,6 +301,89 @@ def _(func, types, args, kwargs):
         raise RuntimeError(f"t() expects a tensor with <= 2 dimensions, but self is {x.ndim}D")
     perm = permutation_from_transpose(0, 1, x.ndim) if x.ndim == 2 else list(range(x.ndim))
     return return_and_correct_aliasing(func, args, kwargs, _permute(x, perm))
+
+
+def _view(func, x: MXTensor, new_shape: tuple[int, ...]) -> MXTensor:
+    """Re-shape ``x``, allowing only the changes its quantization axis can follow.
+
+    A re-shape is only supported when
+
+    * the quant axis is the last dim -- its block boundaries may not move;
+    * that axis is innermost-contiguous in ``qdata`` (``stride == 1``), the layout
+      the MX kernels consume;
+    * for FP4, the pack axis is that same last dim -- its packed pairs may not be split;
+    * the last dim either keeps its size, or changes between sizes that are both
+      multiples of ``2 * block_size`` -- every row then holds whole packed block pairs,
+      so merging or splitting rows preserves the flat pair sequence.
+
+    ``scale`` follows the same split: with the last dim unchanged it keeps its trailing
+    ``(blocks, 2)`` dims; when the last dim changes, both sides are pair-aligned, so the
+    flat pair sequence is preserved and it takes ``(dst[-1] // (2 * block_size), 2)``.
+    Both ``view`` and ``_unsafe_view`` re-view the components strictly; neither copies.
+
+    Args:
+        func: The ``aten`` op being handled, named in the messages.
+        x: The tensor to re-shape.
+        new_shape: The requested shape, possibly holding one ``-1``.
+
+    Returns:
+        An :class:`MXTensor` whose components are views of ``x``'s.
+
+    Raises:
+        ValueError: If an unsupported re-shape is requested.
+    """
+    src_shape = x.shape
+    dst_shape = resolve_view_shape(x.numel(), new_shape)  # logical numel; FP4's qdata is halved
+
+    if x.quant_axis != x.ndim - 1:
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires the quant axis to be the last dim, "
+            f"got quant_axis={x.quant_axis} for a {x.ndim}D tensor."
+        )
+    if x.qdata.stride(x.quant_axis) != 1:
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires an innermost-contiguous quant axis, "
+            f"got stride({x.quant_axis})={x.qdata.stride(x.quant_axis)} for ``qdata``."
+        )
+    if x.qdata.dtype in _FP4_DTYPES and x.pack_axis != normalize_dim(-1, x.ndim):
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires pack_axis to be the last dim for FP4, "
+            f"got pack_axis={x.pack_axis}."
+        )
+    if not dst_shape:
+        raise ValueError(f"{type(x).__name__}'s {func.name()} must yield at least a 1D tensor, got {dst_shape}.")
+    packed_block_size = 2 * x.quant_config.block_size
+    if dst_shape[-1] != src_shape[-1] and (src_shape[-1] % packed_block_size or dst_shape[-1] % packed_block_size):
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} can only change the last dim between multiples of "
+            f"{packed_block_size} (whole packed block pairs); got {src_shape[-1]} -> {dst_shape[-1]}."
+        )
+
+    # ``qdata``'s last dim is stored, not logical: FP4 packs two values per element
+    # along the quant axis, so the target's last dim is halved.
+    # ``scale`` keeps its trailing ``(blocks, 2)`` dims when the last dim is unchanged;
+    # otherwise both sides are pair-aligned and its blocks-per-row count is recomputed.
+    # Forwarding ``func`` re-views each component with the same op.
+    qdata_last = dst_shape[-1] // 2 if x.qdata.dtype in _FP4_DTYPES else dst_shape[-1]
+    scale_blocks = x.scale.shape[-2] if dst_shape[-1] == src_shape[-1] else dst_shape[-1] // packed_block_size
+    qdata = func(x.qdata, (*dst_shape[:-1], qdata_last))
+    scale = func(x.scale, (*dst_shape[:-1], scale_blocks, x.scale.shape[-1]))
+    # The quant axis stays last; FP4's pack axis is that same last dim.
+    pack_axis = -1 if x.pack_axis is not None else None
+    return MXTensor(qdata, scale, x.dtype, -1, x.quant_config, x.act_quant_config, pack_axis)
+
+
+@implements(aten.view.default)
+def _(func, types, args, kwargs):
+    x, new_shape = args[0], args[1]
+    return return_and_correct_aliasing(func, args, kwargs, _view(func, x, tuple(new_shape)))
+
+
+@implements(aten._unsafe_view.default)
+def _(func, types, args, kwargs):
+    # Not an aliasing op per its schema; the re-view shares the components either way.
+    x, new_shape = args[0], args[1]
+    return _view(func, x, tuple(new_shape))
 
 
 def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTensor]:
