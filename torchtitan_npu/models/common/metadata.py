@@ -33,7 +33,7 @@ class KernelFrame:
     the kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix this frame's
     consumer addresses -- how an operator is told to read a prefix of its operand -- and
     ``residual`` the trailing partial group of a compressed axis (``None`` where the axis is not
-    compressed; a backend that must pass the kernels a tensor substitutes zeros for it).
+    compressed; a backend whose kernels need a value substitutes zeros for it).
     """
 
     cu_seqlens: torch.Tensor

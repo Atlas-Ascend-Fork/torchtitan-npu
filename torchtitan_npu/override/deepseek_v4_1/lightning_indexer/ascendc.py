@@ -16,6 +16,7 @@ import torch
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AscLightningIndexerMetadata,
@@ -44,12 +45,10 @@ def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame):
         # no-op there rather than a second code path.
         seqused_q=q.seqused,
         seqused_k=cmp_k.seqused,
-        # A ratio-1 layer addresses the row itself: its frame has no trailing group, so
-        # ``residual`` is ``None``.  The kernel takes a tensor there, and zeros are how an
-        # empty trailing group is spelled.
+        # A3's kernels take the zero-filled empty group; A5 rejects a value at ratio 1.
         cmp_residual_k=(
             cmp_k.residual
-            if cmp_k.residual is not None
+            if cmp_k.residual is not None or _IS_A5
             else torch.zeros(cmp_k.seqused.shape, dtype=torch.int32, device=cmp_k.seqused.device)
         ),
         layout_q=_LAYOUT,
