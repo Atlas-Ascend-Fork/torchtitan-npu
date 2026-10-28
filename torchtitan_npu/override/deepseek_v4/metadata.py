@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The DeepSeek-V4 fused attention's metadata: the AI_CPU records only.
+"""The DeepSeek-V4 fused attention's AI_CPU records and compact-selector proof.
 
 The model-dir entry (``models/deepseek_v4/metadata.py``) owns the row and its frames; this
 module owns exactly what the AscendC kernels add to it, grouped by the consumer that launches
@@ -28,9 +28,9 @@ it -- one group per pair of kernels, one field per direction::
     sized with.
 
 ``AscV4Metadata``
-    the model row with this geometry's records attached; it adds ``aicpu_metadata`` and nothing
-    else.  Under context parallelism its ``prepare_cp_metadata`` rebuilds both the frames and the
-    records for this rank.
+    the model row with this geometry's records and optional compact-selector proof attached.
+    Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, records and proof
+    for this rank.
 
 The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
 (``models/common/carry_exchange.CarryExchange``), which builds the augmented
@@ -134,6 +134,31 @@ class AicpuMetadata:
     lightning_indexer: AscLightningIndexerMetadata
 
 
+@dataclass(frozen=True, kw_only=True, slots=True, eq=False)
+class CompactSelectorFrameProof:
+    """Eager validation bound to the exact compact selector frame tensors.
+
+    Tensor references are pytree leaves, not hidden host context: a frame
+    replacement must not inherit a proof for different boundaries or prefixes.
+    Versions are checked by the real opaque Pro callbacks, outside tracing.
+    """
+
+    q_cu: torch.Tensor
+    q_seqused: torch.Tensor
+    k_cu: torch.Tensor
+    k_seqused: torch.Tensor
+    positions_q: torch.Tensor
+    selector_k_gather: torch.Tensor | None
+    key_tokens: int
+    versions: tuple[int, ...]
+
+    def tensors(self) -> list[torch.Tensor]:
+        tensors = [self.q_cu, self.q_seqused, self.k_cu, self.k_seqused, self.positions_q]
+        if self.selector_k_gather is not None:
+            tensors.append(self.selector_k_gather)
+        return tensors
+
+
 @dataclass(kw_only=True, slots=True)
 class AscV4Metadata(DeepSeekV4Metadata):
     """The fused entry: the model row and frames, plus this geometry's AscendC records.
@@ -149,6 +174,9 @@ class AscV4Metadata(DeepSeekV4Metadata):
 
     aicpu_metadata: AicpuMetadata
     """This geometry's AI_CPU records, grouped by the kernel that reads them."""
+
+    compact_selector_frame_proof: CompactSelectorFrameProof | None = None
+    """Eager proof for the compact-only Pro selector; absent for unverified frames."""
 
     @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
@@ -207,6 +235,12 @@ if AicpuGeometry not in SUPPORTED_NODES:
 
 if AicpuMetadata not in SUPPORTED_NODES:
     register_dataclass(AicpuMetadata, serialized_type_name=f"{AicpuMetadata.__module__}.{AicpuMetadata.__name__}")
+
+if CompactSelectorFrameProof not in SUPPORTED_NODES:
+    register_dataclass(
+        CompactSelectorFrameProof,
+        serialized_type_name=f"{CompactSelectorFrameProof.__module__}.{CompactSelectorFrameProof.__name__}",
+    )
 
 if AscV4Metadata not in SUPPORTED_NODES:
     register_dataclass(AscV4Metadata, serialized_type_name=f"{AscV4Metadata.__module__}.{AscV4Metadata.__name__}")

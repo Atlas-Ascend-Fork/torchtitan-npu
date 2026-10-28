@@ -59,6 +59,7 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
     AicpuMetadata,
     AscLightningIndexerMetadata,
     AscSparseAttentionMetadata,
+    CompactSelectorFrameProof,
     lightning_indexer_options,
 )
 from torchtitan_npu.override.deepseek_v4.metadata import (
@@ -304,6 +305,66 @@ def _sparse_attention_records(
     return smla_metadata, smla_grad_metadata
 
 
+def _compact_selector_frame_proof(
+    q: KernelFrame,
+    key_frame: KernelFrame,
+    positions_q: torch.Tensor,
+    selector_k_gather: torch.Tensor | None,
+    key_tokens: int,
+) -> CompactSelectorFrameProof | None:
+    """Validate once at the eager metadata boundary, never inside a layer graph.
+
+    The single scalar read combines compactness, monotonicity and canonical
+    endpoints. Noncompact frames remain available to backends that support
+    seqused; they simply receive no compact-only Pro proof.
+    """
+    q_cu, q_used = q.cu_seqlens, q.seqused
+    k_cu, k_used = key_frame.cu_seqlens, key_frame.seqused
+    if (
+        q_cu.ndim != 1
+        or k_cu.ndim != 1
+        or q_used.ndim != 1
+        or k_used.ndim != 1
+        or q_cu.numel() < 2
+        or q_cu.shape != k_cu.shape
+        or q_used.numel() != q_cu.numel() - 1
+        or k_used.numel() != k_cu.numel() - 1
+    ):
+        return None
+    q_lengths, k_lengths = torch.diff(q_cu), torch.diff(k_cu)
+    valid = (
+        (q_cu[0] == 0)
+        & (k_cu[0] == 0)
+        & (q_cu[-1] == positions_q.numel())
+        & (k_cu[-1] == key_tokens)
+        & (q_lengths >= 0).all()
+        & (k_lengths >= 0).all()
+        & (q_used == q_lengths).all()
+        & (k_used == k_lengths).all()
+    )
+    if not bool(valid):
+        return None
+    tensors = [q_cu, q_used, k_cu, k_used, positions_q]
+    if selector_k_gather is not None:
+        tensors.append(selector_k_gather)
+    try:
+        versions = tuple(tensor._version for tensor in tensors)
+    except RuntimeError:
+        # Inference tensors do not track versions. Do not change another
+        # backend's usable frames merely because Pro cannot certify them.
+        return None
+    return CompactSelectorFrameProof(
+        q_cu=q_cu,
+        q_seqused=q_used,
+        k_cu=k_cu,
+        k_seqused=k_used,
+        positions_q=positions_q,
+        selector_k_gather=selector_k_gather,
+        key_tokens=key_tokens,
+        versions=versions,
+    )
+
+
 def build_aicpu_metadata(
     metadata: DeepSeekV4Metadata,
     *,
@@ -327,7 +388,8 @@ def build_aicpu_metadata(
     cmp_k = metadata.cmp_k if cmp_k is None else cmp_k
     if cmp_k is not None and ratio <= 1:
         cmp_k = None
-    if cmp_k is not None and ratio > 1 and int(cmp_k.cu_seqlens[-1]) == 0:
+    cmp_tokens = int(cmp_k.cu_seqlens[-1]) if cmp_k is not None and ratio > 1 else 0
+    if cmp_k is not None and ratio > 1 and cmp_tokens == 0:
         raise ValueError(
             f"batch has no complete compression block for ratio={ratio}; doc-packed sequences "
             "must be long enough to produce at least one full block."
@@ -363,16 +425,24 @@ def build_aicpu_metadata(
         sparse_attn=AscSparseAttentionMetadata(fwd=smla_metadata, bwd=smla_grad_metadata),
         lightning_indexer=AscLightningIndexerMetadata(fwd=li_record, bwd=slig_metadata),
     )
+    query_positions = positions_q if positions_q is not None else metadata.positions_q
+    compact_proof = None
+    if ratio == LI_CMP_RATIO and geometry.index_num_heads == 64 and geometry.index_head_dim == 128:
+        key_frame = cmp_k if selector_k is None else selector_k
+        if key_frame is not None:
+            key_tokens = cmp_tokens if selector_k_gather is None else selector_k_gather.numel()
+            compact_proof = _compact_selector_frame_proof(q, key_frame, query_positions, selector_k_gather, key_tokens)
     result = AscV4Metadata(
         cu_seq_q=metadata.cu_seq_q,
         cu_seq_k=metadata.cu_seq_k,
         ratio=ratio,
-        positions_q=positions_q if positions_q is not None else metadata.positions_q,
+        positions_q=query_positions,
         exchange=exchange,
         q=q,
         swa_k=swa_k,
         cmp_k=cmp_k,
         aicpu_metadata=record,
+        compact_selector_frame_proof=compact_proof,
         selector_k=selector_k,
         selector_k_gather=selector_k_gather,
         swa_k_prefix=swa_k_prefix,
