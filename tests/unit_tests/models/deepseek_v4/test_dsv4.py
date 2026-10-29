@@ -149,6 +149,7 @@ def build_compressor(dsv4, ratio):
             head_dim=HD,
             rope_head_dim=RD,
             compress_ratio=ratio,
+            carry_exchange=dsv4.compressor.CarryExchange.Config(ratio=ratio),
             wkv=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             wgate=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             norm=BuildCfg(lambda: RMS(HD)),
@@ -167,7 +168,7 @@ def manual_compress(x, md, comp, ratio):
     """
     flat_x = x.flatten(0, 1).float()
     out = []
-    for qs, qe in pairwise(md.cu_seq_q.tolist()):
+    for qs, qe in pairwise(md.swa_k.cu_seqlens.tolist()):
         c_len = (qe - qs) // ratio
         tokens = flat_x[qs:qe].view(c_len, ratio, DIM)
         kv = F.linear(tokens, comp.wkv.weight.float())
@@ -273,14 +274,14 @@ def test_compressor_numerics_ratio4(inputs, batch_size):
     x = x.reshape(batch_size, -1, DIM).requires_grad_()
     pos = pos.reshape(batch_size, -1)
     comp4 = build_compressor(dsv4, 4)
-    cmp4 = comp4(x, pos, cu_seqlens=md[4].cu_seq_q)
+    cmp4 = comp4(x, pos, cu_seqlens=md[4].swa_k.cu_seqlens)
     # Four 128-token documents: 4 * 128 // 4 whole blocks over the row.
     assert cmp4.shape == (batch_size, 128 // batch_size, 16)
     ref = manual_compress(x, md[4], comp4, 4).reshape_as(cmp4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
     # Reframing the same document stream must preserve its exact backward, including
     # nonuniform upstream gradients. The independent per-document oracle above checks math.
-    packed = comp4(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[4].cu_seq_q)
+    packed = comp4(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[4].swa_k.cu_seqlens)
     upstream = torch.linspace(-0.25, 0.75, cmp4.numel()).reshape_as(cmp4)
     parameters = (x, *comp4.parameters())
     for actual, expected in zip(
@@ -298,13 +299,13 @@ def test_compressor_numerics_ratio128(inputs, batch_size):
     x = x.reshape(batch_size, -1, DIM).requires_grad_()
     pos = pos.reshape(batch_size, -1)
     comp128 = build_compressor(dsv4, 128)
-    cmp128 = comp128(x, pos, cu_seqlens=md[128].cu_seq_q)
+    cmp128 = comp128(x, pos, cu_seqlens=md[128].swa_k.cu_seqlens)
     assert cmp128.shape == (batch_size, 4 // batch_size, 16)
     ref = manual_compress(x, md[128], comp128, 128).reshape_as(cmp128)
     _assert_rounding_floor((cmp128 - ref).abs(), ref.abs().max().item())
     # Reframing the same document stream must preserve its exact backward, including
     # nonuniform upstream gradients. The independent per-document oracle above checks math.
-    packed = comp128(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[128].cu_seq_q)
+    packed = comp128(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[128].swa_k.cu_seqlens)
     upstream = torch.linspace(-0.25, 0.75, cmp128.numel()).reshape_as(cmp128)
     parameters = (x, *comp128.parameters())
     for actual, expected in zip(
@@ -336,7 +337,7 @@ def test_attention_numerics_ratio4_single_block_documents(dsv4):
     cu = torch.tensor([0, 4, 8], dtype=torch.int32)
     md_s = _metadata_for(dsv4, cu, (4,))[4]
     comp_s = build_compressor(dsv4, 4)
-    cmp_s = comp_s(torch.randn(1, 8, DIM), _positions_from(cu), cu_seqlens=md_s.cu_seq_q)
+    cmp_s = comp_s(torch.randn(1, 8, DIM), _positions_from(cu), cu_seqlens=md_s.swa_k.cu_seqlens)
     # Two documents of exactly one block each: two compressed entries.
     assert cmp_s.shape == (1, 2, 16)
     core_s = dsv4.attention.CompressedSparseInnerAttention(
@@ -352,8 +353,8 @@ def test_attention_numerics_ratio4_single_block_documents(dsv4):
             torch.randn(1, 8, 4, 8),
             torch.randn(1, 2, 8),
             torch.randn(1, 8, 4),
-            md_s.cu_seq_q,
-            md_s.cu_seq_k,
+            md_s.swa_k.cu_seqlens,
+            md_s.cmp_k.cu_seqlens,
             4,
         )
         out_s = core_s(
@@ -385,18 +386,20 @@ def _gradient_case(dsv4, ratio=4):
     md = mds[ratio]
     seqlen = sum(docs)
     sink = torch.randn(3)
-    pool = build_compressor(dsv4, ratio)(torch.randn(1, seqlen, DIM), _positions_from(cu), cu_seqlens=md.cu_seq_q)
+    pool = build_compressor(dsv4, ratio)(
+        torch.randn(1, seqlen, DIM), _positions_from(cu), cu_seqlens=md.swa_k.cu_seqlens
+    )
     assert pool.shape[1] > 0, "the fixture must exercise a non-empty compressed pool"
 
     sparse = None
     if ratio == 4:
-        n_cmp = int(mds[4].cu_seq_k[-1])
+        n_cmp = int(mds[4].cmp_k.cu_seqlens[-1])
         sparse = dsv4.compressor.select_compressed_slots(
             torch.randn(1, seqlen, 4, 8),
             torch.randn(1, n_cmp, 8),
             torch.randn(1, seqlen, 4),
-            mds[4].cu_seq_q,
-            mds[4].cu_seq_k,
+            mds[4].swa_k.cu_seqlens,
+            mds[4].cmp_k.cu_seqlens,
             8,
         )
 

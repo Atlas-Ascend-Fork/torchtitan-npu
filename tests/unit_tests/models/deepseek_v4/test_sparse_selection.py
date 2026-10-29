@@ -40,14 +40,16 @@ def _inputs(seqlen, seed=0):
 
 
 def _rescore(dsv4, metadata, idx_q, idx_k, idx_w, picks):
-    return dsv4.compressor.student_logits_at_picks(idx_q, idx_k, idx_w, picks, metadata.cu_seq_q, metadata.cu_seq_k)
+    return dsv4.compressor.student_logits_at_picks(
+        idx_q, idx_k, idx_w, picks, metadata.swa_k.cu_seqlens, metadata.cmp_k.cu_seqlens
+    )
 
 
 def test_student_logits_rescore_a_document_local_selection(dsv4):
     """Each pick is read as its own document's entry, not as a row-wide one."""
     metadata = _metadata(dsv4)
     seqlen = int(_CU[-1])
-    starts = metadata.cu_seq_k
+    starts = metadata.cmp_k.cu_seqlens
     idx_q, idx_k, idx_w = _inputs(seqlen)
 
     scores = _rescore(dsv4, metadata, idx_q, idx_k, idx_w, _PICKS)
@@ -134,8 +136,8 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
         idx_q.detach(),
         idx_k.detach(),
         idx_w.detach(),
-        metadata.cu_seq_q,
-        metadata.cu_seq_k,
+        metadata.swa_k.cu_seqlens,
+        metadata.cmp_k.cu_seqlens,
         2,
     )
     assert torch.equal(picks, expected_picks)

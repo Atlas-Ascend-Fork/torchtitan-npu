@@ -885,6 +885,7 @@ def _stripped(
     non_blocking_capacity_factor: float | None = None,
     *,
     num_experts: int = 4,
+    max_seq_len: int = 8192,
 ) -> DeepSeekV41Model.Config:
     """A single-card DeepSeek-V4.1 that differs from the flash flavor in layers alone.
 
@@ -898,8 +899,12 @@ def _stripped(
     full-resolution layer, so the pool source is a Full Mode layer and the Reindex Mode
     layer after it searches what that source built.  Together with the ratio-2 Full Mode
     layer outside the hierarchy, all three branches of the fused selector are reachable.
+
+    Engram rides along: the fused kernels fix the released geometry, so a context-parallel
+    check of Engram cannot use the debug widths, and the tables come from the debug Engram
+    geometry (small, no tokenizer compression) on the first decoder layer.
     """
-    return _make_v41_config(
+    config = _make_v41_config(
         dim=5120,
         # The released MLA attention geometry; SMLA rejects anything but head_dim 512.
         n_heads=64,
@@ -914,7 +919,7 @@ def _stripped(
         index_topk=512,
         candidate_topk_blocks=2048,
         moe_inter_dim=2304,
-        max_seq_len=4096,
+        max_seq_len=max_seq_len,
         n_layers=len(V41_STRIPPED_COMPRESS_RATIOS),
         vocab_size=129280,
         window_size=128,
@@ -948,6 +953,7 @@ def _stripped(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
+    return _attach_engram(config, dataclasses.replace(_ENGRAM_DEBUG_GEOMETRY, layer_ids=(1,)))
 
 
 def _attach_engram(config, engram):

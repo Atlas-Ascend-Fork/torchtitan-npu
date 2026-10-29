@@ -112,6 +112,7 @@ def _make_compressor_config(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
         param_init=_APE_INIT,
         wkv=Linear.Config(
             in_features=dim,
@@ -171,7 +172,6 @@ def _make_indexer_config(
             coff=coff,
             rope=rope,
         ),
-        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
     )
 
 
@@ -249,7 +249,6 @@ def _make_v4_attn_config(
         norm_eps=norm_eps,
         lightning_indexer=lightning_indexer_cfg,
         inner_attention=inner_attention_cfg,
-        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
         # Attention sites are head_dim wide; the base rope may be reused by
         # the indexer (index_head_dim wide), so split is pinned per site.
         rope=dataclasses.replace(rope, split=head_dim - rope_head_dim),

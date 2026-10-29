@@ -33,7 +33,7 @@ Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
   map's entries carry this rank's frames and the kernel records built from
   them, so they are prepared after the shard, on this rank's rows.  0.3.0 has
   neither ``ParallelismContext`` nor ``shard_tensors``, so the shard inside
-  ``_cp_shard`` is the pinned ``prepare_context_parallel_input`` entry point.
+  ``_cp_shard`` is the pinned ``cp_shard`` entry point.
 
 0.3.0 adaptation, because the pinned version predates #4116/#4617:
 ``labels`` is passed separately (0.3.0 keeps it out of ``input_dict``), and
@@ -48,15 +48,17 @@ from typing import Any
 
 import torch
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import BaseAttention, FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
 
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import layout_needs_positions
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
     cp_shard_context_set,
     prepare_cp_metadata_map,
+    resolve_cp_layout,
 )
 
 __all__ = ["apply"]
@@ -165,44 +167,63 @@ def _cp_shard(
     ``_cp_shard`` is its name.  The map carries this rank's frames and the
     kernel records built from them, so it is rank-dependent exactly as
     ``attention_masks`` is: its transform runs *after* the shard, on this rank's
-    rows, with the permutation the load balancer sharded by and the global
-    positions the map was built from.  Upstream calls the backend's
-    ``prepare_cp_metadata`` per entry with the permutation alone because the
-    mesh is ambient there; 0.3.0 hands the mesh, the load-balancer type and
-    those positions along as well.
+    rows, with the row's positions the map was built from.  Upstream calls the
+    backend's ``prepare_cp_metadata`` per entry because the mesh is ambient
+    there; 0.3.0 hands the mesh, the load-balancer type and those positions
+    along as well.
 
     The shard itself stays 0.3.0's: the pinned version has neither
-    ``ParallelismContext`` nor ``shard_tensors``, so the closed
-    ``prepare_context_parallel_input`` remains the entry point.
+    ``ParallelismContext`` nor ``shard_tensors``, so the pinned ``cp_shard``
+    remains the entry point.
+
+    ``load_balancer_type`` names the layout the inputs are sharded by; ``None``
+    asks the stack, whose metadata declares the layout it can describe
+    (``cp_layout``).  A repository layout -- ``doc_chunk`` -- is built *inside*
+    ``cp_shard`` from the row's boundaries, so nothing here precomputes a
+    permutation; the transform is handed none, because a rank-local entry of
+    these layouts is a function of the row's boundaries alone.  A pinned layout
+    (``headtail``) still hands its permutation over, as upstream does.
     """
     attention_metadata = extra_kwargs.get("attention_metadata")
     # The shard below replaces ``positions`` with this rank's slice; the
     # transform describes the row the shard started from, so keep the global
     # one before that happens.
-    positions = extra_kwargs.get("positions")
+    row_positions = extra_kwargs.get("positions")
+    # Only a boundary-driven layout reads the positions: it is a function of where the documents
+    # start.  The pinned ones are functions of the length alone, so a model that carries none
+    # keeps sharding exactly as it did before this repository's layouts existed.
+    layout = resolve_cp_layout(load_balancer_type, attention_metadata)
+    if layout_needs_positions(layout) and row_positions is None:
+        raise ValueError(f"the {layout!r} layout needs the row's positions: they are what it is derived from.")
     permutation = None
-    if attention_metadata and load_balancer_type == "headtail" and positions is not None:
+    if attention_metadata and layout == "headtail" and row_positions is not None:
         permutation = _HeadTailLoadBalancer(
-            positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
+            row_positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
         )._generate_indices()
 
-    inputs, labels, extra_kwargs = prepare_context_parallel_input(
-        inputs,
-        labels,
-        extra_kwargs,
+    attention_masks = extra_kwargs.get("attention_masks")
+    buffers: tuple[torch.Tensor, ...] = (inputs, labels) if row_positions is None else (inputs, labels, row_positions)
+    sharded, attention_masks = cp_shard(
         cp_mesh,
-        device,
-        load_balancer_type,
-        ptrr_mask_key,
+        buffers,
+        attention_masks,
+        layout,
+        ptrr_mask_key=ptrr_mask_key,
+        positions=row_positions,  # pyrefly: ignore [unexpected-keyword]
     )
+    inputs, labels = sharded[0], sharded[1]
+    if len(sharded) > 2:
+        extra_kwargs["positions"] = sharded[2]
+    if attention_masks is not None:
+        extra_kwargs["attention_masks"] = attention_masks
 
     if attention_metadata:
         # Upstream's loop, with the pinned stand-in for its ambient parallelism
         # context published around it (see ``attention_metadata``).
         with cp_shard_context_set(
             cp_mesh=cp_mesh,
-            load_balancer_type=load_balancer_type,
-            positions=positions,
+            load_balancer_type=layout,
+            positions=row_positions,
         ):
             extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(
                 attention_metadata,

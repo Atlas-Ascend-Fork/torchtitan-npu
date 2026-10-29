@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+from torchtitan_npu.override import _IS_A5
 import torch_npu
 from torch import fx
 from torchtitan.experiments.graph_trainer import passes as graph_passes
@@ -940,11 +942,14 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     assert metadata.ratio == 4
     metadata = _batch_chunk_metadata(metadata)
 
-    # The row stays the row; ``cu_seq_k`` is this entry's own fold of it.
-    assert metadata.cu_seq_q.tolist() == [0, 128, 256]
-    assert metadata.cu_seq_k.tolist() == [0, 32, 64]
+    # The row stays the row; the compressed frame is this entry's own fold of it.
+    assert metadata.swa_k.cu_seqlens.tolist() == [0, 128, 256]
+    assert metadata.cmp_k is not None and metadata.cmp_k.cu_seqlens.tolist() == [0, 32, 64]
     assert metadata.batch_chunk_tensors is not None
-    assert metadata.cu_seq_q._npu_chunk_cv_metadata_pair == ("cu_seq_q", -1)
+    # On arch35 the query and the sliding window share one row tensor, so the first role that
+    # tagged it wins; arch22 rebuilds the window frame, which is tagged under its own name.
+    expected_pair = ("q.cu_seqlens" if _IS_A5 else "swa_k.cu_seqlens", -1)
+    assert metadata.swa_k.cu_seqlens._npu_chunk_cv_metadata_pair == expected_pair
     assert len(li_calls) == 3
     for (_, call), q_bounds, k_bounds in zip(
         li_calls, ([0, 128, 256], [0, 128], [0, 128]), ([0, 32, 64], [0, 32], [0, 32]), strict=True
@@ -955,8 +960,8 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     assert metadata.aicpu_metadata.lightning_indexer.fwd.tolist() == [0, 256]
     for chunk_id, tensors in enumerate(metadata.batch_chunk_tensors):
         fields = {value._npu_chunk_cv_metadata_pair: value for value in tensors}
-        assert fields["cu_seq_q", chunk_id].tolist() == [0, 128]
-        assert fields["cu_seq_k", chunk_id].tolist() == [0, 32]
+        assert fields["q.cu_seqlens", chunk_id].tolist() == [0, 128]
+        assert fields["cmp_k.cu_seqlens", chunk_id].tolist() == [0, 32]
         # One entry is one geometry: the chunk re-cut carries this geometry's record set, and
         # the role names are geometry-free because the ratio is part of the metadata.
         assert (("aicpu.sparse_attn.fwd", chunk_id) in fields) != chunk_only_metadata

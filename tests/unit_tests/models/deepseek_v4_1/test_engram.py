@@ -125,6 +125,28 @@ def test_hash_resets_ngram_context_at_packed_document_boundary():
     torch.testing.assert_close(packed_hashes[:, 2:], document_hashes, rtol=0, atol=0)
 
 
+def test_per_row_history_and_one_window_state_the_same_rows():
+    """Two history contracts, one meaning: the tokens before the local rows.
+
+    ``[B, H]`` states one window shared by every local row (what a contiguous shard hands over);
+    ``[B, L, H]`` states each row's own predecessors (what a document-parallel layout produces).
+    Where both can express the same rows they must hash identically.
+    """
+    table = _build_engram().table
+    ids = torch.tensor([[9, 10]], dtype=torch.int64)
+    positions = torch.tensor([[0, 1]], dtype=torch.int64)
+
+    # Two n-gram orders, so a row looks two tokens back: the window carries both distances.
+    window = table.hash(ids, positions, token_history=torch.tensor([[9, 9]], dtype=torch.int64))
+    per_row = table.hash(ids, positions, token_history=torch.tensor([[[9, 9], [9, 9]]], dtype=torch.int64))
+    torch.testing.assert_close(window, per_row, rtol=0, atol=0)
+
+    # The first row starts its document, so its entries are masked either way; giving it another
+    # document's tail changes nothing, which is the mask the per-row contract relies on.
+    other_tail = table.hash(ids, positions, token_history=torch.tensor([[[5, 5], [9, 9]]], dtype=torch.int64))
+    torch.testing.assert_close(window, other_tail, rtol=0, atol=0)
+
+
 def test_forward_backward_matches_official_demo_dataflow():
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(3)

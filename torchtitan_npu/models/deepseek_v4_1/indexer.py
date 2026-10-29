@@ -443,7 +443,9 @@ class HierarchicalIndexer(Module):
         Args:
             x: Hidden states of shape ``[B, L, D]``.
             qr: Query LoRA latent of shape ``[B, L, Q]``.
-            positions: Position ids of shape ``[B, L]``.
+            positions: The query frame's own position ids (``[B, L]``).  The keys' positions are
+                the entry's ``position_k``, which under context parallelism is the key stream's
+                window rather than the query frame's rows.
             attention_metadata: The forward's varlen metadata; the indexer reads the row's
                 boundaries, which say which pool entries a query's own document contributed.
             latent: The compressor's pre-RoPE latent; a Full Mode layer projects its keys
@@ -477,20 +479,21 @@ class HierarchicalIndexer(Module):
         if self.mode is FULL:
             assert latent is not None, "A Full Mode indexer projects its keys from the compressor latent."
             idx_k = self.k_norm(self.wk(latent))
-            # One rank-2 head; RoPE rotates rank-3 [B, N, 1, H], with the entry's own
-            # first token as its position.
-            idx_k = self.rope(idx_k.unsqueeze(2), positions=positions[..., :: self.compress_ratio]).squeeze(2)
+            # One rank-2 head; RoPE rotates rank-3 [B, N, 1, H], at the key stream's own pooled
+            # positions -- the entry's, one per compression block.
+            idx_k = self.rope(
+                idx_k.unsqueeze(2), positions=attention_metadata.position_k[..., :: self.compress_ratio]
+            ).squeeze(2)
         else:
             assert idx_k is not None, (
                 "A Reindex Mode indexer rescores the shared index keys, which no preceding Full Mode layer produced."
             )
 
-        # The index query is rotated at the token's own position, which the metadata carries: the
-        # positions beside the input describe the keys, and under CP the queries are a permuted
-        # copy of those rows, so the two are not the same list of positions.
+        # The index query rotates at the position the input carried: that frame's own positions,
+        # the same ones the attention's queries rotate at.
         idx_q = self.rope(
             self.wq_b(qr).unflatten(-1, (self.num_index_heads, self.index_head_dim)),
-            positions=attention_metadata.positions_q,
+            positions=positions,
         )
         # Scaled by the index softmax scale and the head count, as in the reference: the
         # per-head scores are averaged rather than summed.

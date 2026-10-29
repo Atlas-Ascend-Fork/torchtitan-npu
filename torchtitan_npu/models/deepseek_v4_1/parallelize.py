@@ -27,6 +27,7 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh, validate_config
 
 from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
@@ -167,6 +168,7 @@ def parallelize_deepseek_v4_1(
     dump_folder: str,
 ):
     """Parallelize V4.1: sharding config, AC, then the decoder FSDP wrap."""
+    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
     if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
         validate_config(parallel_dims, model)
         model.parallelize(parallel_dims)

@@ -250,7 +250,7 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
     reference_x = x.detach().clone().requires_grad_()
     perturbation = torch.linspace(-0.02, 0.03, module.head_dim)
 
-    actual = module(x, positions, cu_seqlens=metadata.cu_seq_q)
+    actual = module(x, positions, cu_seqlens=metadata.swa_k.cu_seqlens)
     # Match the operator boundary: accumulate APE gradients in FP32, then cast
     # once back to the BF16 parameter instead of rounding each sliced contribution.
     raw = _document_pool(
@@ -300,9 +300,9 @@ def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api,
     reference_x = x.detach().clone().requires_grad_()
 
     actual = torch.compile(module, backend="aot_eager", fullgraph=True, dynamic=True)(
-        x, positions, cu_seqlens=metadata.cu_seq_q
+        x, positions, cu_seqlens=metadata.swa_k.cu_seqlens
     )
-    expected = reference(reference_x, positions, cu_seqlens=metadata.cu_seq_q)
+    expected = reference(reference_x, positions, cu_seqlens=metadata.swa_k.cu_seqlens)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
     actual.sum().backward()
     expected.sum().backward()
@@ -407,8 +407,7 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
             boundaries,
         )
         pooled = module(carry.x, carry.positions, cu_seqlens=carry.cu_seqlens)
-        if carry.trim:
-            pooled = pooled.narrow(1, carry.trim, pooled.size(1) - carry.trim)
+        pooled = pooled.narrow(1, carry.trim, pooled.size(1) - carry.trim)
         actual = pooled.squeeze(0)
         expected = global_expected[rank * (slab // ratio) : (rank + 1) * (slab // ratio)]
         # The CP segments and full documents use different CPU GEMM batch shapes.

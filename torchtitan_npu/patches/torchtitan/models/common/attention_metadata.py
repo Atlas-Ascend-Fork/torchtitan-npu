@@ -179,6 +179,32 @@ def cp_shard_context_set(
         _CP_SHARD_CONTEXT.reset(token)
 
 
+def cp_layout_of(attention_metadata: AttentionMetadataMap | None) -> str | None:
+    """The layout these metadata describe, when the run names none (``cp_layout``).
+
+    A stack's rank-local metadata exists for one layout only: the frames it carries address one
+    arrangement of the row.  Declaring it on the metadata class lets a run leave
+    ``--parallelism.context-parallel-load-balancer`` unset and still be sharded by the layout its
+    own attention reads.  A stack that declares nothing keeps the pinned behaviour, and asking for
+    a layout the metadata cannot describe is refused by the transform itself.
+    """
+    for metadata in (attention_metadata or {}).values():
+        layout = getattr(type(metadata), "cp_layout", None)
+        if layout is not None:
+            return layout
+    return None
+
+
+def resolve_cp_layout(load_balancer_type: str | None, attention_metadata: AttentionMetadataMap | None) -> str | None:
+    """The layout this run shards by: the configured one, or the stack's declared default.
+
+    Every ``cp_shard`` call site goes through this, so a run that leaves the flag unset shards
+    *every* replicated tensor by the same layout -- the model's own inputs and the MTP depths
+    alike.  Resolving it at one call site only would silently cut the other one contiguously.
+    """
+    return load_balancer_type or cp_layout_of(attention_metadata)
+
+
 def prepare_cp_metadata_map(
     attention_metadata: AttentionMetadataMap,
     *,

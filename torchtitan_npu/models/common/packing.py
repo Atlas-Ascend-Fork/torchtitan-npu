@@ -56,7 +56,9 @@ def require_document_alignment(
     """
     lengths = cu_seqlens[1:] - cu_seqlens[:-1]
     required = max(cp_size, 1) * max(ratio, 1)
-    if bool((lengths <= 0).any()) or bool((lengths % required).any()):
+    # One device read, not two: the two failures share a message, and this runs once per
+    # geometry per microbatch, where a second sync per call is measurable.
+    if bool(((lengths <= 0) | (lengths % required != 0)).any()):
         factors = []
         if cp_size > 1:
             factors.append(f"cp_size={cp_size}")

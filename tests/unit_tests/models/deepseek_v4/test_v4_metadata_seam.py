@@ -16,10 +16,12 @@ entries and the rank-local rebuild -- and drops the per-field detail.
 import pytest
 import torch
 
+from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry, AscV4Metadata
 from torchtitan_npu.override.deepseek_v4.sparse_attn import asc
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscCompressedSparseInnerAttention
@@ -107,11 +109,12 @@ def test_entries_are_built_per_geometry():
     assert {ratio for _, ratio in metadata} == {1, 4, 128}
     entry = metadata[(CompressedSparseInnerAttention.Config, 4)]
     assert type(entry) is DeepSeekV4Metadata and entry.ratio == 4
-    assert entry.cu_seq_q.tolist() == [0, 128, 256]
-    # The pool grid is this entry's own fold of the row; an unpooled geometry keeps the row.
-    assert entry.cu_seq_k.tolist() == [0, 32, 64]
-    assert metadata[(CompressedSparseInnerAttention.Config, 1)].cu_seq_k.tolist() == [0, 128, 256]
-    assert entry.positions_q.tolist() == [[*range(128), *range(128)]]
+    # The row grid lives on the sliding-window frame; the pool grid is this entry's own fold of it,
+    # and an unpooled geometry has no pool at all.  At one degree nothing is moved or restored.
+    assert entry.swa_k.cu_seqlens.tolist() == [0, 128, 256]
+    assert entry.cmp_k is not None and entry.cmp_k.cu_seqlens.tolist() == [0, 32, 64]
+    assert metadata[(CompressedSparseInnerAttention.Config, 1)].cmp_k is None
+    assert entry.cp is None
     keys = {layer.attention.attention_metadata_key for layer in model.layers.values()}
     assert {key[1] for key in keys} == {1, 4, 128}
     assert all(metadata[key].ratio == key[1] for key in keys)
@@ -130,9 +133,9 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
     def cpu_window_attention(q, swa_k, attn_sink, *, attention_metadata, **kwargs):
         # The fused kernel is unavailable on CPU, while attn-gym's packed reference
         # explicitly rejects B > 1. Isolate only that kernel with dense causal math;
-        # query exchange, RoPE and all input/output projections remain production code.
+        # RoPE and all input/output projections remain production code.
         del kwargs
-        assert attention_metadata.exchange is None
+        assert attention_metadata.cp is None
         scores = torch.einsum("bshd,btd->bhst", q, swa_k) * attention.inner_attention.softmax_scale
         causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
         scores = scores.masked_fill(~causal, float("-inf"))
@@ -146,8 +149,10 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
     positions = torch.arange(seq_len).expand(batch_size, -1)
     entry = model._get_attention_metadata(positions)[attention.attention_metadata_key]
     assert entry.batch_size == batch_size
-    assert entry.positions_q.shape == (batch_size, seq_len)
-    assert entry.cu_seq_q.tolist() == [row * seq_len for row in range(batch_size + 1)]
+    # At one degree the query frame is the row's own grid and every row is a document here;
+    # the KV frame addresses that same row.
+    assert entry.q.cu_seqlens.tolist() == [row * seq_len for row in range(batch_size + 1)]
+    assert entry.swa_k.cu_seqlens.tolist() == entry.q.cu_seqlens.tolist()
     parameters = tuple(attention.parameters())
     upstream = torch.linspace(0.25, 1.25, x.numel()).reshape_as(x)
 
@@ -249,10 +254,15 @@ class _FakeCPMesh:
 def _prepare_for_rank(attention_metadata, positions, *, rank: int, cp_size: int = 2):
     with cp_shard_context_set(
         cp_mesh=_FakeCPMesh(rank, cp_size),
-        load_balancer_type=None,
+        load_balancer_type=DOC_CHUNK_LAYOUT,
         positions=positions,
     ):
         return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=None)
+
+
+def _prefix(lengths: torch.Tensor) -> torch.Tensor:
+    """The frame of a per-document prefix: the running sum of the reach, from zero."""
+    return torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(lengths, 0).to(torch.int32)])
 
 
 def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
@@ -276,21 +286,24 @@ def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
     rank_metadata = [_prepare_for_rank(global_metadata, positions, rank=rank) for rank in range(2)]
     for rank, metadata in enumerate(rank_metadata):
         # The row stays the whole row; the queries are this rank's chunks.
-        assert torch.equal(metadata.cu_seq_q, row)
-        assert torch.equal(metadata.cu_seq_k, (row // 4).to(torch.int32))
+        _prefix_of_reach = _prefix((rank + 1) * chunk)
         assert metadata.cmp_k is not None
         assert torch.equal(metadata.q.cu_seqlens, (row // 2).to(torch.int32))
         assert torch.equal(metadata.q.seqused, chunk)
-        assert torch.equal(metadata.swa_k.cu_seqlens, row)
+        # The key frames are the ones the kernels read: the row itself where they honour
+        # ``seqused``, the reach where they anchor their mask at the frame's end.
+        expected_window = row if _IS_A5 else _prefix_of_reach
+        assert torch.equal(metadata.swa_k.cu_seqlens, expected_window)
         assert torch.equal(metadata.swa_k.seqused, (rank + 1) * chunk)
-        assert torch.equal(metadata.cmp_k.cu_seqlens, (row // 4).to(torch.int32))
+        expected_pool = (row // 4).to(torch.int32) if _IS_A5 else _prefix_of_reach // 4
+        assert torch.equal(metadata.cmp_k.cu_seqlens, expected_pool)
         assert torch.equal(metadata.cmp_k.seqused, ((rank + 1) * chunk) // 4)
         assert metadata.ratio == 4
         assert metadata.aicpu_metadata.sparse_attn.fwd is not global_metadata.aicpu_metadata.sparse_attn.fwd
         assert metadata.aicpu_metadata.geometry == global_metadata.aicpu_metadata.geometry
-        assert metadata.exchange is not None
-    # The movement is rank-dependent even though the row is not.
-    assert rank_metadata[0].positions_q.tolist() != rank_metadata[1].positions_q.tolist()
+        assert metadata.cp is not None and metadata.cp.restore.exchange is not None
+    # The restore is rank-dependent even though the row is.
+    assert rank_metadata[0].position_k.tolist() != rank_metadata[1].position_k.tolist()
 
 
 def test_the_inner_attention_and_selector_own_the_cp_boundary():

@@ -59,10 +59,13 @@ def _inputs(ratio, cu, seed=0):
 def _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp):
     """The HCA rule spelled out again: own document, whole groups, causally complete."""
     entry = metadata[ratio]
-    starts = entry.cu_seq_k
-    documents = torch.searchsorted(entry.cu_seq_q[1:], torch.arange(seqlen), right=True)
+    # The pool grid is whichever frame addresses the keys this ratio pools: the compressed
+    # frame when the geometry has one, the row's own otherwise.
+    starts = entry.swa_k.cu_seqlens if entry.cmp_k is None else entry.cmp_k.cu_seqlens
+    row = entry.swa_k.cu_seqlens
+    documents = torch.searchsorted(row[1:], torch.arange(seqlen), right=True)
     doc_start = starts[documents]
-    local = torch.arange(seqlen) - entry.cu_seq_q[documents]
+    local = torch.arange(seqlen) - row[documents]
     ends = torch.minimum(starts[documents + 1], doc_start + (local + 1) // ratio)
     slots = torch.arange(n_cmp).unsqueeze(0)
     visible = (slots >= doc_start.unsqueeze(1)) & (slots < ends.unsqueeze(1))
@@ -80,8 +83,8 @@ def test_the_core_reads_only_the_packed_offsets(dsv4):
         torch.randn(1, seqlen, 4, 8),
         torch.randn(1, seqlen // 4, 8),
         torch.randn(1, seqlen, 4),
-        common[4].cu_seq_q,
-        common[4].cu_seq_k,
+        common[4].swa_k.cu_seqlens,
+        common[4].cmp_k.cu_seqlens,
         _TOPK,
     )
 
@@ -134,8 +137,8 @@ def test_the_reference_core_ignores_the_selector_scores(dsv4):
         torch.randn(1, seqlen, 4, 8),
         torch.randn(1, seqlen // 4, 8),
         torch.randn(1, seqlen, 4),
-        common[4].cu_seq_q,
-        common[4].cu_seq_k,
+        common[4].swa_k.cu_seqlens,
+        common[4].cmp_k.cu_seqlens,
         _TOPK,
     )
     scores = torch.randn(1, seqlen, picks.shape[-1], requires_grad=True)

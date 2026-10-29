@@ -11,10 +11,16 @@ from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.common.packing import require_document_alignment
-from torchtitan_npu.models.common.query_exchange import cp_plan
+from torchtitan_npu.models.common.restore import (
+    DOC_CHUNK_LAYOUT,
+    RestorePlan,
+    chunk_plan,
+    slab_positions,
+)
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
+from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     build_indexer_metadata,
 )
@@ -58,7 +64,8 @@ def kernel_options(
 
     Both the metadata call and the main call take these, and they must agree
     option-for-option; reading one source is what makes that structural rather than a
-    convention two call sites have to keep in step.
+    convention two call sites have to keep in step.  ``swa_k`` / ``cmp_k`` are the entry's key
+    frames -- on arch22 the per-document reach this rank may read (``a3_workaround``).
     """
     return dict(
         cu_seqlens_q=q.cu_seqlens,
@@ -119,13 +126,20 @@ class AscV41Metadata(DeepSeekV41Metadata):
 
     Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``):
     one model runs one selection width, so there is nothing to look up.  Nothing here compares the
-    metadata's geometry with the layer's own config -- that would need the numbers the reference core
-    never sees -- so an override stated with the wrong widths surfaces as the kernels' shape error.
-    Every field is a tensor, a primitive or another registered node, because the class is a pytree
-    node (see the registration below).
+    metadata's geometry with the layer's own config -- that would need the numbers the reference
+    core never sees -- so an override stated with the wrong widths surfaces as the kernels' shape
+    error.  Every field is a tensor, a primitive or another registered node, because the class is a
+    pytree node (see the registration below).
     """
 
     aicpu_metadata: AicpuMetadata
+
+    a3_workaround: A3KeyWorkaround | None = None
+    """The two key streams as arch22 must be handed them, or ``None`` where the kernels read the
+    model's own spelling (arch35).  Built once per microbatch beside the records, so the forward,
+    the backward and the selector read one frame and one gather each instead of re-deriving them
+    per layer.
+    """
 
     @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
@@ -138,19 +152,19 @@ class AscV41Metadata(DeepSeekV41Metadata):
         """This rank's frames and metadata (upstream #4617's CP half), for one geometry.
 
         The row and the rank come from the shard context, because this rank's copy is derived
-        from all of it.  ``permutation`` is unused and a permuted run is refused: these frames are
-        contiguous slabs of every document, and a load balancer's permutation would have to be
-        folded into the chunk grid, the query exchange and the engram halo alike.
+        from all of it.  ``permutation`` is unused: the layout is stated by the frames themselves
+        (chunk ``r`` of every document), and the context says which layout the shard applied --
+        the two must be the same one, so a run sharded any other way is refused here.
         """
         del permutation
         context = cp_shard_context()
         if context.cp_mesh is None or context.positions is None:
             raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type is not None:
+        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
             raise ValueError(
-                f"the V4.1 fused stack shards contiguous slabs, but the context-parallel load "
-                f"balancer is {context.load_balancer_type!r}: run with "
-                "--parallelism.context-parallel-load-balancer None."
+                "the V4.1 fused stack's rank-local frames describe the doc-chunk layout, but the "
+                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
+                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
             )
         batch_size, row_len = context.positions.shape[0], context.positions.shape[-1]
         return shard_asc_v41_metadata(
@@ -158,7 +172,7 @@ class AscV41Metadata(DeepSeekV41Metadata):
             cp_size=context.cp_mesh.size(),
             cp_rank=context.cp_mesh.get_local_rank(),
             batch_size=batch_size,
-            seq_len=row_len // context.cp_mesh.size(),
+            slab_len=row_len // context.cp_mesh.size(),
         )
 
 
@@ -197,22 +211,21 @@ def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: Aicp
     # geometry, so the port only attaches the operator outputs sized by them.
     q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
     validate_compressed_frame(ratio, cmp_k)
+    workaround = None
+    if not _IS_A5:
+        workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
+    record = build_aicpu_metadata(ratio=ratio, q=q, swa_k=swa_k, cmp_k=cmp_k, geometry=geometry)
     return AscV41Metadata(
         cu_seq_q=cu_seqlens,
         cu_seq_k=row.cu_seq_k,
-        positions_q=row.positions_q,
-        exchange=row.exchange,
+        position_k=row.position_k,
+        restore=row.restore,
         ratio=ratio,
         q=q,
         swa_k=swa_k,
         cmp_k=cmp_k,
-        aicpu_metadata=build_aicpu_metadata(
-            ratio=ratio,
-            q=q,
-            swa_k=swa_k,
-            cmp_k=cmp_k,
-            geometry=geometry,
-        ),
+        aicpu_metadata=record,
+        a3_workaround=workaround,
     )
 
 
@@ -222,7 +235,7 @@ def shard_asc_v41_metadata(
     cp_size: int,
     cp_rank: int,
     batch_size: int,
-    seq_len: int,
+    slab_len: int,
 ) -> AscV41Metadata:
     """One rank's frames and metadata: the row's grid re-cut into this rank's chunks.
 
@@ -234,7 +247,7 @@ def shard_asc_v41_metadata(
 
     The metadata is rebuilt from the rank-local frames: the metadata is the operators'
     answer for one geometry *of one frame set*, so a rank that kept the global ones would hand
-    the kernels a grid its inputs do not have.  ``seq_len`` is the **slab** width -- the shape of
+    the kernels a grid its inputs do not have.  ``slab_len`` is the **slab** width -- the shape of
     the inputs this rank holds, not of the row.
     """
     cu_seqlens = attention_metadata.cu_seq_q
@@ -252,14 +265,14 @@ def shard_asc_v41_metadata(
     chunk = (seqused // cp_size).to(torch.int32)
     # The slab is what the chunk grid has to reproduce: the row is cut into ``cp_size`` slabs and
     # the chunks are this rank's share of every document, so the two must size the same.
-    if int(chunk.sum()) != batch_size * seq_len:
+    if int(chunk.sum()) != batch_size * slab_len:
         raise ValueError(
-            f"the sliced rows ({batch_size * seq_len}) are not the chunks' total "
+            f"the sliced rows ({batch_size * slab_len}) are not the chunks' total "
             f"({int(chunk.sum())}): the boundaries describe a different row than the one the "
             "inputs were sliced from."
         )
     reach = ((cp_rank + 1) * chunk).to(torch.int32)
-    exchange = cp_plan(cu_seqlens, cp_size, cp_rank, seq_len)
+    restore = RestorePlan(exchange=chunk_plan(cu_seqlens, cp_size, cp_rank, slab_len))
     q = KernelFrame(cu_seqlens=(cu_seqlens // cp_size).to(torch.int32), seqused=chunk)
     swa_k = KernelFrame(cu_seqlens=cu_seqlens, seqused=reach)
     cmp_k = None
@@ -269,22 +282,27 @@ def shard_asc_v41_metadata(
             seqused=(reach // ratio).to(torch.int32),
             residual=None if ratio == 1 else (reach % ratio).to(torch.int32),
         )
-    return AscV41Metadata(
-        cu_seq_q=cu_seqlens,
-        cu_seq_k=attention_metadata.cu_seq_k,
-        positions_q=exchange.positions_q.reshape(batch_size, seq_len),
-        exchange=exchange,
+    workaround = None
+    if not _IS_A5:
+        workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
+    record = build_aicpu_metadata(
         ratio=ratio,
         q=q,
         swa_k=swa_k,
         cmp_k=cmp_k,
-        aicpu_metadata=build_aicpu_metadata(
-            ratio=ratio,
-            q=q,
-            swa_k=swa_k,
-            cmp_k=cmp_k,
-            geometry=attention_metadata.aicpu_metadata.geometry,
-        ),
+        geometry=attention_metadata.aicpu_metadata.geometry,
+    )
+    return AscV41Metadata(
+        cu_seq_q=cu_seqlens,
+        cu_seq_k=attention_metadata.cu_seq_k,
+        position_k=slab_positions(cu_seqlens, cp_size, cp_rank, slab_len),
+        restore=restore,
+        ratio=ratio,
+        q=q,
+        swa_k=swa_k,
+        cmp_k=cmp_k,
+        aicpu_metadata=record,
+        a3_workaround=workaround,
     )
 
 
@@ -330,11 +348,28 @@ def build_aicpu_metadata(
     if has_cmp:
         # The selector's metadata belongs to the selector that replaces it, and rides this entry:
         # the teacher edge crosses both kernels, so the two share one lifetime.
+        assert cmp_k is not None, "a geometry with a compressed axis states its frame"
         lightning_indexer = build_indexer_metadata(ratio=ratio, q=q, cmp_k=cmp_k, geometry=geometry)
     return AicpuMetadata(
         geometry=geometry,
         sparse_attn=AscSparseAttentionMetadata(fwd=sparse_attn, bwd=sparse_attn_grad),
         lightning_indexer=lightning_indexer,
+    )
+
+
+def entry_options(metadata: AscV41Metadata, *, ratio: int, window_size: int) -> dict:
+    """The two attention kernels' options, read off this entry's frames.
+
+    The forward and the backward both read their options here, so the two kernel calls cannot drift
+    apart; on arch22 the entry's key frames are the per-document reach this rank may read
+    (``a3_workaround``), and the wrapper compacts the key rows onto them.
+    """
+    return kernel_options(
+        ratio=ratio,
+        q=metadata.q,
+        swa_k=metadata.swa_k,
+        cmp_k=metadata.cmp_k,
+        window_size=window_size,
     )
 
 
@@ -365,13 +400,7 @@ class _SparseMLA(torch.autograd.Function):
         topk_scores,
         wants_teacher,
     ):
-        options = kernel_options(
-            ratio=ratio,
-            q=attention_metadata.q,
-            swa_k=attention_metadata.swa_k,
-            cmp_k=attention_metadata.cmp_k,
-            window_size=window_size,
-        )
+        options = entry_options(attention_metadata, ratio=ratio, window_size=window_size)
         # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
         smla_metadata = attention_metadata.aicpu_metadata.sparse_attn.fwd
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
@@ -419,13 +448,7 @@ class _SparseMLA(torch.autograd.Function):
         # incoming gradient on it exists, and the autograd engine routes that gradient here
         # for being an input.  Nothing is ever read off it -- the teacher comes back from
         # SMLAG below, in the carrier's own layout.
-        options = kernel_options(
-            ratio=ctx.ratio,
-            q=ctx.attention_metadata.q,
-            swa_k=ctx.attention_metadata.swa_k,
-            cmp_k=ctx.attention_metadata.cmp_k,
-            window_size=ctx.window_size,
-        )
+        options = entry_options(ctx.attention_metadata, ratio=ctx.ratio, window_size=ctx.window_size)
         # The gradient metadata rides the forward's schedule, so the backward skips its AI_CPU
         # call too.
         smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
@@ -569,6 +592,23 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
         # gradient into the indexer's SLIKG backward.  In eval there is no indexer
         # gradient to feed and the extra ``p`` would be dead output.
         wants_teacher = self.training and cmp_k is not None
+        if not _IS_A5:
+            # Both KV streams arrive as the gathered whole row, and this rank may read only its
+            # per-document reach: arch22 is handed that reach as the frame, so each row is compacted
+            # onto it here.  Both gathers are differentiable, so the kernels' gradients scatter back
+            # onto the gathered rows; on the rank whose reach is every document in full they are the
+            # identity and no row is copied.
+            workaround = attention_metadata.a3_workaround
+            assert workaround is not None, "an arch22 entry states the key workaround"
+            swa_k = swa_k.squeeze(0)
+            if workaround.swa_k_gather is not None:
+                swa_k = swa_k.index_select(0, workaround.swa_k_gather)
+            swa_k = swa_k.unsqueeze(0)
+            if cmp_k is not None:
+                cmp_k = cmp_k.squeeze(0)
+                if workaround.cmp_k_gather is not None:
+                    cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
+                cmp_k = cmp_k.unsqueeze(0)
         # Shapes, dtypes and the ratio's KV pairing are the kernels' own contract, checked
         # at the operator boundary rather than restated here.
         # The selection arrives document-local from the selector, which chose it with the

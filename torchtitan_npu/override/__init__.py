@@ -6,11 +6,8 @@
 
 """Opt-in NPU overrides for TorchTitan."""
 
-import torch_npu
+from torchtitan_npu.patches.torch_npu.device import is_a5
 
-try:
-    _IS_A5 = torch_npu.npu.get_device_name().startswith("Ascend950")
-except (AttributeError, TypeError):
-    # CPU/UT runs may not have a current NPU device selected.  Keep the
-    # non-A5 behavior in that case.
-    _IS_A5 = False
+_IS_A5 = is_a5()
+"""Whether this run is on an A5 (arch35) part.  The detector lives in ``patches`` because the
+model layer needs the same fact and may not import ``override``."""

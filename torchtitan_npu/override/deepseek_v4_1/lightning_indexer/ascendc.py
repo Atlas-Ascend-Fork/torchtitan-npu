@@ -17,6 +17,7 @@ import torch
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
 from torchtitan_npu.override import _IS_A5
+from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AscLightningIndexerMetadata,
@@ -31,7 +32,8 @@ def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame):
 
     Both the metadata call and the main call take these, and they must agree
     option-for-option; reading one source is what makes that structural rather than a
-    convention two call sites have to keep in step.
+    convention two call sites have to keep in step.  ``cmp_k`` is the entry's frame: on arch22 the
+    pool this rank's reach covers, which its keys are compacted onto.
     """
     return dict(
         cu_seqlens_q=q.cu_seqlens,
@@ -89,6 +91,15 @@ def build_indexer_metadata(
     )
 
 
+def entry_options(ratio: int, metadata) -> dict:
+    """The selector's two kernels' options, read off this entry's frames.
+
+    On arch22 the entry's ``cmp_k`` is the pool this rank's reach covers, which is the frame the
+    wrapper compacts the key row onto, so the operand and its grid are always one pool.
+    """
+    return kernel_options(ratio=ratio, q=metadata.q, cmp_k=metadata.cmp_k)
+
+
 class _LightningIndexerTND(torch.autograd.Function):
     """The BF16 LightningIndexer forward fused with the SLIKG backward.
 
@@ -113,7 +124,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         # autograd.Function's backward must return one gradient per input *in the shape it
         # was handed*, so the kernels' ``[T, H, D]`` layout has to be established outside
         # this node rather than inside it.
-        options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
+        options = entry_options(ratio, attention_metadata)
         # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
         topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
@@ -181,7 +192,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         # SMLAG injects raw teacher weights outside the main loss's normalization.
         # Scaling p scales SLIKG's Z * softmax(I) - p by the same factor.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
-        options = kernel_options(ratio=ctx.ratio, q=ctx.attention_metadata.q, cmp_k=ctx.attention_metadata.cmp_k)
+        options = entry_options(ctx.ratio, ctx.attention_metadata)
         # Rides the same entry as the forward, so the backward skips its AI_CPU call too.
         slig_metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer.bwd
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
@@ -241,7 +252,10 @@ class AscSelector(Selector):
             # The batch axis is the packed row, so it is squeezed rather than indexed: every
             # kernel in this path addresses one row.
             idx_q_BLHiDi.squeeze(0),
-            idx_k_BNDi.squeeze(0).unsqueeze(1),
+            # The keys enter the Function already compacted (arch22): the gather is
+            # differentiable, so the teacher's gradient scatters back onto the gathered row and
+            # the wrapper's ``S(1) -> R`` reduce-scatter then lands it on the compressor.
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi.squeeze(0), attention_metadata, a5=_IS_A5).unsqueeze(1),
             weights_BLHi.squeeze(0).float(),
             topk,
             self.compress_ratio,

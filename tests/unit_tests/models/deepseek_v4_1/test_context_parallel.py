@@ -3,17 +3,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The V4.1 context-parallel query plan: the movement, the frames, and their invariants.
+"""The V4.1 context-parallel layout: the plan, the permutation, the frames, their invariants.
 
 The layout is one packed row's coordinate change, so every property worth pinning is
 checkable without a device and without a process group: which rows a rank ends up holding,
-that the movement is a permutation of the slab, that the receive side's closed form agrees
-with the row-by-row derivation, and that the frames say the queries are the chunks while the
-KV streams stay the row.
+that the shard's permutation lands on exactly those rows, that the movement is a permutation
+of the slab, that the receive side's closed form agrees with the row-by-row derivation, and
+that the frames say the queries are the chunks while the KV streams stay the row.
 
-The collectives are emulated in process, from the plan's own tables -- the same tables the
-forward hands to ``all_to_all_single`` -- because a plan is what this file is about; the
-module's own call into the collective is a thin wrapper over them.
+The per-layer restore's collective is emulated in process, from the plan's own tables -- the
+same tables the forward hands to ``all_to_all_single``.
 """
 
 from itertools import pairwise
@@ -21,16 +20,18 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.common.query_exchange import (
+from torchtitan_npu.models.common.restore import (
     ExchangeMetadata,
-    QueryExchange,
-    cp_plan,
+    chunk_plan,
+    doc_chunk_permutation,
+    to_slab,
 )
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import (
     DeepSeekV41Metadata,
     DeepSeekV41Model,
 )
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
     build_fused_metadata,
@@ -70,6 +71,11 @@ def _row(positions: torch.Tensor, *, ratio: int = _RATIO) -> DeepSeekV41Metadata
     return config.build_attention_metadata(positions)
 
 
+def _prefix(lengths: torch.Tensor) -> torch.Tensor:
+    """The frame of a per-document prefix: the running sum of the reach, from zero."""
+    return torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(lengths, 0).to(torch.int32)])
+
+
 def _masks(positions: torch.Tensor, cp_size: int = 1, cp_rank: int = 0) -> DeepSeekV41Metadata:
     """The row's frames, or this rank's after the backend's CP transform.
 
@@ -87,7 +93,7 @@ def _masks(positions: torch.Tensor, cp_size: int = 1, cp_rank: int = 0) -> DeepS
         cp_size=cp_size,
         cp_rank=cp_rank,
         batch_size=1,
-        seq_len=positions.numel() // cp_size,
+        slab_len=positions.numel() // cp_size,
     )
 
 
@@ -112,10 +118,13 @@ def _oracle_held_rows(cu: list[int], cp_size: int, rank: int) -> list[int]:
     return rows
 
 
-def _oracle_positions(cu: list[int], cp_size: int, rank: int) -> list[int]:
+def _oracle_slab_positions(cu: list[int], cp_size: int, rank: int) -> list[int]:
+    """Rank ``rank``'s window positions, counted row by row: its document start subtracted."""
     bounds = _bounds(cu)
-    held = torch.tensor(_oracle_held_rows(cu, cp_size, rank))
-    return (held - bounds[torch.bucketize(held, bounds, right=True) - 1]).tolist()
+    slab = cu[-1] // cp_size
+    rows = torch.arange(rank * slab, (rank + 1) * slab)
+    document = torch.bucketize(rows, bounds, right=True) - 1
+    return (rows - bounds[document]).tolist()
 
 
 _CASES = [
@@ -143,7 +152,7 @@ def test_the_bounds_are_read_off_the_row():
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
 def test_the_plan_matches_the_row(cu, cp_size):
-    """Both split vectors and the positions, against a derivation that counts every row.
+    """Both split vectors, against a derivation that counts every row.
 
     The receive side is the one worth arguing about: it is a closed form over the documents'
     chunk intervals rather than a histogram of the rows this rank receives, so it is checked
@@ -154,10 +163,32 @@ def test_the_plan_matches_the_row(cu, cp_size):
     matrix = _oracle_splits(cu, cp_size, seq_len)
     assert matrix.sum().item() == cu[-1], "the splits must partition the row"
     for rank in range(cp_size):
-        plan = cp_plan(_bounds(cu), cp_size, rank, seq_len)
+        plan = chunk_plan(_bounds(cu), cp_size, rank, seq_len)
         assert list(plan.send_split) == matrix[rank].tolist()
         assert list(plan.recv_split) == matrix[:, rank].tolist()
-        assert plan.positions_q.tolist() == _oracle_positions(cu, cp_size, rank)
+
+
+@pytest.mark.parametrize("cu, cp_size", _CASES)
+def test_the_permutation_is_the_layout(cu, cp_size):
+    """The permutation the CP shard applies *is* this layout, window for window.
+
+    The shard permutes the replicated row and slices it evenly, so rank ``r`` receives positions
+    ``[r·C, (r+1)·C)`` of the permutation, and the layout says those rows are chunk ``r`` of
+    every document in document order.  The plan's tables say the same from the other side; the
+    two are pinned against one oracle here, because a drift between them would put the frames on
+    rows the tensors do not hold -- silently, since every shape still fits.
+    """
+    cu = list(cu)
+    row = cu[-1]
+    slab = row // cp_size
+    perm = doc_chunk_permutation(_bounds(cu), cp_size, slab)
+    assert perm.shape == (1, row) and perm.dtype == torch.int64
+    assert sorted(perm.reshape(-1).tolist()) == list(range(row))
+    for rank in range(cp_size):
+        window = perm[0, rank * slab : (rank + 1) * slab]
+        assert window.tolist() == _oracle_held_rows(cu, cp_size, rank)
+    inverse = torch.argsort(perm, dim=-1)
+    torch.testing.assert_close(perm[0, inverse[0]], torch.arange(row))
 
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
@@ -172,7 +203,7 @@ def test_the_movement_is_a_permutation_of_the_slab(cu, cp_size):
     seq_len = cu[-1] // cp_size
     chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
     for rank in range(cp_size):
-        plan = cp_plan(_bounds(cu), cp_size, rank, seq_len)
+        plan = chunk_plan(_bounds(cu), cp_size, rank, seq_len)
         assert sorted(plan.send_index.tolist()) == list(range(seq_len))
         assert sum(plan.send_split) == seq_len
         assert sum(plan.recv_split) == seq_len
@@ -198,7 +229,7 @@ def test_the_plan_rejects_a_row_it_cannot_grid(cu, cp_size, why):
     side's interval arithmetic into an out-of-range index, so both are checked up front.
     """
     with pytest.raises(ValueError, match="positive multiples of"):
-        cp_plan(_bounds(list(cu)), cp_size, 0, max(1, list(cu)[-1] // cp_size))
+        chunk_plan(_bounds(list(cu)), cp_size, 0, max(1, list(cu)[-1] // cp_size))
 
 
 @pytest.mark.parametrize(
@@ -222,28 +253,29 @@ def test_the_sharded_path_checks_the_launcher_contract(documents, cp_size):
         _masks(_positions(*documents), cp_size, cp_size - 1)
 
 
-def test_the_exchange_carries_the_movement_and_the_positions():
-    """The container holds nothing a consumer could work out for itself."""
-    plan = cp_plan(_bounds([0, 8, 24]), 2, 1, 12)
+def test_the_exchange_carries_the_movement_only():
+    """The container holds nothing a consumer could work out for itself.
+
+    The held rows' positions are a function of the same boundaries, so the entry states them as
+    its own ``position_k`` rather than carrying them in the exchange's tables.
+    """
+    plan = chunk_plan(_bounds([0, 8, 24]), 2, 1, 12)
     assert isinstance(plan, ExchangeMetadata)
-    assert set(plan.__slots__) == {"send_index", "send_split", "recv_split", "positions_q"}
-    assert plan.send_index.dtype == torch.int64 and plan.positions_q.dtype == torch.int64
+    assert set(plan.__slots__) == {"send_index", "send_split", "recv_split"}
+    assert plan.send_index.dtype == torch.int64
 
 
-def test_the_exchange_is_the_identity_without_a_plan():
+def test_the_restore_is_the_identity_without_a_plan():
     """No plan means no movement, so the same call serves the unsharded forward.
 
     The early return is what keeps the call sites branch-free and lets ``cp = 1`` run without a
-    process group at all; an unwired exchange with a plan is still an error rather than a silent
+    process group at all; an unwired restore with a plan is still an error rather than a silent
     fall back onto the default group.
     """
-    exchange = QueryExchange(QueryExchange.Config())
-    tensor = torch.arange(12, dtype=torch.float32).reshape(-1, 1)
-    assert exchange.group is None
-    assert exchange.permute(tensor, None) is tensor
-    assert exchange.unpermute(tensor, None) is tensor
-    with pytest.raises(RuntimeError, match="parallelize"):
-        exchange.permute(tensor, cp_plan(_bounds([0, 8, 24]), 2, 0, 12))
+    tensor = torch.arange(12, dtype=torch.float32).reshape(1, -1, 1)
+    assert to_slab(tensor, None, group=None) is tensor
+    with pytest.raises(RuntimeError, match="process group"):
+        to_slab(tensor, chunk_plan(_bounds([0, 8, 24]), 2, 0, 12), group=None)
 
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
@@ -258,7 +290,7 @@ def test_the_movement_round_trips_the_whole_row(cu, cp_size):
     """
     cu = list(cu)
     seq_len = cu[-1] // cp_size
-    plans = [cp_plan(_bounds(cu), cp_size, rank, seq_len) for rank in range(cp_size)]
+    plans = [chunk_plan(_bounds(cu), cp_size, rank, seq_len) for rank in range(cp_size)]
     slabs = [torch.arange(r * seq_len, (r + 1) * seq_len, dtype=torch.float32).reshape(-1, 1) for r in range(cp_size)]
     held = _emulate(slabs, plans)
     for rank in range(cp_size):
@@ -298,29 +330,35 @@ def _emulate(tensors: list[torch.Tensor], plans: list[ExchangeMetadata], *, inve
 
 
 def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_row():
-    """The three frames under CP: chunk queries, row KV streams, and the reach in ``seqused``.
+    """The three frames under CP: chunk queries, the row's boundaries, and the reach in ``seqused``.
 
-    ``seqused`` is the whole point of this layout on the kernel side: the KV tensors are the
-    gathered row -- so their ``cu_seqlens`` must address that row -- while the queries only
-    reach ``K_d = (cp_rank + 1) · Q_d`` of each document, which is what the kernels' end-aligned
-    window and causal limit are anchored at.
+    The row the KV tensors are gathered from is the entry's ``cu_seq_q`` / ``cu_seq_k``; the key
+    frames are the reach ``K_d = (cp_rank + 1) · Q_d`` written as a frame of its own, because this
+    SoC's kernels anchor their mask at the frame's end instead of reading ``seqused``.
     """
     for cu, cp_size in _CASES:
         chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
         for rank in range(cp_size):
             masks = _masks(_positions(*[e - s for s, e in pairwise(cu)]), cp_size, rank)
-            assert masks.exchange is not None
+            assert masks.restore is not None
             assert masks.q.cu_seqlens.tolist() == (torch.tensor(cu) // cp_size).tolist()
             assert masks.q.seqused.tolist() == chunk.tolist()
-            assert masks.swa_k.cu_seqlens.tolist() == list(cu)
-            assert masks.swa_k.seqused.tolist() == ((rank + 1) * chunk).tolist()
+            reach = (rank + 1) * chunk
+            assert masks.cu_seq_q.tolist() == list(cu)
+            assert masks.cu_seq_k.tolist() == (torch.tensor(cu) // _RATIO).tolist()
+            # The key frames are the ones the kernels read: the row itself where they honour
+            # ``seqused``, the reach where they anchor their mask at the frame's end.
+            window_grid = list(cu) if _IS_A5 else _prefix(reach).tolist()
+            assert masks.swa_k.cu_seqlens.tolist() == window_grid
+            assert masks.swa_k.seqused.tolist() == reach.tolist()
             frame = masks.cmp_k
             assert frame is not None and masks.ratio == _RATIO
-            assert frame.cu_seqlens.tolist() == (torch.tensor(cu) // _RATIO).tolist()
-            assert frame.seqused.tolist() == (((rank + 1) * chunk) // _RATIO).tolist()
+            pool_grid = (torch.tensor(cu) // _RATIO).tolist() if _IS_A5 else _prefix(reach // _RATIO).tolist()
+            assert frame.cu_seqlens.tolist() == pool_grid
+            assert frame.seqused.tolist() == ((rank + 1) * chunk // _RATIO).tolist()
             assert frame.residual.tolist() == [0] * (len(cu) - 1)
-            # ``positions_q`` rides shaped like the input, so the oracle is compared flat.
-            assert masks.positions_q.reshape(-1).tolist() == _oracle_positions(list(cu), cp_size, rank)
+            # ``position_k`` is the key stream's, one row per restored slot of this rank's window.
+            assert masks.position_k.reshape(-1).tolist() == _oracle_slab_positions(list(cu), cp_size, rank)
 
 
 def test_the_unsharded_forward_is_unchanged():
@@ -331,8 +369,8 @@ def test_the_unsharded_forward_is_unchanged():
     the metadata it builds is the one geometry both the torch-native and the fused paths read.
     """
     masks = _masks(_positions(8, 16))
-    assert masks.exchange is None
-    torch.testing.assert_close(masks.positions_q, _positions(8, 16))
+    assert masks.restore is None
+    torch.testing.assert_close(masks.position_k, _positions(8, 16))
     assert masks.q.cu_seqlens.tolist() == [0, 8, 24]
     assert masks.q.seqused.tolist() == [8, 16]
     assert masks.swa_k.cu_seqlens.tolist() == [0, 8, 24]
@@ -356,13 +394,13 @@ def test_the_cp_transform_carries_the_plan_and_recuts_the_frames():
         for cp_rank in range(cp_size):
             slab = row.numel() // cp_size
             masks = _masks(row, cp_size, cp_rank)
-            plan = masks.exchange
+            plan = masks.restore.exchange
             assert plan is not None
             assert list(plan.send_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
             assert sum(plan.recv_split) == slab
             assert sorted(plan.send_index.tolist()) == list(range(slab))
-            # The carried positions ride shaped like the input, so no consumer reshapes.
-            torch.testing.assert_close(masks.positions_q, plan.positions_q.reshape(1, slab))
+            # The key stream's positions are this rank's window, counted row by row.
+            assert masks.position_k.reshape(-1).tolist() == _oracle_slab_positions([0, 8, 24], cp_size, cp_rank)
             assert masks.q.seqused.tolist() == [8 // cp_size, 16 // cp_size]
             assert masks.swa_k.seqused.tolist() == [(cp_rank + 1) * 8 // cp_size, (cp_rank + 1) * 16 // cp_size]
 
@@ -380,7 +418,7 @@ def test_the_transform_rejects_a_slab_the_row_does_not_grid():
             cp_size=2,
             cp_rank=0,
             batch_size=2,
-            seq_len=12,
+            slab_len=12,
         )
 
 

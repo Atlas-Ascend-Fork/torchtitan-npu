@@ -629,7 +629,7 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
         cu_seq_q=row.cu_seq_q,
         cu_seq_k=row.cu_seq_k,
         ratio=row.ratio,
-        positions_q=row.positions_q,
+        position_k=row.position_k,
         q=row.q,
         swa_k=row.swa_k,
         cmp_k=row.cmp_k,

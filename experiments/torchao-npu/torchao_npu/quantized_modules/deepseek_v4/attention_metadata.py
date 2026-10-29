@@ -96,7 +96,7 @@ def selector_record(
         layout_k=LAYOUT,
         mask_mode=MASK_MODE,
         cmp_ratio=CMP_RATIO,
-        cu_seqlens_q=metadata.cu_seq_q,
+        cu_seqlens_q=metadata.q.cu_seqlens,
         cu_seqlens_k=cmp_k.cu_seqlens,
         cmp_residual_k=cmp_k.residual,
     )
@@ -127,17 +127,10 @@ def attach_selector_record(
         lightning_indexer=replace(metadata.aicpu_metadata.lightning_indexer, fwd=record),
     )
     return QuantV4Metadata(
-        cu_seq_q=metadata.cu_seq_q,
-        cu_seq_k=metadata.cu_seq_k,
         ratio=metadata.ratio,
-        positions_q=metadata.positions_q,
-        exchange=metadata.exchange,
+        position_k=metadata.position_k,
         q=metadata.q,
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,
-        selector_k=metadata.selector_k,
-        selector_k_gather=metadata.selector_k_gather,
-        swa_k_prefix=metadata.swa_k_prefix,
-        swa_k_gather=metadata.swa_k_gather,
         aicpu_metadata=asc,
     )

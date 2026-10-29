@@ -11,12 +11,12 @@ ratio-4 overlap's carry -- the predecessor's last block, prepended and trimmed -
 ``CarryExchange`` beside it, and the two halves of this file pin those two contracts: the frames
 the kernels grid, and the carry that makes a slab compress like the row.
 
-Neither key stream can stay the whole row under context parallelism: every fused kernel
-right-aligns its mask at the end of the key frame it is given (the selector reads no ``seqused``
-at all), so a rank whose reach is a document prefix gets that prefix as its own pool -- the
-compressed blocks (``selector_k`` + ``selector_k_gather``) and the sliding-window tokens
-(``swa_k_prefix`` + ``swa_k_gather``).  ``test_the_selector_is_handed_this_ranks_prefix_pool``
-pins both contracts; the model's own row frames never move.
+Neither key stream can stay the whole row under context parallelism: an arch22 fused kernel
+right-aligns its mask at the end of the key frame it is given and reads no ``seqused``, so the
+options state the reach itself as that frame (``override/a3_workaround.a3_key_frame``) and the
+wrapper compacts both gathered rows onto it before the kernel call.  The entry keeps the model's
+own row frames at every degree, and ``test_the_selector_is_handed_this_ranks_prefix_pool`` pins
+the grids the kernels are actually handed.
 """
 
 from itertools import pairwise
@@ -26,13 +26,12 @@ import torch
 from torch import nn
 
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
 from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry
-from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-    build_aicpu_metadata,
-    shard_asc_v4_metadata,
-)
+from torchtitan_npu.models.deepseek_v4.metadata import doc_chunk_entry
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
 
 _WINDOW = 8
 _RATIO = 4
@@ -73,17 +72,41 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
     entry = _entry(positions, ratio=ratio)
     if cp_size == 1:
         return entry
-    return shard_asc_v4_metadata(
-        entry,
+    local = doc_chunk_entry(
+        _row(positions, ratio=ratio),
         cp_size=cp_size,
         cp_rank=cp_rank,
-        batch_size=1,
-        seq_len=positions.shape[-1] // cp_size,
+        slab_len=positions.shape[-1] // cp_size,
     )
+    return build_aicpu_metadata(local, geometry=_GEOMETRY)
 
 
 def _lengths(bounds: list[int]) -> torch.Tensor:
     return torch.tensor([end - begin for begin, end in pairwise(bounds)], dtype=torch.int32)
+
+
+def _prefix(lengths: torch.Tensor) -> torch.Tensor:
+    """The frame of a per-document prefix: the running sum of the reach, from zero."""
+    return torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(lengths, 0).to(torch.int32)])
+
+
+def _gather_of(entry, stream: str) -> torch.Tensor | None:
+    """The entry's compaction for one key stream, or ``None`` when no row moves.
+
+    arch35 reads each frame's ``seqused`` itself, so it compacts nothing and carries no workaround;
+    arch22 states the reach as the frame and gathers the rows onto it.
+    """
+    workaround = entry.a3_workaround
+    if _IS_A5:
+        assert workaround is None, "arch35 needs no key workaround"
+        return None
+    assert workaround is not None, "an arch22 entry states the key workaround"
+    return workaround.swa_k_gather if stream == "swa_k" else workaround.cmp_k_gather
+
+
+def _kernel_grid(reach: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
+    """The frame the kernels are handed for a stream whose reach is ``reach``."""
+    return row if _IS_A5 else _prefix(reach)
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
@@ -92,18 +115,13 @@ def test_one_degree_passes_the_boundary_differences(bounds, ratio):
     entry = _masks(bounds, ratio=ratio)
     lengths = _lengths(bounds)
     row = torch.tensor(bounds, dtype=torch.int32)
-    # The row's grid is the entry's own: ``cu_seq_k`` is this ratio's fold of it.
-    assert torch.equal(entry.cu_seq_q, row)
-    assert torch.equal(entry.cu_seq_k, row if ratio == 1 else row // ratio)
+    # The row's grid lives on the frame that addresses it.
+    assert torch.equal(entry.swa_k.cu_seqlens, row)
+    assert entry.cmp_k is None or torch.equal(entry.cmp_k.cu_seqlens, row // ratio)
     assert torch.equal(entry.q.cu_seqlens, row)
     assert torch.equal(entry.q.seqused, lengths)
     assert torch.equal(entry.swa_k.cu_seqlens, row)
     assert torch.equal(entry.swa_k.seqused, lengths)
-    # One degree reaches every block of every document, so neither key stream needs a prefix.
-    assert entry.selector_k is None
-    assert entry.selector_k_gather is None
-    assert entry.swa_k_prefix is None
-    assert entry.swa_k_gather is None
     if ratio == 1:
         assert entry.cmp_k is None
     else:
@@ -122,79 +140,66 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     chunk = _lengths(bounds) // cp_size
     reach = (cp_rank + 1) * chunk
     entry = _masks(bounds, cp_size, cp_rank, ratio=ratio)
-    # The row never becomes a rank-local grid: the KV side stays the whole row.
-    assert torch.equal(entry.cu_seq_q, row)
-    assert torch.equal(entry.cu_seq_k, row if ratio == 1 else row // ratio)
+    # The row never becomes a rank-local grid: the KV side stays the whole row, which the entry's
+    # own boundaries state.  The key frames are the frames the kernels are addressed with: the row
+    # itself where they read ``seqused``, the reach where they anchor their mask at the frame's end.
+    assert torch.equal(entry.swa_k.cu_seqlens, _kernel_grid(reach, row))
     assert torch.equal(entry.q.cu_seqlens, (row // cp_size).to(torch.int32))
     assert torch.equal(entry.q.seqused, chunk)
-    assert torch.equal(entry.swa_k.cu_seqlens, row)
     assert torch.equal(entry.swa_k.seqused, reach)
     assert torch.equal(entry.swa_k.seqused - entry.q.seqused, cp_rank * chunk)
     if ratio == 1:
         assert entry.cmp_k is None
     else:
-        assert torch.equal(entry.cmp_k.cu_seqlens, (row // ratio).to(torch.int32))
+        assert torch.equal(entry.cmp_k.cu_seqlens, _kernel_grid(reach // ratio, row // ratio))
         assert torch.equal(entry.cmp_k.seqused, reach // ratio)
         assert entry.cmp_k.residual is not None and not entry.cmp_k.residual.any()
-        if cp_rank == cp_size - 1:
-            # This rank's reach is the whole document, so both key streams are the row.
-            assert entry.selector_k is None
-            assert entry.selector_k_gather is None
-            assert entry.swa_k_prefix is None
-            assert entry.swa_k_gather is None
+        if _IS_A5:
+            # arch35 reads ``seqused`` itself: nothing is compacted.
+            assert entry.a3_workaround is None
+        elif cp_rank == cp_size - 1:
+            # This rank's reach is every document in full, so no row moves.
+            assert _gather_of(entry, "swa_k") is None
+            assert _gather_of(entry, "cmp_k") is None
         else:
-            # Every other rank reaches a prefix: the selector is handed that prefix as its own
-            # pool, laid out in document order, because its kernel right-aligns the mask at the
-            # end of the frame it is given.
-            prefix = reach // ratio
-            assert entry.selector_k is not None
-            assert torch.equal(entry.selector_k.seqused, prefix)
-            expected_cu = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(prefix, 0).to(torch.int32)])
-            assert torch.equal(entry.selector_k.cu_seqlens, expected_cu)
-            starts = (row // ratio)[:-1].to(torch.int64)
-            want = torch.cat(
-                [
-                    torch.arange(int(start), int(start) + int(length))
-                    for start, length in zip(starts, prefix, strict=True)
-                ]
+            starts = row[:-1].to(torch.int64)
+            assert torch.equal(
+                _gather_of(entry, "swa_k"),
+                torch.cat(
+                    [
+                        torch.arange(int(start), int(start) + int(length))
+                        for start, length in zip(starts, reach, strict=True)
+                    ]
+                ),
             )
-            assert torch.equal(entry.selector_k_gather, want)
-            # The sliding window is handed this rank's token prefix, with the same walk.
-            assert entry.swa_k_prefix is not None
-            assert torch.equal(entry.swa_k_prefix.seqused, reach)
-            expected_win_cu = torch.cat([torch.zeros(1, dtype=torch.int32), torch.cumsum(reach, 0).to(torch.int32)])
-            assert torch.equal(entry.swa_k_prefix.cu_seqlens, expected_win_cu)
-            token_starts = row[:-1].to(torch.int64)
-            want_k = torch.cat(
-                [
-                    torch.arange(int(start), int(start) + int(length))
-                    for start, length in zip(token_starts, reach, strict=True)
-                ]
+            pool_starts = (row // ratio)[:-1].to(torch.int64)
+            assert torch.equal(
+                _gather_of(entry, "cmp_k"),
+                torch.cat(
+                    [
+                        torch.arange(int(start), int(start) + int(length))
+                        for start, length in zip(pool_starts, reach // ratio, strict=True)
+                    ]
+                ),
             )
-            assert torch.equal(entry.swa_k_gather, want_k)
-    # The query frame's positions are the held rows' own document-relative positions.
-    held = torch.cat(
-        [
-            torch.arange(
-                start + cp_rank * ((end - start) // cp_size), start + (cp_rank + 1) * ((end - start) // cp_size)
-            )
-            for start, end in pairwise(bounds)
-        ]
-    )
+    # The kernel-side positions are this rank's slab, restored from the doc-chunk input rows.
+    slab = bounds[-1] // cp_size
+    held = torch.arange(cp_rank * slab, (cp_rank + 1) * slab)
     docs = torch.searchsorted(row[1:], held, right=True)
     expected = (held - row[docs]).tolist()
-    assert entry.positions_q.reshape(-1).tolist() == expected
+    assert entry.cp is not None
+    assert entry.position_k.reshape(-1).tolist() == expected
 
 
 def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
-    """The selector's key side is rank-local; the attention's stays the whole row.
+    """The kernels are handed this rank's reach; the entry stays the whole row.
 
     ``lightning_indexer`` right-aligns the compressed causal mask at the end of the key frame it
     is given and reads no ``seqused``, so handing a non-final rank the gathered row makes it pick
-    the document-tail window -- keys its queries cannot read.  The rank's reach is therefore
-    materialized as its own pool (each document's first ``reach // ratio`` blocks), and both of
-    its records are built from that grid.  The picks stay document-local, so the numbers still
-    address the whole-row pool SMLA/SMLAG read.
+    the document-tail window -- keys its queries cannot read.  The options therefore state the
+    reach as the frame -- each document's first ``reach // ratio`` blocks for the pool, its first
+    ``reach`` tokens for the sliding window -- and both records are built from that grid.  The
+    picks stay document-local, so the numbers still address the whole-row pool SMLA/SMLAG read.
     """
     bounds = [0, 32, 48]  # two documents, so every prefix is a per-document prefix
     cp_size, cp_rank = 2, 0
@@ -202,38 +207,48 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
     prefix = (_lengths(bounds) // cp_size * (cp_rank + 1)) // _RATIO
     assert prefix.tolist() == [4, 2]
 
-    # The pooled row is [doc0 blocks 0..7, doc1 blocks 8..11]; the selector's pool is each
-    # document's prefix, in document order.
-    assert entry.cmp_k is not None and entry.cmp_k.cu_seqlens.tolist() == [0, 8, 12]
-    assert entry.selector_k is not None
-    assert entry.selector_k.cu_seqlens.tolist() == [0, 4, 6]
-    assert entry.selector_k.seqused.tolist() == [4, 2]
-    assert entry.selector_k_gather.tolist() == [0, 1, 2, 3, 8, 9]
+    # The entry keeps the frames its kernels read: arch35 states the whole row, arch22 hands the
+    # kernels this rank's reach as the frame (the branch below pins both).
+    assert entry.cmp_k.cu_seqlens.tolist() == ([0, 8, 12] if _IS_A5 else [0, 4, 6])
+    assert entry.swa_k.cu_seqlens.tolist() == ([0, 32, 48] if _IS_A5 else [0, 16, 24])
 
-    # The sliding window gets the token prefix (reach = [16, 8] tokens here).
-    assert entry.swa_k_prefix is not None
-    assert entry.swa_k_prefix.cu_seqlens.tolist() == [0, 16, 24]
-    assert entry.swa_k_prefix.seqused.tolist() == [16, 8]
-    assert entry.swa_k_gather.tolist() == [*range(16), *range(32, 40)]
+    # The pool the selector reads is each document's prefix, in document order, and the sliding
+    # window is this rank's token prefix -- both stated by the entry, both applied to the rows.
+    assert entry.cmp_k is not None
+    assert entry.cmp_k.seqused.tolist() == [4, 2]
+    assert entry.swa_k.seqused.tolist() == [16, 8]
+    if _IS_A5:
+        # arch35 reads ``seqused`` itself: the frames stay the row's and nothing is compacted.
+        assert entry.a3_workaround is None
+        assert entry.cmp_k.cu_seqlens.tolist() == [0, 8, 12]
+        assert entry.swa_k.cu_seqlens.tolist() == [0, 32, 48]
+    else:
+        # arch22 is handed the reach as the frame, and the rows are compacted onto it.
+        assert _gather_of(entry, "cmp_k").tolist() == [0, 1, 2, 3, 8, 9]
+        assert _gather_of(entry, "swa_k").tolist() == [*range(16), *range(32, 40)]
+        assert entry.cmp_k.cu_seqlens.tolist() == [0, 4, 6]
+        assert entry.swa_k.cu_seqlens.tolist() == [0, 16, 24]
 
-    # Both AI_CPU records are sized for the clipped grid, not for the row's.
+    # Both AI_CPU records are sized for the grid their kernels address: this rank's reach where the
+    # kernel anchors at the frame's end, the gathered row where it reads ``seqused``.
+    pool_grid = [0, 8, 12] if _IS_A5 else [0, 4, 6]
+    token_grid = [0, 32, 48] if _IS_A5 else [0, 16, 24]
     li_calls = [call for call in dsv4.cann_ops.calls if call[0] == "lightning_indexer_metadata"]
     assert li_calls
-    assert li_calls[-1][2]["cu_seqlens_k"].tolist() == [0, 4, 6]
+    assert li_calls[-1][2]["cu_seqlens_k"].tolist() == pool_grid
     assert li_calls[-1][2]["seqused_k"].tolist() == [4, 2]
     slig_calls = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_lightning_indexer_kl_loss_grad_metadata"]
     assert slig_calls
-    assert slig_calls[-1][2]["cu_seqlens_k"].tolist() == [0, 4, 6]
+    assert slig_calls[-1][2]["cu_seqlens_k"].tolist() == pool_grid
     assert slig_calls[-1][2]["seqused_k"].tolist() == [4, 2]
 
-    # The compressed attention branch is handed the same pool: the compressed kernels anchor
-    # their mask at the key frame's end, so their keys, grid and selection are one frame.  The
-    # sliding-window stream stays the gathered row, limited by ``seqused_ori_kv``.
+    # The compressed attention branch is handed the same pool: the selection, the keys and the grid
+    # are one frame in both spellings.  The sliding-window stream keeps ``seqused_ori_kv``.
     smla_calls = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_flash_mla_metadata"]
     assert smla_calls
-    assert smla_calls[-1][2]["cu_seqlens_cmp_kv"].tolist() == [0, 4, 6]
+    assert smla_calls[-1][2]["cu_seqlens_cmp_kv"].tolist() == pool_grid
     assert smla_calls[-1][2]["seqused_cmp_kv"].tolist() == [4, 2]
-    assert smla_calls[-1][2]["cu_seqlens_ori_kv"].tolist() == [0, 16, 24]
+    assert smla_calls[-1][2]["cu_seqlens_ori_kv"].tolist() == token_grid
     assert smla_calls[-1][2]["seqused_ori_kv"].tolist() == [16, 8]
 
 
@@ -287,6 +302,7 @@ def _compressor(ratio: int = _RATIO) -> Compressor:
             head_dim=_HEAD_DIM,
             rope_head_dim=_ROPE_HEAD_DIM,
             compress_ratio=ratio,
+            carry_exchange=CarryExchange.Config(ratio=ratio),
             wkv=_Build(lambda: nn.Linear(_DIM, coff * _HEAD_DIM, bias=False)),
             wgate=_Build(lambda: nn.Linear(_DIM, coff * _HEAD_DIM, bias=False)),
             norm=_Build(lambda: _Norm(_HEAD_DIM)),
@@ -411,9 +427,9 @@ def test_the_rank_that_starts_the_row_carries_nothing(monkeypatch):
 
     local = _carry(module, exchange, x, positions, cu)
 
-    # Two collectives (the tokens and their positions): each sends one block to the successor
-    # and receives nothing, but every rank still enters both.
-    assert calls == [((0, 4), (0, 0)), ((0, 4), (0, 0))]
+    # One collective (the tokens alone -- the block's positions are computed, not sent): it sends
+    # one block to the successor and receives nothing, but every rank still enters it.
+    assert calls == [((0, 4), (0, 0))]
     assert local.shape == (1, 4, _HEAD_DIM)
 
 

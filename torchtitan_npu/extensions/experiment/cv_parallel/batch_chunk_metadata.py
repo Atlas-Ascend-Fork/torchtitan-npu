@@ -35,13 +35,26 @@ if BatchChunkAscV4Metadata not in SUPPORTED_NODES:
     )
 
 
+def _row_positions(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """The row's document-relative positions (``[1, N]``), reconstructed from its grid.
+
+    They are a function of the boundaries alone -- a document's positions restart at zero --
+    so the metadata carries the grid and every consumer that needs the positions derives them
+    instead of the entry storing a second copy of the row.
+    """
+    lengths = torch.diff(cu_seqlens)
+    return (
+        torch.arange(int(cu_seqlens[-1]), device=cu_seqlens.device) - torch.repeat_interleave(cu_seqlens[:-1], lengths)
+    ).reshape(1, -1)
+
+
 def _plain_batch_chunk_metadata(
     metadata: DeepSeekV4Metadata,
 ) -> tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]:
     """Build two local plain-stream contracts at an aligned document boundary."""
-    if metadata.exchange is not None:
+    if metadata.cp is not None:
         raise ValueError("batch chunk metadata does not support context parallelism")
-    cu = metadata.cu_seq_q
+    cu = metadata.swa_k.cu_seqlens
     cu_host = tuple(int(value) for value in cu.cpu().tolist())
     total_tokens = cu_host[-1]
     if total_tokens < 2 or total_tokens % 2:
@@ -56,7 +69,7 @@ def _plain_batch_chunk_metadata(
     # One entry is one geometry, so both chunks re-cut the same ratio's grid; the documents do
     # not cross the split, so each chunk is a whole number of pooling blocks again.
     ratio = metadata.ratio
-    positions = metadata.positions_q
+    positions = _row_positions(cu)
     chunks = []
     for start_index, end_index, token_offset in (
         (0, split_index, 0),
@@ -89,10 +102,6 @@ def _metadata_tensor_fields(
             tensors[name] = value
             tagged.add(id(value))
 
-    add("cu_seq_q", metadata.cu_seq_q)
-    if metadata.cu_seq_k is not metadata.cu_seq_q:
-        add("cu_seq_k", metadata.cu_seq_k)
-    add("positions_q", metadata.positions_q)
     # The kernel frames: the query's, the sliding window's and the compressed axis's.  Their
     # role names stay geometry-free on purpose: the full batch and its chunks carry the same
     # geometry, so the pairing is by role, and the ratio is part of the metadata, not the name.
@@ -168,24 +177,20 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
         raise ValueError("batch chunk metadata requires the fused entry's AI_CPU records")
     geometry = asc.geometry
 
-    def chunk_records(chunk: DeepSeekV4Metadata) -> AscV4Metadata:
+    def doc_chunk_records(chunk: DeepSeekV4Metadata) -> AscV4Metadata:
         """This tier's records: the selector's and the attention's."""
         return build_aicpu_metadata(chunk, geometry=geometry)
 
-    chunks = (chunk_records(first), chunk_records(second))
+    chunks = (doc_chunk_records(first), doc_chunk_records(second))
     return BatchChunkAscV4Metadata(
-        cu_seq_q=metadata.cu_seq_q,
-        cu_seq_k=metadata.cu_seq_k,
         ratio=metadata.ratio,
-        positions_q=metadata.positions_q,
-        exchange=metadata.exchange,
         q=metadata.q,
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,
-        selector_k=metadata.selector_k,
-        selector_k_gather=metadata.selector_k_gather,
-        swa_k_prefix=metadata.swa_k_prefix,
-        swa_k_gather=metadata.swa_k_gather,
+        position_k=metadata.position_k,
+        slots=metadata.slots,
+        cp=metadata.cp,
+        a3_workaround=metadata.a3_workaround,
         aicpu_metadata=metadata.aicpu_metadata,
         batch_chunk_tensors=_tag_batch_chunk_metadata(metadata, chunks),
     )

@@ -172,18 +172,19 @@ def _preprocess(model, parallel_dims=_NO_CP, parallelism=_NO_SPMD):
     )
 
 
-def _shard(monkeypatch, events: list, entries=None, positions=None, load_balancer_type="headtail"):
-    """Run the patched ``_cp_shard`` on a bare receiver, with the pinned shard stubbed out."""
+def _shard(monkeypatch, events: list, entries=None, positions=None, load_balancer_type="headtail", shard=None):
+    """Run the patched ``_cp_shard`` on a bare receiver, with the CP shard stubbed out."""
     extra_kwargs = {"positions": torch.zeros(1, _SEQ_LEN, dtype=torch.int64) if positions is None else positions}
     if entries is not None:
         extra_kwargs["attention_metadata"] = entries
 
-    def fake_prepare(inputs, labels, extra_kwargs, *args):
+    def fake_shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, input_seq_dim=1, ptrr_mask_key=None, **kwargs):
+        del cp_mesh, load_balancer_type, input_seq_dim, ptrr_mask_key, kwargs
         events.append("shard")
-        extra_kwargs["positions"] = extra_kwargs["positions"][:, :_SHARD_LEN]
-        return inputs[:, :_SHARD_LEN], labels, extra_kwargs
+        tokens, labels, positions = inputs
+        return (tokens[:, :_SHARD_LEN], labels, positions[:, :_SHARD_LEN]), attention_masks
 
-    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", fake_prepare)
+    monkeypatch.setattr(decoder_patch, "cp_shard", fake_shard if shard is None else shard)
     tokens = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
     return Decoder._cp_shard(
         SimpleNamespace(),
@@ -253,10 +254,11 @@ def test_input_annotation_is_spmd_types_only_and_full_dtensor_is_rejected(monkey
 def test_the_step_counts_the_local_labels_the_seam_hands_back(monkeypatch):
     """With no full_dtensor wrapping, the trainer's counter adds this rank's CP shard, not the batch."""
 
-    def shard(inputs, labels, extra_kwargs, *args):  # the pinned shard, stubbed: the first rows stay here
-        return inputs[:, :_SHARD_LEN], labels[:, :_SHARD_LEN], extra_kwargs
+    def shard(cp_mesh, inputs, attention_masks, *args, **kwargs):  # the CP shard, stubbed: 4 rows stay here
+        del cp_mesh, args, kwargs
+        return tuple(tensor[:, :_SHARD_LEN] for tensor in inputs), attention_masks
 
-    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", shard)
+    monkeypatch.setattr(decoder_patch, "cp_shard", shard)
     trainer = SimpleNamespace(
         model_parts=[_model([_layer()])],
         ntokens_seen=16,
@@ -321,6 +323,27 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     plain_events: list = []
     _, _, plain_out = _shard(monkeypatch, plain_events)  # no map: the pinned shard runs alone
     assert plain_events == ["shard"] and "attention_metadata" not in plain_out
+
+
+def test_an_unnamed_layout_is_the_one_the_metadata_declares(monkeypatch):
+    """A stack declares the layout its frames describe; an unnamed run is sharded by it, and by the row."""
+    seen: dict = {}
+
+    def shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, *args, positions=None, **kwargs):
+        del cp_mesh, args, kwargs
+        seen["layout"], seen["positions"] = load_balancer_type, positions
+        return inputs, attention_masks
+
+    class _DeclaredMetadata:
+        cp_layout = "doc_chunk"
+
+    positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
+    _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type=None, shard=shard)
+    assert seen == {"layout": "doc_chunk", "positions": positions}
+
+    # An explicit balancer wins over the declaration; a stack that declares nothing keeps the pin's default.
+    _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type="headtail", shard=shard)
+    assert seen["layout"] == "headtail"
 
 
 def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):

@@ -223,8 +223,8 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
             return _V41QuantAttentionMetadata(
                 cu_seq_q=row.cu_seq_q,
                 cu_seq_k=row.cu_seq_k,
-                positions_q=row.positions_q,
-                exchange=row.exchange,
+                position_k=row.position_k,
+                restore=row.restore,
                 ratio=self.compress_ratio,
                 q=q,
                 swa_k=swa_k,
@@ -242,7 +242,7 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                     index_head_dim=self.index_head_dim,
                     topk_blocks=self.candidate_topk_blocks,
                     block_size=self.candidate_block_size,
-                    num_rows=row.positions_q.numel(),
+                    num_rows=positions.numel(),
                 ),
             )
 

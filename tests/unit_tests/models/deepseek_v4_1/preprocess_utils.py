@@ -8,9 +8,10 @@
 ``Decoder.preprocess_inputs`` is the seam under test: it builds the per-layer
 attention-metadata map out of the attention backends' builders and, under context
 parallelism, shards the inputs.  A CPU unit test has no process group, so the framework's
-CP entry cannot run: :func:`install_plain_cp_shard` reproduces what it does for a run with
-no load balancer -- one even slab per rank -- which is the configuration every V4.1 recipe
-uses; the map's own CP transform is ``Decoder._cp_shard``'s and runs after it.
+CP entry cannot run: :func:`install_doc_chunk_cp_shard` reproduces what it does for a run with the
+doc-chunk layout -- permute the replicated row, then one even slice per rank -- which is the
+configuration both DeepSeek stacks run; the map's own CP transform is ``Decoder._cp_shard``'s
+and runs after it.
 """
 
 import importlib
@@ -20,6 +21,11 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.common.restore import (
+    DOC_CHUNK_LAYOUT,
+    doc_chunk_permutation,
+    document_starts,
+)
 
 # ``preprocess_inputs`` takes the parallelism context; these models run a single process
 # with no CP and the default SPMD backend.
@@ -119,26 +125,35 @@ def cp_parallel_dims(cp_size: int, cp_rank: int) -> SimpleNamespace:
     return SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
 
 
-def install_plain_cp_shard(monkeypatch) -> None:
+def install_doc_chunk_cp_shard(monkeypatch) -> None:
     """Stand in for the framework's CP input shard, on CPU.
 
-    With ``load_balancer_type=None`` (every V4.1 recipe) the framework shards each input
-    with ``distribute_tensor(..., Shard(1))``, which for a 1-D mesh of ``cp_size`` is one
-    even slab per rank -- what this reproduces, without a device mesh or a collective.
-    Only the shard is stubbed: the map's own CP transform is ``Decoder._cp_shard``'s, and
-    it runs after this returns, on the pre-shard positions, which is the geometry the
-    transform derives this rank's copy from.
+    With the doc-chunk layout the framework permutes the replicated row and slices it evenly,
+    so rank ``r`` holds chunk ``r`` of every document; this reproduces that without a device
+    mesh or a collective.  Only the shard is stubbed: the map's own CP transform is
+    ``Decoder._cp_shard``'s, and it runs after this returns, on the pre-shard positions, which
+    is the geometry the transform derives this rank's copy from.
     """
     import torchtitan_npu.patches.torchtitan.models.common.decoder as decoder_patch
 
-    def shard(inputs, labels, extra_kwargs, cp_mesh, device, load_balancer_type=None, ptrr_mask_key=None):
-        del device, ptrr_mask_key
-        if load_balancer_type is not None:
-            raise AssertionError("the CPU stand-in only reproduces a run with no load balancer")
-        positions = extra_kwargs["positions"]
-        slab = inputs.shape[1] // cp_mesh.size()
+    def shard(
+        cp_mesh,
+        inputs,
+        attention_masks,
+        load_balancer_type=None,
+        input_seq_dim=1,
+        ptrr_mask_key=None,
+        *,
+        positions=None,
+    ):
+        del attention_masks, ptrr_mask_key
+        if load_balancer_type != DOC_CHUNK_LAYOUT or positions is None:
+            raise AssertionError("the CPU stand-in only reproduces the doc-chunk layout")
+        slab = inputs[0].size(input_seq_dim) // cp_mesh.size()
+        permutation = doc_chunk_permutation(document_starts(positions), cp_mesh.size(), slab)
         lo = cp_mesh.get_local_rank() * slab
-        extra_kwargs["positions"] = positions[:, lo : lo + slab]
-        return inputs[:, lo : lo + slab], labels[:, lo : lo + slab], extra_kwargs
+        held = permutation[0][lo : lo + slab]
+        moved = tuple(torch.index_select(tensor, input_seq_dim, held) for tensor in inputs)
+        return moved, None
 
-    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", shard)
+    monkeypatch.setattr(decoder_patch, "cp_shard", shard)

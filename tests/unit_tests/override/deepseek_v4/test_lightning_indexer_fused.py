@@ -116,8 +116,8 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch):
 
     # The forward metadata is the entry's own record; the options are the frame contract.
     assert captured["metadata"] is md.aicpu_metadata.lightning_indexer.fwd
-    key_frame = md.cmp_k if md.selector_k is None else md.selector_k
-    assert captured["options"] == lightning_indexer_options(ratio=md.ratio, q=md.q, cmp_k=key_frame)
+    # The options are the entry's own frame -- the one its keys were compacted onto.
+    assert captured["options"] == lightning_indexer_options(ratio=md.ratio, q=md.q, cmp_k=md.cmp_k)
 
     # The value of the carrier is never read: overwrite it with NaN and still drive the edge.
     teacher = torch.zeros_like(scores)

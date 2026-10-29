@@ -57,6 +57,9 @@ class Compressor(Module):
         super().__init__()
         self.compress_ratio = config.compress_ratio
         self.is_source = config.is_source
+        # The CP mesh: wired by the framework's ``Module.parallelize`` recursion, ``None`` at one
+        # degree.  A reusing layer never restores anything, so this is set before the early return.
+        self.group = None
         if not self.is_source:
             return
         if config.rope is None or config.wkv is None or config.norm is None:
@@ -70,11 +73,18 @@ class Compressor(Module):
         self.norm = config.norm.build()
         self.rope = config.rope.build()
 
+    def parallelize(self, parallel_dims) -> None:
+        """Take the CP mesh the framework hands down to every module."""
+        self.group = parallel_dims.get_optional_mesh("cp")
+        super().parallelize(parallel_dims)
+
     def forward(
         self,
         x_BLD: torch.Tensor,
         positions_BL: torch.Tensor,
         cmp_k: torch.Tensor | None = None,
+        *,
+        attention_metadata=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Args:
             x: Hidden states of shape ``[B, L, D]``.
@@ -98,6 +108,11 @@ class Compressor(Module):
             )
         if not self.is_source:
             return cmp_k, None
+
+        if attention_metadata is not None:
+            # The pooling is the row's, so a source layer restores the stream onto this rank's
+            # window first (the identity at one degree); the caller hands over the chunks it holds.
+            x_BLD = attention_metadata.key_stream(x_BLD, group=self.group)
 
         ratio = self.compress_ratio
         seqlen = x_BLD.size(1)

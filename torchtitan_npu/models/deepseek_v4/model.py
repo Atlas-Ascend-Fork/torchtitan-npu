@@ -14,6 +14,8 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import resolve_cp_layout
+
 from .metadata import DeepSeekV4Metadata
 from .mhc import HcPost, HcPre
 from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
@@ -177,29 +179,27 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Prepare the MTP batch on the global row, then let the seam shard it.
+        """Prepare the MTP batch on the global row, then shard both for context parallel.
 
         The base seam (upstream #4116) builds each attention backend's metadata
         once per microbatch and shards the inputs for context parallel.  The MTP
         depths' rolled tokens have to be derived from the *global* row — a shift
         across a shard boundary is not a shift — so they are prepared here,
-        before the base call, and cut by the same contiguous-slab ``cp_shard``
-        afterwards (a local slice, no communication).  Without context parallel
-        or without MTP depths nothing changes.
+        before the base call, and cut by the same ``cp_shard`` afterwards: the
+        layout is the permutation that shard shards by, so the depths land on the
+        rows that predict them (a local slice, no communication).
+
+        The layout itself -- **chunk ``r`` of every document**, i.e.
+        ``--parallelism.context-parallel-load-balancer doc_chunk`` -- is the seam's:
+        the shard builds its balancer from the row and permutes the replicated row
+        before slicing, so no rank moves anything.  The depths ride the same shard,
+        handed the same row's positions, so the two agree row for row by
+        construction.  Without context parallel or without MTP depths nothing changes.
         """
         cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
         positions = input_dict.get("positions")
         mtp_batch = None
         if cp_mesh is not None and self.mtp_layers is not None:
-            # The MTP batch is cut with the same contiguous slab as the inputs, so a load
-            # balancer's permutation would have to be folded into both cuts.  Fail before the
-            # batch is built, not after it was wasted.
-            if parallelism.context_parallel_load_balancer is not None:
-                raise ValueError(
-                    "the MTP batch is sharded with the same contiguous cut as the inputs, but the "
-                    f"context-parallel load balancer is {parallelism.context_parallel_load_balancer!r}: "
-                    "run with --parallelism.context-parallel-load-balancer None."
-                )
             mtp_batch = prepare_mtp_batch(
                 input_dict["input"],
                 labels,
@@ -219,12 +219,19 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         if mtp_batch is not None:
             # Narrowing for the type checker: the branch above only builds the batch with a mesh.
             assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
+            # The layout the batch was sharded by, resolved exactly as the decoder resolves it:
+            # an unset flag means "the layout this stack declares", and reading the raw config
+            # value here would cut the depths contiguously while the inputs are permuted.
             tensors, _ = cp_shard(
                 cp_mesh,
                 tuple(mtp_batch),
                 None,
-                parallelism.context_parallel_load_balancer,
+                resolve_cp_layout(
+                    parallelism.context_parallel_load_balancer,
+                    extra_kwargs.get("attention_metadata"),
+                ),
                 1,
+                positions=positions,  # pyrefly: ignore [unexpected-keyword]
             )
             extra_kwargs["mtp_batch"] = MTPBatch(*tensors)
         return inputs, labels, extra_kwargs

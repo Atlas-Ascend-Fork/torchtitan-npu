@@ -18,23 +18,25 @@ the metadata from this rank's own frames.
 """
 
 from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass, tree_flatten, tree_unflatten
 from torchtitan.config import derive
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
     cp_parallel_dims,
-    install_plain_cp_shard,
+    install_doc_chunk_cp_shard,
     preprocess,
     tiny_v41_model,
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AicpuMetadata,
@@ -147,17 +149,22 @@ def test_a_geometry_builds_its_own_ratios_frames_and_metadata(monkeypatch, ratio
     assert built.cu_seq_q.tolist() == [0, 4, 8]
     assert built.cu_seq_k.tolist() == [bound // max(ratio, 1) for bound in (0, 4, 8)]
     assert built.q.cu_seqlens.tolist() == [0, 4, 8]
+    # The row's own grids stay the entry's boundaries; on this SoC the key frames are the
+    # per-document reach itself, because these kernels anchor their mask at the frame's end.
+    assert built.cu_seq_q.tolist() == [0, 4, 8]
     assert built.swa_k.cu_seqlens.tolist() == [0, 4, 8]
     if ratio == 0:
         assert built.cmp_k is None, "a window-only layer has no compressed axis to grid"
     else:
         assert built.cmp_k is not None
+        assert built.cu_seq_k.tolist() == [bound // ratio for bound in (0, 4, 8)]
         assert built.cmp_k.cu_seqlens.tolist() == [bound // ratio for bound in (0, 4, 8)]
         assert built.cmp_k.seqused.tolist() == [4 // ratio, 4 // ratio]
         if ratio == 1:
-            # The uncompressed case: the compressed axis is the row itself, and the kernels
-            # reject a residual for an axis they do not compress.
-            assert built.cmp_k.residual is None
+            # The uncompressed case: the compressed axis is the row itself, so it has no partial
+            # trailing group -- ``None`` where the kernels read the model's spelling, zeros where
+            # arch22 has to be told a value.
+            assert built.cmp_k.residual is None if _IS_A5 else not built.cmp_k.residual.any()
         else:
             assert built.cmp_k.residual is not None
             assert built.cmp_k.residual.tolist() == [0, 0]
@@ -343,7 +350,7 @@ def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
     row = _reference_row([0, 4], ratio=2)
     q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16)
 
-    with pytest.raises(AttributeError, match="aicpu_metadata"):
+    with pytest.raises(AttributeError, match="a3_workaround|aicpu_metadata"):
         attention(
             q,
             q.squeeze(2),
@@ -481,20 +488,33 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     local = _prepare_for_rank(entry, mesh, row)
 
     assert isinstance(local, AscV41Metadata)
-    assert local.exchange is not None
+    assert local.restore is not None
     # Chunk queries over the whole-row KV grids: this rank's chunk of every document
     # (``q``), and how far those queries reach into each document (``swa_k``).
     assert local.q.cu_seqlens.tolist() == [0, 4, 10]
     assert local.q.seqused.tolist() == [4, 6]
-    assert local.swa_k.cu_seqlens.tolist() == [0, 16, 40]
+    # The row's own grid stays the entry's boundary; the key frames are the ones the kernels read.
+    assert local.cu_seq_q.tolist() == [0, 16, 40]
+    assert local.swa_k.cu_seqlens.tolist() == ([0, 16, 40] if _IS_A5 else [0, 12, 30])
     assert local.swa_k.seqused.tolist() == [12, 18]
     # The compressed axis is that reach at this geometry's own ratio -- not the row's frame,
     # and not a grid this rank divided for itself.
     assert local.cmp_k is not None
-    assert local.cmp_k.cu_seqlens.tolist() == [0, 8, 20]
+    assert local.cu_seq_k is entry.cu_seq_k
+    assert local.cmp_k.cu_seqlens.tolist() == ([0, 8, 20] if _IS_A5 else [0, 6, 15])
     assert local.cmp_k.seqused.tolist() == [6, 9]
-    assert local.cmp_k.cu_seqlens is entry.cu_seq_k
-    torch.testing.assert_close(local.positions_q, local.exchange.positions_q.reshape(1, -1), rtol=0, atol=0)
+    # The key stream is this rank's window, so its positions are the window's -- one per row of
+    # the slab, its own document start subtracted.
+    bounds = torch.tensor([0, 16, 40], dtype=torch.int32)
+    slab = 40 // cp_size
+    rows = torch.arange(cp_rank * slab, (cp_rank + 1) * slab)
+    documents = torch.bucketize(rows, bounds, right=True) - 1
+    torch.testing.assert_close(
+        local.position_k.reshape(-1),
+        rows - bounds[documents],
+        rtol=0,
+        atol=0,
+    )
     assert local.q.cu_seqlens.tolist() != entry.q.cu_seqlens.tolist()
     # The metadata are rebuilt from the rank-local frames, never shared with the row's.
     rank_metadata, row_metadata = local.aicpu_metadata, entry.aicpu_metadata
@@ -524,14 +544,14 @@ def test_the_cp_alignment_is_this_geometries_own_factor(monkeypatch):
     aligned = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
         _positions([0, 8, 16])
     )
-    sliced = shard_asc_v41_metadata(aligned, cp_size=4, cp_rank=0, batch_size=1, seq_len=4)
+    sliced = shard_asc_v41_metadata(aligned, cp_size=4, cp_rank=0, batch_size=1, slab_len=4)
     assert sliced.q.cu_seqlens.tolist() == [0, 2, 4]
 
     ragged = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
         _positions([0, 6, 12])
     )
     with pytest.raises(ValueError, match=r"positive multiples of 8"):
-        shard_asc_v41_metadata(ragged, cp_size=4, cp_rank=0, batch_size=1, seq_len=3)
+        shard_asc_v41_metadata(ragged, cp_size=4, cp_rank=0, batch_size=1, slab_len=3)
 
 
 def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
@@ -543,21 +563,40 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     rebuilt from its own ratio's frames rather than one stack-wide object being re-cut once.
     """
     state = _fake_metadata_ops(monkeypatch)
-    install_plain_cp_shard(monkeypatch)
+    install_doc_chunk_cp_shard(monkeypatch)
+    row_bounds = torch.tensor([0, 8, 24], dtype=torch.int32)
     row = _positions([0, 8, 24])
     tokens = torch.zeros_like(row)
     cp_size, cp_rank = 2, 1
+    model = _fused_tiny_model(monkeypatch)
+    # This test is about the metadata seam: Engram's halo has its own test below, so dropping it
+    # here keeps the seam's own inputs under test.
+    model.engram_history_size = 0
     _, _, extra = preprocess(
-        _fused_tiny_model(monkeypatch),
+        model,
         tokens,
         tokens,
         row,
         parallel_dims=cp_parallel_dims(cp_size, cp_rank),
+        parallelism=SimpleNamespace(
+            spmd_backend="partial_dtensor",
+            context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
+            context_parallel_ptrr_mask_key=None,
+        ),
     )
 
     slab = row.shape[-1] // cp_size
+    # The inputs ride the layout the metadata describes: chunk ``r`` of every document, so the
+    # shard's positions are those rows' own -- counted row by row here, not taken from the
+    # module that produced them.
     assert extra["positions"].shape[-1] == slab
-    assert extra["positions"].tolist() == row[:, cp_rank * slab : (cp_rank + 1) * slab].tolist()
+    held: list[int] = []
+    for start, end in pairwise(row_bounds.tolist()):
+        chunk = (end - start) // cp_size
+        held += range(start + cp_rank * chunk, start + (cp_rank + 1) * chunk)
+    held_rows = torch.tensor(held)
+    documents = torch.bucketize(held_rows, row_bounds, right=True) - 1
+    assert (held_rows - row_bounds[documents]).tolist() == extra["positions"].reshape(-1).tolist()
     metadata = extra["attention_metadata"]
     assert set(metadata) == {
         (AscV41SparseAttention.Config, 0),
@@ -567,7 +606,7 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     for (port, ratio), entry in metadata.items():
         assert port is AscV41SparseAttention.Config
         assert entry.ratio == ratio
-        assert entry.exchange is not None
+        assert entry.restore is not None
         assert entry.q.cu_seqlens.tolist() == [0, 4, 12]
         assert entry.swa_k.seqused.tolist() == [8, 16]
     # One geometry has no compressed axis at all, the other two carry their own.
@@ -634,6 +673,43 @@ def _fuse_every_layer(config):
         )
 
 
+def test_engram_builds_each_rows_own_history(monkeypatch):
+    """The halo under a document-parallel layout is per row, not one window of the row.
+
+    Rank ``r`` holds chunk ``r`` of every document, so a row's predecessors are the rows before it
+    *in its document*: ``[lo - H, lo)`` of the global row is another document's tail.  The model
+    builds the history from the whole row before the shard, one entry per row and distance, and
+    the entry's positions keep doing the document mask.
+    """
+    _fake_metadata_ops(monkeypatch)
+    install_doc_chunk_cp_shard(monkeypatch)
+    row = _positions([0, 8, 24])  # documents of 8 and 16 rows; cp=2 gives two 12-row slabs
+    tokens = torch.arange(row.shape[1]).unsqueeze(0)
+    model = _fused_tiny_model(monkeypatch)
+    model.engram_history_size = 2
+
+    _, _, extra = preprocess(
+        model,
+        tokens,
+        tokens,
+        row,
+        parallel_dims=cp_parallel_dims(2, 1),
+        parallelism=SimpleNamespace(
+            spmd_backend="partial_dtensor",
+            context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
+            context_parallel_ptrr_mask_key=None,
+        ),
+    )
+
+    # Rank 1 holds chunk 1 of both documents: rows 4..7 of the first, 16..23 of the second.
+    history = extra["engram_token_history"]
+    assert history.shape == (1, 12, 2)
+    assert history[0, :, 0].tolist() == [3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 21, 22]
+    # Two back from the first row of each chunk is in the same document, not across the boundary.
+    assert history[0, 0, 1].item() == 2
+    assert history[0, 4, 1].item() == 14
+
+
 def _fused_tiny_model(monkeypatch):
     """The tiny debug flavor with the AscendC attention on every layer, as the recipe installs it."""
     return tiny_v41_model(monkeypatch, configure=_fuse_every_layer)[0]
@@ -646,5 +722,5 @@ def _prepare_for_rank(attention_metadata, mesh, positions):
     row come from the context the patched shard publishes around it.  It is the metadata's own
     hook, which is what lets a map key be a geometry rather than a backend class.
     """
-    with cp_shard_context_set(cp_mesh=mesh, load_balancer_type=None, positions=positions):
+    with cp_shard_context_set(cp_mesh=mesh, load_balancer_type=DOC_CHUNK_LAYOUT, positions=positions):
         return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=None)

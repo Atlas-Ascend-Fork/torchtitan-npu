@@ -74,7 +74,7 @@ PARALLELISM_ARGS="
     --parallelism.context-parallel-degree ${CP}
     --parallelism.pipeline-parallel-degree ${PP}
     --parallelism.fsdp-reshard-after-forward always
-    --parallelism.context-parallel-load-balancer None
+    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.enable-sequence-parallel
 "
 

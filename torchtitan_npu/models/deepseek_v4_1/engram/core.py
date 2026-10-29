@@ -203,15 +203,25 @@ class EngramTable(Module):
         if distance == 0:
             return token_ids_BL
         compressed_pad_id = _local_tensor(self.compressed_pad_id)
-        shifted = compressed_pad_id.expand_as(token_ids_BL).clone()
-        if token_history is None:
-            shifted[:, distance:] = token_ids_BL[:, :-distance]
+        if token_history is not None and token_history.ndim == 3:
+            # Per-row predecessors: entry ``distance - 1`` is *this* row's ``distance``-th token
+            # back, so the shift is a straight pick -- no window, and no padded buffer that the
+            # pick would then overwrite wholesale.  Writing it into a full slice instead reads
+            # as a copy, but under a sharded dispatcher the write landed in the wrong shard
+            # (CP=2 took rank 1's tokens for rank 0's rows), so the pick *is* the assignment.
+            # Rows whose document starts sooner hold none, and the positions mask below drops
+            # those.
+            shifted = token_history[:, :, distance - 1]
         else:
-            source = torch.cat((token_history, token_ids_BL), dim=1)
-            width = token_history.shape[1]
-            start = max(0, distance - width)
-            if distance < source.shape[1]:
-                shifted[:, start:] = source[:, max(0, width - distance) : source.shape[1] - distance]
+            shifted = compressed_pad_id.expand_as(token_ids_BL).clone()
+            if token_history is None:
+                shifted[:, distance:] = token_ids_BL[:, :-distance]
+            else:
+                source = torch.cat((token_history, token_ids_BL), dim=1)
+                width = token_history.shape[1]
+                start = max(0, distance - width)
+                if distance < source.shape[1]:
+                    shifted[:, start:] = source[:, max(0, width - distance) : source.shape[1] - distance]
         if positions_BL is not None:
             shifted = torch.where(
                 positions_BL >= distance,
@@ -240,8 +250,16 @@ class EngramTable(Module):
         token_id_map = _local_tensor(self.token_id_map)
         compressed_ids_BL = token_id_map[input_ids_BL.long()]
         if token_history is not None:
-            if token_history.ndim != 2 or token_history.shape[0] != input_ids_BL.shape[0]:
-                raise ValueError("Engram token history must be 2-D with the same batch size as input_ids.")
+            # Two contracts: one contiguous window of ``H`` tokens before the local rows
+            # (``[B, H]``, what a contiguous shard hands over), or one entry per local row
+            # (``[B, L, H]``, what a per-document layout produces).
+            if token_history.ndim not in (2, 3) or token_history.shape[0] != input_ids_BL.shape[0]:
+                raise ValueError("Engram token history must be 2-D or 3-D with the same batch size as input_ids.")
+            if token_history.ndim == 3 and token_history.shape[1] != input_ids_BL.shape[1]:
+                raise ValueError(
+                    "Engram per-row token history must have one entry per row of input_ids: "
+                    f"{token_history.shape[1]} vs {input_ids_BL.shape[1]}."
+                )
             if positions_BL is None:
                 raise ValueError("Engram token history requires document-relative positions.")
             if image_mask is not None:

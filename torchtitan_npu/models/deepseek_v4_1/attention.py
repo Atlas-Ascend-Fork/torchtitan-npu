@@ -35,7 +35,7 @@ The reference forward owns Attention Gym attention; fused ports replace the comp
 inner-attention forward.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from attn_gym.sparse import gather_attn
@@ -46,7 +46,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.query_exchange import QueryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
@@ -115,7 +114,7 @@ class CompressedSparseInnerAttention2(Module):
             return DeepSeekV41Metadata(
                 cu_seq_q=bounds,
                 cu_seq_k=pooled,
-                positions_q=positions,
+                position_k=positions,
                 ratio=self.compress_ratio,
                 q=q,
                 swa_k=swa_k,
@@ -233,9 +232,6 @@ class Attention(BaseAttention):
         kv_norm: RMSNorm.Config
         wo_a: BatchedLinear.Config
         wo_b: Linear.Config
-        # The query side's context-parallel movement; it is a module only because the process
-        # group it runs on is run-level state, wired by ``parallelize``.
-        query_exchange: QueryExchange.Config = field(default_factory=QueryExchange.Config)
 
     def __init__(self, config: "Attention.Config"):
         super().__init__()
@@ -256,7 +252,14 @@ class Attention(BaseAttention):
         self.compressor = cfg.compressor.build()
         self.indexer = cfg.indexer.build()
         self.inner_attention = cfg.inner_attention.build()
-        self.query_exchange = cfg.query_exchange.build()
+        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
+        # one degree, where the metadata carries no plan and nothing moves.
+        self.cp_group = None
+
+    def parallelize(self, parallel_dims) -> None:
+        """Take the CP mesh the layer restores its key side on, then recurse."""
+        self.cp_group = parallel_dims.get_optional_mesh("cp")
+        super().parallelize(parallel_dims)
 
     def forward(
         self,
@@ -283,25 +286,30 @@ class Attention(BaseAttention):
         computed where the layer is a source, otherwise the inputs unchanged.
         """
         bsz, seqlen, _ = x.size()
-        # Under context parallelism the queries are this rank's chunks while the keys stay the
-        # slab it holds: the query side is a permuted copy of the input, and only the
-        # projections move -- never the hidden states -- so the keys keep the rows and the
-        # positions they always had, and the queries rotate at the ones the metadata carries.
-        x_q = self.query_exchange.permute(x.squeeze(0), attention_metadata.exchange).unsqueeze(0)
+        # The input layout already put these rows on **chunk ``r`` of every document**, so the
+        # query side projects them as they arrive and never moves.  The key side projects and
+        # rotates the same rows -- every step is per token, so it commutes with the layout -- and
+        # each consumer restores what it reads on its own: the compressor its pooling window, the
+        # core this rank's swa window, whose sharding gathers the whole row at its boundary.
+        # The key stream's own positions are the entry's: the input's at one degree, this rank's
+        # window under CP.  The queries rotate at the positions the input carried.
+        position_k = attention_metadata.position_k
 
-        qr = self.q_norm(self.wq_a(x_q))
+        qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).view(bsz, seqlen, -1, self.head_dim)
         swa_k = self.kv_norm(self.wkv(x))
 
         # Every layer compresses and indexes: a source publishes new tensors, a reusing
-        # layer hands back the ones in flight (asserted inside those modules).
-        cmp_k, latent = self.compressor(x, positions, cmp_k)
+        # layer hands back the ones in flight (asserted inside those modules).  A source restores
+        # the stream onto this rank's window inside the compressor, so the layer hands over the
+        # chunks it holds rather than a pre-restored copy.
+        cmp_k, latent = self.compressor(x, position_k, cmp_k, attention_metadata=attention_metadata)
         # The indexer is trained by distillation alone, so it reads the trunk as
         # constants.  The shared index keys are the exception: a Reindex Mode layer keeps
         # the ``idx_k`` it was handed live, so its consumers go on training the key's
         # owner.
         idx_k, topk_indices, topk_scores, candidates = self.indexer(
-            x_q.detach(),
+            x.detach(),
             qr.detach(),
             positions,
             attention_metadata,
@@ -313,10 +321,14 @@ class Attention(BaseAttention):
         )
 
         # The rope config carries the un-rotated prefix width, so the module rotates the
-        # trailing span and puts the prefix back.
-        q = self.rope(q, positions=attention_metadata.positions_q)
-        # The shared KV latent is one rank-2 head; RoPE rotates rank-3 [B, L, N, H].
+        # trailing span and puts the prefix back.  The queries rotate at the positions the input
+        # carried -- that frame's own -- and the shared KV latent at the key stream's.
+        q = self.rope(q, positions=positions)
+        # The shared KV latent is one rank-2 head; RoPE rotates rank-3 [B, L, N, H] on the chunk
+        # rows' own positions -- per token, so it commutes with the movement -- and the restore
+        # then hands the core this rank's window for its own gather.
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
+        swa_k = attention_metadata.key_stream(swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
         o = self.inner_attention(
@@ -331,15 +343,13 @@ class Attention(BaseAttention):
         # Rotate back and project while the rows are still this rank's chunks: every step here is
         # per token, so it commutes with the movement, and ``wo_b``'s output is an order of
         # magnitude narrower than the attention's -- so that is what takes the collective.
-        o = self.rope(o, positions=attention_metadata.positions_q, inverse=True)
+        o = self.rope(o, positions=positions, inverse=True)
 
         # The output projection is grouped: wo_a projects each query-head group on its
         # own, wo_b mixes the per-group results back to the model dimension.  The group
         # count comes from the module so a group-wise sharding can narrow it later.
         o = self.wo_a(o.reshape(bsz * seqlen, self.wo_a.n_batches, -1))
         o = self.wo_b(o.flatten(-2))
-        # A permutation, so undoing it is exact and accumulates nothing; ``wo_b`` has already
-        # flattened the batch axis, so the row axis is dim 0 here.  Unsharded, the exchange has
-        # no plan and hands the tensor straight back.
-        o = self.query_exchange.unpermute(o, attention_metadata.exchange)
+        # The rows stay this rank's chunks: the window the layer was handed is the window the
+        # layer above is handed, so nothing is un-permuted on the way out.
         return (o, cmp_k, idx_k, topk_indices, topk_scores, candidates)

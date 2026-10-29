@@ -27,16 +27,16 @@ from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
     lightning_indexer_indices,
     sparse_lightning_indexer_kl_loss_grad,
 )
+from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.metadata import (
     AscV4Metadata,
     CompactSelectorFrameProof,
     lightning_indexer_options,
 )
-from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _selector_keys
 
 
 def _pro_options(metadata: AscV4Metadata, ratio: int) -> dict:
-    key_frame = metadata.cmp_k if metadata.selector_k is None else metadata.selector_k
+    key_frame = metadata.cmp_k
     assert key_frame is not None, "the selector needs the entry's compressed frame"
     proof = metadata.compact_selector_frame_proof
     if not isinstance(proof, CompactSelectorFrameProof):
@@ -49,8 +49,6 @@ def _pro_options(metadata: AscV4Metadata, ratio: int) -> dict:
         or proof.q_seqused is not metadata.q.seqused
         or proof.k_cu is not key_frame.cu_seqlens
         or proof.k_seqused is not key_frame.seqused
-        or proof.positions_q is not metadata.positions_q
-        or proof.selector_k_gather is not metadata.selector_k_gather
     ):
         raise ValueError("PyPTO-Pro compact-frame proof is stale; rebuild metadata after replacing frame tensors")
     options = lightning_indexer_options(ratio=ratio, q=metadata.q, cmp_k=key_frame)
@@ -89,7 +87,7 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
                 "with tracked tensor versions; "
                 "manual, noncompact or inference-mode metadata must be rebuilt outside inference_mode"
             )
-        torch._check(idx_q.shape[0] == attention_metadata.positions_q.numel())
+        torch._check(idx_q.shape[0] == proof.positions_q.numel())
         torch._check(idx_k.shape[0] == proof.key_tokens)
         topk_indices = lightning_indexer_indices(
             idx_q,
@@ -148,7 +146,7 @@ class PyPTOProLightningIndexer(LightningIndexer):
             idx_q.flatten(0, 1),
             # index_select stays outside the Function so dk scatters back to
             # the gathered whole-row keys before the CP wrapper reduce-scatters.
-            _selector_keys(idx_k, attention_metadata).unsqueeze(1).contiguous(),
+            A3KeyWorkaround.indexer_keys(idx_k, attention_metadata).unsqueeze(1).contiguous(),
             idx_w.flatten(0, 1).float(),
             self.index_topk,
             attention_metadata.ratio,

@@ -17,7 +17,9 @@ class _CompressorHost(torch.nn.Module):
         self.is_source = is_source
         self.weight = torch.nn.Parameter(torch.tensor(2.0, dtype=torch.bfloat16))
 
-    def forward(self, x, positions, cmp_k=None):
+    def forward(self, x, positions, cmp_k=None, *, attention_metadata=None):
+        # The real Compressor's signature: the swap must forward whatever the host accepts.
+        del attention_metadata
         if not self.is_source:
             return cmp_k, None
         latent = x * self.weight
@@ -45,7 +47,7 @@ def test_quant_compressor_preserves_latent_parameters_and_ste(monkeypatch):
     x = torch.linspace(0.125, 1, 64, dtype=torch.bfloat16).reshape(1, 2, 32).requires_grad_()
     positions = torch.tensor([[0, 2]], dtype=torch.bfloat16)
 
-    main_kv, latent = module(x, positions)
+    main_kv, latent = module(x, positions, attention_metadata=None)
 
     assert module.weight is original_weight
     assert tuple(module.state_dict()) == original_keys

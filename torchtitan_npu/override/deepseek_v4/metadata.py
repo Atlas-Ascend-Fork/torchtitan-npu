@@ -45,7 +45,9 @@ import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, doc_chunk_entry
+from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 
 __all__ = [
     "AicpuGeometry",
@@ -91,7 +93,8 @@ def lightning_indexer_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame)
     """The options the selector's metadata calls and its kernels must agree on.
 
     They are read off this geometry's frames, so the metadata call, the LightningIndexer
-    forward and the SLIKG backward cannot drift option-for-option.
+    forward and the SLIKG backward cannot drift option-for-option.  ``cmp_k`` is the entry's frame
+    -- on arch22 the pool this rank's reach covers, which its keys are compacted onto.
     """
     return dict(
         cu_seqlens_q=q.cu_seqlens,
@@ -163,10 +166,15 @@ class CompactSelectorFrameProof:
 class AscV4Metadata(DeepSeekV4Metadata):
     """The fused entry: the model row and frames, plus this geometry's AscendC records.
 
-    The row, the frames and the query movement are the model's (they describe the tensors, not
-    the kernels); this entry adds only what the fused kernels need on top of them:
-    ``aicpu_metadata``, the operator outputs computed for exactly these frames at the eager
-    boundary and rebuilt per rank under context parallelism.
+    The row, the frames and the doc-chunk plan are the model's (they describe the tensors, not
+    the kernels); this entry adds what the fused kernels need on top of them:
+
+    - ``aicpu_metadata``: the operator outputs computed for exactly these frames at the eager
+      boundary and rebuilt per rank under context parallelism;
+    - ``a3_workaround``: arch22's compaction of the two key streams, because every fused kernel
+      right-aligns its mask at the end of the key frame it is given;
+    - ``compact_selector_frame_proof``: the eager certificate the compact-only Pro selector
+      requires, bound to the exact frame tensors it reads.
 
     Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``);
     one model runs one selection width, so there is nothing to look up.
@@ -174,6 +182,14 @@ class AscV4Metadata(DeepSeekV4Metadata):
 
     aicpu_metadata: AicpuMetadata
     """This geometry's AI_CPU records, grouped by the kernel that reads them."""
+
+    a3_workaround: A3KeyWorkaround | None = None
+    """The two key streams as arch22 must be handed them, or ``None`` where the kernels read the
+    model's own spelling (arch35, and every entry that was not built under ``if not _IS_A5:``).
+
+    Built once per microbatch beside the records, so the forward, the backward and the selector read
+    one frame and one gather each instead of re-deriving them per layer.
+    """
 
     compact_selector_frame_proof: CompactSelectorFrameProof | None = None
     """Eager proof for the compact-only Pro selector; absent for unverified frames."""
@@ -188,33 +204,38 @@ class AscV4Metadata(DeepSeekV4Metadata):
     ) -> "AscV4Metadata":
         """This rank's frames *and* its AscendC records (upstream #4617).
 
-        The rank-local frames come from the pre-shard documents with the same
-        ``models/common/query_exchange.cp_plan`` the V4.1 stack uses.  The records do not carry
-        over, because a record describes the frames it was computed for, so every record is
-        rebuilt for the rank-local frames by the same builder that built the global ones.
+        The rank-local entry comes from the pre-shard row with the static doc-chunk plan
+        (``models/common/restore.chunk_plan``); the records do not carry over, because a record
+        describes the frames it was computed for, so they are rebuilt for the rank-local frames
+        by the same builder that built the global ones.
         """
         del permutation
         # Lazy: the builder imports this module's classes, so the two cannot import each other
         # eagerly; the hook runs at the eager metadata boundary, never inside a graph.
-        from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import shard_asc_v4_metadata
+        from torchtitan_npu.models.deepseek_v4.metadata import chunk_query_positions
+        from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
         from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
         context = cp_shard_context()
         if context.cp_mesh is None or context.positions is None:
             raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type is not None:
+        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
             raise ValueError(
-                f"the DeepSeek-V4 fused stack shards contiguous slabs, but the context-parallel "
-                f"load balancer is {context.load_balancer_type!r}: run with "
-                "--parallelism.context-parallel-load-balancer None."
+                "the DeepSeek-V4 fused stack's rank-local frames describe the doc-chunk layout, but the "
+                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
+                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
             )
-        batch_size, row_len = context.positions.shape[0], context.positions.shape[-1]
-        return shard_asc_v4_metadata(
+        row_len = context.positions.shape[-1]
+        local = doc_chunk_entry(
             attention_metadata,
             cp_size=context.cp_mesh.size(),
             cp_rank=context.cp_mesh.get_local_rank(),
-            batch_size=batch_size,
-            seq_len=row_len // context.cp_mesh.size(),
+            slab_len=row_len // context.cp_mesh.size(),
+        )
+        return build_aicpu_metadata(
+            local,
+            geometry=attention_metadata.aicpu_metadata.geometry,
+            positions_q=chunk_query_positions(local.q.cu_seqlens, context.cp_mesh.get_local_rank()),
         )
 
 

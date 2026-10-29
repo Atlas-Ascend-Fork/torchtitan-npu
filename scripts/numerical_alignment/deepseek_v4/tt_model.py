@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+
 from ..utils import checkpoint as checkpoint_utils
 from . import config as dsv4_config
 
@@ -126,7 +128,7 @@ def forward_logits(
     parallel_dims = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
     parallelism = SimpleNamespace(
         spmd_backend=None,
-        context_parallel_load_balancer=None,
+        context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
         context_parallel_ptrr_mask_key=None,
     )
     tokens, _, extra_kwargs = model.preprocess_inputs(

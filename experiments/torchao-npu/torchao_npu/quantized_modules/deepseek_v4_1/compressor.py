@@ -21,8 +21,13 @@ class QuantCompressor(torch.nn.Module):
     _torchao_npu_original_forward: Callable[..., tuple[torch.Tensor | None, torch.Tensor | None]]
     _torchao_npu_module_swap_config: DeepSeekV41QuantCompressorConfig
 
-    def forward(self, x_BLD, positions_BL, cmp_k=None):
-        main_kv, latent = self._torchao_npu_original_forward(x_BLD, positions_BL, cmp_k)
+    def forward(self, x_BLD, positions_BL, cmp_k=None, *, attention_metadata=None):
+        main_kv, latent = self._torchao_npu_original_forward(
+            x_BLD,
+            positions_BL,
+            cmp_k,
+            attention_metadata=attention_metadata,
+        )
         # Reusing layers must return the same shared tensor without another Q/DQ.
         if not self.is_source:
             return main_kv, latent

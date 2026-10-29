@@ -235,7 +235,8 @@ def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -
         torch.testing.assert_close(row.cu_seq_q, expected_cu, rtol=0, atol=0)
         expected_pool = expected_cu if ratio <= 1 else (expected_cu // ratio).to(torch.int32)
         torch.testing.assert_close(row.cu_seq_k, expected_pool, rtol=0, atol=0)
-        torch.testing.assert_close(row.positions_q, positions)
+        # The key stream's positions are the entry's own, and at one degree they are the row's.
+        torch.testing.assert_close(row.position_k, positions)
 
 
 def test_weightless_compressor_passes_the_container_through(monkeypatch) -> None:
