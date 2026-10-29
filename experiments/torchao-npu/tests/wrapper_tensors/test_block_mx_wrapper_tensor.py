@@ -188,8 +188,11 @@ def test_prequantized_tensor_respects_mixed_precision_policy(device, param_dtype
 
     output, _ = wrapper.fsdp_post_all_gather(payload, metadata, expected_dtype)
 
+    expected_data_type = MXTensor if config.fsdp_prequantize_dtype == "mxfp4" else BlockMXTensor
     assert output.dtype is expected_dtype
-    assert isinstance(output._data, BlockMXTensor)
+    assert isinstance(output._data, expected_data_type), (
+        f"expected a {expected_data_type.__name__} ``_data``, got {type(output._data).__name__}"
+    )
     assert output._data.dtype is expected_dtype
 
 
@@ -335,6 +338,51 @@ def test_prequantize_falls_back_on_size_one_mesh():
     assert payload[0].data_ptr() == wrapper._data.data_ptr()
 
 
+@pytest.mark.parametrize("device", target_devices)
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        lambda: BlockMXQuantizeConfig(fsdp_prequantize=True),
+        lambda: BlockMXQuantizeConfig(
+            fsdp_prequantize=True,
+            fsdp_prequantize_dtype="mxfp4",
+            mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+        ),
+    ],
+    ids=["fp8", "mxfp4"],
+)
+def test_prequantize_quantizes_the_hp_payload_in_post_all_gather(device, config_factory):
+    """The size-1-mesh fallback still quantizes ``_data`` in post-all-gather."""
+    config = config_factory()
+    wrapper = BlockMXTrainingWeightWrapperTensor(
+        torch.randn(32, 32, dtype=torch.bfloat16, device=device),
+        weight_config=config,
+        activation_config=MXQuantizeConfig(),
+    )
+
+    payload, metadata = wrapper.fsdp_pre_all_gather(
+        _SizeOnlyMesh(1),
+        wrapper.shape,
+        wrapper.stride(),
+        None,
+        MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+    )
+    assert len(payload) == 1 and payload[0].dtype is torch.bfloat16
+
+    output, inner = wrapper.fsdp_post_all_gather(payload, metadata, torch.bfloat16)
+
+    expected_type = MXTensor if config.fsdp_prequantize_dtype == "mxfp4" else BlockMXTensor
+    assert isinstance(output._data, expected_type), (
+        f"expected a {expected_type.__name__} ``_data``, got {type(output._data).__name__}"
+    )
+    assert output._data.shape == wrapper.shape
+    assert output._data.dtype is torch.bfloat16
+    if config.fsdp_prequantize_dtype == "mxfp4":
+        assert output._data.quant_config == config.mxfp4_fake_quantize_config
+        assert output._data.qdata.dtype is torch.float4_e2m1fn_x2
+    assert inner is payload
+
+
 def test_prequantize_disabled_falls_back_to_hp_payload():
     """With the flag off, misaligned shards are gathered in high precision."""
     wrapper = BlockMXTrainingWeightWrapperTensor(
@@ -397,8 +445,8 @@ def test_fsdp_post_all_gather_step0_rebuilds_wrapper_from_gathered_components(de
 
 
 @pytest.mark.parametrize("device", target_devices)
-def test_fsdp_post_all_gather_mxfp4_step0_converts_payload_to_block_mx(device):
-    """MXFP4 step 0 converts the gathered MX payload into a BlockMXTensor."""
+def test_fsdp_post_all_gather_mxfp4_step0_keeps_the_mx_payload(device):
+    """MXFP4 step 0 keeps the gathered MX payload as ``_data``."""
     config = BlockMXQuantizeConfig(
         fsdp_prequantize=True,
         fsdp_prequantize_dtype="mxfp4",
@@ -418,10 +466,11 @@ def test_fsdp_post_all_gather_mxfp4_step0_converts_payload_to_block_mx(device):
 
     output, inner = source.fsdp_post_all_gather(payload, metadata, torch.bfloat16)
 
-    assert isinstance(output._data, BlockMXTensor)
-    assert output._data.qdata.shape == (64, 128)
-    # ``to_block_mx`` allocates converted buffers; only ``inner`` aliases the payload.
-    assert output._data.qdata.data_ptr() != payload[0].data_ptr()
+    assert isinstance(output._data, MXTensor), f"expected an MXTensor, got {type(output._data).__name__}"
+    assert output._data.shape == torch.Size([64, 128])
+    # ``__init__`` detaches ``_data``; the detached components still share the payload storages.
+    assert output._data.qdata.data_ptr() == payload[0].data_ptr()
+    assert output._data.scale.data_ptr() == payload[1].data_ptr()
     assert inner is payload
 
 
@@ -468,8 +517,8 @@ def test_fsdp_step1_out_rebinds_data_and_preserves_payload_storage(device):
 
 
 @pytest.mark.parametrize("device", target_devices)
-def test_fsdp_step1_out_mxfp4_rebinds_converted_data(device):
-    """MXFP4 step 1+ rebinds ``out._data`` to the converted BlockMXTensor."""
+def test_fsdp_step1_out_mxfp4_rebinds_the_mx_data(device):
+    """MXFP4 step 1+ rebinds ``out._data`` to the gathered MX payload."""
     config = BlockMXQuantizeConfig(
         fsdp_prequantize=True,
         fsdp_prequantize_dtype="mxfp4",
@@ -498,9 +547,11 @@ def test_fsdp_step1_out_mxfp4_rebinds_converted_data(device):
     result = source.fsdp_post_all_gather(payload, metadata, torch.bfloat16, out=out)
 
     assert result is None
-    assert isinstance(out._data, BlockMXTensor)
+    assert isinstance(out._data, MXTensor), f"expected an MXTensor, got {type(out._data).__name__}"
     assert [tensor.data_ptr() for tensor in payload] == pointers
     assert [tensor._version for tensor in payload] == versions
+    assert out._data.qdata.data_ptr() == payload[0].data_ptr()
+    assert out._data.scale.data_ptr() == payload[1].data_ptr()
     assert out.weight_config is config
     assert out.activation_config is act_config
 
@@ -636,7 +687,7 @@ def test_fp8_prequantize_round_trip_matches_full_weight_quantization(device, sha
 @pytest.mark.parametrize("device", target_devices)
 @pytest.mark.parametrize("shape", [(128, 128), (4, 128, 128)], ids=["matrix", "experts"])
 def test_mxfp4_prequantize_round_trip_matches_full_weight_quantization(device, shape):
-    """MXFP4 gather + conversion must equal converting the full weight."""
+    """MXFP4 gather must equal quantizing the full weight."""
     config = BlockMXQuantizeConfig(
         fsdp_prequantize=True,
         fsdp_prequantize_dtype="mxfp4",
@@ -647,17 +698,19 @@ def test_mxfp4_prequantize_round_trip_matches_full_weight_quantization(device, s
     assert nested_config is not None
 
     output = _quant_fsdp(full, config)
-    reference = MXTensor.from_hp(full, nested_config, axis=-1, act_quant_config=MXQuantizeConfig()).to_block_mx(config)
+    reference = MXTensor.from_hp(full, nested_config, axis=-1, act_quant_config=MXQuantizeConfig())
 
+    assert isinstance(output._data, MXTensor), f"expected an MXTensor, got {type(output._data).__name__}"
+    assert output._data.quant_axis == reference.quant_axis
+    assert output._data.pack_axis == reference.pack_axis
     assert torch.equal(output._data.qdata.view(torch.uint8), reference.qdata.view(torch.uint8))
-    assert torch.equal(output._data.scale1.view(torch.uint8), reference.scale1.view(torch.uint8))
-    assert torch.equal(output._data.scale2.view(torch.uint8), reference.scale2.view(torch.uint8))
+    assert torch.equal(output._data.scale.view(torch.uint8), reference.scale.view(torch.uint8))
 
 
 @pytest.mark.parametrize("device", target_devices)
 @pytest.mark.parametrize("shape", [(128, 128), (4, 128, 128)], ids=["matrix_rows", "experts"])
-def test_mxfp4_communication_matches_fp8_payload(device, shape):
-    """The converted MXFP4 weight matches the FP8 block-MX payload it replaces."""
+def test_mxfp4_payload_converts_to_the_fp8_payload(device, shape):
+    """The kept MXFP4 payload still converts to the FP8 block-MX payload it replaces."""
     config = BlockMXQuantizeConfig(
         fsdp_prequantize=True,
         fsdp_prequantize_dtype="mxfp4",
@@ -666,7 +719,7 @@ def test_mxfp4_communication_matches_fp8_payload(device, shape):
     weight = torch.randn(shape, device=device, dtype=torch.bfloat16)
     output = _quant_fsdp(weight, config)
     # Keep the nested FP4 config: this is the QAT block-quantize path the MXFP4
-    # pre-quantize + ``to_block_mx`` conversion must reproduce.
+    # pre-quantize must reproduce once converted.
     reference = BlockMXTensor.from_hp(
         weight,
         replace(config, fsdp_prequantize_dtype="fp8"),
@@ -674,10 +727,12 @@ def test_mxfp4_communication_matches_fp8_payload(device, shape):
         act_quant_config=MXQuantizeConfig(),
     )
 
-    assert torch.equal(output._data.qdata.view(torch.uint8), reference.qdata.view(torch.uint8))
-    assert torch.equal(output._data.scale1.view(torch.uint8), reference.scale1.view(torch.uint8))
-    assert torch.equal(output._data.scale2.view(torch.uint8), reference.scale2.view(torch.uint8))
-    assert output._data.is_contiguous()
+    converted = output._data.to_block_mx(config)
+
+    assert torch.equal(converted.qdata.view(torch.uint8), reference.qdata.view(torch.uint8))
+    assert torch.equal(converted.scale1.view(torch.uint8), reference.scale1.view(torch.uint8))
+    assert torch.equal(converted.scale2.view(torch.uint8), reference.scale2.view(torch.uint8))
+    assert converted.is_contiguous()
 
 
 @pytest.mark.parametrize("device", target_devices)
@@ -714,9 +769,25 @@ def test_prequantized_forward_matches_on_the_fly(device, config_factory):
 
 
 @pytest.mark.parametrize("device", target_devices)
-def test_prequantized_bmm_matches_on_the_fly(device):
-    """The ``BatchedLinear`` view+transpose sequence multiplies the same either way."""
-    config = BlockMXQuantizeConfig(fsdp_prequantize=True)
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        lambda: BlockMXQuantizeConfig(fsdp_prequantize=True),
+        lambda: BlockMXQuantizeConfig(
+            fsdp_prequantize=True,
+            fsdp_prequantize_dtype="mxfp4",
+            mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+        ),
+    ],
+    ids=["fp8", "mxfp4"],
+)
+def test_prequantized_bmm_matches_on_the_fly(device, config_factory):
+    """The ``BatchedLinear`` view+transpose sequence multiplies the same either way.
+
+    With the mxfp4 config the gathered MXFP4 weight is converted to block MX in the
+    forward, so the batched matmul still runs FP8 x FP8.
+    """
+    config = config_factory()
     num_heads, out_features, in_features, tokens = 8, 64, 128, 8
     weight = torch.randn(num_heads * out_features, in_features, device=device, dtype=torch.bfloat16)
     activation = torch.randn(num_heads, tokens, in_features, device=device, dtype=torch.bfloat16)
@@ -747,7 +818,11 @@ def test_prequantized_bmm_matches_on_the_fly(device):
     ids=["fp8", "mxfp4"],
 )
 def test_prequantized_grouped_mm_matches_on_the_fly(device, config_factory):
-    """Expert weights gathered across ranks multiply like the on-the-fly path."""
+    """Expert weights gathered across ranks multiply like the on-the-fly path.
+
+    With the mxfp4 config the gathered MXFP4 weight is converted to block MX in the
+    forward, so the grouped matmul still runs FP8 x FP8.
+    """
     config = config_factory()
     tokens, num_experts, in_features, out_features = 16, 4, 1024, 2048
     activation = torch.randn(tokens, in_features, device=device, dtype=torch.bfloat16)
@@ -767,21 +842,40 @@ def test_prequantized_grouped_mm_matches_on_the_fly(device, config_factory):
 
 
 @pytest.mark.parametrize("device", target_devices)
-def test_prequantized_forward_does_not_requantize_weight(device, monkeypatch):
-    """The matmul consumer reuses the gathered BlockMXTensor instead of re-quantizing."""
-    config = BlockMXQuantizeConfig(fsdp_prequantize=True)
+@pytest.mark.parametrize(
+    "config_factory",
+    [
+        lambda: BlockMXQuantizeConfig(fsdp_prequantize=True),
+        lambda: BlockMXQuantizeConfig(
+            fsdp_prequantize=True,
+            fsdp_prequantize_dtype="mxfp4",
+            mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+        ),
+    ],
+    ids=["fp8", "mxfp4"],
+)
+def test_prequantized_forward_does_not_requantize_weight(device, monkeypatch, config_factory):
+    """The matmul consumer reuses the gathered quantized tensor instead of re-quantizing.
+
+    An MXFP4 weight is still converted to block MX on every forward; the spy checks that
+    it is not re-quantized from the high-precision weight.
+    """
+    config = config_factory()
     weight = torch.randn(256, 128, device=device, dtype=torch.bfloat16)
     activation = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
     prequantized = _quant_fsdp(weight, config)
 
     quantized_shapes = []
-    original = BlockMXTensor.from_hp.__func__
 
-    def spy(cls, tensor, *args, **kwargs):
-        quantized_shapes.append(tuple(tensor.shape))
-        return original(cls, tensor, *args, **kwargs)
+    def spy(original):
+        def record(cls, tensor, *args, **kwargs):
+            quantized_shapes.append(tuple(tensor.shape))
+            return original(cls, tensor, *args, **kwargs)
 
-    monkeypatch.setattr(BlockMXTensor, "from_hp", classmethod(spy))
+        return record
+
+    monkeypatch.setattr(BlockMXTensor, "from_hp", classmethod(spy(BlockMXTensor.from_hp.__func__)))
+    monkeypatch.setattr(MXTensor, "from_hp", classmethod(spy(MXTensor.from_hp.__func__)))
 
     F.linear(activation, prequantized)
 

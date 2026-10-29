@@ -227,9 +227,10 @@ def _group_list_from_sizes(group_sizes: list[int], device: str = "npu") -> torch
 
 
 # (shape, group_sizes, config_a, config_b, sqnr_threshold) cases shared by the
-# grouped forward and gradient SQNR tests. The direct-FP4 row exists only for
-# the forward test: npu_grouped_matmul does not support mxfp4 with group type
-# 2, which the backward wgrad (db) call needs.
+# grouped forward and gradient SQNR tests. An MXFP4 QAT weight is converted to
+# block MX in the forward, so it still runs FP8 x FP8. The direct-FP4 row
+# (FP4 x FP4) exists only for the forward test: npu_grouped_matmul does not
+# support mxfp4 with group type 2, which the backward wgrad (db) call needs.
 grouped_sqnr_cases = [
     (
         (192, 64, 128, 3),
@@ -311,16 +312,21 @@ def test_grouped_sqnr_forward(shape, group_sizes, config_a, config_b, sqnr_thres
     grouped_sqnr_cases,
 )
 def test_grouped_sqnr_gradients(shape, group_sizes, config_a, config_b, sqnr_threshold):
-    """Grouped block MX backward gradients have acceptable SQNR."""
+    """Grouped block MX backward gradients have acceptable SQNR.
+
+    The weight is stored as ``[E, N, K]`` and transposed for the grouped mm
+    (matching model usage); gradients are checked on the stored leaf parameter.
+    """
     m, k, n, num_experts = shape
     torch.manual_seed(42)
     a = torch.randn(m, k, device="npu", dtype=torch.bfloat16, requires_grad=True)
-    b = torch.randn(num_experts, k, n, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(num_experts, n, k, device="npu", dtype=torch.bfloat16)
     group_list = _group_list_from_sizes(group_sizes)
 
     # --- Reference ---
     a_ref = a.clone().detach().requires_grad_(True)
-    b_ref = b.clone().detach().requires_grad_(True)
+    weight_ref = weight.clone().detach().requires_grad_(True)
+    b_ref = weight_ref.transpose(-1, -2)  # [E, K, N]
     out_ref = []
     for i in range(num_experts):
         s = group_list[i - 1].item() if i > 0 else 0
@@ -331,14 +337,14 @@ def test_grouped_sqnr_gradients(shape, group_sizes, config_a, config_b, sqnr_thr
 
     # --- Block MX ---
     a_fp8 = a.clone().detach().requires_grad_(True)
-    b_fp8 = b.clone().detach().requires_grad_(True)
-    out_fp8 = to_block_mx_then_grouped_mm(a_fp8, b_fp8, group_list, config_a, config_b)
+    weight_fp8 = weight.clone().detach().requires_grad_(True)
+    out_fp8 = to_block_mx_then_grouped_mm(a_fp8, weight_fp8.transpose(-1, -2), group_list, config_a, config_b)
     out_fp8.sum().backward()
 
     sqnr_da = compute_error(a_ref.grad.float(), a_fp8.grad.float()).item()
     assert sqnr_da > sqnr_threshold, f"da SQNR too low: {sqnr_da:.2f} db"
 
-    sqnr_db = compute_error(b_ref.grad.float(), b_fp8.grad.float()).item()
+    sqnr_db = compute_error(weight_ref.grad.float(), weight_fp8.grad.float()).item()
     assert sqnr_db > sqnr_threshold, f"db SQNR too low: {sqnr_db:.2f} db"
 
 
@@ -504,7 +510,8 @@ def test_block_mx_quantize_shape_and_dtype_3d(e, k, n, axis, config_b):
 
 
 # (batch, m, k, n) shape and the (config_a, config_b) pairs shared by the bmm
-# SQNR tests; the forward and gradient thresholds differ.
+# SQNR tests; the forward and gradient thresholds differ. An MXFP4 QAT weight is
+# converted to block MX in the forward, so batched matmuls still run FP8 x FP8.
 bmm_shape = (4, 2048, 4096, 2048)
 bmm_config_pairs = [
     (MXQuantizeConfig(), BlockMXQuantizeConfig()),

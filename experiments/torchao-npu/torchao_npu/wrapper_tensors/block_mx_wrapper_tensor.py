@@ -199,8 +199,11 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         *,
         out: torch.Tensor | None = None,
     ):
-        """
-        Rebuild the wrapper tensor from the gathered and potentially quantized components.
+        """Rebuild the wrapper tensor from the gathered and potentially quantized components.
+
+        With ``fsdp_prequantize`` set, a high-precision payload -- the size-1-mesh
+        fallback of :meth:`fsdp_pre_all_gather` -- is quantized here, so the unsharded
+        ``_data`` matches the multi-rank path.
         """
         if len(all_gather_outputs) == 1:
             (data,) = all_gather_outputs
@@ -209,12 +212,34 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                 f"{_SUPPORTED_HP_DTYPES}, got a {data.dtype} tensor."
             )
 
-            return super().fsdp_post_all_gather(all_gather_outputs, metadata, param_dtype, out=out)
+            if self.weight_config.fsdp_prequantize is True:
+                if self.weight_config.fsdp_prequantize_dtype == "fp8":
+                    quantized = BlockMXTensor.from_hp(
+                        data,
+                        quant_config=self.weight_config,
+                        axis=-1,
+                        act_quant_config=self.activation_config,
+                    )
+                elif self.weight_config.fsdp_prequantize_dtype == "mxfp4":
+                    mxfp4_config = self.weight_config.mxfp4_fake_quantize_config
+                    assert mxfp4_config is not None, "mxfp4_fake_quantize_config is None"
+                    quantized = MXTensor.from_hp(
+                        data,
+                        quant_config=mxfp4_config,
+                        axis=-1,
+                        act_quant_config=self.activation_config,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported fsdp_prequantize_dtype value '{self.weight_config.fsdp_prequantize_dtype}'"
+                    )
+            else:
+                return super().fsdp_post_all_gather(all_gather_outputs, metadata, param_dtype, out=out)
 
         elif len(all_gather_outputs) == 2:
             quantized = MXTensor.__tensor_unflatten__(
                 dict(zip(MXTensor.tensor_data_names, all_gather_outputs, strict=True)), metadata, None, None
-            ).to_block_mx(self.weight_config)
+            )
 
         elif len(all_gather_outputs) == 3:
             # Inverse of ``fsdp_pre_all_gather``'s flatten. ``outer_size`` /

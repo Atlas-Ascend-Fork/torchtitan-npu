@@ -43,19 +43,44 @@ def _maybe_quantize_weight_operand(
     config_A: MXQuantizeConfig,
     config_B: BlockMXQuantizeConfig,
     axis: int,
-) -> BlockMXTensor:
-    """Return the weight operand ``B`` as a
-    :class:`~torchao_npu.quantized_tensors.block_mx_tensor.BlockMXTensor`.
+) -> tuple[MXTensor, MXTensor]:
+    """Return the weight operand ``B`` as its forward / backward :class:`MXTensor` forms.
 
-    A pre-quantized ``B`` is reused as-is, after its ``quant_config`` and
-    ``act_quant_config`` are validated to be the caller's ``config_B`` and ``config_A``.
-    A high-precision ``B`` is quantized with ``config_B``, recording ``config_A`` as its
-    ``act_quant_config``.
+    ``B`` is brought into the block-MX form first:
+
+    - a pre-quantized ``MXTensor`` is converted with ``B.to_block_mx(config_B)``, after its
+      ``quant_config`` and ``act_quant_config`` are validated against
+      ``config_B.mxfp4_fake_quantize_config`` and ``config_A``;
+    - a pre-quantized ``BlockMXTensor`` is reused as-is after its ``quant_config`` and
+      ``act_quant_config`` are validated to be the caller's ``config_B`` and ``config_A``;
+    - a high-precision ``B`` is quantized with ``config_B`` -- an MXFP4 QAT config still
+      applies its FP4 fake-quantization pre-pass -- recording ``config_A`` as its
+      ``act_quant_config``.
+
+    Returns:
+        ``B``'s ``dim=-2`` and ``dim=-1`` forms, for the forward and the backward.
 
     Raises:
-        AssertionError: If a pre-quantized ``B`` carries a different ``quant_config``,
-            or an ``act_quant_config`` that is neither ``None`` nor ``config_A``.
+        AssertionError: If a pre-quantized ``B`` carries a different ``quant_config``
+            (the nested MXFP4 config for an ``MXTensor``), or an ``act_quant_config``
+            that is neither ``None`` nor ``config_A``.
     """
+    if isinstance(B, MXTensor):
+        assert config_B.mxfp4_fake_quantize_config == B.quant_config, (
+            "The quantization configuration of the pre-quantized ``B`` is not consistent with "
+            f"``config_B.mxfp4_fake_quantize_config``, {B.quant_config=}, "
+            f"{config_B.mxfp4_fake_quantize_config=}"
+        )
+
+        if B.act_quant_config is not None:
+            assert B.act_quant_config == config_A, (
+                "The activation quantization configuration of the pre-quantized ``B`` is not consistent with "
+                f"that of the wrapper tensor, ``B.act_quant_config`` is {B.act_quant_config}, that of the "
+                f"wrapper tensor is {config_A}."
+            )
+
+        B = B.to_block_mx(config_B)
+
     if isinstance(B, BlockMXTensor):
         assert B.quant_config is config_B, (
             "The quantization configuration of the pre-quantized ``B`` is not consistent with ``config_B``, "
@@ -70,9 +95,12 @@ def _maybe_quantize_weight_operand(
                 f"wrapper tensor is {config_A}."
             )
 
-        return B
+        quantized_B = B
+
     else:
-        return BlockMXTensor.from_hp(B, config_B, axis, config_A)
+        quantized_B = BlockMXTensor.from_hp(B, config_B, axis, config_A)
+
+    return quantized_B.to_mx_tensor(-2), quantized_B.to_mx_tensor(-1)
 
 
 def _maybe_quantize_operands_then_save_for_backward(
@@ -104,11 +132,14 @@ def _maybe_quantize_operands_then_save_for_backward(
     else:
         dual_axis_mx_A = DualAxisMXTensor.from_hp(A, config_A)
 
-    block_mx_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis)
+    forward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-1)
+    backward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-2)
 
-    ctx.save_for_backward(dual_axis_mx_A.to_mx_tensor(quant_axis=-2), block_mx_B.to_mx_tensor(quant_axis=-1))
+    forward_B, backward_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis)
 
-    return (dual_axis_mx_A.to_mx_tensor(quant_axis=-1), block_mx_B.to_mx_tensor(quant_axis=-2))
+    ctx.save_for_backward(backward_A, backward_B)
+
+    return forward_A, forward_B
 
 
 class _BlockMXQuantMM(torch.autograd.Function):
@@ -239,17 +270,17 @@ def _maybe_quantize_gmm_operands_then_save_for_backward(
     assert not isinstance(A, BaseQuantizedTensor), f"A must be a plain high precision tensor, got {type(A).__name__}."
 
     # A's contracting-dim form, for the forward grouped matmul.
-    mx_A = MXTensor.from_hp(A, config_A, -1)
+    forward_A = MXTensor.from_hp(A, config_A, -1)
 
     # A's M-dim form, for the wgrad: a grouped quant with zero-boundary padding.
     # A [M, K] → A_s2 (M-dim scale) [M//64 + E, K, 2]
-    grouped_mx_A = GroupedMXTensor.from_hp(A, offs, config_A)
+    backward_A = GroupedMXTensor.from_hp(A, offs, config_A)
 
-    block_mx_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis=-2)
+    forward_B, backward_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis=-2)
 
-    ctx.save_for_backward(grouped_mx_A, block_mx_B.to_mx_tensor(-1), offs)
+    ctx.save_for_backward(backward_A, backward_B, offs)
 
-    return mx_A, block_mx_B.to_mx_tensor(-2)
+    return forward_A, forward_B
 
 
 class _BlockMXQuantGroupedMM(torch.autograd.Function):

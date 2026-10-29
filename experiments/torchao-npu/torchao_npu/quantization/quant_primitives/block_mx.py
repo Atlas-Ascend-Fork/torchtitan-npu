@@ -148,7 +148,7 @@ def mxfp4_to_block_mx(
     scale = mxscale.permute([*perm_indices, ndim])
 
     q_p, s1_p, s2_p = torch.ops.cann_ops_nn.mx_to_block_mx_quant(
-        fp4,
+        fp4.view(torch.uint8),
         scale,
         dst_type=dst_config.npu_elem_dtype,
         x_type=src_config.npu_elem_dtype,
