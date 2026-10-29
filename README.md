@@ -17,7 +17,7 @@
 
 ---
 
-`torchtitan-npu`定位为`torchtitan`的昇腾（Huawei Ascend）后端扩展插件，通过即插即用的硬件亲和性优化，充分释放NPU算力，助力`PyTorch native`训练在昇腾平台无缝、高效、稳定地运行。
+`torchtitan-npu`定位为CANN社区基于`torchtitan`在昇腾（Huawei Ascend）上的训练recipe，通过即插即用的硬件亲和性优化，充分释放NPU算力，助力`PyTorch native`训练在昇腾平台无缝、高效、稳定地运行。
 
 本插件通过 torchtitan 配置级 override 和 PyTorch backend 注册机制扩展上游能力，涵盖 NPU 融合算子、显存管理、分布式并行以及调试维测等能力。
 
