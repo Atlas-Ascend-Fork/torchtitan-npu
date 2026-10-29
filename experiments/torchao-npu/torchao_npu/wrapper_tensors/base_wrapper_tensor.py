@@ -88,6 +88,10 @@ else:
     _ops_to_preserve_subclass.add(torch.ops.spmd_types.replicate_to_varying.default)
 
 
+# Packed FP4 has no NPU dim-0 copy kernel, so it pads via the uint8 byte view.
+_PAD_SUBBYTE_UINT8_VIEW_DTYPES = {torch.float4_e2m1fn_x2}
+
+
 def _pad_uneven_shard_dim0(
     inputs: tuple[torch.Tensor, ...],
     outer_size: torch.Size,
@@ -97,8 +101,9 @@ def _pad_uneven_shard_dim0(
 
     ``fsdp_pre_all_gather`` must return the padded shard size or the padded
     rank alone fails the all-gather size assert and the collective hangs.
-    Only dim 0 can shard unevenly, and the gathered padding tail is dropped
-    by FSDP2 via ``as_strided(_orig_size)``.
+    Only dim 0 can shard unevenly. Callers trim the pad tail: FSDP2 drops it
+    via ``as_strided(_orig_size)``; multi-input payloads narrow it back in
+    their ``fsdp_post_all_gather``.
     """
     if world_size <= 1 or outer_size[0] % world_size == 0:
         return inputs
@@ -107,6 +112,11 @@ def _pad_uneven_shard_dim0(
     def pad_dim0(t: torch.Tensor) -> torch.Tensor:
         if t.size(0) >= padded_dim0:
             return t
+        if t.dtype in _PAD_SUBBYTE_UINT8_VIEW_DTYPES:
+            packed = t.view(torch.uint8)
+            padded = packed.new_zeros((padded_dim0, *packed.shape[1:]))
+            padded.narrow(0, 0, packed.size(0)).copy_(packed)
+            return padded.view(t.dtype)
         padded = t.new_zeros((padded_dim0, *t.shape[1:]))
         padded.narrow(0, 0, t.size(0)).copy_(t)
         return padded

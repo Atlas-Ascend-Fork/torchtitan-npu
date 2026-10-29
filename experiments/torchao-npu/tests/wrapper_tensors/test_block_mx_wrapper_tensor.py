@@ -910,3 +910,95 @@ def test_prequantized_backward_keeps_data_grad_free(device):
     assert prequantized_param.grad is not None
     assert torch.equal(prequantized_param.grad, on_the_fly_param.grad)
     assert torch.equal(activation.grad, reference_activation.grad)
+
+
+@pytest.mark.parametrize("device", target_devices)
+@pytest.mark.parametrize("prequantize_dtype", ["fp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "experts, world_size",
+    [(3, 2), (4, 2)],
+    ids=["uneven_3of2", "even_4of2"],
+)
+def test_fsdp_uneven_shard_round_trip(device, prequantize_dtype, experts, world_size):
+    """Uneven dim-0 shards pad every quantized component on dim 0 and trim it back
+    on gather, so the rebuilt weight equals the unsharded quantization.
+
+    ``experts=3`` over 2 ranks forces the uneven path (rank 1 holds 1 of the 2
+    largest-chunk rows); ``experts=4`` is the even control that must stay put.
+    """
+    if prequantize_dtype == "fp8":
+        config = BlockMXQuantizeConfig(fsdp_prequantize=True, fsdp_prequantize_dtype="fp8")
+    else:
+        config = BlockMXQuantizeConfig(
+            fsdp_prequantize=True,
+            fsdp_prequantize_dtype="mxfp4",
+            mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+        )
+    activation_config = MXQuantizeConfig()
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+    weight = torch.randn(experts, 128, 128, device=device, dtype=torch.bfloat16)
+    padded_dim0 = -(-experts // world_size)
+    uneven = experts % world_size != 0
+
+    wrappers = [
+        BlockMXTrainingWeightWrapperTensor(
+            shard.contiguous(), weight_config=config, activation_config=activation_config
+        )
+        for shard in weight.chunk(world_size)
+    ]
+    # Checkpointing reads the local shard's bytes, so pad must live only in the
+    # collective's copies: ``fsdp_pre_all_gather`` must leave every wrapper alone
+    hp_before = [w._data.clone() for w in wrappers]
+    results = [
+        w.fsdp_pre_all_gather(_SizeOnlyMesh(world_size), weight.shape, weight.stride(), None, mp_policy)
+        for w in wrappers
+    ]
+    n_components = len(results[0][0])
+    for w, before in zip(wrappers, hp_before, strict=True):
+        assert torch.equal(w._data, before)
+
+    for inputs, metadata in results:
+        assert all(t.size(0) == padded_dim0 for t in inputs)
+        if uneven:
+            assert metadata["_uneven_logical_dim0"] == experts
+        else:
+            assert "_uneven_logical_dim0" not in metadata
+
+    gathered = tuple(torch.cat([r[0][i] for r in results]) for i in range(n_components))
+    assert all(t.size(0) == padded_dim0 * world_size for t in gathered)
+
+    # Reference: whole-weight quantization, byte-identical to what the uneven
+    # pre→gather→post round trip must reconstruct. Post keeps the wire format:
+    # fp8 payloads rebuild a BlockMXTensor, mxfp4 payloads stay an MXTensor.
+    if prequantize_dtype == "fp8":
+        reference = BlockMXTensor.from_hp(weight.contiguous(), config, axis=-1, act_quant_config=activation_config)
+    else:
+        reference = MXTensor.from_hp(
+            weight.contiguous(),
+            config.mxfp4_fake_quantize_config,
+            axis=-1,
+            act_quant_config=activation_config,
+        )
+
+    def assert_rebuilt_matches_reference(data):
+        assert type(data) is type(reference)
+        assert torch.equal(data.qdata.view(torch.uint8), reference.qdata.view(torch.uint8))
+        if prequantize_dtype == "mxfp4":
+            assert torch.equal(data.scale.view(torch.uint8), reference.scale.view(torch.uint8))
+        else:
+            assert torch.equal(data.scale1.view(torch.uint8), reference.scale1.view(torch.uint8))
+            assert torch.equal(data.scale2.view(torch.uint8), reference.scale2.view(torch.uint8))
+
+    # Step 0 (out=None): logical dim-0 output, full-size inner buffers for reuse.
+    output, inner = wrappers[0].fsdp_post_all_gather(gathered, results[0][1], torch.bfloat16)
+    assert output.shape == weight.shape
+    assert [tuple(t.shape) for t in inner] == [tuple(t.shape) for t in gathered]
+    assert_rebuilt_matches_reference(output._data)
+
+    # Step 1+ (out=pre-allocated unsharded wrapper): in-place, same logical size.
+    out_alloc = BlockMXTrainingWeightWrapperTensor(
+        weight.clone(), weight_config=config, activation_config=activation_config
+    )
+    assert wrappers[0].fsdp_post_all_gather(gathered, results[0][1], torch.bfloat16, out=out_alloc) is None
+    assert out_alloc.shape == weight.shape
+    assert_rebuilt_matches_reference(out_alloc._data)

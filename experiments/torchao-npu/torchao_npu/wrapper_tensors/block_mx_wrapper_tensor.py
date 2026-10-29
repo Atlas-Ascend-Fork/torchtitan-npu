@@ -25,7 +25,10 @@ from torchao_npu.quantization.quant_configs import (
 from torchao_npu.quantization.transform import register_parameter_swap_handler
 from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
-from torchao_npu.wrapper_tensors.base_wrapper_tensor import BaseTrainingWeightWrapperTensor
+from torchao_npu.wrapper_tensors.base_wrapper_tensor import (
+    BaseTrainingWeightWrapperTensor,
+    _pad_uneven_shard_dim0,
+)
 
 
 class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
@@ -187,7 +190,16 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
 
             quantized = quantized.to(mp_policy.param_dtype)
             tensor_names, tensor_attrs = quantized.__tensor_flatten__()
-            return tuple(getattr(quantized, name) for name in tensor_names), tensor_attrs
+            all_gather_inputs = tuple(getattr(quantized, name) for name in tensor_names)
+
+            # Uneven dim-0 sharding (e.g. 3 experts over 2 ranks): every
+            # component shares the leading expert dim, so pad all of them to the
+            # largest chunk and stash the logical dim0 for post to trim back.
+            if outer_size[0] % mesh.size() != 0:
+                all_gather_inputs = _pad_uneven_shard_dim0(all_gather_inputs, outer_size, mesh.size())
+                tensor_attrs = {**tensor_attrs, "_uneven_logical_dim0": outer_size[0]}
+
+            return all_gather_inputs, tensor_attrs
 
         return super().fsdp_pre_all_gather(mesh, outer_size, outer_stride, module, mp_policy)
 
@@ -236,26 +248,35 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
             else:
                 return super().fsdp_post_all_gather(all_gather_outputs, metadata, param_dtype, out=out)
 
-        elif len(all_gather_outputs) == 2:
-            quantized = MXTensor.__tensor_unflatten__(
-                dict(zip(MXTensor.tensor_data_names, all_gather_outputs, strict=True)), metadata, None, None
-            )
-
-        elif len(all_gather_outputs) == 3:
-            # Inverse of ``fsdp_pre_all_gather``'s flatten. ``outer_size`` /
-            # ``outer_stride`` are unused by the class's unflatten. So None is passed.
-            quantized = BlockMXTensor.__tensor_unflatten__(
-                dict(zip(BlockMXTensor.tensor_data_names, all_gather_outputs, strict=True)),
-                metadata,
-                None,
-                None,
-            )
-
         else:
-            raise RuntimeError(
-                "Expect `len(all_gather_outputs)` in (1, 2, 3), got "
-                f"`len(all_gather_outputs)` == {len(all_gather_outputs)}"
-            )
+            # Trim the zero pad tail that ``fsdp_pre_all_gather`` added under uneven
+            # dim-0 sharding, before rebuilding.
+            logical_dim0 = metadata.get("_uneven_logical_dim0") if isinstance(metadata, dict) else None
+            if logical_dim0 is not None:
+                gathered: tuple[torch.Tensor, ...] = tuple(t.narrow(0, 0, logical_dim0) for t in all_gather_outputs)
+            else:
+                gathered = all_gather_outputs
+
+            if len(all_gather_outputs) == 2:
+                quantized = MXTensor.__tensor_unflatten__(
+                    dict(zip(MXTensor.tensor_data_names, gathered, strict=True)), metadata, None, None
+                )
+
+            elif len(all_gather_outputs) == 3:
+                # Inverse of ``fsdp_pre_all_gather``'s flatten. ``outer_size`` /
+                # ``outer_stride`` are unused by the class's unflatten. So None is passed.
+                quantized = BlockMXTensor.__tensor_unflatten__(
+                    dict(zip(BlockMXTensor.tensor_data_names, gathered, strict=True)),
+                    metadata,
+                    None,
+                    None,
+                )
+
+            else:
+                raise RuntimeError(
+                    "Expect `len(all_gather_outputs)` in (1, 2, 3), got "
+                    f"`len(all_gather_outputs)` == {len(all_gather_outputs)}"
+                )
 
         if out is None:
             # Training step 0: build a new wrapper. The components are also the

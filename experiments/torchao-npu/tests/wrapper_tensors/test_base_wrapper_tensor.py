@@ -532,6 +532,26 @@ def test_pad_uneven_shard_dim0_pads_all_inputs():
 
 
 @pytest.mark.parametrize("device", target_devices)
+def test_pad_uneven_shard_dim0_packs_fp4_via_uint8(device):
+    """Packed FP4 (which has no dim-0 copy kernel) is padded through a uint8 byte view."""
+    from torchao_npu.quantized_tensors.mx_tensor import MXTensor
+
+    fp4 = MXTensor.from_hp(
+        torch.randn(1, 64, 128, device=device, dtype=torch.bfloat16),
+        quant_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+        axis=-1,
+        act_quant_config=MXQuantizeConfig(),
+    ).qdata
+
+    (padded,) = _pad_uneven_shard_dim0((fp4,), torch.Size([3, *fp4.shape[1:]]), 2)
+
+    assert padded.shape == (2, *fp4.shape[1:])
+    assert padded.dtype is torch.float4_e2m1fn_x2
+    assert torch.equal(padded[:1].view(torch.uint8), fp4.view(torch.uint8))
+    assert torch.count_nonzero(padded[1:].view(torch.uint8)) == 0
+
+
+@pytest.mark.parametrize("device", target_devices)
 @pytest.mark.parametrize("on_meta", [False, True])
 @pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
 def test_fsdp_post_all_gather_first_step(wrapper_cls, weight_config, act_config, device, on_meta):
