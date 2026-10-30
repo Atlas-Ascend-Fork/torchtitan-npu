@@ -156,10 +156,11 @@ class BlockMXQuantizeConfig(MXQuantizeConfig):
     # When set, apply MXFP4 fake-quant to weights before the block MX matmul.
     mxfp4_fake_quantize_config: MXQuantizeConfig | None = None
 
-    # When set, enable FSDP pre-quantization: the weight is quantized to block
-    # MX in ``fsdp_pre_all_gather`` (before all_gather) and the quantized
-    # weight + scales are all-gathered, so forward/backward reuse the
-    # pre-quantized data instead of re-quantizing on the fly.
+    # When set, enable FSDP pre-quantization: on a multi-rank mesh the weight is
+    # quantized to block MX in ``fsdp_pre_all_gather`` (before all_gather) and the
+    # quantized weight + scales are all-gathered, so forward/backward reuse the
+    # pre-quantized data instead of re-quantizing on the fly. A size-1 mesh runs no
+    # collective and quantizes in ``fsdp_post_all_gather`` instead.
     fsdp_prequantize: bool = field(default=False, compare=False)
     fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = field(default="fp8", compare=False)
 

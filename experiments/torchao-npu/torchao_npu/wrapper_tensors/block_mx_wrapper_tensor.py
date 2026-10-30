@@ -23,6 +23,7 @@ from torchao_npu.quantization.quant_configs import (
     MXQuantizeConfig,
 )
 from torchao_npu.quantization.transform import register_parameter_swap_handler
+from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
 from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
 from torchao_npu.wrapper_tensors.base_wrapper_tensor import (
@@ -41,7 +42,8 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
     pre-quantized to MXFP4 before the block MX matmul.
 
     When ``weight_config.fsdp_prequantize`` is set, the sharded weight is
-    quantized prior to FSDP communication.
+    quantized before the FSDP all-gather; a size-1 mesh, which runs no
+    collective, quantizes while rebuilding the unsharded weight instead.
     """
 
     _data: torch.Tensor
@@ -140,8 +142,10 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         On a multi-rank mesh with ``fsdp_prequantize`` set, the shard is
         quantized and the quantized results instead of the high precision shard
         are all-gathered and reassembled in :meth:`fsdp_post_all_gather`.
-        Otherwise (without this flag, or on a size-1 mesh where no true
-        all-gather communication is executed), the high precision shard is
+        On a size-1 mesh, no collective runs whatever the flag says, so an empty
+        payload is returned to keep FSDP's all-gather buffer at zero bytes, and
+        :meth:`fsdp_post_all_gather` rebuilds from the sharded weight instead.
+        On a multi-rank mesh without the flag, the high precision shard is
         all-gathered.
 
         Raises:
@@ -201,6 +205,14 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
 
             return all_gather_inputs, tensor_attrs
 
+        elif mesh.size() == 1:
+            # A size-1 mesh runs no collective: FSDP would only copy the payload
+            # into an all-gather buffer. Return an empty payload so that buffer
+            # stays at zero bytes; ``fsdp_post_all_gather`` rebuilds the unsharded
+            # weight from the sharded weight, which is full at size 1.
+            dtype = mp_policy.param_dtype or self._data.dtype
+            return (torch.empty(0, dtype=dtype, device=self._data.device),), ()
+
         return super().fsdp_pre_all_gather(mesh, outer_size, outer_stride, module, mp_policy)
 
     def fsdp_post_all_gather(
@@ -213,20 +225,34 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
     ):
         """Rebuild the wrapper tensor from the gathered and potentially quantized components.
 
-        With ``fsdp_prequantize`` set, a high-precision payload -- the size-1-mesh
-        fallback of :meth:`fsdp_pre_all_gather` -- is quantized here, so the unsharded
-        ``_data`` matches the multi-rank path.
+        An empty payload marks a size-1 mesh: no collective ran, the sharded weight is
+        the full weight, and the empty payload stays FSDP's inner tensor. With
+        ``fsdp_prequantize`` set the weight is quantized here from that shard and
+        retagged to ``param_dtype``; on a multi-rank mesh the gathered payload is
+        already quantized, so it is only unflattened here. Without the flag the
+        high-precision payload is used as-is; on a size-1 mesh that keeps the master
+        dtype instead of casting to ``param_dtype``, since the matmul quantizes the
+        weight anyway and the cast would only add a full-size copy.
         """
         if len(all_gather_outputs) == 1:
             (data,) = all_gather_outputs
-            assert data.dtype in _SUPPORTED_HP_DTYPES, (
-                f"When only one tensor is gathered, it is expected to be in high precision "
-                f"{_SUPPORTED_HP_DTYPES}, got a {data.dtype} tensor."
-            )
+            if data.numel() == 0:
+                # Size-1 mesh: the payload is FSDP's empty gather buffer, and the
+                # sharded weight is the full weight. Rebuild from it; the empty
+                # payload remains FSDP's inner tensor.
+                data = self._data
+            else:
+                assert data.dtype in _SUPPORTED_HP_DTYPES, (
+                    f"When only one tensor is gathered, it is expected to be in high precision "
+                    f"{_SUPPORTED_HP_DTYPES}, got a {data.dtype} tensor."
+                )
 
-            if self.weight_config.fsdp_prequantize is True:
+            if self.weight_config.fsdp_prequantize is not True:
+                inner_tensor = data
+
+            else:
                 if self.weight_config.fsdp_prequantize_dtype == "fp8":
-                    quantized = BlockMXTensor.from_hp(
+                    inner_tensor = BlockMXTensor.from_hp(
                         data,
                         quant_config=self.weight_config,
                         axis=-1,
@@ -235,7 +261,7 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                 elif self.weight_config.fsdp_prequantize_dtype == "mxfp4":
                     mxfp4_config = self.weight_config.mxfp4_fake_quantize_config
                     assert mxfp4_config is not None, "mxfp4_fake_quantize_config is None"
-                    quantized = MXTensor.from_hp(
+                    inner_tensor = MXTensor.from_hp(
                         data,
                         quant_config=mxfp4_config,
                         axis=-1,
@@ -245,8 +271,6 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                     raise ValueError(
                         f"Unsupported fsdp_prequantize_dtype value '{self.weight_config.fsdp_prequantize_dtype}'"
                     )
-            else:
-                return super().fsdp_post_all_gather(all_gather_outputs, metadata, param_dtype, out=out)
 
         else:
             # Trim the zero pad tail that ``fsdp_pre_all_gather`` added under uneven
@@ -258,14 +282,14 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                 gathered = all_gather_outputs
 
             if len(all_gather_outputs) == 2:
-                quantized = MXTensor.__tensor_unflatten__(
+                inner_tensor = MXTensor.__tensor_unflatten__(
                     dict(zip(MXTensor.tensor_data_names, gathered, strict=True)), metadata, None, None
                 )
 
             elif len(all_gather_outputs) == 3:
                 # Inverse of ``fsdp_pre_all_gather``'s flatten. ``outer_size`` /
                 # ``outer_stride`` are unused by the class's unflatten. So None is passed.
-                quantized = BlockMXTensor.__tensor_unflatten__(
+                inner_tensor = BlockMXTensor.__tensor_unflatten__(
                     dict(zip(BlockMXTensor.tensor_data_names, gathered, strict=True)),
                     metadata,
                     None,
@@ -278,13 +302,21 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                     f"`len(all_gather_outputs)` == {len(all_gather_outputs)}"
                 )
 
+        # Quantized tensors only retag their logical dtype here. A high-precision
+        # tensor is used as-is: on a size-1 mesh a cast to ``param_dtype`` would add a
+        # full-size copy that the matmul quantizes away anyway.
+        if isinstance(inner_tensor, BaseQuantizedTensor):
+            inner_tensor = inner_tensor.to(param_dtype)
+
         if out is None:
-            # Training step 0: build a new wrapper. The components are also the
-            # ``inner_tensors``: FSDP frees and re-allocates their storage and
-            # reuses them as the gather buffers, so ``_data`` must keep the very
-            # objects handed back here.
+            # Training step 0: build a new wrapper. The returned
+            # ``all_gather_outputs`` become FSDP's inner tensors: it frees and
+            # re-allocates their storage as the gather buffers, so ``_data`` must
+            # not alias them unless it is meant to be rewritten on every step
+            # (the multi-rank quantized payloads are; the size-1 empty payload
+            # is not).
             output = type(self)(
-                quantized,
+                inner_tensor,
                 activation_config=self.activation_config,
                 weight_config=self.weight_config,
             )
@@ -295,14 +327,14 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         # components; the configs are restored from the sharded wrapper (FSDP2
         # hands over a shallow copy of it).
         if isinstance(out, BlockMXTrainingWeightWrapperTensor):
-            out._data = quantized
+            out._data = inner_tensor
             out.activation_config = self.activation_config
             out.weight_config = self.weight_config
         elif isinstance(out, DTensor) and isinstance(out._local_tensor, BlockMXTrainingWeightWrapperTensor):
             # Bind to a local: pyrefly doesn't propagate isinstance narrowing
             # through attribute accesses reliably.
             local: BlockMXTrainingWeightWrapperTensor = out._local_tensor
-            local._data = quantized
+            local._data = inner_tensor
             local.activation_config = self.activation_config
             local.weight_config = self.weight_config
         else:

@@ -95,24 +95,20 @@ def test_wrapper_init_stores_attrs(wrapper_cls, weight_config, act_config, devic
     """__init__ stores _data, weight_config, and activation_config."""
     w = torch.randn(64, 128, device=device)
     wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
-    assert wrapper._data is not w
-    assert wrapper._data.data_ptr() == w.data_ptr()
-    assert torch.equal(wrapper._data, w)
+    assert wrapper._data is w
     assert wrapper.weight_config is weight_config
     assert wrapper.activation_config is act_config
 
 
 @pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
-def test_wrapper_init_detaches_data_and_shares_storage(wrapper_cls, weight_config, act_config):
-    """``_data`` is a detached alias: a new object sharing the input's storage."""
+def test_wrapper_init_keeps_the_supplied_data(wrapper_cls, weight_config, act_config):
+    """``_data`` is the supplied tensor; detaching is the caller's job or the ``detach`` op."""
     w = torch.randn(64, 128, requires_grad=True)
     wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
 
     assert wrapper.requires_grad is True
-    assert wrapper._data.requires_grad is False
-    assert wrapper._data is not w
-    assert wrapper._data.data_ptr() == w.data_ptr()
-    assert torch.equal(wrapper._data, w)
+    assert wrapper._data is w
+    assert wrapper._data.requires_grad is True
 
 
 def test_nn_parameter_wrapper_keeps_grad_on_wrapper_only():
@@ -299,8 +295,8 @@ def test_wrapper_deepcopy(wrapper_cls, weight_config, act_config, device):
 @pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
 def test_wrapper_deepcopy_preserves_requires_grad(wrapper_cls, weight_config, act_config):
     """``__deepcopy__`` restores the wrapper's flag without giving ``_data`` one."""
-    w = torch.randn(16, 32, requires_grad=True)
-    wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
+    wrapper = wrapper_cls(torch.randn(16, 32), activation_config=act_config, weight_config=weight_config)
+    wrapper.requires_grad_(True)
 
     wrapper_copy = copy.deepcopy(wrapper)
 
@@ -322,8 +318,7 @@ def test_wrapper_to_tensor(wrapper_cls, weight_config, act_config, device):
     result = wrapper.to_tensor()
     assert isinstance(result, torch.Tensor)
     assert result is wrapper._data
-    assert result is not w
-    assert result.data_ptr() == w.data_ptr()
+    assert result is w
 
 
 # =========================================================================
@@ -432,10 +427,24 @@ def test_meta_weights(wrapper_cls, weight_config, act_config):
 
 # =========================================================================
 # FSDP hook unit tests
+#
+# These exercise the base hook implementation, so BlockMXTrainingWeightWrapperTensor
+# (which overrides both hooks: an empty payload on a size-1 mesh, high-precision
+# payloads rebound as-is) is left out; its hook contract is covered by
+# ``test_block_mx_wrapper_tensor.py``.
 # =========================================================================
 
 
-@pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "wrapper_cls, weight_config, act_config",
+    [
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
 @pytest.mark.parametrize(
     "dtypes",
     [
@@ -447,7 +456,7 @@ def test_meta_weights(wrapper_cls, weight_config, act_config):
     ids=["fp32-fp32", "fp32-bf16", "bf16-fp32", "bf16-bf16"],
 )
 def test_fsdp_pre_all_gather(wrapper_cls, weight_config, act_config, dtypes, mock_distributed_env):
-    """fsdp_pre_all_gather casts _data to mp_policy.param_dtype and returns it."""
+    """The base fsdp_pre_all_gather casts _data to mp_policy.param_dtype and returns it."""
     tensor_dtype, param_dtype = dtypes
     w = torch.randn(64, 128, dtype=tensor_dtype)
     wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
@@ -555,7 +564,7 @@ def test_pad_uneven_shard_dim0_packs_fp4_via_uint8(device):
 @pytest.mark.parametrize("on_meta", [False, True])
 @pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
 def test_fsdp_post_all_gather_first_step(wrapper_cls, weight_config, act_config, device, on_meta):
-    """fsdp_post_all_gather with out=None creates a new wrapper with preserved configs."""
+    """fsdp_post_all_gather with out=None aliases the gathered payload and preserves the configs."""
     w_device = "meta" if on_meta else device
     w = torch.empty(64, 128, device=w_device)
     wrapper = wrapper_cls(w, activation_config=act_config, weight_config=weight_config)
@@ -563,7 +572,7 @@ def test_fsdp_post_all_gather_first_step(wrapper_cls, weight_config, act_config,
 
     result, inner_tensors = wrapper.fsdp_post_all_gather((gathered,), None, torch.float32, out=None)
     assert isinstance(result, wrapper_cls)
-    assert result._data is not gathered
+    assert result._data is gathered
     assert result._data.untyped_storage().data_ptr() == gathered.untyped_storage().data_ptr()
     assert isinstance(inner_tensors, tuple)
     assert len(inner_tensors) == 1
@@ -572,7 +581,16 @@ def test_fsdp_post_all_gather_first_step(wrapper_cls, weight_config, act_config,
     assert result.activation_config is act_config
 
 
-@pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "wrapper_cls, weight_config, act_config",
+    [
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fsdp_post_all_gather_existing_out_same_dtype(wrapper_cls, weight_config, act_config, dtype):
     """out is bare wrapper, same dtype: configs restored, storage pointer verified."""
@@ -602,7 +620,14 @@ def test_fsdp_post_all_gather_existing_out_same_dtype(wrapper_cls, weight_config
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("device", target_devices)
-@pytest.mark.parametrize("wrapper_spec", _NON_BASE_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "wrapper_spec",
+    [
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
 def test_fsdp_post_all_gather_existing_out_same_dtype_dtensor(wrapper_spec, dtype, device, mock_distributed_env):
     """out is DTensor with wrapped local_tensor -- configs restored on local_tensor."""
     wrapper_cls, weight_config, act_config = wrapper_spec
@@ -639,7 +664,16 @@ def test_fsdp_post_all_gather_existing_out_same_dtype_dtensor(wrapper_spec, dtyp
         (torch.float32, torch.bfloat16),
     ],
 )
-@pytest.mark.parametrize("wrapper_cls, weight_config, act_config", _ALL_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "wrapper_cls, weight_config, act_config",
+    [
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
 def test_fsdp_post_all_gather_existing_out_cross_dtype(wrapper_cls, weight_config, act_config, in_dtype, out_dtype):
     """out is bare wrapper, different dtype: configs restored, out_data.copy_(data)."""
     w = torch.empty(2, 32, 64, device="meta")  # different shape/device -- must not be used
@@ -680,7 +714,14 @@ def test_fsdp_post_all_gather_existing_out_cross_dtype(wrapper_cls, weight_confi
     ],
 )
 @pytest.mark.parametrize("device", target_devices)
-@pytest.mark.parametrize("wrapper_spec", _NON_BASE_WRAPPER_CASES)
+@pytest.mark.parametrize(
+    "wrapper_spec",
+    [
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), Float8FakeQuantizeConfig()),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
 def test_fsdp_post_all_gather_existing_out_cross_dtype_dtensor(
     wrapper_spec, in_dtype, out_dtype, device, mock_distributed_env
 ):
