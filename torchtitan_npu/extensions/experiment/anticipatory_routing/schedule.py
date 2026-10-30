@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.components.data.loader import DataloaderExhaustedError
 from torchtitan.observability import structured_logger as sl
 
 from .cache import RoutingSlot, slot_nbytes

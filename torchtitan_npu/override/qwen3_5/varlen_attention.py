@@ -5,74 +5,50 @@
 
 # pylint: disable=huawei-invalid-name
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torchtitan.config import derive, override
-from torchtitan.models.common.attention import VarlenAttention
+from torchtitan.config import override
+from torchtitan.models.common.attention import VarlenAttention, VarlenMetadata
 
 from torchtitan_npu.override.qwen3_5.parallelize import (
-    exchange_sequence_heads,
-    head_to_sequence_shard,
+    QWEN_CONTEXT_PARALLEL_UNSUPPORTED,
 )
-
-_CAUSAL_MASK = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1)
 
 
 class AscVarlenAttention(VarlenAttention):
+    """Refuse the not-yet-migrated context-parallel varlen attention.
+
+    Upstream 0.4.0 folds the batch dimension into the token row: the base
+    ``VarlenAttention.forward`` now takes ``[T, N, H]`` and a
+    ``VarlenMetadata``.  The removed implementation exchanged rank-local heads
+    on pre-fold ``[B, L, N, H]`` tensors and fed CANN TND attention with
+    ``actual_seq_qlen`` from the old CP metadata, so running it against the
+    folded caller would mis-shard the sequence.  The class and factory remain
+    registered to fail with one explicit explanation until the CP NPU
+    validation pass migrates them.
+    """
+
     context_parallel_mesh: DeviceMesh
 
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
         pass
 
-    def forward(self, q_BLNH, k_BLNH, v_BLNH, *, attention_masks, scale=None, enable_gqa=False, **kwargs):
-        del kwargs
-        mesh = self.context_parallel_mesh
-        if enable_gqa and k_BLNH.size(2) % mesh.size():
-            repeats = q_BLNH.size(2) // k_BLNH.size(2)
-            k_BLNH, v_BLNH = (tensor.repeat_interleave(repeats, 2) for tensor in (k_BLNH, v_BLNH))
-        actual_seq = attention_masks.actual_seq_qlen
-        if k_BLNH.size(1) == q_BLNH.size(1):
-            q_BLNH, k_BLNH, v_BLNH = exchange_sequence_heads((q_BLNH, k_BLNH, v_BLNH), mesh, 2)
-        else:
-            # spmd local_map contract: q stays sequence-sharded on the cp axis
-            # while k/v arrive all-gathered (Replicate on cp) with all heads
-            # local. Exchange only q to the head-sharded view and take this
-            # rank's head slice of k/v without extra collectives.
-            q_BLNH = exchange_sequence_heads((q_BLNH,), mesh, 2)[0]
-            k_BLNH = k_BLNH.chunk(mesh.size(), 2)[mesh.get_local_rank()].contiguous()
-            v_BLNH = v_BLNH.chunk(mesh.size(), 2)[mesh.get_local_rank()].contiguous()
-        batch, length, heads, head_dim = q_BLNH.shape
-        dtype = q_BLNH.dtype
-        query, key, value = (
-            tensor.reshape(batch * length, tensor.size(2), head_dim).to(torch.bfloat16)
-            for tensor in (q_BLNH, k_BLNH, v_BLNH)
-        )
-        causal_mask = getattr(self, "_causal_mask", None)
-        if causal_mask is None or causal_mask.device != query.device:
-            self._causal_mask = causal_mask = _CAUSAL_MASK.to(query.device)
-        output = (
-            torch.ops.npu.npu_fusion_attention_v3(
-                query=query,
-                key=key,
-                value=value,
-                head_num=heads,
-                input_layout="TND",
-                atten_mask=causal_mask,
-                scale=head_dim**-0.5 if scale is None else scale,
-                keep_prob=1.0,
-                pre_tockens=length,
-                next_tockens=0,
-                actual_seq_qlen=actual_seq,
-                actual_seq_kvlen=actual_seq,
-                sparse_mode=7,
-            )[0]
-            .view(batch, length, heads, head_dim)
-            .to(dtype)
-        )
-        return head_to_sequence_shard(output, mesh, 2)
+    def forward(
+        self,
+        q_THK: torch.Tensor,
+        k_THK: torch.Tensor,
+        v_THV: torch.Tensor,
+        *,
+        attention_masks: VarlenMetadata,
+        scale: float | None = None,
+        out_transform: (Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None) = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
 
 
 @override(
@@ -82,4 +58,4 @@ class AscVarlenAttention(VarlenAttention):
     description="Use CANN TND attention with Qwen3.5/3.6 Context Parallel",
 )
 def asc_cp(cfg: VarlenAttention.Config) -> AscVarlenAttention.Config:
-    return derive(cfg, AscVarlenAttention.Config)
+    raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)

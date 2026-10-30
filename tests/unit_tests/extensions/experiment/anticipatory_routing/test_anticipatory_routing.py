@@ -12,14 +12,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
 
-from torchtitan_npu.extensions.torchtitan.trainer import Trainer, TrainerEx
 from torchtitan_npu.extensions.experiment.anticipatory_routing.cache import RoutingMode
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
-
 from torchtitan_npu.extensions.experiment.anticipatory_routing.router import build_routing_cache
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule, Phase
-from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
+from torchtitan_npu.extensions.torchtitan.trainer import Trainer, TrainerEx
 
 
 class Scheduler(torch.optim.lr_scheduler.StepLR):
@@ -37,7 +36,7 @@ class Loader:
         for i in range(self.position, self.size):
             self.position = i + 1
             self.reads.append(i)
-            yield [{"input": torch.tensor([[[i + 1.0, 0.0]]])}, torch.tensor([[i]])]
+            yield [{"input": torch.tensor([[[i + 1.0, 0.0]]]), "num_valid_tokens": 1}, torch.tensor([[i]])]
 
     def state_dict(self):
         return {"position": self.position}
@@ -49,11 +48,9 @@ class Loader:
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        router = AnticipatoryHashRouter.__new__(AnticipatoryHashRouter)
+        router = TokenChoiceTopKRouter.__new__(TokenChoiceTopKRouter)
         nn.Module.__init__(router)
         router.gate = nn.Identity()
-        router.hash = False
-        router.sorted_topk = False
         router.score_func = "sigmoid"
         router.num_experts, router.top_k = 2, 1
         router.num_expert_groups = None
@@ -64,10 +61,37 @@ class Model(nn.Module):
         self.register_buffer("counter", torch.tensor(0.0))
 
 
+    def preprocess_inputs(self, batch, **kwargs):
+        return batch["input"], batch["labels"], {}
+
     def forward(self, x):
         self.counter.add_(1)
         self.router(x)
         return x * self.weight
+
+
+def test_forward_only_preserves_batch_and_forwards_model_metadata():
+    from torchtitan_npu.extensions.experiment.anticipatory_routing.engine import AnticipatoryTrainingEngine
+
+    class ForwardModel(nn.Module):
+        def preprocess_inputs(self, batch, **kwargs):
+            return batch.pop("input"), batch.pop("labels"), batch
+
+        def forward(self, inputs, *, positions):
+            self.seen = (inputs, positions)
+
+    model = ForwardModel()
+    engine = object.__new__(AnticipatoryTrainingEngine)
+    engine.trainer = SimpleNamespace(
+        model_parts=[model], device=torch.device("cpu"), ntokens_seen=0,
+        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=None),
+    )
+    inputs, positions, labels = torch.tensor([1]), torch.tensor([2]), torch.tensor([3])
+    batch = ({"input": inputs, "positions": positions, "num_valid_tokens": 1}, labels)
+    engine.forward_only_microbatch(batch)
+    torch.testing.assert_close(model.seen, (inputs, positions))
+    assert batch[0]["num_valid_tokens"] == 1
+    assert set(batch[0]) == {"input", "positions", "num_valid_tokens"}
 
 
 def make_trainer(monkeypatch, *, delay=2, active=3, size=40, steps=10, device="cpu", compile_backend=None):
@@ -80,9 +104,9 @@ def make_trainer(monkeypatch, *, delay=2, active=3, size=40, steps=10, device="c
         enable=True, delay_steps=delay, active_steps=active
     )
     trainer.config = SimpleNamespace(
-        anticipatory=config, training=SimpleNamespace(steps=steps, disable_cuda_graphs=True, max_norm=100.0), checkpoint=SimpleNamespace(interval=2, keep_latest_k=0)
+        anticipatory=config, training=SimpleNamespace(steps=steps, disable_cuda_graphs=True, max_norm=100.0), checkpoint=SimpleNamespace(interval=2, keep_latest_k=0), parallelism=SimpleNamespace()
     )
-    trainer.gradient_accumulation_steps, trainer.num_pipeline_parallel_microbatches = 2, 1
+    trainer.gradient_accumulation_steps, trainer.num_pp_microbatches = 2, 1
     trainer.parallel_dims = SimpleNamespace(
         pp_enabled=False, dp_enabled=False, ep_enabled=False, dp_cp_enabled=False, get_optional_mesh=lambda name: None
     )
@@ -90,6 +114,7 @@ def make_trainer(monkeypatch, *, delay=2, active=3, size=40, steps=10, device="c
         ntokens_since_last_log=0, data_loading_times=[], should_log=lambda step: False
     )
     trainer.train_context = nullcontext
+    trainer.sdc_replayer = None
     trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: None)
     # Avoid torch_npu's automatic optimizer backend probe in CPU-only CI.
     trainer.optimizers = torch.optim.SGD(
@@ -439,7 +464,8 @@ def test_recording_failure_resets_routing_before_next_forward(monkeypatch, stage
 
 
 def test_rollback_target_skips_checkpoint_without_optimizer(monkeypatch, tmp_path):
-    from torchtitan.components.checkpoint import MODEL, OPTIMIZER
+    from torchtitan.components.checkpointer import MODEL, OPTIMIZER
+
     from torchtitan_npu.extensions.experiment.anticipatory_routing import engine as engine_module
 
     trainer, _ = make_trainer(monkeypatch)
@@ -516,7 +542,7 @@ def test_routing_operation_controls_capture_and_replay(monkeypatch, backend, cap
             cache.reset()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(slot[router._anticipatory_key], expected.to(torch.int16), rtol=0, atol=0)
-        buffer = router._anticipatory_replay_buffer
+        buffer = cache.replay_buffers[router._anticipatory_key]
         recording = buffer.capture_indices.clone()
 
         try:
@@ -551,8 +577,8 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
     monkeypatch, full_ac, compile_every, *, device="cpu", backend_name="aot_eager"
 ):
     """Forty distinct router keys must not require forty compiled variants."""
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
     from torch._dynamo.backends.registry import lookup_backend
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
     from torch.utils.checkpoint import DefaultDeviceType
 
     from torchtitan_npu.extensions.experiment.anticipatory_routing.engine import AnticipatoryTrainingEngine
@@ -588,6 +614,9 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
                 checkpoint_wrapper(Block()) if full_ac else Block() for _ in range(40)
             ])
 
+        def preprocess_inputs(self, batch, **kwargs):
+            return batch["input"], batch["labels"], {}
+
         def forward(self, x):
             for layer in self.layers:
                 x = layer(x)
@@ -614,7 +643,7 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
         engine = object.__new__(AnticipatoryTrainingEngine)
         engine.trainer = SimpleNamespace(
             model_parts=[module], device=torch.device(device), ntokens_seen=0,
-            train_context=nullcontext,
+            train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
             post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
         )
         return engine
@@ -765,7 +794,7 @@ def test_capture_compile_failure_preserves_upstream_entry_and_state():
     engine = object.__new__(AnticipatoryTrainingEngine)
     engine.trainer = SimpleNamespace(
         model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext,
+        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
         post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
     )
     batch = ({"input": torch.ones(1, 3, 2)}, torch.zeros(1))
@@ -811,7 +840,7 @@ def test_compiled_capture_preserves_hooks_and_rng():
     engine = object.__new__(AnticipatoryTrainingEngine)
     engine.trainer = SimpleNamespace(
         model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext,
+        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
         post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
     )
     batch = ({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))
@@ -924,7 +953,7 @@ def test_compiled_capture_keeps_disabled_hooks_outside_graph(monkeypatch, full_a
     engine = object.__new__(AnticipatoryTrainingEngine)
     engine.trainer = SimpleNamespace(
         model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext,
+        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
         post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
     )
     batch = ({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))

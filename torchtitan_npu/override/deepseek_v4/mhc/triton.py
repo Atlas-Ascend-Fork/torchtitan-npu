@@ -29,7 +29,7 @@ class TritonHcPre(HcPre):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Kernels consume the flattened 3-D form ``[B, S, hc_mult * dim]``.
-        x = x.flatten(2)
+        x = x.flatten(-2).unsqueeze(0)
         B, S, nD = x.shape
         dtype = x.dtype
 
@@ -57,7 +57,7 @@ class TritonHcPre(HcPre):
 
         x_unflatten = x.unflatten(dim=-1, sizes=(self.hc_mult, -1))
         y = mhc_pre_bmm_op(h_pre, x_unflatten)
-        return y.to(dtype), post, comb
+        return y.to(dtype).squeeze(0), post.squeeze(0), comb.squeeze(0)
 
 
 class TritonHcPost(HcPost):
@@ -69,6 +69,7 @@ class TritonHcPost(HcPost):
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
         input_x = x
+        x, residual, post, comb = (value.unsqueeze(0) for value in (x, residual, post, comb))
         residual_shape = residual.shape
         post = post.float()
         comb = comb.permute(0, 1, 3, 2).float()
@@ -91,7 +92,7 @@ class TritonHcPost(HcPost):
         bmm2 = mhc_post_bmm2_op(comb, residual_unflat)
         result_flat = bmm1 + bmm2
         y = result_flat.view(B, S, N * D).to(dtype)
-        return y.view(residual_shape).type_as(input_x)
+        return y.view(residual_shape).squeeze(0).type_as(input_x)
 
 
 class TritonHcHead(HcHead):
@@ -108,7 +109,7 @@ class TritonHcHead(HcHead):
         self.hc_mult = config.hc_mult
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.flatten(2)
+        x = x.flatten(-2).unsqueeze(0)
         B, S, nD = x.shape
         dtype = x.dtype
 
@@ -133,4 +134,4 @@ class TritonHcHead(HcHead):
 
         x_unflatten = x.unflatten(dim=-1, sizes=(self.hc_mult, -1))
         y = mhc_pre_bmm_op(h_pre, x_unflatten)
-        return y.to(dtype)
+        return y.to(dtype).squeeze(0)

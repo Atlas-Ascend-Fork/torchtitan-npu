@@ -4,8 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """CPU contracts of ``patches.torchtitan.models.common.decoder``: #4897's map build and per-layer
-dispatch, #4116's ``preprocess_inputs`` and #4617's ``_cp_shard``, plus the trainer step that consumes
-them; the seam's own defaults (``attention_metadata.py``) live in ``test_attention_metadata``.
+dispatch, #4116's ``preprocess_inputs`` and #4617's ``_cp_shard``. The seam's own defaults
+(``attention_metadata.py``) live in ``test_attention_metadata``.
 """
 
 from collections import namedtuple
@@ -27,15 +27,16 @@ from torchtitan_npu.patches.torchtitan.models.common import decoder as decoder_p
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     cp_shard_context,
 )
-from torchtitan_npu.patches.torchtitan.trainer import patched_post_dataloading_process
 
-_TOKENS = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
-# Positions [[0, 1, 2, 0, 1]] pack two documents: [0, 3) and [3, 5).
-_POSITIONS = torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.int64)
+_TOKENS = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+# Positions [0, 1, 2, 0, 1] pack two documents: [0, 3) and [3, 5).
+_POSITIONS = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
 _LEGACY_MASKS = object()
 # ``partial_dtensor`` takes neither SPMD tail branch in ``preprocess_inputs``.
 _NO_SPMD = ParallelismConfig(spmd_backend="partial_dtensor")
-_SPMD_TYPES, _FULL_DTENSOR = (ParallelismConfig(spmd_backend=name) for name in ("spmd_types", "full_dtensor"))
+_SPMD_TYPES = ParallelismConfig(spmd_backend="spmd_types")
+# A stale config can bypass the current dataclass validator.
+_FULL_DTENSOR = SimpleNamespace(spmd_backend="full_dtensor")
 _NO_CP = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
 # ``preprocess_inputs`` only forwards the CP mesh, so a sentinel stands in for it.
 _CP_MESH = object()
@@ -164,28 +165,25 @@ def _model(layers) -> Decoder:
 
 def _preprocess(model, parallel_dims=_NO_CP, parallelism=_NO_SPMD):
     return model.preprocess_inputs(
-        {"input": _TOKENS, "positions": _POSITIONS},
-        _TOKENS,
+        {"input": _TOKENS, "labels": _TOKENS, "positions": _POSITIONS},
         parallel_dims=parallel_dims,
-        device=_TOKENS.device,
         parallelism=parallelism,
     )
 
 
 def _shard(monkeypatch, events: list, entries=None, positions=None, load_balancer_type="headtail", shard=None):
-    """Run the patched ``_cp_shard`` on a bare receiver, with the CP shard stubbed out."""
-    extra_kwargs = {"positions": torch.zeros(1, _SEQ_LEN, dtype=torch.int64) if positions is None else positions}
+    """Run the decoder's named-batch CP adapter with device communication stubbed."""
+    extra_kwargs = {"positions": torch.zeros(_SEQ_LEN, dtype=torch.int64) if positions is None else positions}
     if entries is not None:
         extra_kwargs["attention_metadata"] = entries
 
-    def fake_shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, input_seq_dim=1, ptrr_mask_key=None, **kwargs):
-        del cp_mesh, load_balancer_type, input_seq_dim, ptrr_mask_key, kwargs
+    def fake_shard(batch, layouts, cp_mesh, load_balancer_type, ptrr_mask_key):
+        del layouts, cp_mesh, load_balancer_type, ptrr_mask_key
         events.append("shard")
-        tokens, labels, positions = inputs
-        return (tokens[:, :_SHARD_LEN], labels, positions[:, :_SHARD_LEN]), attention_masks
+        return {**batch, "input": batch["input"][:_SHARD_LEN], "positions": batch["positions"][:_SHARD_LEN]}
 
-    monkeypatch.setattr(decoder_patch, "cp_shard", fake_shard if shard is None else shard)
-    tokens = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
+    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", fake_shard if shard is None else shard)
+    tokens = torch.zeros(_SEQ_LEN, dtype=torch.int64)
     return Decoder._cp_shard(
         SimpleNamespace(),
         tokens,
@@ -237,7 +235,10 @@ def test_preprocess_inputs_hands_metadata_masks_or_neither():
 
 def test_input_annotation_is_spmd_types_only_and_full_dtensor_is_rejected(monkeypatch):
     """Upstream's input half: ``spmd_types`` annotates, and the removed ``full_dtensor`` fails fast."""
-    monkeypatch.setattr(decoder_patch, "annotate_input_spmd_types", lambda *args: ("annotated", *args[2:]))
+    monkeypatch.setattr(
+        decoder_patch, "annotate_input_spmd_types",
+        lambda parallel_dims, batch, layouts: {**batch, "input": "annotated"},
+    )
     assert _preprocess(_model([_layer()]), parallelism=_SPMD_TYPES)[0] == "annotated"  # the annotated path
     assert _preprocess(_model([_layer()]))[0] is _TOKENS  # partial_dtensor: neither branch
 
@@ -246,30 +247,9 @@ def test_input_annotation_is_spmd_types_only_and_full_dtensor_is_rejected(monkey
     # A bare receiver survives no step at all, so the ValueError is the proof that the guard runs first.
     with pytest.raises(ValueError, match="full_dtensor"):
         decoder_patch.preprocess_inputs(
-            SimpleNamespace(), input_dict, inputs, parallel_dims=_NO_CP, device=inputs.device, parallelism=_FULL_DTENSOR
+            SimpleNamespace(), input_dict, parallel_dims=_NO_CP, parallelism=_FULL_DTENSOR
         )
     assert list(input_dict) == ["input", "positions"] and input_dict["input"] is inputs  # nothing was wrapped
-
-
-def test_the_step_counts_the_local_labels_the_seam_hands_back(monkeypatch):
-    """With no full_dtensor wrapping, the trainer's counter adds this rank's CP shard, not the batch."""
-
-    def shard(cp_mesh, inputs, attention_masks, *args, **kwargs):  # the CP shard, stubbed: 4 rows stay here
-        del cp_mesh, args, kwargs
-        return tuple(tensor[:, :_SHARD_LEN] for tensor in inputs), attention_masks
-
-    monkeypatch.setattr(decoder_patch, "cp_shard", shard)
-    trainer = SimpleNamespace(
-        model_parts=[_model([_layer()])],
-        ntokens_seen=16,
-        device=_TOKENS.device,
-        parallel_dims=_CP,
-        config=SimpleNamespace(parallelism=_NO_SPMD),
-    )
-
-    patched_post_dataloading_process(trainer, {"input": _TOKENS, "positions": _POSITIONS}, _TOKENS)
-
-    assert trainer.ntokens_seen == 16 + _SHARD_LEN  # this rank's 4 rows, not the 5 the loader delivered
 
 
 def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
@@ -299,7 +279,7 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     events: list = []
     _CPBackend.calls, _CPBackend.events = [], events
     record, untouched = _CPMetadata(), object()
-    positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
+    positions = torch.zeros(_SEQ_LEN, dtype=torch.int64)
     inputs, labels, out = _shard(monkeypatch, events, {_CPBackend: record, "untouched": untouched}, positions)
 
     assert events == ["shard", "prepare"]  # this rank's rows exist first
@@ -329,15 +309,15 @@ def test_an_unnamed_layout_is_the_one_the_metadata_declares(monkeypatch):
     """A stack declares the layout its frames describe; an unnamed run is sharded by it, and by the row."""
     seen: dict = {}
 
-    def shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, *args, positions=None, **kwargs):
-        del cp_mesh, args, kwargs
-        seen["layout"], seen["positions"] = load_balancer_type, positions
-        return inputs, attention_masks
+    def shard(batch, layouts, cp_mesh, load_balancer_type, ptrr_mask_key):
+        del layouts, cp_mesh, ptrr_mask_key
+        seen["layout"], seen["positions"] = load_balancer_type, batch["positions"]
+        return batch
 
     class _DeclaredMetadata:
         cp_layout = "doc_chunk"
 
-    positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
+    positions = torch.zeros(_SEQ_LEN, dtype=torch.int64)
     _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type=None, shard=shard)
     assert seen == {"layout": "doc_chunk", "positions": positions}
 

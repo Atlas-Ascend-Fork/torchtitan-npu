@@ -36,9 +36,14 @@ sys.meta_path.insert(0, _NoCannOps())
 def _run_isolated(code):
     # Pass a torchtitan source checkout through explicitly when the host uses
     # one (the pytest conftest would otherwise do it); never import the
-    # product conftest here — it installs the fake CANN recorder.
+    # product conftest here — it installs the fake CANN recorder.  The
+    # caller's PYTHONPATH entries stay behind the two checkout roots: they
+    # carry the declared dependency wheels (e.g. the pinned attention-gym),
+    # and dropping them silently switches the subprocess to whatever version
+    # happens to be installed globally.
     torchtitan_dir = os.environ.get("TORCHTITAN_DIR", "")
-    pythonpath = os.pathsep.join(part for part in (str(REPO), torchtitan_dir) if part)
+    inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    pythonpath = os.pathsep.join(dict.fromkeys(part for part in (str(REPO), torchtitan_dir, *inherited) if part))
     result = subprocess.run(
         [sys.executable, "-c", _ISOLATED_PRELUDE + code],
         cwd=REPO,
@@ -87,8 +92,8 @@ assert not any(name == blocked or name.startswith(blocked + ".")
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 model = build_cpu_model(cfg)
-tokens = torch.arange(128).remainder(32).unsqueeze(0)
-_, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128).unsqueeze(0))
+tokens = torch.arange(128).remainder(32)
+_, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128))
 out = model(tokens, **kwargs)
 assert torch.isfinite(out).all()
 out.square().mean().backward()
@@ -138,9 +143,9 @@ def test_common_rope_imports_without_cann():
         "from torchtitan_npu.override.common.rope import (\n"
         "    AscPartialComplexRoPE, WorkaroundComplexRoPE,\n"
         ")\n"
-        "workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_seq_len=16))\n"
+        "workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_context_length=16))\n"
         "assert workaround.cache.shape == (2, 16, 8)\n"
-        "fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=8, max_seq_len=16, split=4))\n"
+        "fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=8, max_context_length=16, split=4))\n"
         "assert fused.cache.shape == (2, 16, 8)\n"
         "try:\n"
         "    fused(torch.randn(1, 3, 2, 12), positions=torch.arange(3).unsqueeze(0))\n"

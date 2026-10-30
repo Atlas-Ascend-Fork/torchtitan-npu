@@ -14,11 +14,9 @@ implementation (``Block.hc_mixes`` / ``Block.hc_post``): the coefficient
 derivation, the Sinkhorn balancing and the residual update are the same
 operations in the same order.
 
-Shape legend: ``B`` batch, ``L`` sequence length, ``D`` model dimension, ``hc``
-``hc_mult`` residual branches.  The pinned torchtitan keeps a batch dim on
-these tensors, so every contraction below names the branch axis of the
-batch-first rank (``[B, L, hc, D]``); ``T`` (tokens) is the folded
-batch-into-token form and does not appear here.
+Shape legend: ``T`` tokens, ``D`` model dimension, ``hc`` residual branches.
+The decoder carries ``[T, hc, D]`` streams. Contractions name the trailing
+branch axes so independent leading dimensions do not change the arithmetic.
 """
 
 from dataclasses import dataclass
@@ -54,84 +52,84 @@ class HcPre(Module):
         self.hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     @staticmethod
-    def identity_pre_mix(x_BLHcD: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    def identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
         """Return the one-hot stream mix used at the input of the stack.
 
         Args:
-            x: Residual branches of shape ``[B, L, hc, D]``; its leading dims are
+            x: Residual branches of shape ``[T, hc, D]``; its leading dims are
                 reused for the mix.
             hc_mult: Number of residual branches ``hc``.
 
         Returns:
-            Mixing coefficients ``[B, L, hc]`` selecting branch 0.
+            Mixing coefficients ``[T, hc]`` selecting branch 0.
         """
-        pre_mix_BLHc = torch.zeros(
-            (*x_BLHcD.shape[:-2], hc_mult),
-            device=x_BLHcD.device,
+        pre_mix = torch.zeros(
+            (*x.shape[:-2], hc_mult),
+            device=x.device,
             dtype=torch.float32,
         )
-        pre_mix_BLHc[..., 0] = 1.0
-        return pre_mix_BLHc
+        pre_mix[..., 0] = 1.0
+        return pre_mix
 
     @staticmethod
-    def collapse(x_BLHcD: torch.Tensor, pre_mix_BLHc: torch.Tensor) -> torch.Tensor:
+    def collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """Collapse the branches into one sublayer input.
 
-        ``[B, L, hc, D] x [B, L, hc] -> [B, L, D]``
+        ``[T, hc, D] x [T, hc] -> [T, D]``
         """
-        y_BLD = torch.sum(pre_mix_BLHc.unsqueeze(-1) * x_BLHcD.float(), dim=2)
-        return y_BLD.to(x_BLHcD.dtype)
+        y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2)
+        return y.to(x.dtype)
 
-    def _split_sinkhorn(self, mixes_BLM: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _split_sinkhorn(self, mixes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split the mixing logits and balance ``comb`` to be doubly stochastic.
 
         Args:
-            mixes: Mixing logits of shape ``[B, L, (2 + hc) * hc]``.
+            mixes: Mixing logits of shape ``[T, (2 + hc) * hc]``.
 
         Returns:
-            ``(pre, post, comb)`` of shapes ``[B, L, hc]``, ``[B, L, hc]`` and
-            ``[B, L, hc, hc]``: a row softmax followed by alternating row and
+            ``(pre, post, comb)`` of shapes ``[T, hc]``, ``[T, hc]`` and
+            ``[T, hc, hc]``: a row softmax followed by alternating row and
             column normalizations (Sinkhorn), so ``comb`` is doubly stochastic
             over the branches.
         """
         hc_mult = self.hc_mult
-        pre_BLHc, post_BLHc, comb_BLMcc = mixes_BLM.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
-        comb_BLHcHc = comb_BLMcc.unflatten(-1, (hc_mult, hc_mult))
+        pre_THc, post, comb_TMcc = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
+        comb = comb_TMcc.unflatten(-1, (hc_mult, hc_mult))
 
-        pre_BLHc = torch.sigmoid(pre_BLHc * self.hc_scale[0] + self.hc_base[:hc_mult]) + self.hc_eps
-        post_BLHc = 2 * torch.sigmoid(post_BLHc * self.hc_scale[1] + self.hc_base[hc_mult : 2 * hc_mult])
-        comb_BLHcHc = comb_BLHcHc * self.hc_scale[2] + self.hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
+        pre_THc = torch.sigmoid(pre_THc * self.hc_scale[0] + self.hc_base[:hc_mult]) + self.hc_eps
+        post = 2 * torch.sigmoid(post * self.hc_scale[1] + self.hc_base[hc_mult : 2 * hc_mult])
+        comb = comb * self.hc_scale[2] + self.hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
 
-        comb_BLHcHc = torch.exp(comb_BLHcHc - comb_BLHcHc.amax(dim=-1, keepdim=True))
-        comb_BLHcHc = comb_BLHcHc / comb_BLHcHc.sum(dim=-1, keepdim=True) + self.hc_eps
-        comb_BLHcHc = comb_BLHcHc / (comb_BLHcHc.sum(dim=-2, keepdim=True) + self.hc_eps)
+        comb = torch.exp(comb - comb.amax(dim=-1, keepdim=True))
+        comb = comb / comb.sum(dim=-1, keepdim=True) + self.hc_eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
         for _ in range(self.sinkhorn_iters - 1):
-            comb_BLHcHc = comb_BLHcHc / (comb_BLHcHc.sum(dim=-1, keepdim=True) + self.hc_eps)
-            comb_BLHcHc = comb_BLHcHc / (comb_BLHcHc.sum(dim=-2, keepdim=True) + self.hc_eps)
-        return pre_BLHc, post_BLHc, comb_BLHcHc
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+        return pre_THc, post, comb
 
     def forward(
-        self, x_BLHcD: torch.Tensor, pre_mix_BLHc: torch.Tensor
+        self, x: torch.Tensor, pre_mix: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Collapse the branches and emit the coefficients the next step consumes.
 
         Args:
-            x: Residual branches of shape ``[B, L, hc, D]``.
-            pre_mix: Input-mixing coefficients ``[B, L, hc]`` produced by the
+            x: Residual branches of shape ``[T, hc, D]``.
+            pre_mix: Input-mixing coefficients ``[T, hc]`` produced by the
                 previous sub-layer (``identity_pre_mix`` at the stack input).
 
         Returns:
-            ``(y, pre, post, comb)``: the sublayer input ``[B, L, D]``, the
+            ``(y, pre, post, comb)``: the sublayer input ``[T, D]``, the
             input-mixing coefficients the next sublayer collapses with
-            ``[B, L, hc]``, and the ``post`` ``[B, L, hc]`` / ``comb``
-            ``[B, L, hc, hc]`` consumed by :class:`HcPost`.
+            ``[T, hc]``, and the ``post`` ``[T, hc]`` / ``comb``
+            ``[T, hc, hc]`` consumed by :class:`HcPost`.
         """
         # One RMS statistic per token over the whole flattened hc * D stream.
-        flat_BLN = x_BLHcD.flatten(2).float()
-        rsqrt_BL1 = torch.rsqrt(flat_BLN.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes_BLM = F.linear(flat_BLN, self.hc_fn) * rsqrt_BL1
-        pre_BLHc, post_BLHc, comb_BLHcHc = self._split_sinkhorn(mixes_BLM)
-        return self.collapse(x_BLHcD, pre_mix_BLHc), pre_BLHc, post_BLHc, comb_BLHcHc
+        flat_TN = x.flatten(-2).float()
+        rsqrt_T1 = torch.rsqrt(flat_TN.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(flat_TN, self.hc_fn) * rsqrt_T1
+        pre_THc, post, comb = self._split_sinkhorn(mixes)
+        return self.collapse(x, pre_mix), pre_THc, post, comb
 
 
 class HcPost(Module):
@@ -146,28 +144,24 @@ class HcPost(Module):
 
     def forward(
         self,
-        y_BLD: torch.Tensor,
-        residual_BLHcD: torch.Tensor,
-        post_BLHc: torch.Tensor,
-        comb_BLHcHc: torch.Tensor,
+        y: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
     ) -> torch.Tensor:
         """Args:
-            y: Sublayer output of shape ``[B, L, D]``.
-            residual: Residual branches entering the sublayer, ``[B, L, hc, D]``.
-            post: Output-mixing coefficients ``[B, L, hc]``, scaling ``y`` onto each branch.
-            comb: Branch-mixing coefficients ``[B, L, hc, hc]``; entry ``(m, q)`` weights
+            y: Sublayer output of shape ``[T, D]``.
+            residual: Residual branches entering the sublayer, ``[T, hc, D]``.
+            post: Output-mixing coefficients ``[T, hc]``, scaling ``y`` onto each branch.
+            comb: Branch-mixing coefficients ``[T, hc, hc]``; entry ``(m, q)`` weights
                 residual branch ``m`` into output branch ``q``.
 
         Returns:
-            Updated residual branches of shape ``[B, L, hc, D]``.
+            Updated residual branches of shape ``[T, hc, D]``.
 
-        ``comb * residual`` has shape ``[B, L, hc, hc, D]`` with axes
-        ``(b, l, m, q, d)``, so the contraction is over ``m`` (``dim=2``, the
-        third-from-last); the batch dim is present here, so ``dim=-2`` would
-        contract ``q`` and reduce the update to ``residual * comb.sum(-1)``: a
-        per-branch rescaling instead of a mixing.
+        ``comb * residual`` has shape ``[T, hc, hc, D]`` with axes
+        ``(t, m, q, d)``. Sum over the input branch ``m`` (``dim=-3``),
+        preserving the output branch ``q`` and feature dimension ``d``.
         """
-        out_BLHcD = post_BLHc.unsqueeze(-1) * y_BLD.unsqueeze(-2) + torch.sum(
-            comb_BLHcHc.unsqueeze(-1) * residual_BLHcD.unsqueeze(-2), dim=2
-        )
-        return out_BLHcD.type_as(y_BLD)
+        out_THcD = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
+        return out_THcD.type_as(y)

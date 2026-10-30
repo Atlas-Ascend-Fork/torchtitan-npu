@@ -83,13 +83,12 @@ def _prepare_quant_lightning_indexer_inputs(
     cmp_k = attention_metadata.cmp_k
     if cmp_k is None or cmp_k.residual is None:
         raise ValueError("Quantized LI requires the geometry's compressed frame.")
-    key = idx_k.flatten(0, 1)
     # The quantized selector is the unsharded backend (its CP hook refuses a re-cut), and the
     # compressor emits exactly the row's compressed blocks -- there is no container to strip.
     return DeepSeekV4QuantizedLightningIndexerInputs(
-        query=idx_q.flatten(0, 1),
-        key=key.unsqueeze(1).contiguous(),
-        weights=idx_w.flatten(0, 1).float(),
+        query=idx_q,
+        key=idx_k.unsqueeze(1).contiguous(),
+        weights=idx_w.float(),
         topk=module.index_topk,
         metadata=li_metadata,
         cu_seqlens_q=attention_metadata.q.cu_seqlens,

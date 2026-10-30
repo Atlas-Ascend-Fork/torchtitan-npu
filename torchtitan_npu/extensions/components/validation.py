@@ -13,7 +13,7 @@ from concurrent.futures import Future
 from typing import Any
 
 import torch.distributed as dist
-from torchtitan.components.checkpoint import AsyncMode
+from torchtitan.components.checkpointer import AsyncMode
 from torchtitan.tools import filesystem
 
 logger = logging.getLogger(__name__)

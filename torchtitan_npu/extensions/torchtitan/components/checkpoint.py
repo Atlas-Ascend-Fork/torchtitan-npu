@@ -11,12 +11,12 @@ from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
-import torchtitan.components.checkpoint
+import torchtitan.components.checkpointer
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
-from torchtitan.components.checkpoint import (
+from torchtitan.components.checkpointer import (
     AsyncMode,
 )
-from torchtitan.components.checkpoint import (
+from torchtitan.components.checkpointer import (
     CheckpointManager as _CheckpointManager,
 )
 from torchtitan.observability import structured_logger as sl
@@ -122,4 +122,4 @@ class CheckpointManager(_CheckpointManager):
         )
 
 
-torchtitan.components.checkpoint.CheckpointManager = CheckpointManager
+torchtitan.components.checkpointer.CheckpointManager = CheckpointManager

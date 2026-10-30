@@ -588,12 +588,7 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         if self.compress_ratio == 4 and (cmp_k is None or topk_indices is None):
             raise ValueError("ratio-4 asc requires cmp_k and topk_indices together.")
         metadata = attention_metadata
-        batch_size, seqlen, _, _ = q.shape
-
-        q = q.flatten(0, 1)
-        swa_k = swa_k.flatten(0, 1)
-        if cmp_k is not None:
-            cmp_k = cmp_k.flatten(0, 1)
+        seqlen = q.shape[0]
         if not _IS_A5:
             # Both KV streams arrive as the gathered whole row, and this rank may read only its
             # per-document reach: the options state that reach as the kernels' frame, so each row is
@@ -636,4 +631,4 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             self.window_size,
             topk_scores_tnd,
         )
-        return output.reshape(batch_size, seqlen, *output.shape[1:])
+        return output.reshape(seqlen, *output.shape[1:])

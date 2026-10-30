@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, overload
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 
 from torchtitan_npu.config import OptimizerConfig

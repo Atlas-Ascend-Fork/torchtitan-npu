@@ -273,6 +273,7 @@ def test_dedicated_mesh_is_not_recursively_recreated(ep_process_group, monkeypat
     source_mesh = _FakeMesh(source_group)
     dedicated_mesh = _FakeMesh(dedicated_group)
     ep_process_group._EP_MESHES["source"] = dedicated_mesh
+    monkeypatch.setattr(ep_process_group, "_is_fake_group", lambda group: False)
     monkeypatch.setattr(
         ep_process_group,
         "_create_separate_ep_mesh",

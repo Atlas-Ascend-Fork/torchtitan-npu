@@ -44,13 +44,15 @@ def _assert_gradients_match(actual, expected, variables, *, rtol=1e-5, atol=1e-6
         torch.testing.assert_close(result, reference, rtol=rtol, atol=atol)
 
 
-def _grouped_mm(*, A, B_t, offs):
+def _grouped_mm(*, A, weight_EOI, offs):
+    # The upstream seam casts and transposes the stored-orientation weight itself.
+    weight_EOI = weight_EOI.bfloat16()
     outputs = []
     start = 0
     for expert, end in enumerate(offs.tolist()):
-        outputs.append(A[start:end] @ B_t[expert])
+        outputs.append(A[start:end] @ weight_EOI[expert].transpose(-2, -1))
         start = end
-    return torch.cat(outputs) if outputs else A.new_empty((0, B_t.shape[-1]))
+    return torch.cat(outputs) if outputs else A.new_empty((0, weight_EOI.shape[-2]))
 
 
 _GroupedLoRAExperts = lora.grouped_lora_class(moe.GroupedExperts)
@@ -61,8 +63,8 @@ class _CpuGroupedLoRAExperts(_GroupedLoRAExperts):
     class Config(_GroupedLoRAExperts.Config):
         pass
 
-    def _grouped_mm(self, *, A, B_t, offs):
-        return _grouped_mm(A=A, B_t=B_t, offs=offs)
+    def _grouped_mm(self, *, A, weight_EOI, offs):
+        return _grouped_mm(A=A, weight_EOI=weight_EOI, offs=offs)
 
 
 def _build_cpu_grouped_lora_module() -> _CpuGroupedLoRAExperts:
@@ -110,10 +112,11 @@ def _per_expert_lora_reference(module, inputs, counts, scores, limit):
 
 
 def test_indexer_scores_and_gradients_with_checkpoint(forward_with_checkpoint):
-    query = torch.randn(1, 4, 2, 3, requires_grad=True)
-    key = torch.randn(1, 2, 3, requires_grad=True)
-    weight = torch.randn(1, 4, 2, requires_grad=True)
-    picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64).view(1, 4, 2)
+    # The folded call form: one packed row, ``[T, H, D]`` queries against ``[N, D]`` keys.
+    query = torch.randn(4, 2, 3, requires_grad=True)
+    key = torch.randn(2, 3, requires_grad=True)
+    weight = torch.randn(4, 2, requires_grad=True)
+    picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64)
     cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
     cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
     actual = forward_with_checkpoint(
@@ -121,11 +124,11 @@ def test_indexer_scores_and_gradients_with_checkpoint(forward_with_checkpoint):
     )
     expected = torch.stack(
         [
-            (torch.einsum("hd,d->h", query[0, token], key[0, pick]).relu() * weight[0, token]).sum()
+            (torch.einsum("hd,d->h", query[token], key[pick]).relu() * weight[token]).sum()
             for token in range(4)
             for pick in (0, 1)
         ]
-    ).view(1, 4, 2)
+    ).view(4, 2)
     torch.testing.assert_close(actual, expected)
     _assert_gradients_match(actual, expected, (query, key, weight))
 

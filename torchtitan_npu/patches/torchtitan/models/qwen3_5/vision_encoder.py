@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from functools import wraps
 
+import torchtitan.models.common.vision_encoder
 from torch.nn.attention.flex_attention import create_block_mask
 from torchtitan.models.qwen3_5 import vision_encoder as upstream_vision
 
@@ -32,7 +33,7 @@ from torchtitan_npu.extensions.torchtitan.eager_flex import (
     mark_dense_sdpa_mask_mod,
 )
 
-_ORIGINAL_MASK_BUILDER = upstream_vision.compiled_create_block_mask
+_ORIGINAL_MASK_BUILDER = torchtitan.models.common.vision_encoder.compiled_create_block_mask
 _ORIGINAL_VISION_FORWARD = upstream_vision.Qwen35VisionEncoder.forward
 
 
@@ -51,7 +52,7 @@ def owning_vision_encoder_forward(self, *args, **kwargs):
 
 def apply() -> None:
     """Install the two narrow vision fixes, rejecting an unknown API."""
-    mask_builder = upstream_vision.compiled_create_block_mask
+    mask_builder = torchtitan.models.common.vision_encoder.compiled_create_block_mask
     vision_forward = upstream_vision.Qwen35VisionEncoder.forward
     if mask_builder not in (eager_create_block_mask, _ORIGINAL_MASK_BUILDER):
         raise RuntimeError("Unsupported upstream Qwen3.5 vision mask builder")
@@ -62,7 +63,7 @@ def apply() -> None:
         raise RuntimeError("Unsupported upstream Qwen3.5 vision forward")
 
     if mask_builder is _ORIGINAL_MASK_BUILDER:
-        upstream_vision.compiled_create_block_mask = eager_create_block_mask
+        torchtitan.models.common.vision_encoder.compiled_create_block_mask = eager_create_block_mask
     if vision_forward is _ORIGINAL_VISION_FORWARD:
         upstream_vision.Qwen35VisionEncoder.forward = owning_vision_encoder_forward
 

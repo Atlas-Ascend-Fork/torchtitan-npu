@@ -5,11 +5,14 @@
 
 """The shared packing-grid checks: one contract for the loader and every CP entry."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from torchtitan_npu.models.common.packing import (
+from torchtitan_npu.models.common.alignment import (
     compression_alignment,
+    require_dataloader_alignment,
     require_document_alignment,
     require_per_doc_alignment,
 )
@@ -52,7 +55,18 @@ def test_require_per_doc_alignment_checks_the_cli_value():
     assert require_per_doc_alignment(128, (1, 4, 128), 1) == 128
     assert require_per_doc_alignment(256, (1, 4, 128), 2) == 256
     assert require_per_doc_alignment(1024, (1, 4, 128), 4) == 512
-    with pytest.raises(ValueError, match=r"--dataloader.per_doc_alignment=128") as exc:
+    with pytest.raises(ValueError, match=r"per-document alignment \(128\)") as exc:
         require_per_doc_alignment(128, (1, 4, 128), 2)
     assert "multiple of 256" in str(exc.value)
     assert "cp_degree=2" in str(exc.value)
+
+
+def test_dataloader_alignment_checks_grain_processor_and_direct_loader():
+    processor = SimpleNamespace(per_doc_alignment=256)
+    grain_loader = SimpleNamespace(dataset=SimpleNamespace(dataset=SimpleNamespace(processor=processor)))
+    direct_loader = SimpleNamespace(per_doc_alignment=256)
+    for loader in (grain_loader, direct_loader):
+        require_dataloader_alignment(loader, (1, 4, 128), 2)
+    processor.per_doc_alignment = 128
+    with pytest.raises(ValueError, match="multiple of 256"):
+        require_dataloader_alignment(grain_loader, (1, 4, 128), 2)

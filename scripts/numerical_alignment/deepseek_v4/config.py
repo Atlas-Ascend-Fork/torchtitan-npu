@@ -97,7 +97,8 @@ def configure_reduced_moe(
         moe.router.num_experts = num_experts
         moe.router.gate.out_features = num_experts
         moe.router.top_k = top_k
-        moe.router.hash = layer_id < n_hash_layers
+        moe.router.layer_id = layer_id
+        moe.router.n_hash_layers = n_hash_layers
         moe.routed_experts.inner_experts.num_experts = num_experts
         moe.routed_experts.token_dispatcher.num_experts = num_experts
         moe.routed_experts.token_dispatcher.top_k = top_k

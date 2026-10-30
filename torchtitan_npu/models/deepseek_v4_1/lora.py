@@ -28,10 +28,10 @@ class _LoRAHostEngramTable(HostEngramTable):
     class Config(HostEngramTable.Config):
         pass
 
-    def forward(self, input_ids_BL, positions_BL=None, **kwargs):
+    def forward(self, input_ids_T, positions_T=None, **kwargs):
         # The host lookup has a live autograd anchor even when its weight is frozen.
         with torch.set_grad_enabled(torch.is_grad_enabled() and self.weight.requires_grad):
-            return super().forward(input_ids_BL, positions_BL, **kwargs)
+            return super().forward(input_ids_T, positions_T, **kwargs)
 
 
 class DeepSeekV41LoRAConverter(DeepSeekV4LoRAConverter):

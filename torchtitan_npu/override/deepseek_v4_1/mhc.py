@@ -22,9 +22,9 @@ class AscV41HcPre(HcPre):
     class Config(HcPre.Config):
         pass
 
-    def _split_sinkhorn(self, mixes_BLM):
+    def _split_sinkhorn(self, mixes):
         n = self.hc_mult
-        pre, post, comb = mixes_BLM.split([n, n, n * n], dim=-1)
+        pre, post, comb = mixes.split([n, n, n * n], dim=-1)
         pre = torch.sigmoid(pre * self.hc_scale[0] + self.hc_base[:n]) + self.hc_eps
         post = 2 * torch.sigmoid(post * self.hc_scale[1] + self.hc_base[n : 2 * n])
         comb = (comb * self.hc_scale[2] + self.hc_base[2 * n :]).unflatten(-1, (n, n)).contiguous()
@@ -37,13 +37,8 @@ class AscV41HcPost(HcPost):
     class Config(HcPost.Config):
         pass
 
-    def forward(self, y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc):
-        # Sequence-parallel linears hand the collapsed stream back batch-folded
-        # (``[T, D]`` with B=1); the reference arithmetic broadcasts that
-        # silently, but the kernel requires the explicit ``[B, T, D]`` form.
-        if y_BLD.ndim == 2:
-            y_BLD = y_BLD.unsqueeze(0)
-        return torch.ops.cann_ops_transformer.mhc_post(residual_BLHcD, comb_BLHcHc, y_BLD, post_BLHc)
+    def forward(self, y, residual, post, comb):
+        return torch.ops.cann_ops_transformer.mhc_post(residual, comb, y, post)
 
 
 @override(target=HcPre.Config, exact=True, description="V4.1 single-pass mHC with native Sinkhorn")

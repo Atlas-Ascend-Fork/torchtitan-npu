@@ -82,10 +82,10 @@ def test_student_logits_rescore_a_document_local_selection() -> None:
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     cu_seqlens_k = torch.tensor([0, 2, 4], dtype=torch.int32)
     num_tokens, heads, dim, topk = 8, 2, 3, 2
-    torch.manual_seed(0)
-    idx_q = torch.randn(1, num_tokens, heads, dim, dtype=torch.float64)
-    idx_k = torch.randn(1, cu_seqlens_k[-1].item(), dim, dtype=torch.float64)
-    weights = torch.randn(1, num_tokens, heads, dtype=torch.float64)
+    generator = torch.Generator().manual_seed(0)
+    idx_q = torch.randn(num_tokens, heads, dim, dtype=torch.float64, generator=generator, requires_grad=True)
+    idx_k = torch.randn(cu_seqlens_k[-1].item(), dim, dtype=torch.float64, generator=generator, requires_grad=True)
+    weights = torch.randn(num_tokens, heads, dtype=torch.float64, generator=generator, requires_grad=True)
 
     # Per row, ``(local id, the pool entry it names)``: padding in both slots and documents.
     picks = [
@@ -98,24 +98,29 @@ def test_student_logits_rescore_a_document_local_selection() -> None:
         [(1, 3), (1, 3)],
         [(0, 2), (1, 3)],
     ]
-    local_BLK = torch.tensor([[[local for local, _ in row] for row in picks]])
+    local_BLK = torch.tensor([[local for local, _ in row] for row in picks])
 
     scores_BLK = _student_logits(idx_q, idx_k, weights, local_BLK, cu_seqlens, cu_seqlens_k)
 
-    expected_BLK = torch.full((1, num_tokens, topk), -torch.inf, dtype=torch.float64)
+    expected_BLK = torch.full((num_tokens, topk), -torch.inf, dtype=torch.float64)
     for token, row in enumerate(picks):
         for slot, (local, entry) in enumerate(row):
             if local < 0:
                 continue
-            dot = torch.einsum("hd,d->h", idx_q[0, token], idx_k[0, entry])
-            expected_BLK[0, token, slot] = (dot.relu() * weights[0, token]).sum()
+            dot = torch.einsum("hd,d->h", idx_q[token], idx_k[entry])
+            expected_BLK[token, slot] = (dot.relu() * weights[token]).sum()
 
     torch.testing.assert_close(scores_BLK, expected_BLK, rtol=1e-12, atol=1e-12)
+    upstream = torch.arange(1, num_tokens * topk + 1, dtype=torch.float64).reshape(num_tokens, topk)
+    actual_gradients = torch.autograd.grad(scores_BLK, (idx_q, idx_k, weights), upstream, retain_graph=True)
+    expected_gradients = torch.autograd.grad(expected_BLK, (idx_q, idx_k, weights), upstream)
+    for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
     # Marking agrees with the indices slot for slot: ``-1`` is the only un-scored slot.
     assert torch.equal(torch.isfinite(scores_BLK), local_BLK >= 0)
     # Row 4 is document 1's first token: reading its local 0 row-wide would score entry 0.
-    row_wide = (torch.einsum("hd,d->h", idx_q[0, 4], idx_k[0, 0]).relu() * weights[0, 4]).sum()
-    assert not torch.isclose(scores_BLK[0, 4, 0], row_wide)
+    row_wide = (torch.einsum("hd,d->h", idx_q[4], idx_k[0]).relu() * weights[4]).sum()
+    assert not torch.isclose(scores_BLK[4, 0], row_wide)
 
 
 def test_v41_config_uses_specialized_attention_with_explicit_ownership() -> None:

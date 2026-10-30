@@ -49,7 +49,6 @@ NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.
                       xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
 NGPU="${NGPU:-8}"
 export NODE_IPS NGPU
-export MBS="${MBS:-1}"
 
 # A5 defaults to block-FP8 quantized training.
 QUANTIZATION_ARGS=(

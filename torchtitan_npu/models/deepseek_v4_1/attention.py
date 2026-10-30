@@ -6,14 +6,14 @@
 """CSA2 attention for DeepSeek V4.1.
 
 Shape legend for this file:
-    B = batch, L = sequence length, D = model dimension,
+    T = folded tokens, D = model dimension,
     H = ``n_heads``, Dk = ``head_dim``, rd = ``rope_head_dim``,
     N = number of compressed KV entries, K = ``index_topk``.
 
 Each query attends to two sources at once, combined into a single masked softmax by
 Attention Gym's ``gather_attn``: its own sliding window over the layer's KV
-``[B, L, Dk]``, and the ``K`` compressed entries selected by the indexer out of the
-shared compressed KV ``[B, N, Dk]``.  A learned per-head sink logit takes part in the
+``[T, Dk]``, and the ``K`` compressed entries selected by the indexer out of the
+shared compressed KV ``[N, Dk]``.  A learned per-head sink logit takes part in the
 softmax denominator without contributing a value, so a row with no reachable entry
 still produces zeros instead of NaN.
 
@@ -139,13 +139,13 @@ class CompressedSparseInnerAttention2(Module):
         topk_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Args:
-            q: Queries of shape ``[B, L, H, Dk]``.
-            swa_k: Sliding-window KV of shape ``[B, L, Dk]``, shared across heads.
+            q: Queries of shape ``[T, H, Dk]``.
+            swa_k: Sliding-window KV of shape ``[T, Dk]``, shared across heads.
             attn_sink: Per-head sink logits of shape ``[H]``.
             attention_metadata: The forward's varlen metadata; the operator reads the row's
                 document boundaries for the sliding-window branch, and grids the compressed
                 pool at this layer's own ratio.
-            cmp_k: Shared compressed KV of shape ``[B, N, Dk]``.
+            cmp_k: Shared compressed KV of shape ``[N, Dk]``.
             topk_indices: Selected compressed entries ``[B, L, K]``, ``-1`` for unused
                 slots.  The indexer emits them document-local, which is the numbering the
                 operator reads, so they are passed through untouched.
@@ -153,7 +153,7 @@ class CompressedSparseInnerAttention2(Module):
                 a port that produces the indexer's teacher has somewhere to carry it.
 
         Returns:
-            Attention output of shape ``[B, L, H, Dk]``.
+            Attention output of shape ``[T, H, Dk]``.
 
         This core is the plain reference: it computes attention and nothing else.  The
         indexer's distillation objective is not here -- it needs this operator's softmax
@@ -163,30 +163,31 @@ class CompressedSparseInnerAttention2(Module):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together.")
 
-        batch, num_tokens, _, head_dim = q.size()
-        local_kv_B1LD = swa_k.reshape(batch, 1, num_tokens, head_dim)
+        num_tokens, _, head_dim = q.size()
+        local_kv_B1LD = swa_k.reshape(1, 1, num_tokens, head_dim)
         cu_seqlens = attention_metadata.cu_seq_q
         if cmp_k is not None:
             # ``forward`` pairs the two inputs, so ``topk_indices`` is present here.
             assert topk_indices is not None
-            sparse_kv_B1ND = cmp_k.reshape(batch, 1, cmp_k.size(1), head_dim)
+            sparse_kv_B1ND = cmp_k.reshape(1, 1, cmp_k.size(0), head_dim)
             assert self.compress_ratio > 0, (
                 "Only a layer that pools has a compressed axis, so a core with a compressed "
                 f"KV must have a positive ratio (got {self.compress_ratio})."
             )
-            kv_indices_BLK = topk_indices
+            kv_indices_BLK = topk_indices.unsqueeze(0)
         else:
             # Window-only layer: the sparse pool is empty and every query keeps the
             # window plus the sink.  The two offsets travel together, so the row's own
             # boundaries are passed here and never read: there is no pool to address.
-            sparse_kv_B1ND = q.new_zeros(batch, 1, 0, head_dim)
-            kv_indices_BLK = torch.empty(batch, num_tokens, 0, dtype=torch.long, device=q.device)
+            sparse_kv_B1ND = q.new_zeros(1, 1, 0, head_dim)
+            kv_indices_BLK = torch.empty(1, num_tokens, 0, dtype=torch.long, device=q.device)
         # The key grid is the metadata's, not this layer's arithmetic: the backend that built the
         # entry folded its ratio there, so the core and the fused port read one set of boundaries.
         cu_seqlens_k = attention_metadata.cu_seq_k
 
+        # Attention Gym owns a batched API; the model stream remains folded.
         result = gather_attn(
-            q.transpose(1, 2),
+            q.transpose(0, 1).unsqueeze(0),
             local_kv_B1LD,
             sparse_kv_B1ND,
             kv_indices_BLK,
@@ -200,7 +201,7 @@ class CompressedSparseInnerAttention2(Module):
             impl="reference",
         )
         assert isinstance(result, torch.Tensor)
-        return result.transpose(1, 2)
+        return result.squeeze(0).transpose(0, 1)
 
 
 class Attention(BaseAttention):
@@ -285,18 +286,11 @@ class Attention(BaseAttention):
         The returned shared tensors are this layer's contribution to the chain: freshly
         computed where the layer is a source, otherwise the inputs unchanged.
         """
-        bsz, seqlen, _ = x.size()
-        # The input layout already put these rows on **chunk ``r`` of every document**, so the
-        # query side projects them as they arrive and never moves.  The key side projects and
-        # rotates the same rows -- every step is per token, so it commutes with the layout -- and
-        # each consumer restores what it reads on its own: the compressor its pooling window, the
-        # core this rank's swa window, whose sharding gathers the whole row at its boundary.
-        # The key stream's own positions are the entry's: the input's at one degree, this rank's
-        # window under CP.  The queries rotate at the positions the input carried.
+        num_tokens = x.size(0)
+        # Queries stay on the input's document chunks; key consumers restore their own slab.
         position_k = attention_metadata.position_k
-
         qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).view(bsz, seqlen, -1, self.head_dim)
+        q = self.wq_b(qr).view(num_tokens, -1, self.head_dim)
         swa_k = self.kv_norm(self.wkv(x))
 
         # Every layer compresses and indexes: a source publishes new tensors, a reusing
@@ -321,13 +315,9 @@ class Attention(BaseAttention):
         )
 
         # The rope config carries the un-rotated prefix width, so the module rotates the
-        # trailing span and puts the prefix back.  The queries rotate at the positions the input
-        # carried -- that frame's own -- and the shared KV latent at the key stream's.
+        # The query and the per-token key projection rotate at the input's positions.
         q = self.rope(q, positions=positions)
-        # The shared KV latent is one rank-2 head; RoPE rotates rank-3 [B, L, N, H] on the chunk
-        # rows' own positions -- per token, so it commutes with the movement -- and the restore
-        # then hands the core this rank's window for its own gather.
-        swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
+        swa_k = self.rope(swa_k.unsqueeze(1), positions=positions).squeeze(1)
         swa_k = attention_metadata.key_stream(swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
@@ -348,7 +338,7 @@ class Attention(BaseAttention):
         # The output projection is grouped: wo_a projects each query-head group on its
         # own, wo_b mixes the per-group results back to the model dimension.  The group
         # count comes from the module so a group-wise sharding can narrow it later.
-        o = self.wo_a(o.reshape(bsz * seqlen, self.wo_a.n_batches, -1))
+        o = self.wo_a(o.reshape(num_tokens, self.wo_a.n_batches, -1))
         o = self.wo_b(o.flatten(-2))
         # The rows stay this rank's chunks: the window the layer was handed is the window the
         # layer above is handed, so nothing is un-permuted on the way out.

@@ -17,8 +17,9 @@ from torchtitan.models.common.config_utils import (
     make_ffn_config,
     make_routed_experts_config,
 )
-from torchtitan.models.common.moe import MoE, TokenChoiceTopKRouter
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -328,7 +329,7 @@ def _make_v4_moe_config(
 ):
     return MoE.Config(
         num_experts=num_experts,
-        router=TokenChoiceTopKRouter.Config(
+        router=DeepSeekV4Router.Config(
             num_experts=num_experts,
             gate=Linear.Config(
                 in_features=dim,
@@ -340,8 +341,9 @@ def _make_v4_moe_config(
             score_func="sqrtsoftplus",  # pyrefly: ignore [bad-argument-type]
             route_scale=route_scale,
             route_norm=route_norm,
-            hash=layer_id < n_hash_layers,  # pyrefly: ignore [unexpected-keyword]
-            vocab_size=vocab_size,  # pyrefly: ignore [unexpected-keyword]
+            layer_id=layer_id,
+            n_hash_layers=n_hash_layers,
+            vocab_size=vocab_size,
         ),
         routed_experts=make_routed_experts_config(
             dim=dim,
@@ -506,7 +508,8 @@ def _build_mtp_layers(
 
         moe = copy.deepcopy(inner_cfg.moe)
         moe.router.gate.param_init = _depth_init(layer_id)
-        moe.router.hash = False  # pyrefly: ignore [missing-attribute]
+        moe.router.layer_id = layer_id  # pyrefly: ignore [missing-attribute]
+        moe.router.n_hash_layers = 0  # pyrefly: ignore [missing-attribute]
         moe.routed_experts.inner_experts.param_init = _depth_experts_init(layer_id)
         if moe.shared_experts is not None:
             depth_init = _depth_init(layer_id)
@@ -591,13 +594,13 @@ def _make_v4_config(
 
     rope = ComplexRoPE.Config(
         dim=rope_head_dim,
-        max_seq_len=max_seq_len,
+        max_context_length=max_seq_len,
         theta=rope_theta,
         scaling="none",
     )
     rope_compress = ComplexRoPE.Config(
         dim=rope_head_dim,
-        max_seq_len=max_seq_len,
+        max_context_length=max_seq_len,
         theta=compress_rope_theta,
         scaling="yarn",
         rope_factor=rope_factor,
@@ -684,6 +687,8 @@ def _debugmodel(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
+    *,
+    seq_len: int = 16384,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=256,
@@ -712,7 +717,7 @@ def _debugmodel(
         hc_mult=4,
         sinkhorn_iters=20,
         hc_eps=1e-6,
-        max_seq_len=4096 * 4,
+        max_seq_len=seq_len,
         compress_rope_theta=40000.0,
         original_seq_len=65536,
         rope_theta=10000.0,
@@ -727,6 +732,7 @@ def _deepseek_v4_flash(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     *,
+    seq_len: int = 4096,
     num_experts: int = 256,
     num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
@@ -757,7 +763,7 @@ def _deepseek_v4_flash(
         hc_mult=4,
         sinkhorn_iters=20,
         hc_eps=1e-6,
-        max_seq_len=4096,
+        max_seq_len=seq_len,
         compress_rope_theta=160000.0,
         original_seq_len=65536,
         rope_theta=10000.0,
@@ -772,6 +778,7 @@ def _deepseek_v4_pro(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     *,
+    seq_len: int = 4096,
     num_experts: int = 384,
     num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
@@ -802,7 +809,7 @@ def _deepseek_v4_pro(
         hc_mult=4,
         sinkhorn_iters=20,
         hc_eps=1e-6,
-        max_seq_len=4096,
+        max_seq_len=seq_len,
         compress_rope_theta=160000.0,
         original_seq_len=65536,
         rope_theta=10000.0,
@@ -814,26 +821,28 @@ def _deepseek_v4_pro(
 
 
 deepseek_v4_configs = {
-    "debugmodel": _debugmodel,
-    "deepseek_v4_flash": _deepseek_v4_flash,
-    "deepseek_v4_flash_43layers_16experts": partial(
-        _deepseek_v4_flash,
-        num_experts=16,
+    "debugmodel": (_debugmodel, 16384),
+    "deepseek_v4_flash": (_deepseek_v4_flash, 4096),
+    "deepseek_v4_flash_43layers_16experts": (
+        partial(_deepseek_v4_flash, num_experts=16),
+        4096,
     ),
-    "deepseek_v4_pro": _deepseek_v4_pro,
-    "deepseek_v4_pro_61layers_32experts": partial(
-        _deepseek_v4_pro,
-        num_experts=32,
+    "deepseek_v4_pro": (_deepseek_v4_pro, 4096),
+    "deepseek_v4_pro_61layers_32experts": (
+        partial(_deepseek_v4_pro, num_experts=32),
+        4096,
     ),
-    "deepseek_v4_pro_61layers_12experts": partial(
-        _deepseek_v4_pro,
-        num_experts=12,
+    "deepseek_v4_pro_61layers_12experts": (
+        partial(_deepseek_v4_pro, num_experts=12),
+        4096,
     ),
 }
 
 
 def model_registry(
     flavor: str,
+    *,
+    seq_len: int | None = None,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
@@ -841,7 +850,12 @@ def model_registry(
 ) -> ModelSpec:
     if flavor not in deepseek_v4_configs:
         raise ValueError(f"Unknown deepseek_v4 flavor: {flavor}. Available: {list(deepseek_v4_configs.keys())}")
-    config = deepseek_v4_configs[flavor](
+    get_config, max_context_len = deepseek_v4_configs[flavor]
+    context_len = max_context_len if seq_len is None else seq_len
+    if not 0 < context_len <= max_context_len:
+        raise ValueError(f"Requested seq_len {context_len} must be between 1 and {max_context_len} for flavor {flavor}")
+    config = get_config(
+        seq_len=context_len,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_layers=num_mtp_layers,
@@ -854,6 +868,7 @@ def model_registry(
         name="deepseek_v4",
         flavor=flavor,
         model=config,
+        max_context_length=context_len,
         parallelize_fn=parallelize_deepseek_v4,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,

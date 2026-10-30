@@ -48,8 +48,9 @@ def build_model_config(
     from torchtitan.config import apply_overrides
 
     cfg = dsv4_config.build_torchtitan_config(model_flavor)
-    cfg.training.global_batch_size = global_batch_size
-    cfg.training.seq_len = seq_len
+    cfg.training.num_tokens_per_microbatch_per_dp_rank = global_batch_size * seq_len
+    cfg.training.num_tokens_per_train_step = global_batch_size * seq_len
+    cfg.training.max_context_length = seq_len
     model_config = cfg.model_spec.model
     dsv4_config.truncate_model_config(model_config, n_layers)
     if (num_experts is None) != (top_k is None):
@@ -113,15 +114,7 @@ def forward_logits(
 ) -> torch.Tensor:
     """Run the DSV4 TorchTitan forward protocol and return logits."""
 
-    positions = (
-        torch.arange(
-            tokens.shape[1],
-            dtype=torch.int64,
-            device=tokens.device,
-        )
-        .unsqueeze(0)
-        .expand(tokens.shape[0], -1)
-    )
+    positions = torch.arange(tokens.shape[1], dtype=torch.int64, device=tokens.device).repeat(tokens.shape[0])
     # The model owns the metadata seam (upstream #4897/#4116): it builds one entry per
     # attention geometry and hands the map to the forward, so an offline forward owes it the
     # same preprocessing the trainer does.
@@ -131,12 +124,13 @@ def forward_logits(
         context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
         context_parallel_ptrr_mask_key=None,
     )
-    tokens, _, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "positions": positions},
-        None,
+    flat_tokens = tokens.flatten()
+    inputs, _, extra_kwargs = model.preprocess_inputs(
+        {"input": flat_tokens, "labels": flat_tokens, "positions": positions},
         parallel_dims=parallel_dims,
-        device=tokens.device,
         parallelism=parallelism,
+        max_num_documents=tokens.shape[0],
+        max_context_length=tokens.shape[1],
     )
-    logits = model(tokens, **extra_kwargs)
+    logits = model(inputs, **extra_kwargs).reshape(*tokens.shape, -1)
     return logits[:, -1, :] if last_token_only else logits

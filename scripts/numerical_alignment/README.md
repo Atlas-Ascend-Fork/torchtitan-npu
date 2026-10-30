@@ -162,6 +162,8 @@ python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
 两种模式都不改变两次训练本身的卡数。跨并行布局加载是否支持取决于模型的 checkpoint 实现；当前不支持恢复完整训练状态的续训比较。
 若两侧无法共用 seed checkpoint，可用 `--no-seed-checkpoint` 改为固定种子初始化。
 
+两侧默认使用 token 预算接口。迁移比较可分别选择序列长度参数：`--baseline-training-api legacy` 使用 `--training.seq-len`，`--test-training-api tokens` 使用 `--training.max-context-length`；长度仍由 `--seq-len` 统一指定。旧侧 local/global batch 与新侧 microbatch/train-step token 预算通过各自 options 显式传入，工具不推断数据并行度或梯度累积。`--baseline-upstream` / `--test-upstream` 可分别指定 TorchTitan 源码目录，并加入对应进程的 `PYTHONPATH`；解释器及依赖仍由各侧环境提供。
+
 #### 输出与清理
 
 默认在 `outputs/compare_results/` 下创建独立结果目录，可用 `--output-dir` 指定空目录或尚不存在的目录。

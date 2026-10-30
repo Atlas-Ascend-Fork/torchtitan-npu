@@ -29,8 +29,8 @@ from torchtitan_npu.models.deepseek_v4_1 import (
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.indexer import REUSE
 
-_TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
-_POSITIONS = torch.arange(128).unsqueeze(0)
+_TOKENS = torch.arange(128).remainder(32)
+_POSITIONS = torch.arange(128)
 # Block return slots: (x, pre_mix, cmp_k, idx_k, topk_indices, topk_scores, candidates).
 _CMP_K, _IDX_K, _TOPK, _TOPK_SCORES, _CANDIDATES = 2, 3, 4, 5, 6
 
@@ -60,8 +60,10 @@ def _tiny_debug_model(monkeypatch):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel_text").model
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
+    for layer in config.layers:
+        layer.engram = None
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config)
     return model, config
@@ -220,7 +222,7 @@ def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -
     row are the override tests' subject.
     """
     model, _ = _tiny_debug_model(monkeypatch)
-    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]], dtype=torch.long)
+    positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 0, 1], dtype=torch.long)
     tokens = torch.zeros_like(positions)
 
     _, _, extra = preprocess(model, tokens, tokens, positions)
@@ -250,14 +252,14 @@ def test_weightless_compressor_passes_the_container_through(monkeypatch) -> None
             assert not list(compressor.parameters())
 
     # A window-only layer owns nothing and is handed nothing.
-    returned, latent = model.layers["0"].attention.compressor(torch.zeros(1, 128, config.dim), _POSITIONS)
+    returned, latent = model.layers["0"].attention.compressor(torch.zeros(128, config.dim), _POSITIONS)
     assert returned is None
     assert latent is None
 
     # A reuse layer hands back the very container it was given, with no latent.
-    handed = torch.zeros(1, 64, config.layers[3].attention.head_dim)
+    handed = torch.zeros(64, config.layers[3].attention.head_dim)
     returned, latent = model.layers["3"].attention.compressor(
-        torch.zeros(1, 128, config.dim),
+        torch.zeros(128, config.dim),
         _POSITIONS,
         handed,
     )
@@ -335,15 +337,15 @@ def test_weightless_indexer_passes_the_selection_through(monkeypatch) -> None:
         if int(layer_id) not in index_sources:
             assert not list(indexer.parameters())
 
-    hidden = torch.zeros(1, 128, config.dim)
-    qr = torch.zeros(1, 128, config.layers[0].attention.q_lora_rank)
+    hidden = torch.zeros(128, config.dim)
+    qr = torch.zeros(128, config.layers[0].attention.q_lora_rank)
 
     # A window-only layer owns nothing and is handed nothing.
     assert model.layers["0"].attention.indexer(hidden, qr, _POSITIONS, None) == (None, None, None, None)
 
     # A reuse layer hands back the very tensors it was given.
-    shared_key = torch.zeros(1, 64, config.layers[4].attention.indexer.index_head_dim)
-    shared_selection = torch.zeros(1, 128, 4, dtype=torch.long)
+    shared_key = torch.zeros(64, config.layers[4].attention.indexer.index_head_dim)
+    shared_selection = torch.zeros(128, 4, dtype=torch.long)
     returned = model.layers["4"].attention.indexer(
         hidden,
         qr,
@@ -363,7 +365,7 @@ def test_reuse_layer_without_the_shared_tensor_fails_loudly(monkeypatch) -> None
     model, config = _tiny_debug_model(monkeypatch)
     _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     attention_metadata = layer_metadata(model.layers["3"], kwargs)
-    hidden = torch.zeros(1, _TOKENS.shape[1], config.dim)
+    hidden = torch.zeros(_TOKENS.numel(), config.dim)
 
     # A layer that reuses the compressed KV must be handed one.
     with pytest.raises(AssertionError, match="reuses the compressed KV"):
@@ -377,5 +379,5 @@ def test_reuse_layer_without_the_shared_tensor_fails_loudly(monkeypatch) -> None
             hidden,
             _POSITIONS,
             attention_metadata,
-            cmp_k=torch.zeros(1, _TOKENS.shape[1], head_dim),
+            cmp_k=torch.zeros(_TOKENS.numel(), head_dim),
         )

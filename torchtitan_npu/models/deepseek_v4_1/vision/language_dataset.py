@@ -13,15 +13,17 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import load_dataset
-from datasets.distributed import split_dataset_by_node
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
-from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.data import GrainDataLoader
+from torchtitan.components.data.collators import Collator
+from torchtitan.components.data.dataset import SampleProcessor, SingleDatasetConfig
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.data.sources import HuggingFaceStreamingSource
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from .data import TEXT, ImagePatchProcessor, build_image_token_layout
-from .dataloader import _MultiModalDataset
+from .dataloader import DeepSeekV41DataLoader
 from .language_encoder import (
     DeepSeekV41VisionLanguageEncoder,
     ReasoningEffort,
@@ -344,52 +346,65 @@ class DeepSeekV41VisionLanguageProcessor:
         return {**inputs, "input_ids": inputs["input"], "labels": labels}
 
 
-class DeepSeekV41VisionLanguageDataset(_MultiModalDataset):
-    """Adapt an SFT source while inheriting the existing V4.1 lifecycle."""
+class _GrainSFTProcessor(SampleProcessor):
+    @dataclass(kw_only=True, slots=True)
+    class Config(SampleProcessor.Config):
+        dataset_path: str
+        image_root: str
+        thinking_mode: ThinkingMode
+        drop_thinking: bool
+        add_default_bos_token: bool
+        reasoning_effort: ReasoningEffort | None
 
-    def __init__(self, source, processor, tokenizer, batch_size, seq_len, dp_rank, dp_world_size, infinite):
-        self._data = split_dataset_by_node(source, dp_rank, dp_world_size)
-        self.sample_processor = processor
-        self._tokenizer = tokenizer
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.enable_packing = False
-        self.infinite = infinite
-        self._sample_idx = 0
-        self._hf_state_restored = False
+    def __init__(self, config: Config, *, context):
+        encoder = DeepSeekV41VisionLanguageEncoder(
+            str(Path(context.tokenizer.tokenizer_path) / "encoding" / "encoding.py"),
+            thinking_mode=config.thinking_mode,
+            drop_thinking=config.drop_thinking,
+            add_default_bos_token=config.add_default_bos_token,
+            reasoning_effort=config.reasoning_effort,
+        )
+        self.processor = DeepSeekV41VisionLanguageProcessor(
+            dataset_path=config.dataset_path,
+            image_root=config.image_root,
+            tokenizer=context.tokenizer,
+            vision_language_encoder=encoder,
+            seq_len=context.max_context_length,
+        )
 
-        image_processor = processor.processor
-        self.patch_size = image_processor.patch_size
-        self.temporal_patch_size = 1
-        self.spatial_merge_size = image_processor.downsample_ratio
-        self.min_pixels = image_processor.min_pixels
-        self.max_pixels = 0
-        self.image_mean = image_processor.mean
-        self.image_std = image_processor.std
-        self.resize_fn = image_processor.target_grid
-        self.max_patches = image_processor.max_n_token
-        self.max_patches_per_side = 0
-        self.video_dir = ""
-        self.video_fps = 2.0
-        self.video_min_frames = 0
-        self.video_max_frames = 0
+    def __call__(self, sample, rng):
+        del rng
+        return self.processor(sample)
 
 
-class _SFTCollator:
+class _SFTCollator(Collator):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Collator.Config):
+        pass
+
+    def __init__(self, config: Config, *, context):
+        del config, context
+
     def __call__(self, batch: list[dict[str, Any]]):
         (sample,) = batch
-        inputs = {key: torch.as_tensor(sample[key]).unsqueeze(0) for key in _STACKED_INPUT_KEYS}
-        inputs["pixel_values"] = torch.as_tensor(sample["pixel_values"])
-        inputs["image_grid"] = torch.as_tensor(sample["image_grid"])
-        inputs["image_feature_indices"] = torch.as_tensor(sample["image_feature_indices"]).unsqueeze(0)
-        return inputs, torch.as_tensor(sample["labels"]).unsqueeze(0)
+        # The input dict holds the model's forward kwargs plus ``num_valid_tokens``,
+        # the valid-token count the trainer pops (the upstream collator contract),
+        # so its values are not all tensors.
+        inputs: dict[str, Any] = {
+            key: torch.as_tensor(sample[key])
+            for key in (*_STACKED_INPUT_KEYS, "pixel_values", "image_grid", "image_feature_indices")
+        }
+        labels = torch.as_tensor(sample["labels"])
+        inputs["num_valid_tokens"] = int((labels != -100).sum())
+        return inputs, labels
 
 
-class DeepSeekV41VisionLanguageDataLoader(ParallelAwareDataloader):
+class DeepSeekV41VisionLanguageDataLoader(BaseDataLoader):
+    """One assistant-masked chat context per rank, with Grain cursor state."""
+
     @dataclass(kw_only=True, slots=True)
-    class Config(ParallelAwareDataloader.Config):
+    class Config(DeepSeekV41DataLoader.Config):
         image_root: str = ""
-        infinite: bool = True
         thinking_mode: ThinkingMode = "chat"
         drop_thinking: bool = True
         add_default_bos_token: bool = True
@@ -402,58 +417,62 @@ class DeepSeekV41VisionLanguageDataLoader(ParallelAwareDataloader):
         tokenizer: HuggingFaceTokenizer,
         dp_world_size: int,
         dp_rank: int,
-        seq_len: int,
-        local_batch_size: int,
-        snapshot_every_n_steps: int | None = 1,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ):
-        if local_batch_size != 1:
-            raise ValueError("DeepSeek V4.1 uses one sequence per data-parallel rank (local_batch_size=1)")
+        if num_tokens_per_batch != max_context_length:
+            raise ValueError("vision SFT requires num_tokens_per_batch == max_context_length (one chat context)")
+        if config.packing_buffer_size:
+            raise ValueError("vision SFT does not support packing_buffer_size; use one chat context per batch")
+        if config.per_doc_alignment < 1 or max_context_length % config.per_doc_alignment:
+            raise ValueError("max_context_length must be divisible by positive per_doc_alignment")
         if not config.dataset_path:
             raise ValueError("set --dataloader.dataset-path to a JSON, JSONL, or Parquet SFT dataset")
         dataset_path = str(Path(config.dataset_path).resolve())
         suffix = Path(dataset_path).suffix.lower()
         if suffix not in (".json", ".jsonl", ".parquet"):
             raise ValueError("vision SFT dataset must be JSON, JSONL, or Parquet")
-        vision_language_encoder = DeepSeekV41VisionLanguageEncoder(
-            str(Path(tokenizer.tokenizer_path) / "encoding" / "encoding.py"),
-            thinking_mode=config.thinking_mode,
-            drop_thinking=config.drop_thinking,
-            add_default_bos_token=config.add_default_bos_token,
-            reasoning_effort=config.reasoning_effort,
+        dataset = SingleDatasetConfig(
+            source=HuggingFaceStreamingSource.Config(
+                path="parquet" if suffix == ".parquet" else "json",
+                split="train",
+                load_dataset_kwargs={"data_files": {"train": dataset_path}},
+            ),
+            processor=_GrainSFTProcessor.Config(
+                dataset_path=dataset_path,
+                image_root=config.image_root,
+                thinking_mode=config.thinking_mode,
+                drop_thinking=config.drop_thinking,
+                add_default_bos_token=config.add_default_bos_token,
+                reasoning_effort=config.reasoning_effort,
+            ),
+            post_filters=(lambda sample: sample is not None,),
         )
-        processor = DeepSeekV41VisionLanguageProcessor(
-            dataset_path=dataset_path,
-            image_root=config.image_root,
+        self._loader = GrainDataLoader(
+            GrainDataLoader.Config(
+                dataset=dataset,
+                collator=_SFTCollator.Config(),
+                seed=config.seed,
+                shuffle=config.shuffle,
+                repeat=config.infinite,
+            ),
             tokenizer=tokenizer,
-            vision_language_encoder=vision_language_encoder,
-            seq_len=seq_len,
-        )
-        source = load_dataset(
-            "parquet" if suffix == ".parquet" else "json",
-            data_files={"train": dataset_path},
-            split="train",
-            streaming=True,
-        )
-        dataset = DeepSeekV41VisionLanguageDataset(
-            source,
-            processor,
-            tokenizer,
-            local_batch_size,
-            seq_len,
-            dp_rank,
-            dp_world_size,
-            config.infinite,
-        )
-        super().__init__(
-            dataset,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            snapshot_every_n_steps=snapshot_every_n_steps,
-            batch_size=local_batch_size,
-            collate_fn=_SFTCollator(),
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
+            **kwargs,
         )
+
+    def __iter__(self):
+        return iter(self._loader)
+
+    def state_dict(self):
+        return self._loader.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self._loader.load_state_dict(state_dict)
+
+    def close(self):
+        self._loader.close()

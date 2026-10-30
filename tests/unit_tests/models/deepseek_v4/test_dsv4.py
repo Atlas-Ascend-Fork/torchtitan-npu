@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """DSV4 host-logic CPU tests: the AscendC metadata layer, the packed layout,
 the compressor/indexer/attention numerics, and the ported DSA semantics.
 
@@ -166,7 +171,7 @@ def manual_compress(x, md, comp, ratio):
     entry's own ratio.  Every document is a whole number of blocks, so the row's flat
     fold and this per-document pass address the same blocks.
     """
-    flat_x = x.flatten(0, 1).float()
+    flat_x = x.float()
     out = []
     for qs, qe in pairwise(md.swa_k.cu_seqlens.tolist()):
         c_len = (qe - qs) // ratio
@@ -188,7 +193,7 @@ def manual_compress(x, md, comp, ratio):
             score = torch.cat([score_prev, score[:, :, HD:]], dim=1)
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
         out.append(comp.norm(kv.to(x.dtype)))
-    return torch.cat(out).view(md.batch_size, -1, HD)
+    return torch.cat(out).view(-1, HD)
 
 
 def _pool_blocks_where(comp, block_tokens, block_positions, overlap_valid, dtype, ratio):
@@ -219,7 +224,7 @@ def _pool_blocks_where(comp, block_tokens, block_positions, overlap_valid, dtype
 
 def _positions_for(doc_lens):
     """A packed row whose documents have the given lengths (positions reset)."""
-    return torch.cat([torch.arange(length) for length in doc_lens]).unsqueeze(0)
+    return torch.cat([torch.arange(length) for length in doc_lens])
 
 
 def _positions_from(cu):
@@ -257,8 +262,7 @@ def _assert_rounding_floor(diff, scale, *, ulps: int = 4):
     assert diff.max().item() <= ulps * _EPS32 * scale, (diff.max().item(), scale)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
-def test_compressor_numerics_ratio4(inputs, batch_size):
+def test_compressor_numerics_ratio4(inputs):
     """C4A pooling vs the independent manual reference.
 
     The residual must sit at the fp32 rounding floor: the two paths project
@@ -271,65 +275,24 @@ def test_compressor_numerics_ratio4(inputs, batch_size):
     while still flagging any multi-ulp arithmetic regression.
     """
     dsv4, md, x, pos = inputs
-    x = x.reshape(batch_size, -1, DIM).requires_grad_()
-    pos = pos.reshape(batch_size, -1)
+    x = x.squeeze(0).requires_grad_()
     comp4 = build_compressor(dsv4, 4)
     cmp4 = comp4(x, pos, cu_seqlens=md[4].swa_k.cu_seqlens)
     # Four 128-token documents: 4 * 128 // 4 whole blocks over the row.
-    assert cmp4.shape == (batch_size, 128 // batch_size, 16)
+    assert cmp4.shape == (128, 16)
     ref = manual_compress(x, md[4], comp4, 4).reshape_as(cmp4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
-    # Reframing the same document stream must preserve its exact backward, including
-    # nonuniform upstream gradients. The independent per-document oracle above checks math.
-    packed = comp4(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[4].swa_k.cu_seqlens)
-    upstream = torch.linspace(-0.25, 0.75, cmp4.numel()).reshape_as(cmp4)
-    parameters = (x, *comp4.parameters())
-    for actual, expected in zip(
-        torch.autograd.grad((cmp4 * upstream).sum(), parameters),
-        torch.autograd.grad((packed.reshape_as(cmp4) * upstream).sum(), parameters),
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
-def test_compressor_numerics_ratio128(inputs, batch_size):
+def test_compressor_numerics_ratio128(inputs):
     """C128A pools every whole 128-block of the row, one per document here."""
     dsv4, md, x, pos = inputs
-    x = x.reshape(batch_size, -1, DIM).requires_grad_()
-    pos = pos.reshape(batch_size, -1)
+    x = x.squeeze(0).requires_grad_()
     comp128 = build_compressor(dsv4, 128)
     cmp128 = comp128(x, pos, cu_seqlens=md[128].swa_k.cu_seqlens)
-    assert cmp128.shape == (batch_size, 4 // batch_size, 16)
+    assert cmp128.shape == (4, 16)
     ref = manual_compress(x, md[128], comp128, 128).reshape_as(cmp128)
     _assert_rounding_floor((cmp128 - ref).abs(), ref.abs().max().item())
-    # Reframing the same document stream must preserve its exact backward, including
-    # nonuniform upstream gradients. The independent per-document oracle above checks math.
-    packed = comp128(x.reshape(1, -1, DIM), pos.reshape(1, -1), cu_seqlens=md[128].swa_k.cu_seqlens)
-    upstream = torch.linspace(-0.25, 0.75, cmp128.numel()).reshape_as(cmp128)
-    parameters = (x, *comp128.parameters())
-    for actual, expected in zip(
-        torch.autograd.grad((cmp128 * upstream).sum(), parameters),
-        torch.autograd.grad((packed.reshape_as(cmp128) * upstream).sum(), parameters),
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("operation", ["selection", "student-logits"])
-def test_reference_indexer_refuses_mbs_above_one(dsv4, operation):
-    idx_q = torch.randn(2, 8, 2, DIM)
-    idx_k = torch.randn(2, 2, DIM)
-    idx_w = torch.randn(2, 8, 2)
-    cu_seq_q = torch.tensor([0, 8, 16], dtype=torch.int32)
-    cu_seq_k = torch.tensor([0, 2, 4], dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="MBS>1 is currently supported only by the fused path"):
-        if operation == "selection":
-            dsv4.compressor.select_compressed_slots(idx_q, idx_k, idx_w, cu_seq_q, cu_seq_k, 1)
-        else:
-            picks = torch.zeros(2, 8, 1, dtype=torch.int64)
-            dsv4.compressor.student_logits_at_picks(idx_q, idx_k, idx_w, picks, cu_seq_q, cu_seq_k)
 
 
 def test_attention_numerics_ratio4_single_block_documents(dsv4):
@@ -337,9 +300,9 @@ def test_attention_numerics_ratio4_single_block_documents(dsv4):
     cu = torch.tensor([0, 4, 8], dtype=torch.int32)
     md_s = _metadata_for(dsv4, cu, (4,))[4]
     comp_s = build_compressor(dsv4, 4)
-    cmp_s = comp_s(torch.randn(1, 8, DIM), _positions_from(cu), cu_seqlens=md_s.swa_k.cu_seqlens)
+    cmp_s = comp_s(torch.randn(8, DIM), _positions_from(cu), cu_seqlens=md_s.swa_k.cu_seqlens)
     # Two documents of exactly one block each: two compressed entries.
-    assert cmp_s.shape == (1, 2, 16)
+    assert cmp_s.shape == (2, 16)
     core_s = dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
             window_size=8,
@@ -350,16 +313,16 @@ def test_attention_numerics_ratio4_single_block_documents(dsv4):
     )
     with torch.no_grad():
         sparse_s = dsv4.compressor.select_compressed_slots(
-            torch.randn(1, 8, 4, 8),
-            torch.randn(1, 2, 8),
-            torch.randn(1, 8, 4),
+            torch.randn(8, 4, 8),
+            torch.randn(2, 8),
+            torch.randn(8, 4),
             md_s.swa_k.cu_seqlens,
             md_s.cmp_k.cu_seqlens,
             4,
         )
         out_s = core_s(
-            torch.randn(1, 8, 3, HD),
-            torch.randn(1, 8, HD),
+            torch.randn(8, 3, HD),
+            torch.randn(8, HD),
             torch.randn(3),
             cmp_k=cmp_s,
             topk_indices=sparse_s,
@@ -367,9 +330,9 @@ def test_attention_numerics_ratio4_single_block_documents(dsv4):
         )
     # A document's block is complete only at its last token, so the first three queries have
     # nothing to select and the last token of each document is the one that can.
-    assert (sparse_s[0, :3] == -1).all()
-    assert (sparse_s[0, 3:] >= 0).any()
-    assert out_s.shape == (1, 8, 3, HD) and torch.isfinite(out_s).all()
+    assert (sparse_s[:3] == -1).all()
+    assert (sparse_s[3:] >= 0).any()
+    assert out_s.shape == (8, 3, HD) and torch.isfinite(out_s).all()
 
 
 def _gradient_case(dsv4, ratio=4):

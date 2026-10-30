@@ -367,7 +367,8 @@ def _find_rope_configs(layers):
 
 
 def _is_hash_moe(layer) -> bool:
-    return bool(getattr(getattr(layer.moe, "router", None), "hash", False))
+    router = getattr(layer.moe, "router", None)
+    return getattr(router, "layer_id", 0) < getattr(router, "n_hash_layers", 0)
 
 
 def _model_derived_config_fields(model_config) -> dict:
@@ -780,7 +781,7 @@ def _discard_failed_export(output_dir: Path, shard_names: list[str]) -> None:
 
 def _build_model_and_adapter(model_name: str, model_flavor: str, hf_assets_path: Path):
     """Build the model (for state-dict shapes only) with its HF adapter and model config."""
-    from torchtitan.components.checkpoint import ModelWrapper
+    from torchtitan.components.checkpointer import ModelWrapper
 
     # ``--model_name`` may be a dotted module path (e.g.
     # torchtitan_npu.models.deepseek_v4) or the short ``llama3`` form used

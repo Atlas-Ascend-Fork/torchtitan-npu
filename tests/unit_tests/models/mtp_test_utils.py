@@ -16,7 +16,9 @@ BATCH_SIZE = 1
 SEQ_LEN = 256
 VOCAB_SIZE = 64
 _DOCUMENT_LEN = SEQ_LEN // 2
-PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMENT_LEN)]).unsqueeze(0)
+# The folded-token form: one flat packed row, two documents, positions resetting
+# at the document boundary.
+PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMENT_LEN)])
 
 # ``preprocess_inputs`` (the seam under test) takes the parallelism context;
 # these models run a single process with no CP and the default SPMD backend.
@@ -39,13 +41,12 @@ def preprocess(model, tokens, labels, positions):
     """Run the model's own input preprocessing, whatever seam it uses.
 
     Migrated stacks hand back an ``attention_metadata`` map, the others the
-    pinned single ``attention_masks``; the forward takes either.
+    pinned single ``attention_masks``; the forward takes either.  The labels
+    ride inside the batch dict, as the 0.4.0 trainer hands it over.
     """
     inputs, labels, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "positions": positions},
-        labels,
+        {"input": tokens, "labels": labels, "positions": positions},
         parallel_dims=_NO_CP_DIMS,
-        device=tokens.device,
         parallelism=_NO_SPMD,
     )
     assert "attention_masks" in extra_kwargs or "attention_metadata" in extra_kwargs, (
@@ -57,7 +58,7 @@ def preprocess(model, tokens, labels, positions):
 def assert_packed_mtp_training(model) -> None:
     from torchtitan.models.deepseek_v3.mtp import MTPLoss
 
-    tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
     tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
@@ -67,7 +68,7 @@ def assert_packed_mtp_training(model) -> None:
         raise AssertionError(f"Expected MTP outputs as a list, got {type(output).__name__}.")
     if len(output) != 2:
         raise AssertionError(f"Expected two MTP outputs, got {len(output)}.")
-    expected_shape = (BATCH_SIZE, SEQ_LEN, VOCAB_SIZE)
+    expected_shape = (SEQ_LEN, VOCAB_SIZE)
     if output[0].shape != expected_shape:
         raise AssertionError(f"Expected main output shape {expected_shape}, got {tuple(output[0].shape)}.")
     if output[1].shape != output[0].shape:

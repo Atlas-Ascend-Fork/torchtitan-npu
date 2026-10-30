@@ -109,7 +109,7 @@ def patched_cp_shard(
     inputs: tuple[torch.Tensor, ...],
     attention_masks: AttentionMasksType | None,
     load_balancer_type: str | None = "headtail",
-    input_seq_dim: int = 1,
+    input_seq_dims: int | tuple[int, ...] = 0,
     ptrr_mask_key: str | None = None,
     *,
     positions: torch.Tensor | None = None,
@@ -127,6 +127,9 @@ def patched_cp_shard(
     Without a repository layout the pinned behaviour is unchanged: shard the inputs and, for a
     varlen stack, build the rank-local varlen metadata after sharding.
     """
+    seq_dims = (input_seq_dims,) * len(inputs) if isinstance(input_seq_dims, int) else input_seq_dims
+    if len(seq_dims) != len(inputs):
+        raise ValueError("input_seq_dims must match the number of inputs")
     balancer_cls = _LAYOUT_BALANCERS.get(load_balancer_type) if load_balancer_type else None
     if balancer_cls is not None:
         if attention_masks is not None:
@@ -136,6 +139,10 @@ def patched_cp_shard(
                 "boundaries, not BlockMask objects the shard could slice."
             )
         if positions is None:
+            from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
+
+            positions = cp_shard_context().positions
+        if positions is None:
             raise ValueError(
                 f"the {load_balancer_type!r} layout is a function of the row's document boundaries: "
                 "pass the row's positions to cp_shard."
@@ -143,10 +150,10 @@ def patched_cp_shard(
         sharded = _context_parallel_shard(
             mesh=cp_mesh,
             buffers=tuple(inputs),
-            seq_dims=tuple(input_seq_dim for _ in inputs),
+            seq_dims=seq_dims,
             load_balancer=balancer_cls(
                 document_starts(positions),
-                inputs[0].size(input_seq_dim),
+                inputs[0].size(seq_dims[0]),
                 cp_mesh.size(),
             ),
         )
@@ -157,14 +164,14 @@ def patched_cp_shard(
     varlen_metadata = _varlen_from_masks(attention_masks)
     is_varlen = varlen_metadata is not None
     batch_size = inputs[0].size(0)
-    seq_len = inputs[0].size(input_seq_dim)
+    seq_len = inputs[0].size(seq_dims[0])
 
     inputs, output_masks = original_cp_shard(
         cp_mesh,
         inputs,
         None if is_varlen else attention_masks,
         load_balancer_type,
-        input_seq_dim,
+        input_seq_dims=seq_dims,
         ptrr_mask_key=ptrr_mask_key,
     )
 

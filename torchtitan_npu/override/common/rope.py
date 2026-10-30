@@ -33,7 +33,7 @@ from torchtitan_npu.patches.torchtitan.models.common.rope import (
 
 _ROPE_CACHE_FIELDS = (
     "dim",
-    "max_seq_len",
+    "max_context_length",
     "theta",
     "scaling",
     "scaling_factor",
@@ -152,34 +152,7 @@ def workaround(cfg: ComplexRoPE.Config) -> WorkaroundComplexRoPE.Config:
     return derive(cfg, WorkaroundComplexRoPE.Config)
 
 
-class _FirstRowPositionsMixin:
-    """Use the first position row for the fused batch-wide cosine/sine table.
-
-    All batch rows must have the same position layout.
-    """
-
-    def _reshape_cache(
-        self,
-        query: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if positions is not None:
-            # ``positions`` is per batch row, and the fused cosine/sine table is row-invariant,
-            # so one row is enough.  Take it with a slice rather than a ``size(0) > 1`` branch:
-            # the leading dim is marked dynamic (``_mark_dynamic``), and Dynamo cannot guard on
-            # a data-dependent ``size(0) > 1`` once that symbol loses its hint ("Could not
-            # guard on data-dependent expression u0 > 1").  ``[:1]`` is shape-stable and
-            # returns the same tensor for the single-row case the branch used to pass through.
-            positions = positions[:1]
-        return super()._reshape_cache(  # pyrefly: ignore [missing-attribute]
-            query, positions
-        )
-
-
-class AscComplexRoPE(
-    _FirstRowPositionsMixin,
-    WorkaroundComplexRoPE,
-):
+class AscComplexRoPE(WorkaroundComplexRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(WorkaroundComplexRoPE.Config):
         pass
@@ -206,7 +179,7 @@ class AscComplexRoPE(
         return xq_out, xk_out
 
 
-class AscCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
+class AscCosSinRoPE(CosSinRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(SplitCosSinRoPEConfig):
         pass
@@ -214,17 +187,19 @@ class AscCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
     @staticmethod
     def apply_rotary_emb(
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
         *,
         inverse: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if inverse:
             raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
         head_dim = query.shape[-1]
         cos = rope_cache[..., :head_dim].to(query.dtype)
         sin = rope_cache[..., head_dim:].to(query.dtype)
         xq_out = torch_npu.npu_rotary_mul(query.float(), cos, sin, rotary_mode="half").type_as(query)
+        if key is None:
+            return xq_out
         xk_out = torch_npu.npu_rotary_mul(
             key.float(), cos.to(key.dtype), sin.to(key.dtype), rotary_mode="half"
         ).type_as(key)

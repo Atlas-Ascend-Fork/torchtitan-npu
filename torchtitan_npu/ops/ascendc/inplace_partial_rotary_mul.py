@@ -62,4 +62,10 @@ def inplace_partial_rotary_mul(
 ) -> torch.Tensor:
     """Return a partially-rotated clone of ``x`` (CANN inplace kernel)."""
     partial_slice = [0, 0] if partial_slice is None else partial_slice
-    return _PartialRotaryMulFn.apply(x, r1, r2, rotary_mode, partial_slice)
+    # The CANN kernel expects [batch, tokens, heads, dim], while TorchTitan
+    # folds batch into tokens and supplies [tokens, heads, dim].
+    folded = x.ndim == 3
+    if folded:
+        x, r1, r2 = x.unsqueeze(0), r1.unsqueeze(0), r2.unsqueeze(0)
+    result = _PartialRotaryMulFn.apply(x, r1, r2, rotary_mode, partial_slice)
+    return result.squeeze(0) if folded else result

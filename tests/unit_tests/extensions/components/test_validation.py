@@ -81,7 +81,7 @@ class _AsyncCheckpointManager:
         return self.checkpoint_path
 
 
-checkpoint_stub = types.ModuleType("torchtitan.components.checkpoint")
+checkpoint_stub = types.ModuleType("torchtitan.components.checkpointer")
 checkpoint_stub.AsyncMode = _AsyncMode
 tools_stub = types.ModuleType("torchtitan.tools")
 tools_stub.filesystem = _FilesystemAdapter
@@ -93,7 +93,7 @@ product_validation = importlib.util.module_from_spec(module_spec)
 with patch.dict(
     sys.modules,
     {
-        "torchtitan.components.checkpoint": checkpoint_stub,
+        "torchtitan.components.checkpointer": checkpoint_stub,
         "torchtitan.tools": tools_stub,
     },
 ):

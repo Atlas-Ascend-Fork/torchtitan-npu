@@ -35,6 +35,12 @@ export CKPT_INIT_LOAD_PATH=/path/to/init_hf_ckpt
 ```
 
 A5 默认每节点使用 8 张 NPU，A3 默认每节点使用 16 张 NPU；需要改变时设置 `NGPU`。
+训练参数在基础脚本中直接设置；派生入口通过 CLI 覆盖不同的默认值。命令末尾的
+`--training.max-context-length`、`--training.num-tokens-per-microbatch-per-dp-rank` 和
+`--training.num-tokens-per-train-step` 可覆盖相应参数。单独修改上下文长度不会重算 microbatch，
+单独修改 microbatch 也不会重算每步预算；需要调整时应同时指定相关参数。
+每步预算须能被「每 rank microbatch token 数 × 有效 DP 度 × PP microbatch 数」整除。
+例如 8 卡 Flash debug 的 A3 默认梯度累积 8 次，A5 默认梯度累积 4 次。
 
 ## 裁剪 Debug 模型
 
@@ -42,12 +48,31 @@ Debug/performance 验证优先使用等价裁剪模型，避免为了快速验�
 
 ### 1P mini 模型
 
+固定 TorchTitan 基线使用展平的 token 布局：输入与标签为 `[T]`，隐藏状态为
+`[T, D]`。此入口默认每步处理 2048 个 token，最大上下文长度为 2048。
+数据集及源文件由 `MODULE` / `CONFIG` 选择的 recipe 配置，入口不再读取
+`DATASET` / `DATASET_PATH`。自定义数据源通过独立 recipe 指定。
+
+`USE_GOLDEN=1` 选择模型默认的参考 attention、实数缓存 RoPE 和 AdamW。
+在当前 Ascend A3 环境中，此组合已完成单卡、确定性 eager 前向、反向及
+optimizer step；参考 indexer 的离散选择不提供 indexer 训练目标。
+默认融合组合使用 Muon。融合算子组合另以 AdamW 完成两步功能验证；当前
+CANN 的 `SparseFlashMlaGrad` 拒绝确定性模式，因此该功能验证未启用
+`--debug.deterministic`，不能作为数值对齐证据。Muon、多卡及编译仍需独立验证。
+
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 
-USE_GOLDEN=1 \
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+USE_GOLDEN=1 HF_ASSETS_PATH="$PWD/tests/assets/deepseek_v3" \
+bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
+  --training.steps 2 --debug.seed 42 --debug.deterministic
 ```
+
+token 预算使用 `--training.num-tokens-per-microbatch-per-dp-rank` 和
+`--training.num-tokens-per-train-step`；两者均统计 token slot。模型上下文
+在 registry 构造时选定，recipe 同步设置 `training.max_context_length`。
+单独覆盖训练上下文不会重新配置 RoPE；修改上下文长度需使用匹配的 recipe。
+其他入口的迁移与验证状态独立于本单卡 mini 记录。
 
 ### 8P Flash 16-expert Debug
 
@@ -86,8 +111,9 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
   --compile.backend inductor \
   --parallelism.data-parallel-shard-degree 1 \
   --parallelism.data-parallel-replicate-degree 1 \
-  --training.seq-len 131072 \
-  --training.global-batch-size 8 \
+  --training.max-context-length 131072 \
+  --training.num-tokens-per-microbatch-per-dp-rank 131072 \
+  --training.num-tokens-per-train-step 1048576 \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
@@ -156,8 +182,9 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --compile.backend inductor \
   --parallelism.data-parallel-shard-degree 16 \
   --parallelism.data-parallel-replicate-degree 1 \
-  --training.seq-len 65536 \
-  --training.global-batch-size 128 \
+  --training.max-context-length 65536 \
+  --training.num-tokens-per-microbatch-per-dp-rank 131072 \
+  --training.num-tokens-per-train-step 8388608 \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
@@ -182,8 +209,9 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
 CP=128 \
 --parallelism.data-parallel-shard-degree 1 \
 --parallelism.data-parallel-replicate-degree 1 \
---training.seq-len 1048576 \
---training.global-batch-size 8
+--training.max-context-length 1048576 \
+--training.num-tokens-per-microbatch-per-dp-rank 1048576 \
+--training.num-tokens-per-train-step 8388608
 ```
 
 ## A5 量化与 BF16

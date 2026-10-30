@@ -11,6 +11,20 @@ import pytest
 from torchtitan_npu.extensions.torchtitan import trainer as trainer_module
 
 
+def test_trainer_config_revalidates_after_swap_optimizer_override():
+    from torchtitan.config.override import OverrideConfig, apply_overrides
+
+    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+    from torchtitan_npu.override.common.optimizer import OptimizerStateSwapContainer
+
+    config = deepseek_v4_debugmodel()
+    apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.common.optimizer.swap_optimizer"]), config)
+
+    config.__post_init__()
+
+    assert isinstance(config.optimizer, OptimizerStateSwapContainer.Config)
+
+
 @pytest.mark.parametrize(
     "allow_hf32",
     [False, True],

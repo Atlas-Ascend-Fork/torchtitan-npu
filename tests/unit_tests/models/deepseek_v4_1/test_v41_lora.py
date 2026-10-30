@@ -13,6 +13,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import DefaultDeviceType
+from torchtitan.components.data import GrainDataLoader
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 
@@ -35,14 +36,13 @@ from torchtitan_npu.models.deepseek_v4_1.lora import DeepSeekV41LoRAConverter
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
 from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import DeepSeekV41DataLoader
-from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedHuggingfaceDataloader
 
 
 @pytest.mark.parametrize(
     "recipe,flavor,vision,loader_type",
     [
         (deepseek_v4_1_flash_lora, "deepseek_v4_1_flash", True, DeepSeekV41DataLoader.Config),
-        (deepseek_v4_1_flash_text_lora, "deepseek_v4_1_flash_text", False, AlignedHuggingfaceDataloader.Config),
+        (deepseek_v4_1_flash_text_lora, "deepseek_v4_1_flash_text", False, GrainDataLoader.Config),
     ],
     ids=["multimodal", "text"],
 )
@@ -168,8 +168,8 @@ def test_lora_host_table_stays_frozen_after_state_initialization(tiny_registry, 
     base_table = next(module for module in base.modules() if isinstance(module, HostEngramTable))
     assert type(base_table) is HostEngramTable
     table.load_state_dict(base_table.state_dict())
-    tokens = torch.arange(16).reshape(1, -1)
-    positions = torch.arange(16).reshape(1, -1)
+    tokens = torch.arange(16)
+    positions = torch.arange(16)
     frozen_rows = table(tokens, positions)
     trainable_rows = base_table(tokens, positions)
     torch.testing.assert_close(frozen_rows, trainable_rows, rtol=0, atol=0)
@@ -191,15 +191,17 @@ def test_multimodal_lora_updates_adapters_with_frozen_vision_and_engram(tiny_reg
     assert model.lora_config.rank == 64
     assert model.layers["1"].engram is not None
     ids, types, feature_ids = build_image_token_layout([(3, 3)], span_start=2, vocab_size=64)
-    tokens = torch.arange(128).remainder(32).unsqueeze(0)
+    # The folded-token multimodal stack: one flat row of tokens, with the
+    # modality fields describing that same row.
+    tokens = torch.arange(128).remainder(32)
     image_span_end = ids.numel()
-    tokens[:, 2:image_span_end] = ids[2:]
+    tokens[2:image_span_end] = ids[2:]
     token_types = torch.full_like(tokens, -1)
-    token_types[:, : types.numel()] = types
+    token_types[: types.numel()] = types
     indices = torch.full_like(tokens, -1)
-    indices[:, : feature_ids.numel()] = feature_ids
+    indices[: feature_ids.numel()] = feature_ids
     inputs = dict(
-        positions=torch.arange(128).unsqueeze(0),
+        positions=torch.arange(128),
         pixel_values=torch.linspace(-1, 1, 9 * 588).reshape(1, 9, 588),
         image_grid=torch.tensor([[3, 3]]),
         image_feature_indices=indices,
@@ -380,8 +382,8 @@ def test_peft_merge_reloads_with_frozen_engram(tiny_registry, monkeypatch, tmp_p
     merged_model.load_state_dict(adapter.from_hf(merged))
     frozen_base = build_cpu_model(registry.model_registry("deepseek_v4_1_debugmodel_text").model)
     frozen_base.load_state_dict(adapter.from_hf(base_state))
-    tokens = torch.arange(16).reshape(1, -1)
-    positions = torch.arange(16).reshape(1, -1)
+    tokens = torch.arange(16)
+    positions = torch.arange(16)
     with torch.no_grad():
         tokens_in, _, kwargs = preprocess(model, tokens, tokens, positions)
         expected = model(tokens_in, **kwargs)

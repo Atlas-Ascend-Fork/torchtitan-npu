@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from torchtitan.components.checkpoint import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+from torchtitan.components.checkpointer import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
 
 from .cache import IndexStoreDtype  # noqa: TC001 - required by tyro at runtime
 from .detector import LossSpikeDetector

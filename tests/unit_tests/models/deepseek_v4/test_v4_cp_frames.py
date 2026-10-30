@@ -50,7 +50,7 @@ def _positions(*documents: int) -> torch.Tensor:
     flat: list[int] = []
     for length in documents:
         flat += list(range(length))
-    return torch.tensor([flat])
+    return torch.tensor(flat)
 
 
 def _row(positions: torch.Tensor, *, ratio: int = _RATIO):
@@ -68,7 +68,7 @@ def _entry(positions: torch.Tensor, *, ratio: int = _RATIO):
 
 
 def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _RATIO):
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
     entry = _entry(positions, ratio=ratio)
     if cp_size == 1:
         return entry
@@ -315,7 +315,7 @@ def _compressor(ratio: int = _RATIO) -> Compressor:
 def _carry(module: Compressor, exchange: CarryExchange, x, positions, cu_seqlens):
     """The call site's composition: exchange -> compress -> trim."""
     carry = exchange(x, positions, cu_seqlens)
-    out = module(carry.x, carry.positions, cu_seqlens=carry.cu_seqlens)
+    out = module(carry.x.squeeze(0), carry.positions.squeeze(0), cu_seqlens=carry.cu_seqlens).unsqueeze(0)
     if carry.trim:
         out = out.narrow(1, carry.trim, out.size(1) - carry.trim)
     return out
@@ -361,7 +361,9 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     total = 16 * ratio
     doc_len = total // 2
     bounds = [0, doc_len, total]
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    # The production call site (compressor.py) hands the exchange one row at a
+    # time: ``[1, rows, D]`` tokens with ``[1, rows]`` positions.
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])[None, :]
     cu = torch.tensor(bounds, dtype=torch.int32)
     module = _compressor(ratio)
     generator = torch.Generator().manual_seed(11)
@@ -369,7 +371,7 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     slab = total // cp_size
 
     with torch.no_grad():
-        global_pool = module(x, positions, cu_seqlens=cu)
+        global_pool = module(x.squeeze(0), positions.reshape(-1), cu_seqlens=cu).unsqueeze(0)
     assert global_pool.shape == (1, total // ratio, _HEAD_DIM)
 
     def fake_all_to_all(send, *, output_split_sizes, input_split_sizes, group):

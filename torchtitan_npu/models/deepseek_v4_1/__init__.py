@@ -37,6 +37,7 @@ from .indexer import (
 )
 from .mhc import HcPost, HcPre
 from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel, DeepSeekV41TransformerBlock
+from .moe import DeepSeekV41Router
 from .state_dict_adapter import DeepSeekV41StateDictAdapter
 
 # std=1.0 mirrors the reference debug initialization; the marker values
@@ -478,7 +479,9 @@ def _make_v41_moe_config(
     # image-masked vision bias follows the stack's modality -- a text-only stack has no
     # image token to bias, so it builds no ``bias_vl`` at all -- while the reference's
     # descending selection order holds for every V4.1 layer.
-    router = dataclasses.replace(router, vision_enabled=vision_enabled, sorted_topk=True)
+    from torchtitan.config import derive
+
+    router = derive(router, DeepSeekV41Router.Config, vision_enabled=vision_enabled, sorted_topk=True)
     return make_moe_config(
         num_experts=num_experts,
         router=router,
@@ -599,13 +602,13 @@ def _make_v41_config(
     # override entries (workaround / asc_complex / asc_partial).
     rope = ComplexRoPE.Config(
         dim=rope_head_dim,
-        max_seq_len=max_seq_len,
+        max_context_length=max_seq_len,
         theta=rope_theta,
         scaling="none",
     )
     rope_compress = ComplexRoPE.Config(
         dim=rope_head_dim,
-        max_seq_len=max_seq_len,
+        max_context_length=max_seq_len,
         theta=compress_rope_theta,
         scaling="yarn",
         rope_factor=rope_factor,
@@ -1027,6 +1030,7 @@ def model_registry(
         name="deepseek_v4_1",
         flavor=flavor,
         model=config,
+        max_context_length=config.layers[0].attention.rope.max_context_length,
         parallelize_fn=parallelize_deepseek_v4_1,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,

@@ -50,10 +50,10 @@ torchtitan_stub.__path__ = []
 components_stub = types.ModuleType("torchtitan.components")
 components_stub.__path__ = []
 torchtitan_stub.components = components_stub
-checkpoint_stub = types.ModuleType("torchtitan.components.checkpoint")
+checkpoint_stub = types.ModuleType("torchtitan.components.checkpointer")
 checkpoint_stub.AsyncMode = _AsyncMode
 checkpoint_stub.CheckpointManager = _CheckpointManager
-components_stub.checkpoint = checkpoint_stub
+components_stub.checkpointer = checkpoint_stub
 observability_stub = types.ModuleType("torchtitan.observability")
 observability_stub.structured_logger = types.SimpleNamespace(log_trace_span=lambda name: lambda function: function)
 torchtitan_stub.observability = observability_stub
@@ -78,7 +78,7 @@ with patch.dict(
     {
         "torchtitan": torchtitan_stub,
         "torchtitan.components": components_stub,
-        "torchtitan.components.checkpoint": checkpoint_stub,
+        "torchtitan.components.checkpointer": checkpoint_stub,
         "torchtitan.observability": observability_stub,
         "torchtitan.tools": tools_stub,
         "torchtitan.tools.utils": utils_stub,

@@ -11,7 +11,7 @@ from pathlib import Path
 import torch.distributed.checkpoint as dcp
 
 from tests.integration_tests import OverrideDefinitions
-from tests.integration_tests.deepseek_v4 import GOLDEN_OVERRIDES
+from tests.integration_tests.deepseek_v4 import GOLDEN_OVERRIDES, V4_TRAIN_ARGS
 
 _EMA_CHECKPOINT_PREFIX = "ema_optimizer."
 
@@ -27,7 +27,7 @@ def build_ema_test_list() -> list[OverrideDefinitions]:
                     "--training.steps=2",
                     "--parallelism.expert-parallel-degree=2",
                     "--hf-assets-path=tests/assets/deepseek_v3",
-                    "--training.global-batch-size=2",
+                    "--training.num-tokens-per-train-step=4096",
                     "--ema-weights.enable",
                     "--ema-weights.decay=0.5",
                     "--ema-weights.offload-to-cpu",
@@ -39,6 +39,7 @@ def build_ema_test_list() -> list[OverrideDefinitions]:
             test_descr="DeepSeek-V4 EMA EP2/FSDP2 CPU-offload checkpoint smoke",
             test_name="dsv4_ema_ep2_fsdp2",
             ngpu=2,
+            train_args=V4_TRAIN_ARGS,
             use_golden=True,
             check_loss=False,
             verify_ema_checkpoint=True,

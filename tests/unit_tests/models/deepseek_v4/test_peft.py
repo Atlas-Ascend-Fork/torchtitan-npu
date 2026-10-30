@@ -16,7 +16,7 @@ from torch import distributed as dist, multiprocessing as mp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
-from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan_npu.models.deepseek_v4 import lora, peft, state_dict_adapter
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _adapter_with_converter
 

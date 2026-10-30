@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import unittest
 from typing import TYPE_CHECKING
 
@@ -73,7 +74,7 @@ def compare_checkpoint_metrics(job_dump_folder: str | Path, expected_steps: Sequ
                 raise ValueError(f"{tag} phase {idx}: expected steps {list(expected_steps[idx])}, got {sorted(values)}")
         baseline, resumed = phases
         for step, value in resumed.items():
-            if step not in baseline or baseline[step] != value:
+            if step not in baseline or struct.pack("!f", baseline[step]) != struct.pack("!f", value):
                 raise AssertionError(
                     f"{tag} mismatch at step {step}: uninterrupted={baseline.get(step)!r}, resumed={value!r}"
                 )

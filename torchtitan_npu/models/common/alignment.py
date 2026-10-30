@@ -16,6 +16,16 @@ each ratio inside one document.
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+from torchtitan.components.data import TextSequence
+from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.hf_datasets.text_datasets import TextProcessor
+
+if TYPE_CHECKING:
+    from torchtitan.components.data import DatasetBuildContext
 
 import torch
 
@@ -50,7 +60,7 @@ def require_document_alignment(
     is the contract (intentional, do not relax it): the fused compressors grid whole groups
     only.
 
-    The loader satisfies it by padding through ``--dataloader.per_doc_alignment``, which must
+    The loader satisfies it by padding through the processor's ``per_doc_alignment``, which must
     be a multiple of the returned value.  The check runs on the boundaries tensor (no host
     round-trip).  Returns the required multiple.
     """
@@ -67,7 +77,7 @@ def require_document_alignment(
         what = " x ".join(factors) if factors else "the packing grid"
         raise ValueError(
             f"document lengths must be positive multiples of {required} ({what}), got "
-            f"{lengths.tolist()}. Pad every document through `--dataloader.per_doc_alignment` "
+            f"{lengths.tolist()}. Pad every document through the processor's `per_doc_alignment` "
             f"(a multiple of {required}): under context parallel each rank's chunk must stay "
             "ratio-aligned, and partial compression blocks are not supported."
         )
@@ -93,10 +103,62 @@ def require_per_doc_alignment(
     required = compression_alignment(compress_ratios) * max(cp_degree, 1)
     if per_doc_alignment < 1 or per_doc_alignment % required:
         raise ValueError(
-            f"`--dataloader.per_doc_alignment={per_doc_alignment}` is not a multiple of "
+            f"per-document alignment ({per_doc_alignment}) is not a multiple of "
             f"{required} (= compression_alignment({tuple(compress_ratios)}) * "
             f"cp_degree={cp_degree}). A context-parallel run splits every document into "
             f"{cp_degree} chunks and each chunk must stay ratio-aligned; set "
-            f"--dataloader.per_doc_alignment to a multiple of {required}."
+            f"the dataloader or its dataset processor alignment to a multiple of {required}."
         )
     return required
+
+
+def require_dataloader_alignment(dataloader, compress_ratios: Sequence[int], cp_degree: int) -> None:
+    """Validate document padding for the model's configured data pipeline."""
+    alignment = getattr(dataloader, "per_doc_alignment", None)
+    if alignment is None:
+        packing = getattr(dataloader, "dataset", None)
+        dataset = getattr(packing, "dataset", None)
+        processor = getattr(dataset, "processor", None)
+        alignment = getattr(processor, "per_doc_alignment", 1)
+    require_per_doc_alignment(alignment, compress_ratios, cp_degree)
+
+
+def validate_alignment(multiple: int, *, context: "DatasetBuildContext") -> None:
+    if multiple < 1:
+        raise ValueError("per_doc_alignment must be positive")
+    if context.max_context_length % multiple or context.num_tokens_per_batch % multiple:
+        raise ValueError("context length and token batch must be multiples of per_doc_alignment")
+
+
+def align_text_sequence(sequence: TextSequence, *, multiple: int) -> TextSequence:
+    pad_len = -len(sequence.input_ids) % multiple
+    if not pad_len:
+        return sequence
+    positions = sequence.positions
+    if positions is not None:
+        positions = np.concatenate((positions, positions[-1] + np.arange(1, pad_len + 1, dtype=positions.dtype)))
+    return replace(
+        sequence,
+        input_ids=np.pad(sequence.input_ids, (0, pad_len), constant_values=0),
+        labels=np.pad(sequence.labels, (0, pad_len), constant_values=IGNORE_INDEX),
+        positions=positions,
+    )
+
+
+class AlignedTextProcessor(TextProcessor):
+    """Pad tokenized documents before native Grain packing forms compression groups."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TextProcessor.Config):
+        per_doc_alignment: int = 1
+
+    def __init__(self, config: Config, *, context: "DatasetBuildContext") -> None:
+        super().__init__(config, context=context)
+        validate_alignment(config.per_doc_alignment, context=context)
+        self._per_doc_alignment = config.per_doc_alignment
+
+    def __call__(self, sample: dict[str, Any], rng: np.random.Generator) -> TextSequence | None:
+        sequence = super().__call__(sample, rng)
+        if sequence is None:
+            return None
+        return align_text_sequence(sequence, multiple=self._per_doc_alignment)

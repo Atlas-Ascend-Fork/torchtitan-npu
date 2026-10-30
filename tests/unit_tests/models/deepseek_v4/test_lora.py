@@ -203,8 +203,8 @@ def test_registry_model_forward_backward_freezes_base_and_differentiates_adapter
         model = spec.model.build()
     model.init_states()
     model = spec.parallelize_fn(model, **parallelize_kwargs)
-    inputs = torch.arange(128).reshape(1, 128)
-    inputs, _, kwargs = preprocess(model, inputs, inputs, torch.arange(128).reshape(1, 128))
+    inputs = torch.arange(128)
+    inputs, _, kwargs = preprocess(model, inputs, inputs, torch.arange(128))
     output = model(inputs, **kwargs)
     assert torch.isfinite(output).all()
     output.float().square().mean().backward()
@@ -243,10 +243,10 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
             from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
             from functools import partial
 
-            q = torch.randn(1, 4, 2, 3, requires_grad=True)
-            k = torch.randn(1, 2, 3, requires_grad=True)
-            w = torch.randn(1, 4, 2, requires_grad=True)
-            picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64).view(1, 4, 2)
+            q = torch.randn(4, 2, 3, requires_grad=True)
+            k = torch.randn(2, 3, requires_grad=True)
+            w = torch.randn(4, 2, requires_grad=True)
+            picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64)
             cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
             context = partial(create_selective_checkpoint_contexts, list(ac.build().get_save_ops()))
@@ -263,11 +263,11 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
             )
             expected = torch.stack(
                 [
-                    (torch.einsum("hd,d->h", q[0, token], k[0, pick]).relu() * w[0, token]).sum()
+                    (torch.einsum("hd,d->h", q[token], k[pick]).relu() * w[token]).sum()
                     for token in range(4)
                     for pick in (0, 1)
                 ]
-            ).view(1, 4, 2)
+            ).view(4, 2)
             torch.testing.assert_close(actual, expected)
             for result, reference in zip(
                 torch.autograd.grad(actual.sum(), (q, k, w)),

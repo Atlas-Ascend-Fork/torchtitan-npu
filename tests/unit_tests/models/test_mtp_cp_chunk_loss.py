@@ -29,9 +29,9 @@ _community_mtp = import_module("torchtitan.models.deepseek_v3.mtp")
 
 
 def test_dsv4_mtp_batch_precedes_cp_sharding():
-    tokens = torch.arange(8).unsqueeze(0)
+    tokens = torch.arange(8)
     labels = tokens + 1
-    positions = torch.arange(8).unsqueeze(0)
+    positions = torch.arange(8)
 
     batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=1)
 
@@ -39,15 +39,15 @@ def test_dsv4_mtp_batch_precedes_cp_sharding():
     # from the globally shifted tensor preserves the future token at index 1;
     # rolling the already-local tensor would incorrectly select token 6.
     local_indices = torch.tensor([0, 1, 6, 7])
-    prepared_local = batch.input_tokens[:, local_indices, 0]
+    prepared_local = batch.input_tokens[local_indices, 0]
     incorrectly_rolled_local = _community_mtp.roll_mtp_sequence(
-        tokens[:, local_indices],
+        tokens[local_indices],
         shift=1,
         fill_value=0,
     )
 
-    torch.testing.assert_close(prepared_local, torch.tensor([[1, 2, 7, 0]]))
-    assert prepared_local[0, 1] != incorrectly_rolled_local[0, 1]
+    torch.testing.assert_close(prepared_local, torch.tensor([1, 2, 7, 0]))
+    assert prepared_local[1] != incorrectly_rolled_local[1]
 
 
 def test_dsv32_default_config_disables_mtp():
@@ -77,25 +77,23 @@ def test_dsv32_mtp_keeps_community_cp_restriction():
         "debugmodel",
         num_mtp_layers=1,
     )
-    config.training = dataclasses.replace(
-        config.training,
-        global_batch_size=8,
-    )
     config.parallelism = dataclasses.replace(
         config.parallelism,
         context_parallel_degree=2,
     )
 
-    with pytest.raises(NotImplementedError, match="context parallelism"):
+    # The community decoder's own refusal fires at config time for the
+    # VarlenAttention-derived cores; the reference core's metadata-seam
+    # refusal (``ReferenceVarlenMetadata``) is the later, rank-local guard.
+    with pytest.raises(NotImplementedError, match="Context Parallel is not supported"):
         config.model_spec.model.update_from_config(config=config)
 
 
 def test_dsv4_mtp_accepts_cp_configuration():
     config = deepseek_v4_debugmodel()
-    config.training = dataclasses.replace(
-        config.training,
-        global_batch_size=8,
-    )
+    # A CP run splits every document into equal chunks and each chunk must stay
+    # ratio-aligned, so the loader's per-document alignment grows with the degree.
+    config.dataloader.dataset.dataset.processor.per_doc_alignment = 256
     config.parallelism = dataclasses.replace(
         config.parallelism,
         context_parallel_degree=2,
@@ -105,9 +103,9 @@ def test_dsv4_mtp_accepts_cp_configuration():
 
 
 def test_prepare_mtp_batch_respects_packed_sequence_boundaries():
-    tokens = torch.arange(10, 18).unsqueeze(0)
+    tokens = torch.arange(10, 18)
     labels = tokens + 100
-    positions = torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]])
+    positions = torch.tensor([0, 1, 2, 0, 1, 0, 1, 2])
 
     batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=2)
 
@@ -122,7 +120,7 @@ def test_prepare_mtp_batch_respects_packed_sequence_boundaries():
             [17, 0],
             [0, 0],
         ]
-    ).unsqueeze(0)
+    )
     expected_valid = expected_tokens.ne(0)
     expected_labels = torch.where(
         expected_valid,
@@ -136,10 +134,10 @@ def test_prepare_mtp_batch_respects_packed_sequence_boundaries():
 
 
 def test_prepared_mtp_labels_match_community_roll():
-    batch_size, seq_len = 1, 8
-    labels = torch.arange(seq_len).unsqueeze(0)
-    positions = torch.arange(seq_len).unsqueeze(0)
-    tokens = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    seq_len = 8
+    labels = torch.arange(seq_len)
+    positions = torch.arange(seq_len)
+    tokens = torch.zeros(seq_len, dtype=torch.long)
 
     mtp_batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=2)
     expected = torch.stack(
@@ -172,17 +170,17 @@ class _MTPChunkedLossCase:
 
 
 def _build_mtp_chunked_loss_case() -> _MTPChunkedLossCase:
-    batch_size, seq_len, dim, vocab_size = 1, 8, 4, 16
+    seq_len, dim, vocab_size = 8, 4, 16
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(42)
-        labels = torch.randint(vocab_size, (batch_size, seq_len))
-        tokens = torch.randint(vocab_size, (batch_size, seq_len))
-        hidden = [torch.randn(batch_size, seq_len, dim, requires_grad=True) for _ in range(3)]
+        labels = torch.randint(vocab_size, (seq_len,))
+        tokens = torch.randint(vocab_size, (seq_len,))
+        hidden = [torch.randn(seq_len, dim, requires_grad=True) for _ in range(3)]
         lm_head = torch.nn.Linear(dim, vocab_size, bias=False)
 
     return _MTPChunkedLossCase(
         labels=labels,
-        positions=torch.arange(seq_len).unsqueeze(0),
+        positions=torch.arange(seq_len),
         tokens=tokens,
         hidden=hidden,
         full_hidden=[item.detach().clone().requires_grad_() for item in hidden],

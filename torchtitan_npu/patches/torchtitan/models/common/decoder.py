@@ -33,12 +33,11 @@ Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
   map's entries carry this rank's frames and the kernel records built from
   them, so they are prepared after the shard, on this rank's rows.  0.3.0 has
   neither ``ParallelismContext`` nor ``shard_tensors``, so the shard inside
-  ``_cp_shard`` is the pinned ``cp_shard`` entry point.
+  ``_cp_shard`` is the pinned ``prepare_context_parallel_input`` entry point.
 
-0.3.0 adaptation, because the pinned version predates #4116/#4617:
-``labels`` is passed separately (0.3.0 keeps it out of ``input_dict``), and
-``parallel_dims``/``device``/``parallelism`` stand in for #4116's
-``parallelism_context`` (0.3.0 has no ``ParallelismContext``).  The
+The caller follows the pinned model contract: ``input_dict`` includes
+``labels``, and ``parallel_dims``/``parallelism`` are keyword arguments.
+The internal CP adapter derives its device from the input tensor. The
 ``build_attention_masks`` branch is transitional: it is the pre-#4116 shape of
 the same seam, and disappears with the DeepSeek models' migration onto
 ``build_attention_metadata``.
@@ -48,12 +47,12 @@ from typing import Any
 
 import torch
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
-from torchtitan.distributed.context_parallel import cp_shard
+from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import BaseAttention, FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 
-from torchtitan_npu.patches.torchtitan.distributed.context_parallel import layout_needs_positions
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
     cp_shard_context_set,
@@ -167,78 +166,45 @@ def _cp_shard(
     ``_cp_shard`` is its name.  The map carries this rank's frames and the
     kernel records built from them, so it is rank-dependent exactly as
     ``attention_masks`` is: its transform runs *after* the shard, on this rank's
-    rows, with the row's positions the map was built from.  Upstream calls the
-    backend's ``prepare_cp_metadata`` per entry because the mesh is ambient
-    there; 0.3.0 hands the mesh, the load-balancer type and those positions
-    along as well.
+    rows, with the permutation the load balancer sharded by and the global
+    positions the map was built from.  Upstream calls the backend's
+    ``prepare_cp_metadata`` per entry with the permutation alone because the
+    mesh is ambient there; 0.3.0 hands the mesh, the load-balancer type and
+    those positions along as well.
 
-    The shard itself stays 0.3.0's: the pinned version has neither
-    ``ParallelismContext`` nor ``shard_tensors``, so the pinned ``cp_shard``
-    remains the entry point.
-
-    ``load_balancer_type`` names the layout the inputs are sharded by; ``None``
-    asks the stack, whose metadata declares the layout it can describe
-    (``cp_layout``).  A repository layout -- ``doc_chunk`` -- is built *inside*
-    ``cp_shard`` from the row's boundaries, so nothing here precomputes a
-    permutation; the transform is handed none, because a rank-local entry of
-    these layouts is a function of the row's boundaries alone.  A pinned layout
-    (``headtail``) still hands its permutation over, as upstream does.
+    The pinned native ``prepare_context_parallel_input`` shards a named
+    batch using declared input layouts; all decoder token axes are flat.
     """
     attention_metadata = extra_kwargs.get("attention_metadata")
-    # The shard below replaces ``positions`` with this rank's slice; the
-    # transform describes the row the shard started from, so keep the global
-    # one before that happens.
-    row_positions = extra_kwargs.get("positions")
-    # Only a boundary-driven layout reads the positions: it is a function of where the documents
-    # start.  The pinned ones are functions of the length alone, so a model that carries none
-    # keeps sharding exactly as it did before this repository's layouts existed.
+    positions = extra_kwargs.get("positions")
     layout = resolve_cp_layout(load_balancer_type, attention_metadata)
-    if layout_needs_positions(layout) and row_positions is None:
-        raise ValueError(f"the {layout!r} layout needs the row's positions: they are what it is derived from.")
     permutation = None
-    if attention_metadata and layout == "headtail" and row_positions is not None:
+    if attention_metadata and layout == "headtail" and positions is not None:
         permutation = _HeadTailLoadBalancer(
-            row_positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
+            positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
         )._generate_indices()
 
-    attention_masks = extra_kwargs.get("attention_masks")
-    buffers: tuple[torch.Tensor, ...] = (inputs, labels) if row_positions is None else (inputs, labels, row_positions)
-    sharded, attention_masks = cp_shard(
-        cp_mesh,
-        buffers,
-        attention_masks,
-        layout,
-        ptrr_mask_key=ptrr_mask_key,
-        positions=row_positions,  # pyrefly: ignore [unexpected-keyword]
-    )
-    inputs, labels = sharded[0], sharded[1]
-    if len(sharded) > 2:
-        extra_kwargs["positions"] = sharded[2]
-    if attention_masks is not None:
-        extra_kwargs["attention_masks"] = attention_masks
-
-    if attention_metadata:
-        # Upstream's loop, with the pinned stand-in for its ambient parallelism
-        # context published around it (see ``attention_metadata``).
-        with cp_shard_context_set(
-            cp_mesh=cp_mesh,
-            load_balancer_type=layout,
-            positions=row_positions,
-        ):
-            extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(
-                attention_metadata,
-                permutation=permutation,
-            )
+    del device
+    with cp_shard_context_set(cp_mesh=cp_mesh, load_balancer_type=layout, positions=positions):
+        batch = prepare_context_parallel_input(
+            {"input": inputs, "labels": labels, **extra_kwargs},
+            decoder_input_sharding(),
+            cp_mesh,
+            layout,
+            ptrr_mask_key,
+        )
+        inputs, labels = batch.pop("input"), batch.pop("labels")
+        extra_kwargs = batch
+        if attention_metadata:
+            extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(attention_metadata, permutation=permutation)
     return inputs, labels, extra_kwargs
 
 
 def preprocess_inputs(
     self,
     input_dict: dict[str, torch.Tensor],
-    labels: torch.Tensor,
     *,
     parallel_dims: Any,
-    device: torch.device,
     parallelism: Any,
     max_num_documents: int | None = None,
     max_context_length: int | None = None,
@@ -259,7 +225,8 @@ def preprocess_inputs(
             "field), and this seam does not support it; use spmd_types"
         )
     inputs = input_dict["input"]
-    extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k != "input"}
+    labels = input_dict["labels"]
+    extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k not in ("input", "labels")}
 
     build_attention_masks = getattr(self, "build_attention_masks", None)
     if build_attention_masks is not None:
@@ -302,13 +269,19 @@ def preprocess_inputs(
                 labels,
                 extra_kwargs,
                 cp_mesh=cp_mesh,
-                device=device,
+                device=inputs.device,
                 load_balancer_type=parallelism.context_parallel_load_balancer,
                 ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
             )
 
     if parallelism.spmd_backend == "spmd_types":
-        inputs, labels, extra_kwargs = annotate_input_spmd_types(parallel_dims, inputs, labels, extra_kwargs)
+        batch = annotate_input_spmd_types(
+            parallel_dims,
+            {"input": inputs, "labels": labels, **extra_kwargs},
+            decoder_input_sharding(),
+        )
+        inputs, labels = batch.pop("input"), batch.pop("labels")
+        extra_kwargs = batch
 
     return inputs, labels, extra_kwargs
 

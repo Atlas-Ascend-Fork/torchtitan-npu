@@ -27,7 +27,6 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.config import (
     AnticipatoryRoutingConfig,
     validate_anticipatory_config,
 )
-from torchtitan_npu.extensions.experiment.anticipatory_routing.router import configure_router_override
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
 
 from .tools.profiler import CANNProfiler
@@ -80,6 +79,9 @@ class TrainerEx(Trainer):
             validate_anticipatory_config(self)
 
         def _post_init_optimizer(self) -> None:
+            # Overrides may already have materialized and replaced the CLI schema.
+            if not isinstance(self.optimizer, OptimizerConfig):
+                return
             self.optimizer.materialize()
             if self.optimizer.name == "Muon" and (
                 self.parallelism.tensor_parallel_degree > 1 or self.parallelism.pipeline_parallel_degree > 1
@@ -146,8 +148,6 @@ class TrainerEx(Trainer):
             )
 
         set_allow_hf32(config.training.extension.allow_hf32)
-        # Both parent initialization paths apply overrides before building the model.
-        configure_router_override(config)
         if getattr(config.training, "enable_cpu_offload", False):
             # CPU DTensor parameters need NPU-side initialization during
             # model materialization: Module._init_param fires inside

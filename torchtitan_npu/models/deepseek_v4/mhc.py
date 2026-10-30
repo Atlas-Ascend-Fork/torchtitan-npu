@@ -40,9 +40,9 @@ class HcPre(Module):
         pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
         comb = comb.unflatten(-1, (hc_mult, hc_mult))
 
-        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)) + self.eps
-        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0))
-        comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult).unsqueeze(0).unsqueeze(0)
+        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult]) + self.eps
+        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
+        comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
 
         row_max = comb.max(dim=-1, keepdim=True).values
         comb = torch.exp(comb - row_max)
@@ -55,11 +55,11 @@ class HcPre(Module):
 
     def forward(self, x):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+        x = x.flatten(-2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, self.hc_fn.float()) * rsqrt
         pre, post, comb = self._sinkhorn(mixes, self.hc_scale.float(), self.hc_base.float())
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype), post, comb
 
 
@@ -72,7 +72,7 @@ class HcPost(Module):
         super().__init__()
 
     def forward(self, x, residual, post, comb):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
         return y.type_as(x)
 
 
@@ -97,9 +97,9 @@ class HcHead(Module):
 
     def forward(self, x):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+        x = x.flatten(-2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, self.hc_fn.float()) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_scale + self.hc_base) + self.eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype)

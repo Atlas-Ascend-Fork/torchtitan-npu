@@ -7,14 +7,16 @@
 
 import json
 from copy import deepcopy
+from itertools import islice
 from pathlib import Path
 
 import pytest
 import torch
 from PIL import Image
-from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.config.override import OverrideConfig, apply_overrides
 
+from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision import language_dataset as dataset_module
 from torchtitan_npu.models.deepseek_v4_1.vision.data import ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
@@ -32,6 +34,8 @@ def tokenizer():
 
 
 class _StubVisionLanguageEncoder:
+    """Encode plain text/image blocks only; exclude the official chat template."""
+
     def encode_messages_with_assistant_mask(self, messages, tokenizer, **_kwargs):
         token_ids = []
         assistant_mask = []
@@ -84,20 +88,18 @@ def _loader(
     world=1,
     infinite=False,
     batch_size=1,
-    num_workers=0,
 ):
     config = DeepSeekV41VisionLanguageDataLoader.Config(
         dataset_path=str(dataset_path),
         infinite=infinite,
-        num_workers=num_workers,
     )
     return DeepSeekV41VisionLanguageDataLoader(
         config,
         tokenizer=tokenizer,
         dp_rank=rank,
         dp_world_size=world,
-        seq_len=512,
-        local_batch_size=batch_size,
+        max_context_length=512,
+        num_tokens_per_batch=512 * batch_size,
     )
 
 
@@ -170,24 +172,36 @@ def test_streaming_dp_shards_and_resume_round_trip(tmp_path, tokenizer):
 
     shards = []
     for rank in range(2):
-        samples = list(_loader(dataset_path, tokenizer, rank=rank, world=2))
+        loader = _loader(dataset_path, tokenizer, rank=rank, world=2, infinite=True)
+        try:
+            samples = list(islice(loader, 3))
+        finally:
+            loader.close()
         shards.append({tuple(labels[labels != -100].tolist()) for _, labels in samples})
     assert shards[0] and shards[1] and shards[0].isdisjoint(shards[1])
 
     original = _loader(dataset_path, tokenizer, infinite=True)
-    iterator = iter(original)
-    next(iterator)
-    state = deepcopy(original.state_dict())
-    expected = next(iterator)
     restored = _loader(dataset_path, tokenizer, infinite=True)
-    restored.load_state_dict(state)
-    actual = next(iter(restored))
-    assert torch.equal(actual[1], expected[1])
-    for key in expected[0]:
-        assert torch.equal(actual[0][key], expected[0][key]), key
+    try:
+        iterator = iter(original)
+        next(iterator)
+        state = deepcopy(original.state_dict())
+        expected = next(iterator)
+        restored.load_state_dict(state)
+        actual = next(iter(restored))
+        assert torch.equal(actual[1], expected[1])
+        for key in expected[0]:
+            # ``num_valid_tokens`` rides the batch as the int the trainer pops.
+            if isinstance(expected[0][key], torch.Tensor):
+                assert torch.equal(actual[0][key], expected[0][key]), key
+            else:
+                assert actual[0][key] == expected[0][key], key
+    finally:
+        original.close()
+        restored.close()
 
 
-def test_batch_contract_and_worker_forwarding(tmp_path, tokenizer, monkeypatch):
+def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     dataset_path = tmp_path / "text_vqa.jsonl"
     dataset_path.write_text(
         json.dumps(
@@ -201,15 +215,66 @@ def test_batch_contract_and_worker_forwarding(tmp_path, tokenizer, monkeypatch):
         + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="local_batch_size=1"):
+    with pytest.raises(ValueError, match="num_tokens_per_batch == max_context_length"):
         _loader(dataset_path, tokenizer, batch_size=2)
 
-    captured = {}
+    recipe = deepseek_v4_1_debugmodel_multimodal()
+    recipe.dataloader.dataset_path = str(dataset_path)
+    recipe.dataloader.seed = 137
+    recipe.dataloader.infinite = False
+    recipe.override = OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft"])
+    apply_overrides(recipe.override, recipe)
+    assert isinstance(recipe.dataloader, DeepSeekV41VisionLanguageDataLoader.Config)
+    assert recipe.dataloader.seed == 137
+    assert not recipe.dataloader.infinite
+    loader = recipe.dataloader.build(
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_batch=512
+    )
+    try:
+        inputs, labels = next(iter(loader))
+    finally:
+        loader.close()
+    raw = json.loads(dataset_path.read_text())
+    expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(raw)
+    assert inputs["input"].shape == labels.shape == (512,)
+    assert type(inputs["num_valid_tokens"]) is int
+    assert inputs["num_valid_tokens"] == (expected_labels != -100).sum()
+    torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)
+    for key, value in expected_inputs.items():
+        torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
 
-    def capture_init(_self, _dataset, **kwargs):
-        captured.update(kwargs)
 
-    monkeypatch.setattr(ParallelAwareDataloader, "__init__", capture_init)
-    _loader(dataset_path, tokenizer, num_workers=2)
-    assert captured["batch_size"] == 1
-    assert captured["num_workers"] == 2
+@pytest.mark.parametrize("num_images", (0, 2), ids=("text-dummy", "interleaved-images"))
+def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, num_images):
+    for index, size in enumerate(((101, 100), (140, 70))):
+        Image.new("RGB", size, color=(index * 127, 37, 255)).save(tmp_path / f"image{index}.png")
+    blocks = []
+    for index in range(num_images):
+        blocks.extend(
+            [
+                {"type": "text", "text": f"Look at image {index}:"},
+                {"type": "image", "source": f"image{index}.png"},
+            ]
+        )
+    blocks.append({"type": "text", "text": "Describe the colors."})
+    row = {"messages": [{"role": "user", "content": blocks}, {"role": "assistant", "content": "Blue and red."}]}
+    dataset_path = tmp_path / "multimodal.jsonl"
+    # Overlong rows are filtered before collation; they must not affect labels.
+    overlong = {"messages": [{"role": "user", "content": "word " * 700}, {"role": "assistant", "content": "Skipped."}]}
+    dataset_path.write_text(json.dumps(overlong) + "\n" + json.dumps(row) + "\n")
+    expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(row)
+    loader = _loader(dataset_path, tokenizer)
+    try:
+        inputs, labels = next(iter(loader))
+    finally:
+        loader.close()
+    torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)
+    for key, value in expected_inputs.items():
+        torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
+    expected_reply = [*tokenizer.tokenizer.encode("Blue and red.").ids, tokenizer.eos_id]
+    assert labels[labels != -100].tolist() == expected_reply
+    assert inputs["num_valid_tokens"] == len(expected_reply)
+    assert inputs["pixel_values"].shape[0] == max(num_images, 1)
+    if not num_images:
+        assert (inputs["image_feature_indices"] == -1).all()
+        assert torch.count_nonzero(inputs["pixel_values"]) == 0

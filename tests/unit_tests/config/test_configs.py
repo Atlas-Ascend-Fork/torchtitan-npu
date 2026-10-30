@@ -50,8 +50,8 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
         hf_assets_path=str(tmp_path),
         dump_folder="custom-output",
         training=UpstreamTrainingConfig(
-            local_batch_size=3,
-            seq_len=4096,
+            num_tokens_per_microbatch_per_dp_rank=3 * 4096,
+            num_tokens_per_train_step=6 * 4096,
             steps=17,
         ),
     )

@@ -15,8 +15,8 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor
-from torchtitan.components.checkpoint import MODEL
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer import MODEL
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.tools import filesystem
 from torchtitan.tools.logging import logger
 

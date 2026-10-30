@@ -26,15 +26,15 @@ class VisionBatch:
     image_feature_indices: torch.Tensor
     token_types: torch.Tensor
 
-    def validate(self, *, batch_size: int, seq_len: int) -> None:
+    def validate(self, *, num_tokens: int) -> None:
         if self.grid_hw.ndim != 2 or self.grid_hw.shape[-1] != 2:
             raise ValueError("grid_hw must have shape [num_images, 2]")
         if self.patch_offsets.ndim != 1 or self.patch_offsets.numel() != self.grid_hw.shape[0] + 1:
             raise ValueError("patch_offsets must have one entry per image plus a sentinel")
-        if self.image_feature_indices.shape != (batch_size, seq_len):
-            raise ValueError("image_feature_indices must have shape [batch, seq]")
-        if self.token_types.shape != (batch_size, seq_len):
-            raise ValueError("token_types must have shape [batch, seq]")
+        if self.image_feature_indices.shape != (num_tokens,):
+            raise ValueError("image_feature_indices must have shape [tokens]")
+        if self.token_types.shape != (num_tokens,):
+            raise ValueError("token_types must have shape [tokens]")
 
 
 def _downsampled_grid(height: int, width: int, ratio: int) -> tuple[int, int]:
@@ -111,20 +111,18 @@ def scatter_image_features(
     image_feature_indices: torch.Tensor,
 ) -> torch.Tensor:
     """Differentiably write concatenated visual features into token embeddings."""
-    if hidden.ndim != 3 or image_feature_indices.shape != hidden.shape[:2]:
-        raise ValueError("hidden and image_feature_indices must describe [batch, seq]")
+    if hidden.ndim != 2 or image_feature_indices.shape != hidden.shape[:1]:
+        raise ValueError("hidden and image_feature_indices must describe [tokens, hidden]")
     if visual_features.ndim != 2 or visual_features.shape[1] != hidden.shape[-1]:
         raise ValueError("visual_features must have shape [features, hidden]")
-    positions = torch.nonzero(image_feature_indices >= 0, as_tuple=False)
+    positions = torch.nonzero(image_feature_indices >= 0, as_tuple=False).flatten()
     if positions.numel() == 0:
         return hidden + visual_features.sum() * 0
-    feature_ids = image_feature_indices[positions[:, 0], positions[:, 1]]
+    feature_ids = image_feature_indices.index_select(0, positions)
     if int(feature_ids.max()) >= visual_features.shape[0]:
         raise ValueError("image feature index exceeds visual feature count")
-    flat_positions = positions[:, 0] * hidden.shape[1] + positions[:, 1]
     values = visual_features.index_select(0, feature_ids).to(hidden.dtype)
-    output = hidden.clone().reshape(-1, hidden.shape[-1])
-    return output.index_copy(0, flat_positions, values).view_as(hidden)
+    return hidden.index_copy(0, positions, values)
 
 
 @dataclass(frozen=True, slots=True)

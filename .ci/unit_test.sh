@@ -33,8 +33,8 @@ trap _cleanup_python_shims EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
-TORCHTITAN_VERSION="$(grep -E '^torchtitan==' "${PROJECT_ROOT}/requirements.txt" | head -1 | cut -d= -f3 | tr -d '[:space:][:cntrl:]')"
-TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-v${TORCHTITAN_VERSION}}"
+source "${SCRIPT_DIR}/setup_torchtitan.sh"
+TORCHTITAN_COMMIT="$(_torchtitan_revision)"
 TORCHTITAN_DIR="${TORCHTITAN_DIR:-${PROJECT_ROOT}/third_party/torchtitan}"
 
 source /home/jenkins/Ascend/cann-9.2.0/set_env.sh
@@ -45,12 +45,8 @@ cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 pip install -r requirements-dev.txt
 
-if [[ ! -d "${TORCHTITAN_DIR}/.git" ]]; then
-    mkdir -p "$(dirname "${TORCHTITAN_DIR}")"
-    git clone --filter=blob:none --no-checkout "${TORCHTITAN_REPO}" "${TORCHTITAN_DIR}"
-fi
-git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
-git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
+_setup_torchtitan "${TORCHTITAN_DIR}"
+export TORCHTITAN_DIR
 pip install --no-deps -e "${TORCHTITAN_DIR}"
 pip install \
     --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torchft/index.html \
@@ -62,7 +58,10 @@ pip install --no-deps -e .
 # the image pins a *different* torch/torch_npu build than requirements.txt does, so
 # re-running the whole file would upgrade the CANN stack mid-job (it broke the
 # fused-op smoke tests once).  New pure-Python runtime wheels go here by name.
-pip install --no-deps attn-gym==0.0.16
+pip install --no-deps attn-gym==0.0.16 spmd_types==0.2.5 \
+    'torch_checkpointing>=0.1.0' 'torch_remat>=0.2.0'
+# Resolve Grain's own data-pipeline dependencies without changing the torch stack.
+pip install grain==0.2.18
 
 pip install --no-deps torchvision==0.30.0.dev20260918 \
     --extra-index-url https://download.pytorch.org/whl/nightly/cpu

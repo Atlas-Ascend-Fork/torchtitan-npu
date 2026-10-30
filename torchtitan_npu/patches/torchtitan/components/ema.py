@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.tools import utils
@@ -30,7 +30,7 @@ class _EMAParamOptimizer(Optimizer):
     """Holds ``state[p]["ema_params"]`` per parameter for one model part.
 
     Never step()-ed; reuses ``Optimizer``'s per-param state dict plus the
-    FQN-flattening DCP machinery in ``checkpoint_utils.py`` instead of a
+    FQN-flattening DCP machinery in ``optimizer/utils.py`` instead of a
     bespoke DTensor state-dict format. When constructed it always wraps the
     real parameters; ``enable`` controls EMA tensor allocation.
     """

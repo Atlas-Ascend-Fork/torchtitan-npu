@@ -14,17 +14,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prefetch/pin 1M GA8 batches so queue drain and async H2D can overlap compute.
+DSV4_PER_DOC_ALIGNMENT="${DSV4_PER_DOC_ALIGNMENT:-16384}" \
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
+    --training.max-context-length 1048576 \
+    --training.num-tokens-per-microbatch-per-dp-rank 1048576 \
+    --training.num-tokens-per-train-step 8388608 \
     --parallelism.context-parallel-degree 128 \
-    --dataloader.per_doc_alignment 16384 \
     --parallelism.context-parallel-load-balancer doc_chunk \
     --parallelism.data-parallel-shard-degree 1 \
     --parallelism.data-parallel-replicate-degree 1 \
-    --training.seq-len 1048576 \
-    --training.local-batch-size 1 \
-    --training.global-batch-size 8 \
-    --dataloader.num-workers 1 \
-    --dataloader.prefetch-factor 8 \
-    --dataloader.pin-memory \
     "$@"

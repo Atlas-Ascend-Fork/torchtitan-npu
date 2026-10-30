@@ -160,9 +160,9 @@ class Compressor(Module):
         positional-or-keyword parameter to be passed positionally.
 
         Args:
-            x: The stream as the layout produced it, ``[B, L, D]``: the row at one degree, this
+            x: The stream as the layout produced it, ``[T, D]``: the row at one degree, this
                 rank's chunks under context parallelism.
-            positions: The **key stream's** own document-relative positions, ``[B, L]`` (the
+            positions: The **key stream's** own document-relative positions, ``[T]`` (the
                 entry's ``position_k``: the input's at one degree, this rank's window under CP).
                 The pooled blocks rotate at ``positions[..., ::ratio]``.
             cu_seqlens: The **row's** document boundaries (``[n + 1]``), required by the ratio-4
@@ -173,7 +173,7 @@ class Compressor(Module):
                 carry is prepended.
 
         Returns:
-            The row's pooled key blocks ``[B, L // ratio, D]``, the carry block already trimmed.
+            The row's pooled key blocks ``[T // ratio, D]``, the carry block already trimmed.
         """
         # The aligned dataloader and trainer validate the grid before model execution.
         trim = 0
@@ -182,22 +182,21 @@ class Compressor(Module):
             # slab under CP.  The carry then completes the document the window starts inside.
             x = attention_metadata.key_stream(x, group=self.group)
             if self.overlap:
-                carry = self.carry_exchange(x, positions, cu_seqlens)
-                x, positions, cu_seqlens = carry.x, carry.positions, carry.cu_seqlens
+                carry = self.carry_exchange(x.unsqueeze(0), positions.unsqueeze(0), cu_seqlens)
+                x, positions, cu_seqlens = carry.x.squeeze(0), carry.positions.squeeze(0), carry.cu_seqlens
                 trim = carry.trim
-        batch_size = x.size(0)
         # Implementations consume one packed stream whose boundaries already include every
         # batch row. Restore the container shape only after pooling, including RoPE.
         pooled = self.implementation.forward(
             self,
-            x.flatten(0, 1).unsqueeze(0),
+            x.unsqueeze(0),
             positions.reshape(1, -1),
             cu_seqlens=cu_seqlens,
         )
-        pooled = pooled.reshape(batch_size, -1, pooled.size(-1))
+        pooled = pooled.squeeze(0)
         # The carry's own block is the head of the pooled stream: dropping it leaves exactly the
         # blocks this rank holds of the row.
-        return pooled.narrow(1, trim, pooled.size(1) - trim) if trim else pooled
+        return pooled.narrow(0, trim, pooled.size(0) - trim) if trim else pooled
 
     def _forward(
         self,
@@ -236,7 +235,7 @@ class Compressor(Module):
         # once the overlap prepended the previous block's a-series.
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(x.dtype))
-        return self.rope(kv.unsqueeze(2), positions=positions[..., ::ratio]).squeeze(2)
+        return self.rope(kv.squeeze(0).unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)
 
 
 class Indexer(Module):
@@ -273,16 +272,16 @@ class Indexer(Module):
         compressed stream.
 
         Returns:
-            idx_q: Indexer queries ``[B, L, num_index_heads, index_head_dim]``
+            idx_q: Indexer queries ``[T, num_index_heads, index_head_dim]``
                 with RoPE applied and Hadamard-rotated.
             idx_k: Indexer compressed keys in the container grid
-                ``[B, L // ratio, index_head_dim]``, Hadamard-rotated.
-            idx_w: Per-head indexer weights ``[B, L, num_index_heads]``
+                ``[num_blocks, index_head_dim]``, Hadamard-rotated.
+            idx_w: Per-head indexer weights ``[T, num_index_heads]``
                 (the local rows).
         """
-        bsz, seqlen, _ = qr.size()
+        num_tokens = qr.size(0)
         idx_q = self.wq_b(qr)
-        idx_q = idx_q.view(bsz, seqlen, self.num_index_heads, self.head_dim)
+        idx_q = idx_q.view(num_tokens, self.num_index_heads, self.head_dim)
         idx_q = self.rope(idx_q, positions=positions)
         idx_q = self._rotate_activation(idx_q)
         # The compressor restores this rank's window and, for a ratio-4 geometry, prepends the
@@ -324,23 +323,18 @@ def select_compressed_slots(
     own scale, so multiplying them by ``sqrt(H * D)`` cancels that division exactly.  ``topk``
     is clamped to the pool's width, as this model's selection has always been.
     """
-    bsz, _, heads, head_dim = idx_q.shape
-    if bsz != 1:
-        raise ValueError(
-            "MBS>1 is currently supported only by the fused path; "
-            f"the reference selector requires batch size 1 (got {bsz})."
-        )
+    _, heads, head_dim = idx_q.shape
     return lightning_indexer(
-        idx_q.float(),
-        idx_k.float(),
-        idx_w.float() * math.sqrt(heads * head_dim),
-        min(topk, idx_k.size(1)),
+        idx_q.float().unsqueeze(0),
+        idx_k.float().unsqueeze(0),
+        idx_w.float().unsqueeze(0) * math.sqrt(heads * head_dim),
+        min(topk, idx_k.size(0)),
         causal=True,
         compress_ratio=4,
         cu_seqlens=cu_seqlens.contiguous(),
         cu_seqlens_k=cu_seqlens_k.contiguous(),
         impl="reference",
-    )
+    ).squeeze(0)
 
 
 def student_logits_at_picks(
@@ -366,16 +360,11 @@ def student_logits_at_picks(
     selector's backward consumes the same quantity: at the picks, the student logits are the
     only differentiable edge of the selection.
     """
-    if idx_q.size(0) != 1:
-        raise ValueError(
-            "MBS>1 is currently supported only by the fused path; "
-            f"the reference student logits require batch size 1 (got {idx_q.size(0)})."
-        )
-    pool_start_L1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
-    picked_BLKDi = idx_k.squeeze(0)[(topk_indices + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
-    scores_BLHK = torch.einsum("blhd,blkd->blhk", idx_q, picked_BLKDi)
-    weighted_BLHK = scores_BLHK.relu() * idx_w.unsqueeze(-1)
-    return weighted_BLHK.sum(dim=2).masked_fill(topk_indices < 0, -torch.inf)
+    pool_start_T1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(0))
+    picked_TKDi = idx_k[(topk_indices + pool_start_T1).clamp_min(0)]
+    scores_THK = torch.einsum("thd,tkd->thk", idx_q, picked_TKDi)
+    weighted_THK = scores_THK.relu() * idx_w.unsqueeze(-1)
+    return weighted_THK.sum(dim=1).masked_fill(topk_indices < 0, -torch.inf)
 
 
 class LightningIndexer(Module):

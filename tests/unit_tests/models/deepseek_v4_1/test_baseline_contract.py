@@ -34,7 +34,7 @@ def test_plain_weights_use_routed_experts_and_track_empty_experts():
     calls = []
     handle = moe.routed_experts.register_forward_hook(lambda module, args, output: calls.append(output))
     try:
-        x = torch.linspace(-1, 1, 24).reshape(1, 3, 8).requires_grad_()
+        x = torch.linspace(-1, 1, 24).reshape(3, 8).requires_grad_()
         out = moe(x)
         assert len(calls) == 1
         torch.testing.assert_close(moe.tokens_per_expert_E, torch.tensor([3.0, 3.0, 0.0, 0.0]))
@@ -101,10 +101,10 @@ def test_v41_moe_rides_the_common_stack_with_an_opt_in_vision_bias():
         top_k=2,
         score_func="sigmoid",
     )
-    assert not plain.vision_enabled and not plain.sorted_topk
+    assert type(plain) is TokenChoiceTopKRouter.Config
     with torch.random.fork_rng(devices=[]):
         plain_router = build_cpu_model(plain)
-    assert plain_router.bias_vl is None
+    assert not hasattr(plain_router, "bias_vl")
 
     x_BLD = torch.linspace(-1, 1, 24).reshape(1, 3, 8)
     image_mask = torch.tensor([[True, False, True]])
@@ -124,11 +124,11 @@ def test_trainer_config_rejects_a_ratio_table_shorter_than_the_stack():
     # Positive control: the registered table is accepted by the same entry point, so a
     # check that always raised would not pass this test.
     registered = deepseek_v4_1_debugmodel_multimodal()
-    registered.training.seq_len = 512
+    registered.training.max_context_length = 512
     registered.model_spec.model.update_from_config(config=registered)
 
     config = deepseek_v4_1_debugmodel_multimodal()
-    config.training.seq_len = 512
+    config.training.max_context_length = 512
     model_config = config.model_spec.model
     model_config.compress_ratios = model_config.compress_ratios[:-1]
     with pytest.raises(ValueError, match="compress_ratios must match n_layers"):

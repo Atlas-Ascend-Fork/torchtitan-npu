@@ -138,7 +138,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     }
                 )
             layer_cfg = model_config.layers[layer_id]
-            if layer_cfg.moe.router.hash:
+            if layer_cfg.moe.router.layer_id < layer_cfg.moe.router.n_hash_layers:
                 self.from_hf_map.update(
                     {
                         f"layers.{layer_id}.ffn.gate.tid2eid": (f"layers.{layer_id}.moe.router.tid2eid"),
@@ -209,7 +209,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     and key.endswith(".moe.expert_bias_E")
                     and self.model_config.layers[  # pyrefly: ignore [missing-attribute]
                         int(layer_num)
-                    ].moe.router.hash
+                    ].moe.router.layer_id
+                    < self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        int(layer_num)
+                    ].moe.router.n_hash_layers
                 ):
                     continue
                 new_key = new_key.format(layer_num)
@@ -364,7 +367,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     and key.endswith("ffn.gate.bias")
                     and self.model_config.layers[  # pyrefly: ignore [missing-attribute]
                         int(layer_num)
-                    ].moe.router.hash
+                    ].moe.router.layer_id
+                    < self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        int(layer_num)
+                    ].moe.router.n_hash_layers
                 ):
                     continue
                 new_key, layer_num = self._map_from_hf_layer_key(

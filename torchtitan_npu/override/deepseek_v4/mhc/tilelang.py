@@ -109,7 +109,9 @@ class TilelangHcHead(HcHead):
         return y.to(dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self._forward_a5(x) if self._use_a5_backend else self._forward_tilelang(x)
+        kernel_x = x.unsqueeze(0)
+        y = self._forward_a5(kernel_x) if self._use_a5_backend else self._forward_tilelang(kernel_x)
+        return y.squeeze(0)
 
 
 class TilelangHcPost(HcPost):
@@ -126,6 +128,7 @@ class TilelangHcPost(HcPost):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
+        x, residual, post, comb = (value.unsqueeze(0) for value in (x, residual, post, comb))
         if x.device.type != "npu":
             raise ValueError(f"TileLang HcPost requires NPU inputs, got {x.device}")
         if x.ndim != 3:
@@ -160,7 +163,7 @@ class TilelangHcPost(HcPost):
         if any(not tensor.is_contiguous() for tensor in (x, residual, post, comb)):
             raise ValueError("TileLang HcPost requires contiguous x, residual, post and comb inputs")
 
-        return tilelang_mhc_post(x, residual, post.unsqueeze(-1), comb)
+        return tilelang_mhc_post(x, residual, post.unsqueeze(-1), comb).squeeze(0)
 
 
 class TilelangHcPre(HcPre):
@@ -180,6 +183,7 @@ class TilelangHcPre(HcPre):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = x.unsqueeze(0)
         if isinstance(x, DTensor) or any(
             isinstance(parameter, DTensor) for parameter in (self.hc_fn, self.hc_base, self.hc_scale)
         ):
@@ -201,7 +205,7 @@ class TilelangHcPre(HcPre):
         if not x.is_contiguous():
             raise ValueError("TileLang HcPre requires contiguous input")
 
-        return tilelang_mhc_pre(
+        outputs = tilelang_mhc_pre(
             x,
             self.hc_fn.float(),
             self.hc_scale.float(),
@@ -211,3 +215,6 @@ class TilelangHcPre(HcPre):
             self.eps,
             self.norm_eps,
         )
+
+        hidden, post, comb = outputs
+        return hidden.squeeze(0), post.squeeze(0), comb.squeeze(0)

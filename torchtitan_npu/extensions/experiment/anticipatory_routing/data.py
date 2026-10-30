@@ -9,7 +9,7 @@ import copy
 import time
 from dataclasses import dataclass
 
-from torchtitan.components.dataloader import DataloaderExhaustedError
+from torchtitan.components.data.loader import DataloaderExhaustedError
 
 
 def copy_batch(batch, *, device):

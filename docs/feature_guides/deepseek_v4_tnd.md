@@ -94,13 +94,31 @@ cu_seqlens = [0, 3, 5]   # 一行里打包了 2 条序列
 
 文档在进入行拼接前按 `lcm(compress_ratios)`（V4 为 `128`）对齐：dataloader 在 EOS 之后补 pad token
 （label 为 `-100`，位置继续累加），因此每篇文档都是所有压缩比的整数倍，尾部余数恒为 0，压缩块不会跨文档。
-对齐由 `dataloader.per_doc_alignment` 驱动：非 CP 时 registry 从 `compress_ratios` 推出 `lcm`（V4 为 `128`）；CP 时该值提升为 `lcm × cp_size`（V4 为 `128 × cp`，由 recipe/example 传入 `--dataloader.per_doc_alignment`），与压缩器、内核看到的块网格同源。布局构建器把这条契约当作前提：`build_v4_metadata` 对非空且按
+对齐由 processor 的 `per_doc_alignment` 驱动：非 CP 时 registry 从 `compress_ratios` 推出 `lcm`（V4 为 `128`）；CP 时该值提升为 `lcm × cp_size`（V4 为 `128 × cp`，由 recipe/example 通过 `DSV4_PER_DOC_ALIGNMENT` 指定），与压缩器、内核看到的块网格同源。布局构建器把这条契约当作前提：`build_v4_metadata` 对非空且按
 `lcm(compress_ratios)` 对齐的流，直接把这一行按 ratio 除出压缩网格（`cmp_k.cu_seqlens`），没有逐文档扫描、
 也没有「尾部不足一块」的分支；破约的流（含空文档或长度不是对齐倍数）在构建处直接报错。压缩器本身同样是扁平的
 `unflatten(1, (-1, ratio))` 折叠，只有在 ratio-4 重叠时才用 `cu_seqlens` 的段起点做掩码。CP 时文档按 `128 × cp` 对齐（每个 entry 再检查 `cp × max(ratio, 1)`）：查询按文档内部分 cp 片，切分后每段仍要是压缩块的整数倍。`doc_chunk_entry` 对未按该值对齐的流直接报错。CP=128 面向长文本（1M 序列），把短文档拼成长文本再切分不是目标场景，填充开销在该场景下可接受。
 
-同一对齐值也约束后续两条路径：`seq_len` 必须是 `per_doc_alignment` 的倍数（loader 在构建时校验），
-SFT 的 chat 数据集按同一个值补 pad（`chat_dataloader.sft` 把对齐值透传到 `DeepSeekV4ChatDataLoader`）。
+`max_context_length` 和每批 token 数必须是对齐值的倍数，processor 在构建时校验。
+CPT 与 SFT 直接使用上游 `GrainDataLoader`，无需 loader override。
+`SingleDatasetConfig` 连接 Hugging Face 数据源、processor 与过滤：CPT 使用 `AlignedTextProcessor`，
+SFT 使用 `DeepSeekV4ChatProcessor`，两个 processor 共用 `align_text_sequence` 补齐文档。
+聊天处理器保留官方 chat encoder 的 tool、developer、reminder 和 assistant-only 标签语义，
+先做 next-token shift，再补无监督 pad。过长或无监督 token 的对话被过滤。
+CPT 使用 `ConcatThenSplitPackingConfig`，SFT 使用 `FirstFitPackingConfig`。
+
+SFT 入口选择 `deepseek_v4_flash_sft` recipe；JSON/JSONL 路径通过 `DSV4_SFT_DATASET` 传入。
+现有 launcher 将 `DATASET_PATH` 转为该变量：
+
+```bash
+DATASET_PATH=/path/to/train.jsonl \
+bash examples/deepseek_v4/deepseek_v4_flash_sft_4k_a3.sh
+```
+
+自定义 recipe 可按 registry 中的嵌套配置组合随机访问或流式 Hugging Face source、chat encoder 和
+`num_packing_bins`（默认 `1`），并配置上游 loader 的 seed、shuffle/repeat、read options 和 prefetch。
+数据采用 Grain 的排序、分片和打包状态，不能直接恢复旧
+TorchData loader 的 checkpoint；迁移后需使用新的训练 checkpoint 目录，模型权重可单独初始化。
 
 补出的 pad 只影响它自己的位置：压缩槽位只在所属块的**最后一个** token 上可见，而被 pad 补完的尾块最后一个位置必然是 pad，
 因此真实 token 因果上看不到任何含 pad 的压缩键（ratio-4 的选择器同样只会从因果可达的整块里挑），pad 的 label 又是
@@ -151,6 +169,19 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 | `cu_seqlens_cmp_kv` / `seqused_cmp_kv` / `cmp_residual_kv` | `metadata.cmp_k` |
 | `layout_q` / `layout_kv` | 固定为 `TND` |
 | 四个 `*_metadata` 张量 | metadata 的 `asc`（融合 backend 的 config 在 metadata 边界预计算；CP 下按 rank-local frame 重建） |
+
+## Grain SFT 集成验证
+
+`tests/integration_tests/deepseek_v4.py` 注册了 `dsv4_grain_sft`：单 NPU、debugmodel、参考算子、eager，检查两步训练完成。提供包含官方 `encoding_dsv4.py` 的 tokenizer 目录和至少一条编码后不超过 512 token、含 assistant 监督标签的 JSON/JSONL 样本：
+
+```bash
+DSV4_SFT_ASSETS=/path/to/DeepSeekV4_tokenizer \
+DSV4_SFT_DATASET=/path/to/short_chat.jsonl \
+python -m tests.integration_tests.run_tests /tmp/dsv4-grain-sft-results \
+  --test_suite deepseek_v4 --test_name dsv4_grain_sft --ngpu 1 --no-parallel
+```
+
+输出目录必须为空。未提供两个环境变量时该 case 被禁用；不能把跳过视为验证通过。外部语料没有固定 golden loss，此 case 只检查完成性，不证明旧 loader 的数值等价或吞吐提升。CPU 单测使用固定编码结果验证 labels、padding、positions 和 Grain 状态恢复，不替代官方编码器与真实 NPU 训练验证。
 
 ## 当前边界
 

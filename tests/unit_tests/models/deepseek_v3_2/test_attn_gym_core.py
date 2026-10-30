@@ -56,7 +56,7 @@ def _clean_aux_loss_state():
 
 
 def _masks():
-    return create_varlen_metadata_for_document(_POSITIONS)
+    return create_varlen_metadata_for_document(_POSITIONS.reshape(-1))
 
 
 def _document_of(row: int) -> int:
@@ -143,7 +143,7 @@ def _indexer_config() -> Indexer.Config:
         wk=Linear.Config(in_features=8, out_features=_INDEX_HEAD_DIM),
         k_norm=LayerNorm.Config(normalized_shape=_INDEX_HEAD_DIM),
         weights_proj=Linear.Config(in_features=8, out_features=_INDEX_HEADS),
-        rope=CosSinRoPE.Config(dim=_ROPE_HEAD_DIM, max_seq_len=_TOKENS, theta=10000.0),
+        rope=CosSinRoPE.Config(dim=_ROPE_HEAD_DIM, max_context_length=_TOKENS, theta=10000.0),
     )
 
 
@@ -337,7 +337,7 @@ def test_the_shipped_layers_dispatch_to_a_varlen_mask():
     layer_cfg = model_registry("debugmodel").model.layers[0]
     owner = SimpleNamespace(config=SimpleNamespace(first_attention=layer_cfg.attention))
 
-    masks = DeepSeekV32Model.get_attention_masks(owner, _POSITIONS)
+    masks = DeepSeekV32Model.get_attention_masks(owner, _POSITIONS.reshape(-1))
 
     assert isinstance(layer_cfg.attention.inner_attention, SparseInnerAttention.Config)
     assert issubclass(SparseInnerAttention.Config, VarlenAttention.Config)

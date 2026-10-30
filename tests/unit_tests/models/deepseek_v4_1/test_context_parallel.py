@@ -48,7 +48,7 @@ def _positions(*documents: int) -> torch.Tensor:
     flat: list[int] = []
     for length in documents:
         flat += list(range(length))
-    return torch.tensor([flat])
+    return torch.tensor(flat)
 
 
 def _bounds(cu: list[int]) -> torch.Tensor:

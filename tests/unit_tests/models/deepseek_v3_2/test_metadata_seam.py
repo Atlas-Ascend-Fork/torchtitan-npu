@@ -36,9 +36,9 @@ from torchtitan_npu.override.deepseek_v3_2.sparse_attn.ascendc import AscSparseI
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
-# Two documents of four tokens in one row: the headtail load balancer needs a
-# sequence length divisible by ``2 * cp`` for the two-rank case below.
-_POSITIONS = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+# Two documents of four tokens in one packed row: the headtail load balancer
+# needs a sequence length divisible by ``2 * cp`` for the two-rank case below.
+_POSITIONS = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
 _SEQ_LEN = 8
 _CU_SEQ = [0, 4, 8]
 _NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
@@ -82,7 +82,7 @@ def _model_config(n_layers: int = 3, *, ascendc: bool = False) -> DeepSeekV32Mod
         router_score_func="softmax",
         moe_comm_backend="standard",
         non_blocking_capacity_factor=None,
-        rope=ComplexRoPE.Config(dim=8, max_seq_len=_SEQ_LEN, theta=10000.0, original_seq_len=_SEQ_LEN),
+        rope=ComplexRoPE.Config(dim=8, max_context_length=_SEQ_LEN, theta=10000.0, original_seq_len=_SEQ_LEN),
         index_n_heads=4,
         index_head_dim=8,
         index_topk=4,
@@ -138,10 +138,12 @@ def test_preprocess_inputs_hands_the_map_to_the_forward():
     model = _model_config(n_layers=1).build()
 
     _, _, extra_kwargs = model.preprocess_inputs(
-        {"input": torch.zeros(1, _SEQ_LEN, dtype=torch.int64), "positions": _POSITIONS},
-        torch.zeros(1, _SEQ_LEN, dtype=torch.int64),
+        {
+            "input": torch.zeros(_SEQ_LEN, dtype=torch.int64),
+            "labels": torch.zeros(_SEQ_LEN, dtype=torch.int64),
+            "positions": _POSITIONS,
+        },
         parallel_dims=_NO_CP_DIMS,
-        device=torch.device("cpu"),
         parallelism=_NO_SPMD,
     )
 

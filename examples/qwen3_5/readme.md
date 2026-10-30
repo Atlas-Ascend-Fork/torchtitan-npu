@@ -8,6 +8,12 @@
 - `qwen3_5_debugmodel_moe_8p_cpt_512.sh`：Qwen3.5 MoE debugmodel 8 卡入口，
   默认 `qwen35_debugmodel_moe` 配置，EP=8/DP_SHARD=8（spmd_types 后端）。
 
+纯文本 SFT 的 `qwen35_27b_4k_sft` 和 `qwen35_27b_long_text_sft` recipe 使用
+`GrainDataLoader`、Hugging Face JSON/JSONL source、上游 `ChatProcessor` 和 first-fit packing。
+`DATA_FILES` 指定文件，长文本 recipe 支持逗号分隔的多个文件；样本由各自的消息转换函数映射为
+单轮 `[user, assistant]`，原始 `messages` 也须满足上游单轮约束。训练长度与 microbatch 均使用 token 预算字段。
+多模态 debug 入口的数据管线与此独立。
+
 ## Qwen3.5 multimodal dependencies
 
 The Qwen3.5 adapter reuses TorchTitan's upstream image and video preprocessing.

@@ -16,9 +16,6 @@ export TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER=1
 export TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER=0
 export TORCH_NPU_USE_COMPATIBLE_IMPL=1
 
-SEQ_LEN="${SEQ_LEN:-4096}"
-MBS="${MBS:-2}"
-GBS="${GBS:-512}"
 STEPS="${STEPS:-20}"
 
 EP_OVERLAP_ARGS=(
@@ -30,10 +27,8 @@ EP_OVERLAP_ARGS=(
 )
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
+    --training.num-tokens-per-train-step 2097152 \
     --parallelism.spmd-backend partial_dtensor \
-    --training.local-batch-size "${MBS}" \
-    --training.global-batch-size "${GBS}" \
-    --training.seq-len "${SEQ_LEN}" \
     --training.steps "${STEPS}" \
     --debug.moe-force-load-balance \
     "${EP_OVERLAP_ARGS[@]}" \

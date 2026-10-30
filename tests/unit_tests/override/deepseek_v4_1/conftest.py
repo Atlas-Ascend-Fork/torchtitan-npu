@@ -21,7 +21,7 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
 
 def packed_positions(bounds: list[int]) -> torch.Tensor:
     """One packed row whose documents have these boundaries: an ``arange`` per document."""
-    return torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    return torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
 
 
 def reference_row(positions: torch.Tensor, *, ratio: int) -> DeepSeekV41Metadata:

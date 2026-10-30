@@ -20,9 +20,9 @@ from torchtitan_npu.patches.torchtitan.models.common.rope import SplitComplexRoP
 
 @pytest.mark.parametrize("rope_cls", [WorkaroundComplexRoPE, AscComplexRoPE])
 def test_interleaved_rope_caches_expanded_cos_and_sin(rope_cls):
-    config = rope_cls.Config(dim=8, max_seq_len=16)
+    config = rope_cls.Config(dim=8, max_context_length=16)
     rope = rope_cls(config)
-    complex_cache = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16)).cache
+    complex_cache = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16)).cache
 
     assert rope.cache.shape == (2, 16, 8)
     torch.testing.assert_close(
@@ -41,11 +41,13 @@ def test_interleaved_rope_caches_expanded_cos_and_sin(rope_cls):
 
 
 def test_workaround_rope_matches_complex_reference():
-    config = ComplexRoPE.Config(dim=8, max_seq_len=16)
+    config = ComplexRoPE.Config(dim=8, max_context_length=16)
     reference = ComplexRoPE(config)
-    workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_seq_len=16))
-    query = torch.randn(2, 3, 1, 8)
-    positions = torch.arange(3).expand(2, -1)
+    workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_context_length=16))
+    # The folded-token call form the migrated attention uses: ``[T, H, D]``
+    # queries with flat per-token positions (two three-token rows folded).
+    query = torch.randn(6, 1, 8)
+    positions = torch.arange(3).repeat(2)
 
     expected = reference(query, positions=positions)
     actual = workaround(query, positions=positions)
@@ -55,8 +57,8 @@ def test_workaround_rope_matches_complex_reference():
 
 @pytest.mark.parametrize("rope_cls", [WorkaroundComplexRoPE, AscComplexRoPE])
 def test_interleaved_rope_cache_pool_reuses_compatible_cache(rope_cls):
-    first = rope_cls(rope_cls.Config(dim=8, max_seq_len=16))
-    second = rope_cls(rope_cls.Config(dim=8, max_seq_len=16))
+    first = rope_cls(rope_cls.Config(dim=8, max_context_length=16))
+    second = rope_cls(rope_cls.Config(dim=8, max_context_length=16))
 
     assert first.cache is second.cache
 
@@ -64,21 +66,21 @@ def test_interleaved_rope_cache_pool_reuses_compatible_cache(rope_cls):
     second._init_self_buffers(buffer_device=torch.device("cpu"))
     assert first.cache is second.cache
 
-    different = rope_cls(rope_cls.Config(dim=8, max_seq_len=16, theta=123.0))
+    different = rope_cls(rope_cls.Config(dim=8, max_context_length=16, theta=123.0))
     assert different.cache is not first.cache
 
 
 def test_interleaved_rope_cache_pool_reuses_across_implementations():
-    workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_seq_len=16))
-    ascend = AscComplexRoPE(AscComplexRoPE.Config(dim=8, max_seq_len=16))
+    workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_context_length=16))
+    ascend = AscComplexRoPE(AscComplexRoPE.Config(dim=8, max_context_length=16))
 
     assert workaround.cache is ascend.cache
 
 
 def test_meta_rope_cache_deferred_until_init_states():
     with torch.device("meta"):
-        workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_seq_len=16))
-        ascend = AscComplexRoPE(AscComplexRoPE.Config(dim=8, max_seq_len=16))
+        workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_context_length=16))
+        ascend = AscComplexRoPE(AscComplexRoPE.Config(dim=8, max_context_length=16))
         module = torch.nn.ModuleList([workaround, ascend])
 
     assert workaround.cache.device.type == "meta"
@@ -95,9 +97,9 @@ def test_meta_rope_cache_deferred_until_init_states():
 
     # Deferred materialization must preserve the RoPE math, not just restore
     # the shared buffer shape/alias.
-    reference = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16))
-    query = torch.randn(2, 3, 1, 8)
-    positions = torch.arange(3).expand(2, -1)
+    reference = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16))
+    query = torch.randn(6, 1, 8)
+    positions = torch.arange(3).repeat(2)
     expected = reference(query, positions=positions)
     actual = workaround(query, positions=positions)
     torch.testing.assert_close(actual, expected)
@@ -107,7 +109,7 @@ def test_meta_rope_cache_deferred_until_init_states():
 
 
 def test_patched_config_accepts_and_carries_split():
-    config = ComplexRoPE.Config(dim=8, max_seq_len=16, split=12)
+    config = ComplexRoPE.Config(dim=8, max_context_length=16, split=12)
 
     assert isinstance(config, SplitComplexRoPEConfig)
     assert config.split == 12
@@ -124,10 +126,10 @@ def test_patched_config_accepts_and_carries_split():
 
 def test_split_aware_default_rope_matches_manual_split():
     split, rotary_dim = 12, 8
-    rope = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_seq_len=16, split=split))
-    plain = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_seq_len=16))
-    x = torch.randn(2, 5, 3, split + rotary_dim)
-    positions = torch.arange(5).unsqueeze(0)
+    rope = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_context_length=16, split=split))
+    plain = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_context_length=16))
+    x = torch.randn(10, 3, split + rotary_dim)
+    positions = torch.arange(5).repeat(2)
 
     out = rope(x, positions=positions)
     expected = torch.cat((x[..., :split], plain(x[..., split:], positions=positions)), dim=-1)
@@ -137,10 +139,10 @@ def test_split_aware_default_rope_matches_manual_split():
 
 
 def test_split_zero_keeps_whole_tensor_rotation():
-    plain = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16))
-    zero_split = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16, split=0))
-    x = torch.randn(2, 5, 3, 8)
-    positions = torch.arange(5).unsqueeze(0)
+    plain = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16))
+    zero_split = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16, split=0))
+    x = torch.randn(10, 3, 8)
+    positions = torch.arange(5).repeat(2)
 
     assert torch.equal(zero_split(x, positions=positions), plain(x, positions=positions))
 
@@ -152,11 +154,11 @@ def test_split_aware_default_rope_matches_manual_split_qk(inverse):
     plain whole-tensor rope, and concatenating the prefix back — for the
     query+key call form and for inverse rotation."""
     split, rotary_dim = 12, 8
-    rope = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_seq_len=16, split=split))
-    plain = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_seq_len=16))
-    q = torch.randn(2, 5, 3, split + rotary_dim)
-    k = torch.randn(2, 5, 3, split + rotary_dim)
-    positions = torch.arange(5).unsqueeze(0)
+    rope = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_context_length=16, split=split))
+    plain = ComplexRoPE(ComplexRoPE.Config(dim=rotary_dim, max_context_length=16))
+    q = torch.randn(10, 3, split + rotary_dim)
+    k = torch.randn(10, 3, split + rotary_dim)
+    positions = torch.arange(5).repeat(2)
 
     out_q, out_k = rope(q, k, positions=positions, inverse=inverse)
 
@@ -173,7 +175,7 @@ def test_split_aware_default_rope_matches_manual_split_qk(inverse):
 def test_split_rope_reference_api():
     """The br_dpsk_v4_1 API surface: ``self.split`` mirrors the config and
     ``_split``/``_unsplit`` are pass-throughs for unset splits and None keys."""
-    rope = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16, split=12))
+    rope = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16, split=12))
     x = torch.randn(2, 5, 3, 20)
 
     assert rope.split == 12
@@ -183,7 +185,7 @@ def test_split_rope_reference_api():
     rotated = x[..., 12:]
     assert rope._unsplit(rotated, None) is rotated
 
-    plain = ComplexRoPE(ComplexRoPE.Config(dim=8, max_seq_len=16))
+    plain = ComplexRoPE(ComplexRoPE.Config(dim=8, max_context_length=16))
     y = torch.randn(2, 5, 3, 8)
     assert plain.split == 0
     assert plain._split(y) is y

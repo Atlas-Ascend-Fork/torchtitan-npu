@@ -22,6 +22,27 @@ pytestmark = pytest.mark.tooling
 CLI = Path(loss_compare.__file__).resolve()
 
 
+def test_loss_compare_supports_independent_sequence_apis_and_upstreams(tmp_path):
+    common = dict(steps=100, options="", seed_checkpoint=None, seq_len=512)
+    old = loss_compare.build_training_command(tmp_path / "run.sh", tmp_path / "old", training_api="legacy", **common)
+    new = loss_compare.build_training_command(tmp_path / "run.sh", tmp_path / "new", **common)
+
+    assert "--training.seq-len=512" in old
+    assert "--training.max-context-length=512" in new
+    assert not any(arg.startswith("--training.seq-len") for arg in new)
+    env = loss_compare.training_env(2, {"PYTHONPATH": "/independent/npu"}, upstream=tmp_path)
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(tmp_path.resolve()), "/independent/npu"]
+
+
+def test_loss_compare_bitwise_rejects_signed_zero():
+    comparisons = loss_compare.compare_metrics(
+        {"loss": {1: 0.0}, "grad_norm": {1: 1.0}},
+        {"loss": {1: -0.0}, "grad_norm": {1: 1.0}},
+        mode="bitwise", thresholds=loss_compare.DEFAULT_THRESHOLDS, expected_steps=1,
+    )
+    assert not comparisons[0].passed
+
+
 @pytest.fixture
 def runner_repo(tmp_path):
     """Two refs differ only in their runner's emitted scalar value, not a model."""
@@ -427,6 +448,7 @@ def test_loss_compare_keeps_shared_runner_as_other_side_default(tmp_path, runner
     [
         ("--training.seq_len 2048", "use --seq-len"),
         ("--training.seq-len=2048", "use --seq-len"),
+        ("--training.max-context-length=2048", "use --seq-len"),
         ("--training.steps=5", "use --steps"),
         ("--debug.seed 123", "fixed at 42"),
         ("--debug.deterministic", "use --no-deterministic"),
@@ -439,6 +461,7 @@ def test_loss_compare_keeps_shared_runner_as_other_side_default(tmp_path, runner
     ids=[
         "seq_len_space",
         "seq_len_equals",
+        "max_context_length",
         "steps",
         "seed",
         "deterministic",

@@ -57,7 +57,7 @@ export OPTIMIZER_OVERRIDES=""
 # Tyro treats activation-checkpoint:selective as a subcommand, so it must be
 # the final token after all regular options and override targets.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
-    --training.local-batch-size 2 \
+    --training.num-tokens-per-microbatch-per-dp-rank 8192 \
     "${QUANTIZATION_ARGS[@]}" \
     --debug.moe-force-load-balance \
     "$@" \

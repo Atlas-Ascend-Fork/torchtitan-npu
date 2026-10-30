@@ -1,4 +1,4 @@
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4095
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/5543
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
@@ -6,7 +6,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Backport standard-dispatch support for pre-W2 router-score absorption.
+"""Adapt PR 5543 score transport for pre-W2 router-score absorption.
+
+The PR's rematerialization changes are not included.
 
 The TorchTitan revision pinned by ``requirements.txt`` applies scores after
 combine. This patch adds the opt-in score transport needed by standard EP1/EP2
@@ -15,7 +17,7 @@ exposes the same ``absorb_router_scores`` configuration knob here; pre-W2
 absorption is implemented by the NPU dispatcher override. HybridEP,
 MinimalAsyncEP, and TorchAO keep their pinned behavior and are not patched here.
 The dispatcher contract follows the upstream design in
-https://github.com/pytorch/torchtitan/pull/4095.
+https://github.com/pytorch/torchtitan/pull/5543.
 """
 
 from dataclasses import dataclass

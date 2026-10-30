@@ -91,9 +91,4 @@ class AscCompressor(CompressorImplementation):
         # The kernel may allocate capacity beyond this stream's blocks; the kept blocks are
         # this stream's own count, expressed with its shape symbol rather than a host value.
         pooled = compressor.norm(pooled[: x.shape[1] // ratio].to(x.dtype))
-        return (
-            compressor.rope(pooled.unsqueeze(0).unsqueeze(2), positions=positions[..., ::ratio])
-            .squeeze(0)
-            .squeeze(1)
-            .unsqueeze(0)
-        )
+        return compressor.rope(pooled.unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)

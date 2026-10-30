@@ -195,36 +195,29 @@ class EngramTable(Module):
 
     def _shift_tokens(
         self,
-        token_ids_BL: torch.Tensor,
-        positions_BL: torch.Tensor | None,
+        token_ids_T: torch.Tensor,
+        positions_T: torch.Tensor | None,
         distance: int,
         token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if distance == 0:
-            return token_ids_BL
+            return token_ids_T
         compressed_pad_id = _local_tensor(self.compressed_pad_id)
-        if token_history is not None and token_history.ndim == 3:
-            # Per-row predecessors: entry ``distance - 1`` is *this* row's ``distance``-th token
-            # back, so the shift is a straight pick -- no window, and no padded buffer that the
-            # pick would then overwrite wholesale.  Writing it into a full slice instead reads
-            # as a copy, but under a sharded dispatcher the write landed in the wrong shard
-            # (CP=2 took rank 1's tokens for rank 0's rows), so the pick *is* the assignment.
-            # Rows whose document starts sooner hold none, and the positions mask below drops
-            # those.
-            shifted = token_history[:, :, distance - 1]
+        if token_history is not None and token_history.ndim == 2:
+            shifted = token_history[:, distance - 1]
         else:
-            shifted = compressed_pad_id.expand_as(token_ids_BL).clone()
+            shifted = compressed_pad_id.expand_as(token_ids_T).clone()
             if token_history is None:
-                shifted[:, distance:] = token_ids_BL[:, :-distance]
+                shifted[distance:] = token_ids_T[:-distance]
             else:
-                source = torch.cat((token_history, token_ids_BL), dim=1)
-                width = token_history.shape[1]
+                source = torch.cat((token_history, token_ids_T), dim=0)
+                width = token_history.shape[0]
                 start = max(0, distance - width)
-                if distance < source.shape[1]:
-                    shifted[:, start:] = source[:, max(0, width - distance) : source.shape[1] - distance]
-        if positions_BL is not None:
+                if distance < source.shape[0]:
+                    shifted[start:] = source[max(0, width - distance) : source.shape[0] - distance]
+        if positions_T is not None:
             shifted = torch.where(
-                positions_BL >= distance,
+                positions_T >= distance,
                 shifted,
                 compressed_pad_id,
             )
@@ -232,52 +225,44 @@ class EngramTable(Module):
 
     def hash(
         self,
-        input_ids_BL: torch.Tensor,
-        positions_BL: torch.Tensor | None = None,
+        input_ids_T: torch.Tensor,
+        positions_T: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
         token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return global row IDs with shape ``(B, L, orders * heads)``."""
-        if input_ids_BL.ndim != 2:
-            raise ValueError(f"Engram input_ids must be 2-D (B, L), got {tuple(input_ids_BL.shape)}.")
-        if positions_BL is not None and positions_BL.shape != input_ids_BL.shape:
+        """Return global row IDs with shape ``(T, orders * heads)``."""
+        if positions_T is not None and positions_T.shape != input_ids_T.shape:
             raise ValueError(
                 "Engram positions must have the same shape as input_ids: "
-                f"{tuple(positions_BL.shape)} vs {tuple(input_ids_BL.shape)}."
+                f"{tuple(positions_T.shape)} vs {tuple(input_ids_T.shape)}."
             )
 
         token_id_map = _local_tensor(self.token_id_map)
-        compressed_ids_BL = token_id_map[input_ids_BL.long()]
+        compressed_ids_T = token_id_map[input_ids_T.long()]
         if token_history is not None:
-            # Two contracts: one contiguous window of ``H`` tokens before the local rows
-            # (``[B, H]``, what a contiguous shard hands over), or one entry per local row
-            # (``[B, L, H]``, what a per-document layout produces).
-            if token_history.ndim not in (2, 3) or token_history.shape[0] != input_ids_BL.shape[0]:
-                raise ValueError("Engram token history must be 2-D or 3-D with the same batch size as input_ids.")
-            if token_history.ndim == 3 and token_history.shape[1] != input_ids_BL.shape[1]:
-                raise ValueError(
-                    "Engram per-row token history must have one entry per row of input_ids: "
-                    f"{token_history.shape[1]} vs {input_ids_BL.shape[1]}."
-                )
-            if positions_BL is None:
+            if token_history.ndim not in (1, 2):
+                raise ValueError("Engram token history must be a window or a per-token history.")
+            if token_history.ndim == 2 and token_history.shape[0] != input_ids_T.shape[0]:
+                raise ValueError("Engram per-token history must have one entry per input token.")
+            if positions_T is None:
                 raise ValueError("Engram token history requires document-relative positions.")
             if image_mask is not None:
                 raise ValueError("Engram context parallelism currently supports text-only inputs.")
             token_history = token_id_map[token_history.long()]
         shifts = [
-            self._shift_tokens(compressed_ids_BL, positions_BL, distance, token_history)
+            self._shift_tokens(compressed_ids_T, positions_T, distance, token_history)
             for distance in range(max(self.ngram_orders))
         ]
         if image_mask is not None:
-            if image_mask.shape != input_ids_BL.shape or image_mask.dtype != torch.bool:
+            if image_mask.shape != input_ids_T.shape or image_mask.dtype != torch.bool:
                 raise ValueError("Engram image_mask must be boolean and match input_ids")
             # No n-gram may cross an image token, including a multi-token image span.
             alive = ~image_mask
             for distance in range(len(shifts)):
                 if distance:
                     previous = torch.zeros_like(alive)
-                    previous[:, distance:] = ~image_mask[:, :-distance]
+                    previous[distance:] = ~image_mask[:-distance]
                     alive = alive & previous
                 shifts[distance] = torch.where(alive, shifts[distance], _local_tensor(self.compressed_pad_id))
         multipliers = _local_tensor(self.hash_multipliers)
@@ -302,25 +287,29 @@ class EngramTable(Module):
 
     def forward(
         self,
-        input_ids_BL: torch.Tensor,
-        positions_BL: torch.Tensor | None = None,
+        input_ids_T: torch.Tensor,
+        positions_T: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
         token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        row_ids_BLH = self.hash(
-            input_ids_BL,
-            positions_BL,
+        row_ids_TH = self.hash(
+            input_ids_T,
+            positions_T,
             image_mask=image_mask,
             token_history=token_history,
         )
-        B, L, H = row_ids_BLH.shape
-        rows = self._distributed_lookup(row_ids_BLH.reshape(-1))
-        return rows.view(B, L, H * self.embedding_dim)
+        T, H = row_ids_TH.shape
+        rows = self._distributed_lookup(row_ids_TH.reshape(-1))
+        return rows.view(T, H * self.embedding_dim)
 
 
 class EngramContextGate(Module):
-    """Branch-specific keys and gates with a value projection shared by mHC."""
+    """Branch-specific keys and gates with a value projection shared by mHC.
+
+    Shape suffixes: T tokens, M branches, D hidden, E memory,
+    F = M * D flattened keys, and X = F + D projected key/value width.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -347,25 +336,25 @@ class EngramContextGate(Module):
 
     def forward(
         self,
-        hidden_states_BLMD: torch.Tensor,
-        memory_BLE: torch.Tensor,
+        hidden_states_TMD: torch.Tensor,
+        memory_TE: torch.Tensor,
     ) -> torch.Tensor:
-        kv_BLX = F.linear(memory_BLE, _local_tensor(self.wkv))
-        keys_BLMD, values_BLD = kv_BLX.split([self.num_branches * self.hidden_size, self.hidden_size], dim=-1)
+        kv_TX = F.linear(memory_TE, _local_tensor(self.wkv))
+        keys_TF, values_TD = kv_TX.split([self.num_branches * self.hidden_size, self.hidden_size], dim=-1)
         # The inference reference accumulates the normalized dot product and
         # residual in FP32, with only the projection in the activation dtype.
-        keys_BLMD = keys_BLMD.float().unflatten(-1, (self.num_branches, self.hidden_size))
-        queries_BLMD = hidden_states_BLMD.float()
+        keys_TMD = keys_TF.float().unflatten(-1, (self.num_branches, self.hidden_size))
+        queries_TMD = hidden_states_TMD.float()
         norm_weight_MD = _local_tensor(self.q_weight).float() * _local_tensor(self.k_weight).float()
-        inverse_norm_BLM = torch.rsqrt(queries_BLMD.square().mean(-1) + self.norm_eps)
-        inverse_norm_BLM = inverse_norm_BLM * torch.rsqrt(keys_BLMD.square().mean(-1) + self.norm_eps)
-        logits_BLM = (queries_BLMD * norm_weight_MD * keys_BLMD).sum(-1)
-        logits_BLM = logits_BLM * inverse_norm_BLM * self.hidden_size**-0.5
+        inverse_norm_TM = torch.rsqrt(queries_TMD.square().mean(-1) + self.norm_eps)
+        inverse_norm_TM = inverse_norm_TM * torch.rsqrt(keys_TMD.square().mean(-1) + self.norm_eps)
+        logits_TM = (queries_TMD * norm_weight_MD * keys_TMD).sum(-1)
+        logits_TM = logits_TM * inverse_norm_TM * self.hidden_size**-0.5
         if self.signed_sqrt_gate:
-            magnitude = logits_BLM.abs().clamp_min(1e-6).sqrt()
-            logits_BLM = torch.where(logits_BLM >= 0, magnitude, -magnitude)
-        gates_BLM1 = logits_BLM.sigmoid().unsqueeze(-1)
-        return gates_BLM1 * values_BLD.float().unsqueeze(2)
+            magnitude = logits_TM.abs().clamp_min(1e-6).sqrt()
+            logits_TM = torch.where(logits_TM >= 0, magnitude, -magnitude)
+        gates_TM1 = logits_TM.sigmoid().unsqueeze(-1)
+        return gates_TM1 * values_TD.float().unsqueeze(-2)
 
 
 class Engram(Module):
@@ -383,9 +372,9 @@ class Engram(Module):
 
     def forward(
         self,
-        hidden_states_BLMD: torch.Tensor,
-        input_ids_BL: torch.Tensor,
-        positions_BL: torch.Tensor | None = None,
+        hidden_states_TMD: torch.Tensor,
+        input_ids_T: torch.Tensor,
+        positions_T: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
         token_history: torch.Tensor | None = None,
@@ -395,16 +384,16 @@ class Engram(Module):
         # preventing the fetched memory from promoting the model's mixed-
         # precision activation stream (and all following fused operators) to
         # FP32.  Autograd casts the gradient back to the table output dtype.
-        memory_BLE = self.table(
-            input_ids_BL,
-            positions_BL,
+        memory_TE = self.table(
+            input_ids_T,
+            positions_T,
             image_mask=image_mask,
             token_history=token_history,
-        ).to(dtype=hidden_states_BLMD.dtype)
-        residual = self.gate(hidden_states_BLMD, memory_BLE)
+        ).to(dtype=hidden_states_TMD.dtype)
+        residual = self.gate(hidden_states_TMD, memory_TE)
         if image_mask is not None:
             residual = residual.masked_fill(image_mask[..., None, None], 0)
-        return (hidden_states_BLMD.float() + residual).to(hidden_states_BLMD.dtype)
+        return (hidden_states_TMD.float() + residual).to(hidden_states_TMD.dtype)
 
 
 __all__ = [

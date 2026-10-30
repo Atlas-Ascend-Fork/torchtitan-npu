@@ -38,8 +38,8 @@ cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
-TORCHTITAN_VERSION="$(grep -E '^torchtitan==' requirements.txt | head -1 | cut -d= -f3 | tr -d '[:space:][:cntrl:]')"
-TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-v${TORCHTITAN_VERSION}}"
+source "${PROJECT_ROOT}/.ci/setup_torchtitan.sh"
+TORCHTITAN_COMMIT="$(_torchtitan_revision)"
 TORCHTITAN_DIR="${TORCHTITAN_DIR:-${PROJECT_ROOT}/third_party/torchtitan}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/test_reports/smoke}"
 NGPU="${NGPU:-4}"
@@ -61,12 +61,7 @@ chmod +x "${PYTHON_SHIMS}/torchrun"
 export PATH="${PYTHON_SHIMS}:${PATH}"
 
 # Clone and install torchtitan.
-if [[ ! -d "${TORCHTITAN_DIR}/.git" ]]; then
-    mkdir -p "$(dirname "${TORCHTITAN_DIR}")"
-    git clone --filter=blob:none --no-checkout "${TORCHTITAN_REPO}" "${TORCHTITAN_DIR}"
-fi
-git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
-git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
+_setup_torchtitan "${TORCHTITAN_DIR}"
 
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${TORCHTITAN_DIR}"
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${PROJECT_ROOT}"
@@ -74,7 +69,11 @@ git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 # The image predates wheels added to requirements.txt; install only the missing
 # wheels, never the whole file, whose torch/torch_npu pins differ from the image
 # build.
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.16
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.16 spmd_types==0.2.5 \
+    'torch_checkpointing>=0.1.0' 'torch_remat>=0.2.0'
+# Grain needs its data-pipeline dependencies (for example etils and array-record).
+# Its dependency graph does not include torch or torch_npu.
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-cache-dir grain==0.2.18
 # The CI image supplies torch 2.15.0.dev; the matching torchvision nightly
 # is installed with --no-deps (resolving its torch pin would fight the image).
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/nightly/cpu "torchvision==0.30.0.dev20260918"

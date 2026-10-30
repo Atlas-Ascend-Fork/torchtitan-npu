@@ -26,10 +26,11 @@ import torch
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
 
 
-class _NoParameters:
+class _NoParameters(torch.nn.Module):
     """Parameter-free model stand-in for attention-only arithmetic tests."""
 
     def __init__(self, n_layers):
+        super().__init__()
         self.layers = {str(idx): _NoEngramLayer() for idx in range(n_layers)}
 
     def named_parameters(self):

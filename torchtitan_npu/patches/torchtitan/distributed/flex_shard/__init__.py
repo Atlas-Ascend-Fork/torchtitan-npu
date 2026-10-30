@@ -1,8 +1,9 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 from . import (
-    _optimizer_reshard_schedule,  # noqa: F401
     dist_muon,  # noqa: F401
-    optimizer_reshard,  # noqa: F401
     replica_dedup,  # noqa: F401
 )

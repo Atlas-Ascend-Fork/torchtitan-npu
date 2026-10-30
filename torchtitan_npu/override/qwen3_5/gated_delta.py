@@ -10,28 +10,18 @@
 
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import cast
 
 import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 from torchtitan.config import derive, override
-from torchtitan.models.common.attention import AttentionMasksType
-
-from torchtitan_npu.models.qwen3_5._fla_compat import ensure_qwen3_5_importable
-
-ensure_qwen3_5_importable()
-
 from torchtitan.models import qwen3_5
-from torchtitan.models.qwen3_5.model import GatedDeltaKernel
+from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
 
 from torchtitan_npu.ops.triton.gdn import gated_delta_rule as run_gdn
 from torchtitan_npu.override.qwen3_5.parallelize import (
-    QwenCPMetadata,
-    exchange_sequence_heads,
-    head_to_sequence_shard,
-    shard_local_heads,
+    QWEN_CONTEXT_PARALLEL_UNSUPPORTED,
 )
 
 
@@ -42,20 +32,31 @@ class TritonGatedDeltaKernel(GatedDeltaKernel):
 
     def forward(
         self,
-        xq_BLNK: torch.Tensor,
-        xk_BLNK: torch.Tensor,
-        xv_BLNV: torch.Tensor,
-        g_BLN: torch.Tensor,
-        beta_BLN: torch.Tensor,
+        xq_THK: torch.Tensor,
+        xk_THK: torch.Tensor,
+        xv_THV: torch.Tensor,
+        g_TH: torch.Tensor,
+        beta_TH: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor | None = None,
-        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # One reset flag per row of the packed row; ``cu_seqlens[:-1]`` are the
+        # document starts.  The Triton-Ascend op speaks the batched ``[B, T, H, K]``
+        # layout, so the folded caller's single row goes on as ``B=1`` and the
+        # result's batch axis comes back off.
         reset = None
         if cu_seqlens is not None:
-            reset = torch.zeros(xq_BLNK.shape[:2], dtype=torch.bool, device=xq_BLNK.device)
-            reset.view(-1)[cu_seqlens[:-1].to(device=reset.device, dtype=torch.long)] = True
-        return run_gdn(xq_BLNK, xk_BLNK, xv_BLNV, g_BLN, beta_BLN, reset=reset)
+            reset = torch.zeros(xq_THK.shape[0], dtype=torch.bool, device=xq_THK.device)
+            reset[cu_seqlens[:-1].to(device=reset.device, dtype=torch.long)] = True
+            reset = reset.unsqueeze(0)
+        return run_gdn(
+            xq_THK.unsqueeze(0),
+            xk_THK.unsqueeze(0),
+            xv_THV.unsqueeze(0),
+            g_TH.unsqueeze(0),
+            beta_TH.unsqueeze(0),
+            reset=reset,
+        ).squeeze(0)
 
 
 @override(target=GatedDeltaKernel.Config, exact=True, description="Use the Triton-Ascend GDN kernel")
@@ -177,118 +178,52 @@ def _causal_conv1d_varlen(
     return torch.cat(outputs, dim=1) if outputs else x_BTD[:, :0, :]
 
 
-def _npu_causal_conv(
-    self,
-    x_BLD: torch.Tensor,
-    conv,
-    cu_seqlens: torch.Tensor | None = None,
-    cu_seqlens_cpu: torch.Tensor | None = None,
+def _causal_conv1d_varlen_folded(
+    x_TD: torch.Tensor,
+    weight_C1W: torch.Tensor,
+    cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Use the NPU-safe reference convolution instead of lazy FLA imports."""
-    stride = conv.stride
-    padding = conv.padding
-    dilation = conv.dilation
-    if cu_seqlens is not None:
-        if isinstance(x_BLD, DTensor):
+    """The folded ``[T, C]`` signature the 0.4.0 ``InnerGatedDeltaNet`` closure calls.
 
-            def _conv_varlen(x_local_BLD, w_local, cu_seqlens_local):
-                return _causal_conv1d_varlen(
-                    x_local_BLD,
-                    w_local,
-                    cu_seqlens_cpu,
-                    cu_seqlens=cu_seqlens_local,
-                    stride=stride,
-                    padding=padding,
-                    dilation=dilation,
-                )
-
-            return self._local_map_conv(x_BLD, conv, _conv_varlen, cu_seqlens)
-        return _causal_conv1d_varlen(
-            x_BLD,
-            conv.weight,
-            cu_seqlens_cpu,
-            cu_seqlens=cu_seqlens,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-        )
-
-    if isinstance(x_BLD, DTensor):
-
-        def _conv_fixed(x_local_BLD, w_local):
-            return _causal_conv1d(
-                x_local_BLD,
-                w_local,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-            )
-
-        return self._local_map_conv(x_BLD, conv, _conv_fixed)
-    return _causal_conv1d(
-        x_BLD,
-        conv.weight,
-        stride=stride,
-        padding=padding,
-        dilation=dilation,
-    )
+    Device-side offsets keep the convolution traceable inside checkpoint HOP; the
+    eager strict-validation branch of :func:`_causal_conv1d_varlen` cannot run
+    because the folded metadata no longer carries CPU-side offsets.
+    """
+    return _causal_conv1d_varlen_tensor(x_TD.unsqueeze(0), weight_C1W, cu_seqlens).squeeze(0)
 
 
 @override(target=GatedDeltaKernel.Config, exact=True, description="Use the NPU GDN kernel without FLA")
 def npu(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
-    # The upstream GatedDeltaNet config remains the owner of the module.  Only
-    # its kernel config and convolution implementation are replaced, matching
-    # the upstream build contract and keeping pipeline stage metadata unchanged.
-    # FLA availability is not used as a backend selector because its
-    # convolution is not an NPU implementation.
-    qwen3_5.GatedDeltaNet._causal_conv = _npu_causal_conv  # pyrefly: ignore [bad-assignment]
+    # The upstream 0.4.0 ``InnerGatedDeltaNet`` closure resolves its packed
+    # convolution through the ``gdn`` module global at call time, so swapping
+    # that global is the seam the folded upstream actually calls.  FLA's
+    # ``causal_conv1d`` is CUDA-only, which is why the reference cannot run
+    # as-is on NPU.  FLA availability is not used as a backend selector
+    # because its convolution is not an NPU implementation.
+    qwen3_5.gdn._causal_conv1d_varlen = _causal_conv1d_varlen_folded  # pyrefly: ignore [bad-assignment]
     return derive(cfg, TritonGatedDeltaKernel.Config)
 
 
 class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
+    """Refuse the not-yet-migrated context-parallel GDN forward.
+
+    The class stays registered so the CP recipe fails at the factory with the
+    shared explanation instead of importing a missing symbol, but the forward
+    itself also refuses: the pre-fold implementation exchanged rank-local
+    heads, convolved ``[B, L, D]`` rows, and called the kernel through
+    ``self.kernel``, none of which exists on the folded ``[T, ...]`` module.
+    """
+
     context_parallel_mesh: DeviceMesh
 
     @dataclass(kw_only=True, slots=True)
     class Config(qwen3_5.GatedDeltaNet.Config):
         pass
 
-    def causal_convolution(self, tensor, convolution, metadata):
-        mesh = self.context_parallel_mesh
-        weight = shard_local_heads(convolution.weight, mesh)[:, 0]
-        reset = torch.zeros(tensor.shape[:2], dtype=torch.bool, device=tensor.device)
-        reset.view(-1)[metadata.cu_seqlens[1:-1].to(reset.device)] = True
-        segments = reset.cumsum(1)
-        output = tensor * weight[:, -1]
-        for delay in range(1, self.conv_kernel_size):
-            source = tensor[:, :-delay] * weight[:, -1 - delay]
-            output[:, delay:] += source * (segments[:, delay:] == segments[:, :-delay]).unsqueeze(-1)
-        return F.silu(output)
-
-    def forward(self, x_BLD: torch.Tensor, attention_masks: AttentionMasksType | None = None):
-        batch, local_length, _ = x_BLD.shape
-        mesh = self.context_parallel_mesh
-        metadata = cast("QwenCPMetadata", attention_masks)
-        query, key, value, decay, beta = exchange_sequence_heads(
-            tuple(
-                projection(x_BLD)
-                for projection in (self.in_proj_q, self.in_proj_k, self.in_proj_v, self.in_proj_a, self.in_proj_b)
-            ),
-            mesh,
-            2,
-        )
-        output_gate = self.in_proj_z(x_BLD).view(batch, local_length, -1, self.value_head_dim)
-        length = query.size(1)
-        query = self.causal_convolution(query, self.conv_q, metadata).view(batch, length, -1, self.key_head_dim)
-        key = self.causal_convolution(key, self.conv_k, metadata).view(batch, length, -1, self.key_head_dim)
-        value = self.causal_convolution(value, self.conv_v, metadata).view(batch, length, -1, self.value_head_dim)
-        a_log = shard_local_heads(self.A_log, mesh)
-        dt_bias = shard_local_heads(self.dt_bias, mesh)
-        gate = -a_log.float().exp() * F.softplus(decay.float() + dt_bias)
-        output = self.kernel(query, key, value, gate, beta.sigmoid(), cu_seqlens=metadata.cu_seqlens)
-        output = head_to_sequence_shard(output, mesh, 2)
-        return self.out_proj(self.norm(output, output_gate).flatten(2))
+    def forward(self, x_TD: torch.Tensor, attention_masks: VarlenMetadata | None = None) -> torch.Tensor:
+        raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
 
 
 @override(target=qwen3_5.GatedDeltaNet.Config, exact=True, description="Use Triton GDN with Context Parallel")
 def context_parallel(cfg: qwen3_5.GatedDeltaNet.Config) -> ContextParallelGatedDeltaNet.Config:
-    return derive(cfg, ContextParallelGatedDeltaNet.Config, kernel=derive(cfg.kernel, TritonGatedDeltaKernel.Config))
+    raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)

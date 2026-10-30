@@ -11,13 +11,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CPT_SCRIPT="${CPT_SCRIPT:-${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh}"
-SFT_OVERRIDE="${SFT_OVERRIDE:-torchtitan_npu.override.deepseek_v4.chat_dataloader.sft}"
 DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
 
+CONFIG="${CONFIG:-deepseek_v4_flash_sft}" \
+DSV4_SFT_DATASET="${DATASET_PATH}" \
 exec bash "${CPT_SCRIPT}" \
-    "${SFT_OVERRIDE}" \
-    --dataloader.dataset json \
-    --dataloader.dataset-path "${DATASET_PATH}" \
     --checkpoint.enable \
     --checkpoint.no-load-only \
     "$@"

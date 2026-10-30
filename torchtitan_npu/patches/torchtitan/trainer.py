@@ -1,6 +1,6 @@
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3985
-# Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4421
+# Backport upstream PR: https://github.com/pytorch/torchtitan/pull/3864
 
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
@@ -25,62 +25,7 @@ from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 logger = logging.getLogger(__name__)
 
-original_post_dataloading_process = Trainer.post_dataloading_process
 original_pp_forward_backward_step = Trainer.pp_forward_backward_step
-
-
-@functools.wraps(original_post_dataloading_process)
-def _require_packing_alignment(self) -> None:
-    """First-batch guard: the loader's document padding must match the model's packing grid.
-
-    Every document is split into ``cp_degree`` equal chunks and each chunk must keep a whole
-    number of pooling groups, so ``--dataloader.per_doc_alignment`` must be a multiple of
-    ``lcm(compress_ratios) * cp_degree``.  Checked here, before the first forward, because the
-    trainer is where the model spec, the parallelism degree and the loader config meet; the
-    flag is cached so the check runs once per trainer.
-    """
-    if getattr(self, "_packing_alignment_checked", False):
-        return
-    self._packing_alignment_checked = True
-    model = getattr(getattr(self.config, "model_spec", None), "model", None)
-    compress_ratios = getattr(model, "compress_ratios", None)
-    if compress_ratios is None:
-        return
-    from torchtitan_npu.models.common.packing import require_per_doc_alignment
-
-    require_per_doc_alignment(
-        getattr(self.config.dataloader, "per_doc_alignment", 1),
-        compress_ratios,
-        self.config.parallelism.context_parallel_degree,
-    )
-
-
-def patched_post_dataloading_process(self, input_dict, labels):
-    """Delegate the dataloader-to-forward preprocessing to the model.
-
-    Upstream #4116 gives the model the seam (``Decoder.preprocess_inputs``:
-    mask/metadata build, CP shard, SPMD annotation), so the trainer does not
-    keep its own copy of it — the validator's duplicate disappears with it.
-    A model-level ``build_attention_masks`` override (transitional, the
-    pre-#4116 shape of the same seam) is honored inside ``preprocess_inputs``.
-    """
-    _require_packing_alignment(self)
-    model = self.model_parts[0]
-    preprocess_inputs = getattr(model, "preprocess_inputs", None)
-    if preprocess_inputs is None:
-        return original_post_dataloading_process(self, input_dict, labels)
-    inputs, labels, extra_kwargs = preprocess_inputs(
-        input_dict,
-        labels,
-        parallel_dims=self.parallel_dims,
-        device=self.device,
-        parallelism=self.config.parallelism,
-    )
-    # ``preprocess_inputs`` rejects the full_dtensor input path, so ``labels``
-    # is always a plain local tensor here: ``numel()`` is the post-CP-shard
-    # token count this counter recorded before #4116 moved the step into the model.
-    self.ntokens_seen += labels.numel()
-    return inputs, labels, extra_kwargs
 
 
 def _run_presplit_pipeline_schedule(
@@ -139,13 +84,9 @@ def patched_pp_forward_backward_step(self, *args, **kwargs):
             del schedule.step
 
 
-# Backport TorchTitan #4421 for the DataLoader batch H2D copies, plus the
-# aux-loss denominator of #3864: both land in the same method.
+# Backport TorchTitan #3864's aux-loss denominator into the trainer.
 def patch_train_step() -> None:
     src = textwrap.dedent(inspect.getsource(Trainer.train_step))
-    assert src.count("value.to(self.device)") == src.count("labels.to(self.device)") == 1
-    src = src.replace("value.to(self.device)", "value.to(self.device, non_blocking=True)")
-    src = src.replace("labels.to(self.device)", "labels.to(self.device, non_blocking=True)")
 
     # Auxiliary losses normalize by the same per-step token count as the main
     # loss, so their scale is independent of parallelism degrees.  The token
@@ -189,9 +130,7 @@ class EMATrainer(Trainer):
 
 
 def apply() -> None:
-    logger.info("[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process")
-    Trainer.post_dataloading_process = patched_post_dataloading_process
-    logger.info("[PATCH] Trainer.train_step -> async H2D and aux-loss denominator (upstream #4421, #3864)")
+    logger.info("[PATCH] Trainer.train_step -> aux-loss denominator (upstream #3864)")
     patch_train_step()
     logger.info("[PATCH] Trainer.pp_forward_backward_step -> patched_pp_forward_backward_step")
     Trainer.pp_forward_backward_step = patched_pp_forward_backward_step

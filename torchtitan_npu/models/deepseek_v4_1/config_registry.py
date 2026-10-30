@@ -4,11 +4,18 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 from torch.distributed.tensor import Shard
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    SingleDatasetConfig,
+)
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optimizer import ParamGroupConfig, default_adamw
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -28,8 +35,8 @@ from torchtitan_npu.config import MuonOptimizerProfile, OptimizerConfig, Trainin
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingTrainer
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
 from torchtitan_npu.models.common.muon import make_owned_layout
-from torchtitan_npu.models.common.packing import compression_alignment
 
 from . import model_registry
 from .indexer import Selector
@@ -43,7 +50,8 @@ def _per_doc_alignment(model_spec: ModelSpec) -> int:
     cannot disagree: a document whose length is not a multiple of every ratio would
     get a group straddling its edge.
     """
-    return compression_alignment(model_spec.model.compress_ratios)  # pyrefly: ignore [missing-attribute]
+    alignment = compression_alignment(cast("DeepSeekV41Model.Config", model_spec.model).compress_ratios)
+    return int(os.environ.get("DSV41_PER_DOC_ALIGNMENT", alignment))
 
 
 @dataclass(kw_only=True)
@@ -283,13 +291,6 @@ def _vision_dataloader_config(model_spec: ModelSpec):
     return DeepSeekV41DataLoader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
 
 
-def _text_dataloader_config(model_spec: ModelSpec):
-    """The packed text loader with the same per-document pooling alignment."""
-    from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedHuggingfaceDataloader
-
-    return AlignedHuggingfaceDataloader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
-
-
 def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
     model_spec = model_registry(flavor, converters=converters)
     if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
@@ -297,12 +298,10 @@ def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
 
     return DeepSeekV41Trainer.Config(
-        # One packed row per rank, which is what the model asserts and the loaders
-        # produce: documents are packed into a single row and the row is cut at
-        # ``seq_len``.  Upstream's default is 8, so the recipe states it rather than
-        # inheriting it -- a launcher that wants a different value still overrides the
-        # flag, and the model rejects it.
-        training=TrainingConfig(local_batch_size=1),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=min(4096, model_spec.max_context_length),
+            max_context_length=min(4096, model_spec.max_context_length),
+        ),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_spec),
@@ -310,7 +309,23 @@ def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
         ),
         model_spec=model_spec,
         tokenizer=HuggingFaceTokenizer.Config(),
-        dataloader=(_vision_dataloader_config(model_spec) if vision else _text_dataloader_config(model_spec)),
+        dataloader=(
+            _vision_dataloader_config(model_spec)
+            if vision
+            else GrainDataLoader.Config(
+                dataset=ConcatThenSplitPackingConfig(
+                    dataset=SingleDatasetConfig(
+                        source=HuggingFaceRandomAccessSource.Config(
+                            path="json",
+                            split="train",
+                            load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"},
+                        ),
+                        processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model_spec)),
+                        post_filters=(lambda sample: sample is not None,),
+                    ),
+                ),
+            )
+        ),
         optimizer=_v41_optimizer_config(model_spec),
         activation_checkpoint=FullAC.Config(),
     )

@@ -234,8 +234,8 @@ def grouped_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
                 for axis in ("dp", "cp"):
                     spmd.mutate_type(offsets, axis, src=spmd.P, dst=spmd.V)
 
-            gate = self._grouped_mm(A=input_tokens.bfloat16(), B_t=w1.bfloat16().transpose(-2, -1), offs=offsets)
-            up = self._grouped_mm(A=input_tokens.bfloat16(), B_t=w3.bfloat16().transpose(-2, -1), offs=offsets)
+            gate = self._grouped_mm(A=input_tokens.bfloat16(), weight_EOI=w1.bfloat16(), offs=offsets)
+            up = self._grouped_mm(A=input_tokens.bfloat16(), weight_EOI=w3.bfloat16(), offs=offsets)
             gate, up = self._add_grouped_w13_delta(gate=gate, up=up, x=input_tokens, offsets=offsets)
             swiglu_limit = getattr(self, "swiglu_limit", 0.0)
             if swiglu_limit > 0:
@@ -244,7 +244,7 @@ def grouped_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
             hidden = torch.nn.functional.silu(gate) * up
             if routed_scores is not None:
                 hidden = (hidden.float() * routed_scores.float().reshape(-1, 1)).to(hidden.dtype)
-            output = self._grouped_mm(A=hidden, B_t=w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(input_tokens)
+            output = self._grouped_mm(A=hidden, weight_EOI=w2.bfloat16(), offs=offsets).type_as(input_tokens)
             return self._add_grouped_w2_delta(output=output, x=hidden, offsets=offsets)
 
         def _iter_grouped_row_chunks(self, num_rows: int, offsets: torch.Tensor):
@@ -262,13 +262,12 @@ def grouped_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
             self, *, gate: torch.Tensor, up: torch.Tensor, x: torch.Tensor, offsets: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
             a = _local_tensor(self.w13_lora_a)
-            a_t = a.bfloat16().transpose(-2, -1)
-            gate_b_t = _local_tensor(self.w1_lora_b).bfloat16().transpose(-2, -1)
-            up_b_t = _local_tensor(self.w3_lora_b).bfloat16().transpose(-2, -1)
+            gate_b = _local_tensor(self.w1_lora_b).bfloat16()
+            up_b = _local_tensor(self.w3_lora_b).bfloat16()
             for start, end, chunk_offsets in self._iter_grouped_row_chunks(x.shape[0], offsets):
-                hidden = self._grouped_mm(A=x[start:end].bfloat16(), B_t=a_t, offs=chunk_offsets)
-                gate_delta = self._grouped_mm(A=hidden, B_t=gate_b_t, offs=chunk_offsets)
-                up_delta = self._grouped_mm(A=hidden, B_t=up_b_t, offs=chunk_offsets)
+                hidden = self._grouped_mm(A=x[start:end].bfloat16(), weight_EOI=a, offs=chunk_offsets)
+                gate_delta = self._grouped_mm(A=hidden, weight_EOI=gate_b, offs=chunk_offsets)
+                up_delta = self._grouped_mm(A=hidden, weight_EOI=up_b, offs=chunk_offsets)
                 gate[start:end].add_(gate_delta.to(gate.dtype), alpha=self._lora_scaling)
                 up[start:end].add_(up_delta.to(up.dtype), alpha=self._lora_scaling)
             return gate, up
@@ -278,11 +277,9 @@ def grouped_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
         ) -> torch.Tensor:
             a = _local_tensor(self.w2_lora_a)
             b = _local_tensor(self.w2_lora_b)
-            a_t = a.bfloat16().transpose(-2, -1)
-            b_t = b.bfloat16().transpose(-2, -1)
             for start, end, chunk_offsets in self._iter_grouped_row_chunks(x.shape[0], offsets):
-                hidden = self._grouped_mm(A=x[start:end].bfloat16(), B_t=a_t, offs=chunk_offsets)
-                delta = self._grouped_mm(A=hidden, B_t=b_t, offs=chunk_offsets)
+                hidden = self._grouped_mm(A=x[start:end].bfloat16(), weight_EOI=a, offs=chunk_offsets)
+                delta = self._grouped_mm(A=hidden, weight_EOI=b, offs=chunk_offsets)
                 output[start:end].add_(delta.to(output.dtype), alpha=self._lora_scaling)
             return output
 

@@ -5,21 +5,21 @@
 
 """The aligned text dataloader's padding and row-cut contracts."""
 
+from itertools import islice
 from pathlib import Path
 
+import grain
+import numpy as np
 import pytest
 import torch
+from torchtitan.components.data import DatasetBuildContext, TextSequence
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+from tests.unit_tests.models.common.text_data_utils import aligned_text_config
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess, tiny_v41_model
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor, align_text_sequence, compression_alignment
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.common.packing import compression_alignment
-from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import (
-    AlignedHuggingfaceDataloader,
-    AlignedTextDataset,
-    pad_segments_to_multiple,
-)
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -30,17 +30,16 @@ def tokenizer():
 
 
 def _loader(tokenizer, *, rank=0, world=1, alignment=2, seq_len=512, infinite=False):
-    return AlignedHuggingfaceDataloader.Config(
-        dataset="c4_test",
-        dataset_path=str(ASSETS / "c4_test"),
-        infinite=infinite,
-        per_doc_alignment=alignment,
+    return aligned_text_config(
+        ASSETS / "c4_test" / "data.json",
+        alignment=alignment,
+        repeat=infinite or world > 1,
     ).build(
         tokenizer=tokenizer,
         dp_rank=rank,
         dp_world_size=world,
-        seq_len=seq_len,
-        local_batch_size=1,
+        max_context_length=seq_len,
+        num_tokens_per_batch=seq_len,
     )
 
 
@@ -48,12 +47,13 @@ def _stream(loader):
     """Every supervisable (token, label) pair and token count the loader emitted."""
     pairs: list[tuple[int, int]] = []
     tokens_total = 0
-    for inputs, labels in loader:
-        tokens = inputs["input"][0]
-        row_labels = labels[0]
+    for inputs, labels in islice(loader, 8):
+        tokens = inputs["input"]
+        row_labels = labels
         tokens_total += int(tokens.numel())
         supervised = row_labels != IGNORE_INDEX
         pairs.extend(zip(tokens[:-1][supervised[:-1]].tolist(), row_labels[:-1][supervised[:-1]].tolist(), strict=True))
+    loader.close()
     return tokens_total, pairs
 
 
@@ -67,38 +67,22 @@ def test_compression_alignment_is_the_lcm_of_the_pooling_ratios():
     assert compression_alignment((0, 0) + (2,) * 18 + (1,) * 20) == 2
 
 
-def test_pad_segments_to_multiple_appends_only_pads():
-    ids = [2002, 11, 12]
-    labels = [IGNORE_INDEX, 12, 2003]
-    padded_ids, padded_labels = pad_segments_to_multiple((ids, labels), multiple=2)
-    assert padded_ids == [*ids, 0]
-    assert padded_labels == [*labels, IGNORE_INDEX]
-    # The original ids and labels are a prefix of the padded ones, in order.
-    assert padded_ids[: len(ids)] == ids and padded_labels[: len(labels)] == labels
-    # An already-aligned segment is returned untouched.
-    assert pad_segments_to_multiple((ids, labels), multiple=3) == (ids, labels)
-    assert pad_segments_to_multiple((ids, labels), multiple=1) == (ids, labels)
-    # A single-token segment is padded to the alignment, not dropped.
-    assert pad_segments_to_multiple(([7], [IGNORE_INDEX]), multiple=4) == ([7, 0, 0, 0], [IGNORE_INDEX] * 4)
-    # Tensors go through the same way: the pads are appended, never prepended.
-    tensor_ids, tensor_labels = pad_segments_to_multiple((torch.tensor(ids), torch.tensor(labels)), multiple=2)
-    assert tensor_ids.tolist() == padded_ids
-    assert tensor_labels.tolist() == padded_labels
-    # A length mismatch is rejected instead of silently truncating one side.
-    with pytest.raises(ValueError, match="same length"):
-        pad_segments_to_multiple((ids, labels[:-1]), multiple=2)
+def test_alignment_appends_only_pads():
+    ids = np.array([2002, 11, 12], dtype=np.int64)
+    labels = np.array([IGNORE_INDEX, 12, 2003], dtype=np.int64)
+    sequence = TextSequence(input_ids=ids, labels=labels)
+    aligned = align_text_sequence(sequence, multiple=2)
+    assert aligned.input_ids.tolist() == [2002, 11, 12, 0]
+    assert aligned.labels.tolist() == [IGNORE_INDEX, 12, 2003, IGNORE_INDEX]
+    assert align_text_sequence(sequence, multiple=3) is sequence
+    assert align_text_sequence(sequence, multiple=1) is sequence
+    with pytest.raises(ValueError, match="equal lengths"):
+        TextSequence(input_ids=ids, labels=labels[:-1])
 
 
 def test_alignment_adds_a_bounded_number_of_untrained_tokens(tokenizer):
-    """Padding adds at most one untrained position per document.
-
-    The pads themselves are never targets.  What padding does cost is one target per
-    odd-length document: labels are shifted within the document, so the EOS token's
-    label pointed at the pad that now follows it and is no longer supervised.
-    """
     aligned_tokens, aligned = _stream(_loader(tokenizer, alignment=2))
     unaligned_tokens, unaligned = _stream(_loader(tokenizer, alignment=1))
-    # At most one pad per emitted document, and each costs at most one EOS target.
     assert 0 <= aligned_tokens - unaligned_tokens <= len(aligned)
     assert abs(len(aligned) - len(unaligned)) <= len(aligned)
     assert aligned and unaligned
@@ -114,7 +98,7 @@ def test_row_cut_rebases_positions(tokenizer):
     count up, so every row is an independent pooling problem."""
     loader = _loader(tokenizer, alignment=2, seq_len=128)
     inputs, _ = next(iter(loader))
-    positions = inputs["positions"][0]
+    positions = inputs["positions"]
     assert int(positions.numel()) == 128
     assert int(positions[0]) == 0
     assert torch.equal(positions, torch.arange(128))
@@ -125,15 +109,14 @@ def test_alignment_must_divide_seq_len(tokenizer):
         _loader(tokenizer, alignment=3, seq_len=128)
     with pytest.raises(ValueError, match="per_doc_alignment"):
         _loader(tokenizer, alignment=0)
-    # The dataset validates before it touches the tokenizer or the dataset path.
-    with pytest.raises(ValueError, match="multiple of per_doc_alignment"):
-        AlignedTextDataset.__init__(
-            object.__new__(AlignedTextDataset),
-            dataset_name="c4_test",
-            dataset_path=str(ASSETS / "c4_test"),
-            tokenizer=None,
-            seq_len=10,
-            per_doc_alignment=4,
+    with pytest.raises(ValueError, match="per_doc_alignment"):
+        AlignedTextProcessor.Config(per_doc_alignment=4).build(
+            context=DatasetBuildContext(
+                tokenizer=None,
+                max_context_length=10,
+                num_tokens_per_batch=10,
+                read_options=grain.ReadOptions(num_threads=0),
+            ),
         )
 
 
@@ -144,7 +127,7 @@ def test_dp_shards_partition_the_aligned_stream(tokenizer):
     assert all(tokens > 0 and pairs for tokens, pairs in ranks)
     # Neither rank is a prefix of the other: the shard really partitioned the source.
     assert ranks[0][1] != ranks[1][1]
-    for inputs, _ in _loader(tokenizer, rank=0, world=2, alignment=2):
+    for inputs, _ in islice(_loader(tokenizer, rank=0, world=2, alignment=2), 3):
         assert int(inputs["input"].numel()) % 2 == 0
 
 
@@ -155,7 +138,7 @@ def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):
     leave behind a batch key the forward does not accept, which is how the metadata stays the
     backends' business rather than the model's signature.
     """
-    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 4, 5]], dtype=torch.long)
+    positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 4, 5], dtype=torch.long)
     model, _ = tiny_v41_model(monkeypatch)
     _, _, extra = preprocess(model, positions, positions, positions)
 
@@ -184,10 +167,10 @@ def test_the_metadata_carries_no_validity_marks(monkeypatch):
     The packed loader marks structural padding with ``IGNORE_INDEX``, which the loss consumes
     directly; the model must not expect a mark field the loader no longer emits.
     """
-    positions = torch.arange(6).unsqueeze(0)
+    positions = torch.arange(6)
     tokens = torch.zeros_like(positions)
     labels = torch.full_like(positions, IGNORE_INDEX)
-    labels[0, 1] = 7
+    labels[1] = 7
     model, _ = tiny_v41_model(monkeypatch)
     _, _, extra = preprocess(model, tokens, labels, positions)
 

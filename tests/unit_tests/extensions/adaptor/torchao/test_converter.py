@@ -621,13 +621,11 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
         AscSparseAttentionMetadata,
     )
 
-    positions = torch.arange(8).unsqueeze(0)
+    positions = torch.arange(8)
     row = build_v4_metadata(positions, ratio=4, build_slots=False)
     forward_record = torch.tensor([7], dtype=torch.int32)
     backward_record = torch.tensor([9], dtype=torch.int32)
     metadata = QuantV4Metadata(
-        cu_seq_q=row.cu_seq_q,
-        cu_seq_k=row.cu_seq_k,
         ratio=row.ratio,
         position_k=row.position_k,
         q=row.q,
@@ -641,9 +639,9 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
             lightning_indexer=AscLightningIndexerMetadata(fwd=forward_record, bwd=backward_record),
         ),
     )
-    query = torch.zeros(1, 8, 2, 4, dtype=torch.bfloat16)
-    key = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
-    weights = torch.zeros(1, 8, 2, dtype=torch.bfloat16)
+    query = torch.zeros(8, 2, 4, dtype=torch.bfloat16)
+    key = torch.zeros(2, 4, dtype=torch.bfloat16)
+    weights = torch.zeros(8, 2, dtype=torch.bfloat16)
 
     inputs = converter_module._prepare_quant_lightning_indexer_inputs(
         SimpleNamespace(index_topk=4), query, key, weights, metadata
@@ -655,6 +653,6 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     assert inputs.metadata is forward_record and inputs.backward_metadata is backward_record
     assert inputs.seqused_q is metadata.q.seqused
     assert inputs.seqused_k is metadata.cmp_k.seqused
-    assert inputs.cu_seqlens_q is row.cu_seq_q
+    assert inputs.cu_seqlens_q is row.q.cu_seqlens
     assert inputs.cu_seqlens_k is row.cmp_k.cu_seqlens
     assert inputs.cmp_residual_k is row.cmp_k.residual

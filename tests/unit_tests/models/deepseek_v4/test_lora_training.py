@@ -41,7 +41,7 @@ def _converted_debug_model() -> torch.nn.Module:
 @pytest.mark.parametrize("checkpointed", [False, True])
 def test_muon_group_is_non_empty_and_every_member_has_a_compute_layout(monkeypatch, checkpointed):
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-    from torchtitan.components.checkpoint_utils import canonical_fqn
+    from torchtitan.components.checkpointer.utils import canonical_fqn
 
     base_spec = model_registry("debugmodel", num_mtp_layers=1)
     profile = _dsv4_muon_profile(base_spec)

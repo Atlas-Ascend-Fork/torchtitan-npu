@@ -18,11 +18,10 @@
 # the first ratio-1 layer -- so this shape does not invent a combination the model lacks.
 #
 # Run from the repository root:
-#   NGPU=1 bash examples/deepseek_v4_1/debug/deepseek_v4_1_stripped_1p_a5.sh --training.steps 5
+#   NGPU=1 bash examples/deepseek_v4_1/debug/deepseek_v4_1_mini_1p_cpt_a5.sh --training.steps 5
 #
-# Append CLI arguments to override the defaults below. `QUANTIZATION_ARGS` swaps the whole
-# quantized stack in -- QLI/QSLI for the selector and the quantized sparse attention for the
-# teacher provider -- and needs `custom_ops`; without those flags the recipe runs both BF16 ports.
+# Append CLI arguments to override the defaults below. `QUANTIZATION_ARGS` enables
+# the all_block_fp8 training recipe.
 
 set -euo pipefail
 
@@ -39,13 +38,10 @@ export TORCHTITAN_ENGRAM_TABLE_ROWS="${TORCHTITAN_ENGRAM_TABLE_ROWS:-100000}"
 #
 LIGHTNING_INDEXER_OVERRIDE="torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"
 
-# The quantized selector launches the quantized sparse attention's schedules, so the two switches
-# go together: without the sparse-attention quantization the entry carries the unquantized kernel's
-# metadata, which is a different schedule.  Needs `custom_ops` (kv_compress_epilog_v2).
+# Enable block FP8 quantized training.
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
-    --extension.quantization.li-quantization mxfp4
-    --extension.quantization.enable-sparse-attention-quantization
+    --extension.quantization.recipe all_block_fp8
 )
 
 CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rms_norm.asc \
@@ -54,13 +50,15 @@ CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rms_norm.asc \
                                ${LIGHTNING_INDEXER_OVERRIDE} \
                                torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc}"
 
+SEQ_LEN=2048
+NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=2048
+NUM_TOKENS_PER_TRAIN_STEP=2048
+
 exec bash scripts/run_train.sh \
     --hf-assets-path "${HF_ASSETS_PATH:-tests/assets/deepseek_v3}" \
-    --dataloader.dataset "${DATASET:-c4_test}" \
-    --dataloader.dataset-path "${DATASET_PATH:-tests/assets/c4_test}" \
-    --training.local-batch-size "${MBS:-1}" \
-    --training.global-batch-size "${GBS:-1}" \
-    --training.seq-len "${SEQ_LEN:-2048}" \
+    --training.num-tokens-per-microbatch-per-dp-rank "${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}" \
+    --training.num-tokens-per-train-step "${NUM_TOKENS_PER_TRAIN_STEP}" \
+    --training.max-context-length "${SEQ_LEN}" \
     --training.steps "${STEPS:-5}" \
     --parallelism.data-parallel-shard-degree 1 \
     --parallelism.data-parallel-replicate-degree 1 \

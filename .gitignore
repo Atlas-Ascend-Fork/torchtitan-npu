@@ -124,3 +124,6 @@ log/
 
 # Generated training-log visualizations (created lazily by the skill).
 /outputs/
+
+# torch.compile debug dumps written by the rope-compile unit tests.
+/torch_compile_debug/

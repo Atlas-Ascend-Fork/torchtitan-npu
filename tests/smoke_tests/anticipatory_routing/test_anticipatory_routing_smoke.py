@@ -89,12 +89,12 @@ def _worker(folder):
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    from torchtitan.components.checkpoint import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+    from torchtitan.components.checkpointer import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+    from torchtitan.models.common.moe import TokenChoiceTopKRouter
 
     from torchtitan_npu.extensions.experiment.anticipatory_routing.cache import RoutingMode
     from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
     from torchtitan_npu.extensions.experiment.anticipatory_routing.detector import LossSpikeDetector
-    from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
     from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule, Phase
     from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
@@ -112,7 +112,7 @@ def _worker(folder):
                 if rank == 0 and index in (10, 11) and index not in self.injected:
                     target = 1
                     self.injected.add(index)
-                yield {"input": inputs}, torch.tensor([[target]])
+                yield {"input": inputs, "num_valid_tokens": 1}, torch.tensor([[target]])
 
         def state_dict(self):
             return {"position": self.position}
@@ -126,11 +126,9 @@ def _worker(folder):
             super().__init__()
             self.routers = torch.nn.ModuleList()
             for _ in range(2):
-                router = AnticipatoryHashRouter.__new__(AnticipatoryHashRouter)
+                router = TokenChoiceTopKRouter.__new__(TokenChoiceTopKRouter)
                 torch.nn.Module.__init__(router)
                 router.gate = torch.nn.Identity()
-                router.hash = False
-                router.sorted_topk = False
                 router.score_func = "sigmoid"
                 router.num_experts, router.top_k = 2, 1
                 router.num_expert_groups = None
@@ -142,6 +140,9 @@ def _worker(folder):
             self.recorded = {}
             self.replayed = []
             self.trained = []
+
+        def preprocess_inputs(self, batch, **kwargs):
+            return batch["input"], batch["labels"], {}
 
         def forward(self, x):
             self.counter.add_(1)
@@ -179,7 +180,7 @@ def _worker(folder):
     trainer.model_parts = [model]
     trainer.dataloader = Loader()
     trainer.gradient_accumulation_steps = 2
-    trainer.num_pipeline_parallel_microbatches = 1
+    trainer.num_pp_microbatches = 1
     trainer.config = SimpleNamespace(
         anticipatory=AnticipatoryRoutingConfig(
             enable=True,
@@ -189,6 +190,7 @@ def _worker(folder):
         ),
         training=SimpleNamespace(steps=10, disable_cuda_graphs=True, max_norm=100.0),
         checkpoint=SimpleNamespace(interval=2, keep_latest_k=0),
+        parallelism=SimpleNamespace(),
     )
     trainer.parallel_dims = SimpleNamespace(
         pp_enabled=False,
@@ -203,6 +205,7 @@ def _worker(folder):
         should_log=lambda step: False,
     )
     trainer.train_context = nullcontext
+    trainer.sdc_replayer = None
     trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: None)
     trainer.optimizers = torch.optim.SGD(model.parameters(), lr=1e-4, momentum=0.9)
     trainer.lr_schedulers = Scheduler(trainer.optimizers, step_size=1, gamma=0.99)

@@ -18,7 +18,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
     --parallelism.data-parallel-shard-degree "${NGPU}" \
     --parallelism.data-parallel-replicate-degree 1 \
     --parallelism.expert-parallel-degree "${NGPU}" \
-    --training.local-batch-size 2 \
     --compile.mode aot_fx_trace \
     --compile.enable-passes \
     --compile.backend aot_eager \

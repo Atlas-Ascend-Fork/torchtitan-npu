@@ -227,8 +227,8 @@ def test_grouped_experts_apply_scores_to_w2_input(monkeypatch):
     up = torch.full((2, 2), 2.0, dtype=torch.bfloat16)
     grouped_mm_inputs = []
 
-    def fake_grouped_mm(A, B_t, *, offs):
-        del B_t, offs
+    def fake_grouped_mm(A, weight_EOI, *, offs):
+        del weight_EOI, offs
         grouped_mm_inputs.append(A)
         if len(grouped_mm_inputs) == 1:
             return gate
@@ -264,8 +264,8 @@ def _build_routed_experts(*, absorb: bool):
 def _fake_grouped_mm_factory(gate, up):
     inputs = []
 
-    def fake_grouped_mm(A, B_t, *, offs):
-        del B_t, offs
+    def fake_grouped_mm(A, weight_EOI, *, offs):
+        del weight_EOI, offs
         inputs.append(A)
         if len(inputs) == 1:
             return gate
@@ -283,21 +283,13 @@ def test_routed_experts_forward_absorbs_scores_through_local_dispatcher(monkeypa
     fake_mm, mm_inputs = _fake_grouped_mm_factory(gate, up)
     monkeypatch.setattr(torch, "_grouped_mm", fake_mm)
 
-    x_BLD = torch.randn(1, 4, 4, dtype=torch.bfloat16)
-    scores = torch.tensor(
-        [
-            [[0.25], [0.5], [0.75], [1.0]],
-        ]
-    )
-    expert_ids = torch.tensor(
-        [
-            [[0], [1], [0], [1]],
-        ]
-    )
+    x_TD = torch.randn(4, 4, dtype=torch.bfloat16)
+    scores = torch.tensor([[0.25], [0.5], [0.75], [1.0]])
+    expert_ids = torch.tensor([[0], [1], [0], [1]])
     counts_E = torch.tensor([2, 2])
 
-    out_BLD = experts(
-        x_BLD,
+    out_TD = experts(
+        x_TD,
         scores,
         expert_ids,
         counts_E,
@@ -306,7 +298,7 @@ def test_routed_experts_forward_absorbs_scores_through_local_dispatcher(monkeypa
     sorted_scores = torch.tensor([0.25, 0.75, 0.5, 1.0]).bfloat16()
     expected_w2_input = (F.silu(gate).float() * up.float() * sorted_scores.float().reshape(-1, 1)).to(torch.bfloat16)
     torch.testing.assert_close(mm_inputs[-1], expected_w2_input)
-    assert out_BLD.shape == x_BLD.shape
+    assert out_TD.shape == x_TD.shape
 
 
 def test_routed_experts_forward_default_path_without_absorption(monkeypatch):
@@ -316,21 +308,13 @@ def test_routed_experts_forward_default_path_without_absorption(monkeypatch):
     fake_mm, mm_inputs = _fake_grouped_mm_factory(gate, up)
     monkeypatch.setattr(torch, "_grouped_mm", fake_mm)
 
-    x_BLD = torch.randn(1, 4, 4, dtype=torch.bfloat16)
-    scores = torch.tensor(
-        [
-            [[0.25], [0.5], [0.75], [1.0]],
-        ]
-    )
-    expert_ids = torch.tensor(
-        [
-            [[0], [1], [0], [1]],
-        ]
-    )
+    x_TD = torch.randn(4, 4, dtype=torch.bfloat16)
+    scores = torch.tensor([[0.25], [0.5], [0.75], [1.0]])
+    expert_ids = torch.tensor([[0], [1], [0], [1]])
     counts_E = torch.tensor([2, 2])
 
     experts(
-        x_BLD,
+        x_TD,
         scores,
         expert_ids,
         counts_E,
@@ -352,21 +336,13 @@ def test_routed_experts_forward_falls_back_for_unsupported_dispatcher(monkeypatc
     fake_mm, mm_inputs = _fake_grouped_mm_factory(gate, up)
     monkeypatch.setattr(torch, "_grouped_mm", fake_mm)
 
-    x_BLD = torch.randn(1, 4, 4, dtype=torch.bfloat16)
-    scores = torch.tensor(
-        [
-            [[0.25], [0.5], [0.75], [1.0]],
-        ]
-    )
-    expert_ids = torch.tensor(
-        [
-            [[0], [1], [0], [1]],
-        ]
-    )
+    x_TD = torch.randn(4, 4, dtype=torch.bfloat16)
+    scores = torch.tensor([[0.25], [0.5], [0.75], [1.0]])
+    expert_ids = torch.tensor([[0], [1], [0], [1]])
     counts_E = torch.tensor([2, 2])
 
     experts(
-        x_BLD,
+        x_TD,
         scores,
         expert_ids,
         counts_E,

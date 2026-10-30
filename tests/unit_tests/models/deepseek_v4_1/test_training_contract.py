@@ -65,14 +65,16 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
 
     # Real image protocol without depending on the synthetic RNG fallback.
     ids, types, feature_ids = build_image_token_layout([(3, 3)], span_start=2, vocab_size=64)
-    tokens = torch.arange(128).remainder(32).unsqueeze(0)
-    tokens[:, 2 : ids.numel()] = ids[2:]
+    # The folded-token multimodal stack: one flat row of tokens, with the
+    # modality fields describing that same row.
+    tokens = torch.arange(128).remainder(32)
+    tokens[2 : ids.numel()] = ids[2:]
     token_types = torch.full_like(tokens, -1)
-    token_types[:, : types.numel()] = types
+    token_types[: types.numel()] = types
     indices = torch.full_like(tokens, -1)
-    indices[:, : feature_ids.numel()] = feature_ids
+    indices[: feature_ids.numel()] = feature_ids
     inputs = dict(
-        positions=torch.arange(128).unsqueeze(0),
+        positions=torch.arange(128),
         pixel_values=torch.linspace(-1, 1, 9 * 588).reshape(1, 9, 588),
         image_grid=torch.tensor([[3, 3]]),
         image_feature_indices=indices,

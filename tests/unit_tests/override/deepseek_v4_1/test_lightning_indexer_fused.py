@@ -37,8 +37,8 @@ from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
 from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import build_fused_metadata
 
-_TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)]).unsqueeze(0)
-_POSITIONS = torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0)
+_TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)])
+_POSITIONS = torch.cat([torch.arange(64), torch.arange(64)])
 
 # The tiny debug layer's own geometry, at the widths ``_tiny_model`` builds it with.  The port's
 # records are sized from the override's arguments and it has no inline operator path, so every
@@ -63,7 +63,7 @@ def _metadata(bounds: list[int], *, ratio: int = 2, geometry: AicpuGeometry | No
     is what the fused selector and core read.  The default geometry is the tiny layer's own, which
     is what the fused stacks below are built with; a test that drives another shape states it.
     """
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
     reference = CompressedSparseInnerAttention2.Config(window_size=128, softmax_scale=0.5, compress_ratio=ratio)
     return build_fused_metadata(
         reference.build_attention_metadata(positions),
@@ -100,19 +100,19 @@ def _relaxed_scores(q, k, w, cu_seqlens_q, cu_seqlens_k, cmp_ratio):
     coordinates.
     """
     total = q.shape[0]
-    scores_blhn = torch.einsum("blhd,bnd->blhn", q.unsqueeze(0), k.squeeze(1).unsqueeze(0))
-    scores_bln = (scores_blhn.relu() * w.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
+    scores_lhn = torch.einsum("lhd,nd->lhn", q, k.squeeze(1))
+    scores_ln = (scores_lhn.relu() * w.unsqueeze(-1)).sum(dim=1)
     cu_q = cu_seqlens_q.to(torch.long).tolist()
     cu_k = cu_seqlens_k.to(torch.long).tolist()
-    visible = torch.zeros_like(scores_bln, dtype=torch.bool)
+    visible = torch.zeros_like(scores_ln, dtype=torch.bool)
     starts = torch.zeros(total, dtype=torch.long)
     for doc in range(len(cu_q) - 1):
         q0, q1 = cu_q[doc], cu_q[doc + 1]
         k0, k1 = cu_k[doc], cu_k[doc + 1]
         token_pos = torch.arange(q1 - q0)
-        visible[0, q0:q1, k0:k1] = torch.arange(k1 - k0).view(1, -1) < ((token_pos + 1) // cmp_ratio).view(-1, 1)
+        visible[q0:q1, k0:k1] = torch.arange(k1 - k0).view(1, -1) < ((token_pos + 1) // cmp_ratio).view(-1, 1)
         starts[q0:q1] = k0
-    return scores_bln.masked_fill(~visible, float("-inf")), visible, starts
+    return scores_ln.masked_fill(~visible, float("-inf")), visible, starts
 
 
 def _select(relaxed, reachable, starts, topk):
@@ -121,16 +121,16 @@ def _select(relaxed, reachable, starts, topk):
     The picks come back in document-local coordinates, the kernels' contract, and the
     unreachable ones as ``-1``.
     """
-    total = relaxed.size(1)
+    total = relaxed.size(0)
     indices = torch.full((total, 1, topk), -1, dtype=torch.int32)
     values = torch.full((total, 1, topk), float("-inf"))
     pick = min(topk, relaxed.size(-1))
     selected = relaxed.topk(pick, dim=-1, sorted=False).indices
-    selected = selected.topk(pick, dim=-1, largest=False, sorted=True).values[0]
-    ok = reachable[0].gather(-1, selected)
+    selected = selected.topk(pick, dim=-1, largest=False, sorted=True).values
+    ok = reachable.gather(-1, selected)
     local = torch.where(ok, selected - starts.unsqueeze(-1), torch.full_like(selected, -1))
     indices[:, 0, :pick] = local.to(torch.int32)
-    values[:, 0, :pick] = relaxed[0].gather(-1, selected)
+    values[:, 0, :pick] = relaxed.gather(-1, selected)
     return indices, values
 
 
@@ -282,9 +282,9 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     torch.manual_seed(7)
     b, l = 1, 128
     hi, di = eager_indexer.num_index_heads, eager_indexer.index_head_dim
-    idx_q = torch.randn(b, l, hi, di, requires_grad=True)
-    idx_k = torch.randn(b, 64, di, requires_grad=True)
-    weights = torch.randn(b, l, hi, requires_grad=True)
+    idx_q = torch.randn(l, hi, di, requires_grad=True)
+    idx_k = torch.randn(64, di, requires_grad=True)
+    weights = torch.randn(l, hi, requires_grad=True)
 
     ei, es, _ = eager_indexer.forward(idx_q, idx_k, weights, metadata, candidates_BL1C=None)
     fi, fs, _ = fused_indexer.forward(idx_q, idx_k, weights, metadata, candidates_BL1C=None)
@@ -303,17 +303,17 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     # entries -- the fused one because that is what the kernel grids, the eager one because
     # that is what ``gather_attn`` reads -- so the comparison is direct.
     for t in range(l):
-        eager_row = {int(j) for j in ei[0, t].tolist() if j >= 0}
-        fused_row = {int(j) for j in fi[0, t].tolist() if j >= 0}
+        eager_row = {int(j) for j in ei[t].tolist() if j >= 0}
+        fused_row = {int(j) for j in fi[t].tolist() if j >= 0}
         assert fused_row == eager_row, t
 
     # A pool smaller than index_topk: the fused kernel keeps its own K and reports the
     # unreachable slots as ``-1``, so it is wider than the eager selection.  The
     # reachable sets still have to agree, and the wider padding must stay inert.
     small_metadata = _metadata([0, 16, 32])
-    idx_q2 = torch.randn(1, 32, hi, di, requires_grad=True)
-    idx_k2 = torch.randn(1, 16, di, requires_grad=True)
-    weights2 = torch.randn(1, 32, hi, requires_grad=True)
+    idx_q2 = torch.randn(32, hi, di, requires_grad=True)
+    idx_k2 = torch.randn(16, di, requires_grad=True)
+    weights2 = torch.randn(32, hi, requires_grad=True)
     ei2, _es2, _ = eager_indexer.forward(idx_q2, idx_k2, weights2, small_metadata, candidates_BL1C=None)
     fi2, fs2, _ = fused_indexer.forward(idx_q2, idx_k2, weights2, small_metadata, candidates_BL1C=None)
     assert fi2.shape[-1] == fused_indexer.index_topk == 32
@@ -321,8 +321,8 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     assert fs2.dtype == torch.float32
     # Same document-local numbering as above.
     for t in range(32):
-        fused_t = {int(j) for j in fi2[0, t].tolist() if j >= 0}
-        eager_t = {int(j) for j in ei2[0, t].tolist() if j >= 0}
+        fused_t = {int(j) for j in fi2[t].tolist() if j >= 0}
+        eager_t = {int(j) for j in ei2[t].tolist() if j >= 0}
         assert fused_t == eager_t, t
 
 
@@ -389,7 +389,7 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
 
     for teacher, padding in zip(seen["teacher"], seen["padding"], strict=True):
         tokens = seen["tokens"][0]
-        assert tokens == _TOKENS.shape[1], (tokens, _TOKENS.shape[1])
+        assert tokens == _TOKENS.numel(), (tokens, _TOKENS.numel())
         assert constant > num_global_queries
         # The ``-1`` slots are SMLAG's junk zeroed out on the way here; the unpadded ones
         # are what the division acts on.
@@ -466,9 +466,9 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
     selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
     heads, head_dim = selector.num_index_heads, selector.index_head_dim
     selector.forward(
-        torch.zeros(1, 8, heads, head_dim, dtype=torch.bfloat16, device=device),
-        torch.zeros(1, 4, head_dim, dtype=torch.bfloat16, device=device),
-        torch.zeros(1, 8, heads, dtype=torch.float32, device=device),
+        torch.zeros(8, heads, head_dim, dtype=torch.bfloat16, device=device),
+        torch.zeros(4, head_dim, dtype=torch.bfloat16, device=device),
+        torch.zeros(8, heads, dtype=torch.float32, device=device),
         _metadata([0, 8], ratio=1),
         candidates_BL1C=None,
     )
@@ -537,7 +537,7 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
     with torch.autocast("cpu", dtype=torch.bfloat16):
         _run_forward_backward(model)
 
-    seq_len = _TOKENS.shape[1]
+    seq_len = _TOKENS.numel()
     topk = model.layers["2"].attention.indexer.index_topk
     # Model-facing ``[B, L, 1, K]`` becomes the kernel's ``[T, N2, K]`` at both SMLA inputs.
     assert seen["smla_indices"] == seen["smla_carrier"] == (seq_len, 1, topk)
@@ -575,14 +575,14 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
     # requires_grad on the operands, as in a real layer: an autograd Function only gives
     # its outputs a grad_fn when one of its inputs needs a gradient, and the carrier's edge
     # is the whole point of the second output.
-    q = torch.randn(1, 128, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
-    k = torch.randn(1, 64, selector.index_head_dim, requires_grad=True)
-    w = torch.randn(1, 128, selector.num_index_heads, requires_grad=True)
+    q = torch.randn(128, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
+    k = torch.randn(64, selector.index_head_dim, requires_grad=True)
+    w = torch.randn(128, selector.num_index_heads, requires_grad=True)
     indices, scores, _ = selector.forward(q, k, w, metadata, candidates_BL1C=None)
 
     checked = 0
-    for t in range(indices.shape[1]):
-        row = indices[0, t]
+    for t in range(indices.shape[0]):
+        row = indices[t]
         valid = row[row >= 0]
         if valid.numel() < 2:
             continue
@@ -732,9 +732,9 @@ def test_both_ports_requested_pass_the_pair_gate():
 
     recipes = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
     job = recipes.deepseek_v4_1_debugmodel_text()
-    # The sequence length is part of a CP-capable config: torchtitan's rope budget is checked
+    # The context length is part of a CP-capable config: torchtitan's rope budget is checked
     # inside update_from_config, alongside the gate this test is about.
-    job.training = dataclasses.replace(job.training, seq_len=512)
+    job.training = dataclasses.replace(job.training, max_context_length=512)
     job.override = OverrideConfig(
         imports=[
             "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
@@ -761,9 +761,9 @@ def test_the_teacher_sources_are_the_index_source_layers():
 def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch):
     selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
     generator = torch.Generator().manual_seed(42)
-    q = torch.rand(1, 8, selector.num_index_heads, selector.index_head_dim, generator=generator, requires_grad=True)
-    k = torch.rand(1, 4, selector.index_head_dim, generator=generator, requires_grad=True)
-    w = torch.rand(1, 8, selector.num_index_heads, generator=generator, requires_grad=True)
+    q = torch.rand(8, selector.num_index_heads, selector.index_head_dim, generator=generator, requires_grad=True)
+    k = torch.rand(4, selector.index_head_dim, generator=generator, requires_grad=True)
+    w = torch.rand(8, selector.num_index_heads, generator=generator, requires_grad=True)
     selector.num_global_queries = torch.tensor(32.0)
     indices, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
     teacher = (indices >= 0).float() * 0.25
@@ -772,8 +772,8 @@ def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch
     scores.backward(teacher)
 
     qr, kr, wr = [x.detach().clone().requires_grad_() for x in (q, k, w)]
-    selected = kr.squeeze(0)[indices.squeeze(0).clamp_min(0)].unsqueeze(0)
-    logits = (torch.einsum("blhd,blkd->blhk", qr, selected).relu() * wr.unsqueeze(-1)).sum(dim=2)
+    selected = kr[indices.clamp_min(0)]
+    logits = (torch.einsum("lhd,lkd->lhk", qr, selected).relu() * wr.unsqueeze(-1)).sum(dim=1)
     logits = logits.masked_fill(indices < 0, -1e9)
     loss = -(teacher * logits.log_softmax(dim=-1)).sum() / 32
     expected = torch.autograd.grad(loss, (qr, kr, wr))
@@ -784,9 +784,9 @@ def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch
 def test_indexer_backward_requires_global_query_count(monkeypatch):
     selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
     selector.num_global_queries = None
-    q = torch.ones(1, 8, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
-    k = torch.ones(1, 4, selector.index_head_dim, requires_grad=True)
-    w = torch.ones(1, 8, selector.num_index_heads, requires_grad=True)
+    q = torch.ones(8, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
+    k = torch.ones(4, selector.index_head_dim, requires_grad=True)
+    w = torch.ones(8, selector.num_index_heads, requires_grad=True)
     _, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
     with pytest.raises(RuntimeError, match=r"Set Selector\.num_global_queries"):
         scores.backward(torch.ones_like(scores))

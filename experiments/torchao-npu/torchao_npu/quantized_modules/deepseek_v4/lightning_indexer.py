@@ -106,5 +106,4 @@ def quantized_lightning_indexer_forward(self, idx_q, idx_k, idx_w, *, attention_
         raise RuntimeError("Quantized LI requires a host input adapter")
     inputs = config.input_adapter(self, idx_q, idx_k, idx_w, attention_metadata)
     indices, scores = _QuantLightningIndexerTND.apply(inputs.query, inputs.key, inputs.weights, inputs, config)
-    batch, seqlen = idx_q.shape[:2]
-    return indices.reshape(batch, seqlen, -1), scores.reshape(batch, seqlen, -1)
+    return indices.squeeze(1), scores.squeeze(1)

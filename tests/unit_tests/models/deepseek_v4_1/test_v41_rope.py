@@ -87,7 +87,7 @@ def test_a3_text_rope_override_preserves_the_split_site_contract(launcher_config
         assert after.split == before.split
         assert after.dim == before.dim
         assert after.theta == before.theta
-        assert after.max_seq_len == before.max_seq_len
+        assert after.max_context_length == before.max_context_length
         assert after.scaling == before.scaling
 
 

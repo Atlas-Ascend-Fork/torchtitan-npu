@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint, DefaultDeviceType
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer import optimizer as host_mod
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
@@ -71,6 +71,79 @@ def test_local_sparse_training_and_checkpoint_match_embedding(monkeypatch, recom
             table.load_state_dict(weights)
             optimizer = torch.optim.SparseAdam([table.weight], lr=0.05)
             optimizer.load_state_dict(states)
+
+
+def test_token_forward_microbatch_clipping_and_sparse_adam_match_embedding():
+    from torchtitan.components.optimizer import ParamGroupConfig
+
+    table = table_config().build()
+    table._init_self_buffers(buffer_device=torch.device("cpu"))
+    with torch.no_grad():
+        table.weight.copy_(torch.arange(48).view(12, 4) / 16)
+    initial_weight = table.weight.detach().clone()
+    reference = torch.nn.Embedding.from_pretrained(initial_weight.clone(), freeze=False, sparse=True)
+    model = torch.nn.Module()
+    model.add_module("table", table)
+    optimizer = host_mod.HostSparseOptimizersContainer.Config(
+        lr=0.05,
+        weight_decay=0.0,
+        implementation="for-loop",
+        param_groups=[
+            ParamGroupConfig(pattern="table.weight", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05}),
+        ],
+    ).build(model_parts=[model])
+    ref_optimizer = torch.optim.SparseAdam(reference.parameters(), lr=0.05)
+
+    for step in range(2):
+        for microbatch, tokens in enumerate(([4, 4, 4, 5], [4, 5, 4, 4])):
+            ids, positions = torch.tensor(tokens), torch.arange(4)
+            row_ids = table.hash(ids, positions)
+            output = table(ids, positions)
+            expected = reference(row_ids).flatten(1)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            upstream = torch.arange(output.numel()).reshape_as(output).float() / 8 + step + microbatch
+            output.backward(upstream)
+            expected.backward(upstream)
+            pending = table.pending_sparse_grad()
+            ref_grad = reference.weight.grad.coalesce()
+            assert table.weight.grad is None
+            torch.testing.assert_close(pending.indices(), ref_grad.indices(), rtol=0, atol=0)
+            torch.testing.assert_close(pending.values(), ref_grad.values(), rtol=0, atol=0)
+
+        expected_norm = ref_grad.values().square().sum().sqrt()
+        expected_scale = torch.clamp(1.0 / (expected_norm + 1e-6), max=1.0)
+        norm = host_mod.clip_grad_norm_with_host_sparse_tables(
+            [],
+            1.0,
+            tables=[table],
+            clipper=torch.nn.utils.clip_grad_norm_,
+        )
+        reference.weight.grad = torch.sparse_coo_tensor(
+            ref_grad.indices(),
+            ref_grad.values() * expected_scale,
+            ref_grad.shape,
+        ).coalesce()
+        torch.testing.assert_close(norm, expected_norm, rtol=0, atol=0)
+        torch.testing.assert_close(
+            table.pending_sparse_grad().values(),
+            reference.weight.grad.values(),
+            rtol=0,
+            atol=0,
+        )
+        optimizer.step()
+        ref_optimizer.step()
+        torch.testing.assert_close(table.weight, reference.weight, rtol=0, atol=0)
+        actual_state = optimizer.optimizers[0].state[table.weight]
+        expected_state = ref_optimizer.state[reference.weight]
+        assert actual_state["step"] == expected_state["step"] == step + 1
+        for name in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(actual_state[name], expected_state[name], rtol=0, atol=0)
+        untouched = torch.ones(table.num_embeddings, dtype=torch.bool)
+        untouched[ref_grad.indices()[0]] = False
+        torch.testing.assert_close(table.weight[untouched], initial_weight[untouched], rtol=0, atol=0)
+        optimizer.zero_grad(set_to_none=True)
+        ref_optimizer.zero_grad(set_to_none=True)
+        assert table.pending_sparse_grad() is None and table.weight.grad is None
 
 
 def _ramp(rows):
@@ -183,11 +256,11 @@ def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_s
 def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch, anticipatory):
     from torchtitan.components.optimizer import ParamGroupConfig
     from torchtitan.distributed import utils as dist_utils
-    from torchtitan.trainer import Trainer
     from torchtitan.models.common.linear import Linear
+    from torchtitan.models.common.moe import TokenChoiceTopKRouter
+    from torchtitan.trainer import Trainer
 
     from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
-    from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
     from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
     from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
     from torchtitan_npu.models.deepseek_v4_1.indexer import FULL
@@ -195,6 +268,9 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
 
     class RoutingModel(torch.nn.Module):
         """CPU fixture whose initialization forward visits the real router."""
+
+        def preprocess_inputs(self, batch, **kwargs):
+            return batch["input"], batch["labels"], {}
 
         def forward(self, input_ids):
             return self.router((input_ids.float() + 1).unsqueeze(-1))[0]
@@ -205,7 +281,9 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     with torch.no_grad():
         model.table.weight.fill_(1)
     optimizer = host_mod.HostSparseOptimizersContainer.Config(
-        lr=0.1, weight_decay=0.0, implementation="for-loop",
+        lr=0.1,
+        weight_decay=0.0,
+        implementation="for-loop",
         param_groups=[
             ParamGroupConfig(pattern="table.weight", optimizer_name="SparseAdam"),
             ParamGroupConfig(pattern="dense", optimizer_name="AdamW"),
@@ -214,41 +292,50 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     trainer = object.__new__(DeepSeekV41Trainer)
     trainer.model_parts, trainer.optimizers = [model], optimizer
     model.selector = AscSelector.Config(
-        mode=FULL, compress_ratio=1, num_index_heads=1, index_head_dim=4, index_topk=1,
+        mode=FULL,
+        compress_ratio=1,
+        num_index_heads=1,
+        index_head_dim=4,
+        index_topk=1,
     ).build()
-    model.router = AnticipatoryHashRouter.Config(
-        num_experts=2, top_k=1, gate=Linear.Config(in_features=1, out_features=2),
+    model.router = TokenChoiceTopKRouter.Config(
+        num_experts=2,
+        top_k=1,
+        gate=Linear.Config(in_features=1, out_features=2),
     ).build()
     with torch.no_grad():
         model.router.gate.weight.copy_(torch.tensor([[1.0], [-1.0]]))
     trainer._indexer_selectors = [model.selector]
     trainer.config = SimpleNamespace(
         training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0, steps=2),
+        parallelism=SimpleNamespace(),
         anticipatory=AnticipatoryRoutingConfig(enable=anticipatory),
         checkpoint=SimpleNamespace(interval=1, keep_latest_k=0),
     )
     trainer.parallel_dims = SimpleNamespace(
-        dp_enabled=False, pp_enabled=False, ep_enabled=False, dp_cp_enabled=False,
+        dp_enabled=False,
+        pp_enabled=False,
+        ep_enabled=False,
+        dp_cp_enabled=False,
         get_optional_mesh=lambda name: None,
     )
     trainer.device = torch.device("cpu")
-    trainer.step = trainer.num_pipeline_parallel_microbatches = 1
+    trainer.step = trainer.num_pp_microbatches = 1
+    trainer.sdc_replayer = None
     trainer.gradient_accumulation_steps = 2
     trainer.ntokens_seen = 1
     trainer.train_context = nullcontext
 
-    def preprocess(inputs, labels):
-        trainer.ntokens_seen += labels.numel()
-        return inputs["input"], labels, {}
-
-    trainer.post_dataloading_process = preprocess
     events, metrics = [], []
     trainer.lr_schedulers = SimpleNamespace(get_metrics=lambda: {}, step=lambda: events.append("lr"))
-    trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True)
+    trainer.checkpointer = SimpleNamespace(
+        maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True
+    )
     trainer.metrics_processor = SimpleNamespace(
         should_log=lambda step: True,
         log=lambda *args, **kwargs: metrics.append(args),
-        ntokens_since_last_log=0, data_loading_times=[],
+        ntokens_since_last_log=0,
+        data_loading_times=[],
     )
     trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: events.append("sdc"))
 
@@ -256,8 +343,8 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         """Two fixed CPU batches for the schedule's initial training step."""
 
         def __iter__(self):
-            yield {"input": torch.tensor([0])}, torch.tensor([-100])
-            yield {"input": torch.tensor([0, 1])}, torch.tensor([1, 2])
+            yield {"input": torch.tensor([0]), "num_valid_tokens": 0}, torch.tensor([-100])
+            yield {"input": torch.tensor([0, 1]), "num_valid_tokens": 2}, torch.tensor([1, 2])
 
         def state_dict(self):
             return {}
@@ -270,6 +357,7 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         # Both microbatches, including unsupervised positions, must be counted
         # before the first fused selector consumes the step denominator.
         assert model.selector.num_global_queries.item() == 3
+        assert kwargs["global_valid_tokens"].item() == 2
         if anticipatory:
             assert trainer.anticipatory_schedule.engine.in_step
         loss = (3 * model.dense.sum() + 4 * model.table._distributed_lookup(input_dict["input"])[0, 0]) / 2
@@ -294,7 +382,7 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         assert engine.last_global_loss == 7.0 and not engine.in_step and not engine.failed
         assert trainer.metrics_processor.ntokens_since_last_log == 3
         assert trainer.ntokens_seen == 1  # Initialization must not credit training tokens.
-        buffer = model.router._anticipatory_replay_buffer
+        buffer = trainer.anticipatory_schedule.cache.replay_buffers[model.router._anticipatory_key]
         torch.testing.assert_close(buffer.indices, torch.zeros(1, 1, dtype=torch.int64))
     assert events == expected_events
     assert metrics == [(1, 7.0, 7.0, 5.0)]
@@ -309,3 +397,31 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     assert Trainer.train_step is original_step
     assert Trainer.train_step.__globals__["dist_utils"] is dist_utils
     assert dist_utils.clip_grad_norm_ is dense_clip
+
+
+def test_lora_host_table_accepts_folded_parent_keywords_without_frozen_autograd():
+    # LoRA is optional, so import its adapter only for this parent-signature contract.
+    from torchtitan_npu.models.deepseek_v4_1.lora import _LoRAHostEngramTable
+
+    table = _LoRAHostEngramTable.Config(
+        vocab_size=16,
+        layer_id=0,
+        ngram_orders=(2,),
+        num_heads=1,
+        head_vocab_sizes=(11,),
+        embedding_dim=4,
+        num_embeddings=12,
+        require_token_id_map=False,
+        pin_memory=False,
+    ).build()
+    table._init_self_buffers(buffer_device=torch.device("cpu"))
+    with torch.no_grad():
+        table.weight.copy_(torch.arange(48).view(12, 4) / 16)
+    table.weight.requires_grad_(False)
+    tokens, positions = torch.tensor([3, 4, 3, 4]), torch.arange(4)
+
+    output = table(input_ids_T=tokens, positions_T=positions)
+
+    expected = table.weight[table.hash(tokens, positions)].flatten(1)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert not output.requires_grad

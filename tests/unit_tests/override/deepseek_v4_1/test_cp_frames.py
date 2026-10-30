@@ -56,7 +56,7 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
     delegates to the same function -- and the frames it returns are the ones the operators grid,
     so the tests below read them through the same option builder the kernels are called with.
     """
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
     entry = build_fused_metadata(
         _row(positions, ratio),
         ratio=ratio,

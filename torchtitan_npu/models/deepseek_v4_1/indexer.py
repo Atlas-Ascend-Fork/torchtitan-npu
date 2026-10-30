@@ -7,7 +7,7 @@
 """Lightning indexer for DeepSeek V4.1 (CSA2).
 
 Shape legend for this file:
-    B = batch, L = sequence length, D = model dimension,
+    T = folded tokens, D = model dimension,
     Hi = ``num_index_heads``, Di = ``index_head_dim``,
     N = number of compressed KV entries (``L // compress_ratio``),
     K = ``index_topk`` (entries selected per query).
@@ -145,15 +145,15 @@ def _student_logits(
     indices-only selection leaves nothing to gather them from, which is why this is a pass of
     its own rather than a gather out of the selection pass.  ``local_BLK`` is renumbered onto
     the row-wide entries the keys live in; a ``-1`` slot is gathered harmlessly and marked
-    ``-inf``.  The row is the batch, so the key axis is squeezed.  Returns ``[B, L, K]``,
+    ``-inf``.  The row is the batch, so the key axis is squeezed.  Returns ``[T, K]``,
     head-summed.
     """
-    pool_start_L1, _, _ = _document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q_BLHiDi.size(1))
+    pool_start_L1, _, _ = _document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q_BLHiDi.size(0))
     # A ``-1`` slot may name a real entry once shifted; the value is discarded below.
-    selected_BLKDi = idx_k_BNDi.squeeze(0)[(local_BLK + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
-    logits_BLHiK = torch.einsum("blhd,blkd->blhk", idx_q_BLHiDi, selected_BLKDi)
+    selected_BLKDi = idx_k_BNDi[(local_BLK + pool_start_L1).clamp_min(0)]
+    logits_BLHiK = torch.einsum("thd,tkd->thk", idx_q_BLHiDi, selected_BLKDi)
     logits_BLHiK = logits_BLHiK.relu() * weights_BLHi.unsqueeze(-1)
-    return logits_BLHiK.sum(dim=2).masked_fill(local_BLK < 0, -torch.inf)
+    return logits_BLHiK.sum(dim=1).masked_fill(local_BLK < 0, -torch.inf)
 
 
 class Selector(Module):
@@ -214,7 +214,7 @@ class Selector(Module):
         """The candidate source's blockwise selection: keep the best-scoring blocks.
 
         Args:
-            scores_BLN: Index scores ``[B, L, N]``, already masked to ``-inf`` on entries
+            scores_BLN: Index scores ``[T, N]``, already masked to ``-inf`` on entries
                 the query cannot select (other documents and incomplete groups).
             newest_L1: Index of each query's newest selectable entry, ``[L, 1]``.
             newest_valid_L1: Whether that entry exists (the query's document has at least
@@ -223,7 +223,7 @@ class Selector(Module):
             block_size: Positions per block.
 
         Returns:
-            Boolean mask ``[B, L, N]`` selecting every position of the kept blocks.
+            Boolean mask ``[T, N]`` selecting every position of the kept blocks.
 
         The two entry-index tables describe the whole packed row, so they carry no batch axis
         and broadcast against ``scores_BLN``: a query's reach is an interval of the row-wide
@@ -273,12 +273,12 @@ class Selector(Module):
         4. :func:`_student_logits` rescores those entries with gradient.
 
         ``candidates_BL1C`` carries the pool between layers as this reference's boolean mask
-        ``[B, L, N]``, where a fused selector moves the kernels' block table.
+        ``[T, N]``, where a fused selector moves the kernels' block table.
 
         Returns ``(topk_indices_BLK, topk_scores_BLK, candidates_BL1C)``: document-local
         indices, ``-1`` for an unused slot, and ``-inf`` for that slot in the scores.
         """
-        num_cmp = idx_k_BNDi.size(1)
+        num_cmp = idx_k_BNDi.size(0)
         assert self.compress_ratio > 0, (
             "A selector reads its compressed pool's frame, which only a layer that pools "
             f"owns, so compress_ratio must be positive (got {self.compress_ratio})."
@@ -291,14 +291,14 @@ class Selector(Module):
         visible_LN, newest_L1, newest_valid_L1, pool_start_L1 = _selection_mask(
             cu_seqlens,
             cu_seqlens_k,
-            num_tokens=idx_q_BLHiDi.size(1),
+            num_tokens=idx_q_BLHiDi.size(0),
             num_cmp=num_cmp,
             compress_ratio=self.compress_ratio,
         )
 
         with torch.no_grad():
-            scores_BLHiN = torch.einsum("blhd,bnd->blhn", idx_q_BLHiDi, idx_k_BNDi)
-            scores_BLN = (scores_BLHiN.relu() * weights_BLHi.unsqueeze(-1)).sum(dim=2)
+            scores_BLHiN = torch.einsum("thd,nd->thn", idx_q_BLHiDi, idx_k_BNDi)
+            scores_BLN = (scores_BLHiN.relu() * weights_BLHi.unsqueeze(-1)).sum(dim=1)
             scores_BLN = scores_BLN.masked_fill(~visible_LN, -torch.inf)
 
             if self.mode is FULL and self.has_candidate_pool:
@@ -317,11 +317,11 @@ class Selector(Module):
                 scores_BLN = scores_BLN.masked_fill(~candidates_BL1C, -torch.inf)
 
             topk = min(self.index_topk, num_cmp)
-            selected_BLK = scores_BLN.topk(topk, dim=-1, sorted=False).indices
-            # Unreachable entries -- another document's, an incomplete group, or one a pool
-            # excluded -- become -1, which the attention and the loss both skip; the mask
-            # covers real entries only, so it is gathered at the picks.
-            selected_valid_BLK = visible_LN.unsqueeze(0).gather(-1, selected_BLK)
+            selection = scores_BLN.topk(topk, dim=-1, sorted=False)
+            selected_BLK = selection.indices
+            # Preserve the baseline's visibility-only padding rule during layout migration.
+            # Revising underfull candidate pools changes selections and the golden trajectory.
+            selected_valid_BLK = visible_LN.gather(-1, selected_BLK)
             local_BLK = torch.where(selected_valid_BLK, selected_BLK - pool_start_L1, -1)
             # Emitted in the fused selector's order: position descending, so ``-1`` padding
             # lands at the tail.  The values alone are the emission; ``-1`` is the smallest
@@ -441,11 +441,9 @@ class HierarchicalIndexer(Module):
         Full Mode also projects the keys, from its own compressor latent.
 
         Args:
-            x: Hidden states of shape ``[B, L, D]``.
-            qr: Query LoRA latent of shape ``[B, L, Q]``.
-            positions: The query frame's own position ids (``[B, L]``).  The keys' positions are
-                the entry's ``position_k``, which under context parallelism is the key stream's
-                window rather than the query frame's rows.
+            x: Hidden states of shape ``[T, D]``.
+            qr: Query LoRA latent of shape ``[T, Q]``.
+            positions: Query positions ``[T]``; key positions come from the metadata.
             attention_metadata: The forward's varlen metadata; the indexer reads the row's
                 boundaries, which say which pool entries a query's own document contributed.
             latent: The compressor's pre-RoPE latent; a Full Mode layer projects its keys
@@ -479,11 +477,10 @@ class HierarchicalIndexer(Module):
         if self.mode is FULL:
             assert latent is not None, "A Full Mode indexer projects its keys from the compressor latent."
             idx_k = self.k_norm(self.wk(latent))
-            # One rank-2 head; RoPE rotates rank-3 [B, N, 1, H], at the key stream's own pooled
-            # positions -- the entry's, one per compression block.
+            # The compressed keys rotate at the restored key stream's positions.
             idx_k = self.rope(
-                idx_k.unsqueeze(2), positions=attention_metadata.position_k[..., :: self.compress_ratio]
-            ).squeeze(2)
+                idx_k.unsqueeze(1), positions=attention_metadata.position_k[:: self.compress_ratio]
+            ).squeeze(1)
         else:
             assert idx_k is not None, (
                 "A Reindex Mode indexer rescores the shared index keys, which no preceding Full Mode layer produced."

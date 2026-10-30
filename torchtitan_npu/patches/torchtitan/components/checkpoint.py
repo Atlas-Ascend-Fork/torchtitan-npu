@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch.distributed.checkpoint as dcp
-import torchtitan.components.checkpoint
 import torchtitan.components.checkpointer
 from torchtitan.components.checkpointer import CheckpointManager as OriginalCheckpointManager
 
@@ -72,12 +71,9 @@ class EMACheckpointManager(OriginalCheckpointManager):
 
 
 def apply() -> None:
-    # torchtitan v0.3.0 split CheckpointManager into the checkpointer package;
-    # the legacy components.checkpoint module is now a re-export shim. Replace
-    # the name in every namespace later consumers import it from.
+    # Replace the implementation and public checkpointer bindings.
     torchtitan.components.checkpointer.dcp.CheckpointManager = EMACheckpointManager
     torchtitan.components.checkpointer.CheckpointManager = EMACheckpointManager
-    torchtitan.components.checkpoint.CheckpointManager = EMACheckpointManager
 
 
 apply()

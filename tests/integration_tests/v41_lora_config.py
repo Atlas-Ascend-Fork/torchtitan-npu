@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import derive
 from torchtitan.tools.logging import logger
 

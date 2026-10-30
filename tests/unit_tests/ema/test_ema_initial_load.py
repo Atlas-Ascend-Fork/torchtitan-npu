@@ -103,7 +103,7 @@ def _load_checkpoint_conversion_module() -> types.ModuleType:
 
 @pytest.fixture
 def isolated_ema_environment():
-    import torchtitan.components.checkpoint as upstream_checkpoint
+    import torchtitan.components.checkpointer as upstream_checkpoint
     import torchtitan.components.checkpointer as upstream_checkpointer
     import torchtitan.trainer as upstream_trainer
 
@@ -508,7 +508,7 @@ def test_ema_schema_is_inherited_by_npu_trainer_ex_config() -> None:
         from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
         from torchtitan_npu.patches.torchtitan import trainer as trainer_module
         from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
-        import torchtitan.components.checkpoint as upstream_checkpoint
+        import torchtitan.components.checkpointer as upstream_checkpoint
         import torchtitan.trainer as upstream_trainer
         from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 

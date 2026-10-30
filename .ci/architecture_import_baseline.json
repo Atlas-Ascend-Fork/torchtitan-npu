@@ -1,9 +1,7 @@
 {
   "patch_metadata": {
     "missing": [
-      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/_optimizer_reshard_schedule.py",
       "torchtitan_npu/patches/torchtitan/distributed/flex_shard/dist_muon.py",
-      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/optimizer_reshard.py",
       "torchtitan_npu/patches/torchtitan/distributed/flex_shard/replica_dedup.py",
       "torchtitan_npu/patches/torchtitan/experiments/graph_trainer/functionalize_recompute_mutations.py",
       "torchtitan_npu/patches/torchtitan/hf_datasets/text_datasets.py",
@@ -32,6 +30,7 @@
   "activation_order": {
     "torchtitan_npu/extensions/__init__.py": [
       ".torchtitan.ep_process_group",
+      ".torchtitan.models.common",
       ".torchtitan.trainer",
       ".torchtitan.components.metrics",
       ".torchtitan.experiments.graph_trainer",
@@ -44,9 +43,7 @@
       ".trainer",
       ".components.metrics",
       ".components.optimizer",
-      ".components.validate",
       ".distributed.context_parallel",
-      ".distributed.full_dtensor",
       ".distributed.flex_shard.dist_muon",
       ".experiments.graph_trainer.chunked_loss",
       ".experiments.graph_trainer.ep_chunk_concretization",

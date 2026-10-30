@@ -6,8 +6,8 @@
 from dataclasses import dataclass, field
 
 import torch
-from attn_gym.sparse import AuxRequest, gather_attn
-from torchtitan.models.common.attention import BaseAttention, VarlenAttention
+from attn_gym.sparse import AuxRequest, GatherAttnAux, gather_attn
+from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -67,12 +67,12 @@ class CompressedSparseInnerAttention(Module):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(VarlenAttention.Config):
-        # The int DSA window, replacing the varlen attention's ``(left, right)`` tuple: the
-        # model's window is a count of preceding tokens.  The varlen base is also the type the
-        # pinned decoder's mask dispatch recognises on the stacks that still build a single
-        # mask object; this stack builds its metadata through the seam instead.
-        window_size: int  # pyrefly: ignore [bad-override]
+    class Config(Module.Config):
+        # TODO: Revisit the upstream attention config contract on the next refactor;
+        # reuse or inherit the upstream interface when it can express this CP-capable
+        # sparse backend without classifying it as VarlenAttention.
+        # The model's window is a count of preceding tokens.
+        window_size: int
         compress_ratio: int
         softmax_scale: float
         index_topk: int
@@ -144,16 +144,16 @@ class CompressedSparseInnerAttention(Module):
             )
         if self.compress_ratio == 4 and (cmp_k is None) != (topk_indices is None):
             raise ValueError("ratio-4 attention requires cmp_k and topk_indices together.")
-        bsz, seqlen, _, head_dim = q.size()
-        n_cmp = 0 if cmp_k is None else cmp_k.size(1)
+        seqlen, _, head_dim = q.size()
+        n_cmp = 0 if cmp_k is None else cmp_k.size(0)
         # The frames the kernels grid: the query's and, for a pooling geometry, the compressed
         # pool's.  The reference path and a fused port read the same ones.
         cu_seqlens = attention_metadata.q.cu_seqlens
         if n_cmp == 0:
             # A window-only layer: the pool is empty, and the operator wants both offsets.
             cu_seqlens_k = cu_seqlens
-            kv_indices = q.new_empty((bsz, seqlen, 0), dtype=torch.long)
-            sparse_kv = q.new_zeros((bsz, 1, 0, head_dim))
+            kv_indices = q.new_empty((1, seqlen, 0), dtype=torch.long)
+            sparse_kv = q.new_zeros((1, 1, 0, head_dim))
         else:
             # ``n_cmp`` is this tensor's width, so the frame is present here.
             assert cmp_k is not None
@@ -163,15 +163,19 @@ class CompressedSparseInnerAttention(Module):
             cu_seqlens_k = cmp_frame.cu_seqlens
             # The selection is an input: the selector's picks at ratio four, and the entry's
             # precomputed reference selection for a geometry without a selector.
-            kv_indices = topk_indices if self.compress_ratio == 4 else attention_metadata.slots
+            kv_indices = (
+                topk_indices.unsqueeze(0)
+                if self.compress_ratio == 4 and topk_indices is not None
+                else attention_metadata.slots
+            )
             if kv_indices is None:
                 raise ValueError("the entry carries no selection for this geometry")
-            sparse_kv = cmp_k.reshape(bsz, 1, n_cmp, head_dim)
+            sparse_kv = cmp_k.reshape(1, 1, n_cmp, head_dim)
 
         aux = AuxRequest(lse=True) if self.return_lse else None
         result = gather_attn(
-            q.transpose(1, 2),
-            swa_k.reshape(bsz, 1, seqlen, head_dim),
+            q.transpose(0, 1).unsqueeze(0),
+            swa_k.reshape(1, 1, seqlen, head_dim),
             sparse_kv,
             kv_indices,
             attention_sink=attn_sink,
@@ -184,9 +188,11 @@ class CompressedSparseInnerAttention(Module):
         )
         if aux is None:
             assert isinstance(result, torch.Tensor)
-            return result.transpose(1, 2)
+            return result.squeeze(0).transpose(0, 1)
+        assert isinstance(result, tuple)
         output, gathered = result
-        return output.transpose(1, 2), gathered.lse
+        assert isinstance(gathered, GatherAttnAux) and gathered.lse is not None
+        return output.squeeze(0).transpose(0, 1), gathered.lse.squeeze(0)
 
 
 class Attention(BaseAttention):
@@ -273,12 +279,12 @@ class Attention(BaseAttention):
         each consumer restores what it reads on its own: the compressor its pooling window, the
         core this rank's swa window, whose sharding then gathers the whole row at its boundary.
         """
-        bsz, seqlen, _ = x.size()
+        num_tokens = x.size(0)
         metadata = attention_metadata
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
-        q = q.view(bsz, seqlen, -1, self.head_dim)
+        q = q.view(num_tokens, -1, self.head_dim)
         q = self.q_head_norm(q)
         # RoPE owns the [nope | rope] split: it receives the full-width
         # tensor and rotates only the trailing rope_head_dim channels.  The
@@ -293,7 +299,7 @@ class Attention(BaseAttention):
         # commutes with the movement.  The restore then hands the core this rank's window, whose
         # sharding gathers the rows to the whole row at the core's own boundary.
         swa_k = self.kv_norm(self.wkv(x))
-        swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
+        swa_k = self.rope(swa_k.unsqueeze(1), positions=positions).squeeze(1)
         swa_k = metadata.key_stream(swa_k, group=self.cp_group)
 
         cmp_k = None
@@ -341,10 +347,10 @@ class Attention(BaseAttention):
 
         # ``wo_a`` is a BatchedLinear over the head groups; group the heads
         # before the per-group matmul.
-        n_local_groups = self.n_groups // (self.n_heads // o.shape[2])
-        o = o.view(bsz, seqlen, n_local_groups, -1)
+        n_local_groups = self.n_groups // (self.n_heads // o.shape[1])
+        o = o.view(num_tokens, n_local_groups, -1)
         o = self.wo_a(o)
-        o = o.reshape(bsz, seqlen, -1)
+        o = o.reshape(num_tokens, -1)
         o = self.wo_b(o)
         # The projection is per token, so ``wo_b``'s output stays in the frame the input
         # arrived in: the residual and every other consumer are token-wise, and the loss is

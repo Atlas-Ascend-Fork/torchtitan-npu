@@ -6,7 +6,8 @@
 """Compressed main KV for DeepSeek V4.1 (CSA2).
 
 Shape legend for this file:
-    B = batch, L = sequence length, D = model dimension, R = ``compress_ratio``,
+    T = folded tokens, D = model dimension, R = ``compress_ratio``,
+    N = T // R compressed entries for a source layer (R > 0),
     Dk = head dimension of a compressed KV entry (``head_dim``).
 
 Every layer owns a :class:`Compressor` instance, but only the *source* layers
@@ -80,22 +81,22 @@ class Compressor(Module):
 
     def forward(
         self,
-        x_BLD: torch.Tensor,
-        positions_BL: torch.Tensor,
+        x_TD: torch.Tensor,
+        positions_T: torch.Tensor,
         cmp_k: torch.Tensor | None = None,
         *,
         attention_metadata=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Args:
-            x: Hidden states of shape ``[B, L, D]``.
-            positions: Position ids of shape ``[B, L]``.
+            x_TD: Hidden states of shape ``[T, D]``.
+            positions_T: Position ids of shape ``[T]``.
             cmp_k: The shared compressed KV when this layer is not a source.
 
         Returns:
-            ``(cmp_k, latent)``. A source layer returns its newly compressed,
-            RoPE-rotated KV ``[B, L // R, head_dim]`` together with the pre-RoPE latent
+            ``(cmp_k, latent_NDk)``. A source layer returns its newly compressed,
+            RoPE-rotated KV ``[N, Dk]`` together with the pre-RoPE latent
             of the same shape that the indexer projects its keys from. A non-source layer
-            returns the tensor it was handed and ``latent=None``.
+            returns the tensor it was handed and ``latent_NDk=None``.
         """
         # A source supersedes whatever compressed KV was in flight: the first source of
         # the stack sees ``None``, and a later group's source replaces the previous
@@ -112,26 +113,26 @@ class Compressor(Module):
         if attention_metadata is not None:
             # The pooling is the row's, so a source layer restores the stream onto this rank's
             # window first (the identity at one degree); the caller hands over the chunks it holds.
-            x_BLD = attention_metadata.key_stream(x_BLD, group=self.group)
+            x_TD = attention_metadata.key_stream(x_TD, group=self.group)
 
         ratio = self.compress_ratio
-        seqlen = x_BLD.size(1)
-        if seqlen % ratio != 0:
-            raise ValueError(f"token count ({seqlen}) must be divisible by compress_ratio ({ratio})")
+        num_tokens = x_TD.size(0)
+        if num_tokens % ratio != 0:
+            raise ValueError(f"token count ({num_tokens}) must be divisible by compress_ratio ({ratio})")
 
         if ratio == 1:
-            latent_BLD = self.norm(self.wkv(x_BLD))
+            latent_NDk = self.norm(self.wkv(x_TD))
         else:
             # The softmax pooling runs in fp32; the projection itself stays in the model
             # dtype, as every other projection in the model does.
-            kv_BLrD = self.wkv(x_BLD).unflatten(1, (-1, ratio))
-            gate_BLrD = self.wgate(x_BLD).unflatten(1, (-1, ratio))  # pyrefly: ignore [not-callable]
-            pooled_BLD = (kv_BLrD.float() * gate_BLrD.float().softmax(dim=2)).sum(dim=2)
-            latent_BLD = self.norm(pooled_BLD.to(x_BLD.dtype))
+            kv_NRDk = self.wkv(x_TD).unflatten(0, (-1, ratio))
+            gate_NRDk = self.wgate(x_TD).unflatten(0, (-1, ratio))  # pyrefly: ignore [not-callable]
+            pooled_NDk = (kv_NRDk.float() * gate_NRDk.float().softmax(dim=1)).sum(dim=1)
+            latent_NDk = self.norm(pooled_NDk.to(x_TD.dtype))
 
         # Entry j stands for the group starting at token j * R, so it rotates at that
         # token's position; the packed positions reset per document, so the stride
-        # selects each group's first token.  The latent is one rank-2 head; the rope
-        # rotates rank-3 [B, N, 1, H].
-        rotated_BLD = self.rope(latent_BLD.unsqueeze(2), positions=positions_BL[..., ::ratio]).squeeze(2)
-        return rotated_BLD, latent_BLD
+        # selects each group's first token.  The latent is one head; the rope
+        # rotates [N, 1, Dk].
+        rotated_NDk = self.rope(latent_NDk.unsqueeze(1), positions=positions_T[::ratio]).squeeze(1)
+        return rotated_NDk, latent_NDk

@@ -24,7 +24,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh, validate_config
+from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 
 from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
@@ -169,10 +169,7 @@ def parallelize_deepseek_v4_1(
 ):
     """Parallelize V4.1: sharding config, AC, then the decoder FSDP wrap."""
     compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
-    if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
-        validate_config(parallel_dims, model)
-        model.parallelize(parallel_dims)
-    elif parallel_dims.ep_enabled:
+    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
         model.parallelize(parallel_dims)
 
     if ac_config is not None:
@@ -182,7 +179,7 @@ def parallelize_deepseek_v4_1(
     if model_compile_enabled:
         _apply_compile_v4_1(model, compile_config=compile_config)
 
-    if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+    if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
     else:

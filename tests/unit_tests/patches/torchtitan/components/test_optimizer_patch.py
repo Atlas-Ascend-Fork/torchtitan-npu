@@ -10,7 +10,6 @@ query NPU hardware on CPU-only runners.
 """
 
 import torch
-import torchtitan.components.checkpoint_utils
 import torchtitan.components.optimizer
 import torchtitan.components.optimizer.optimizer
 import torchtitan.components.optimizer.utils
@@ -20,10 +19,9 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan_npu.patches.torchtitan.components import optimizer as optimizer_patch
 
 
-def test_patch_replaces_loaded_optimizer_state_helpers():
-    assert torchtitan.components.checkpoint_utils.init_optim_state is optimizer_patch.patched_init_optim_state
-    assert torchtitan.components.optimizer.utils.init_optim_state is optimizer_patch.patched_init_optim_state
-    assert torchtitan.components.optimizer.optimizer.init_optim_state is optimizer_patch.patched_init_optim_state
+def test_patch_replaces_optimizer_checkpoint_layout_methods():
+    assert OptimizersContainer.state_dict is optimizer_patch.patched_optimizers_state_dict
+    assert OptimizersContainer.load_state_dict is optimizer_patch.patched_optimizers_load_state_dict
 
 
 def test_init_optim_state_materializes_missing_state():
@@ -37,7 +35,7 @@ def test_init_optim_state_materializes_missing_state():
     saved_lr = optim.param_groups[0]["lr"]
     saved_state = {key: value.clone() for key, value in optim.state[initialized].items()}
 
-    torchtitan.components.checkpoint_utils.init_optim_state(optim)
+    torchtitan.components.optimizer.utils.init_optim_state(optim)
 
     assert initialized.grad is saved_grad
     assert missing.grad is None
@@ -66,8 +64,8 @@ def test_init_optim_state_exposes_all_checkpoint_state_keys():
     initialized.grad = torch.ones_like(initialized)
     optim.step()
 
-    torchtitan.components.checkpoint_utils.init_optim_state(optim)
-    flat_state = torchtitan.components.checkpoint_utils.get_flat_optim_state_dict(optim)
+    torchtitan.components.optimizer.utils.init_optim_state(optim)
+    flat_state = torchtitan.components.optimizer.utils.get_flat_optim_state_dict(optim)
 
     expected_state_keys = {
         f"state.{param_name}.{state_name}"
@@ -95,7 +93,7 @@ def test_materialized_state_matches_lazy_adamw_first_update():
         optim.step()
         optim.zero_grad(set_to_none=True)
 
-    optimizer_patch.patched_init_optim_state(patched_optim)
+    torchtitan.components.optimizer.utils.init_optim_state(patched_optim)
 
     for params in (control_params, patched_params):
         params[0].grad = torch.tensor([-0.5])

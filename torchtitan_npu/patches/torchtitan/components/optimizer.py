@@ -2,12 +2,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4474
+# Upstream-PR: https://github.com/pytorch/torchtitan/pull/4411
 
-"""Patch partial optimizer-state materialization for checkpointing.
-
-Remove this module after the TorchTitan dependency includes the PR.
-"""
+"""Use standard checkpoint layouts for replica-deduplicated Muon state."""
 
 import functools
 import logging
@@ -15,51 +12,12 @@ from contextlib import ExitStack
 from typing import Any
 
 import torch
-import torchtitan.components.checkpoint_utils
 import torchtitan.components.optimizer
 
 logger = logging.getLogger(__name__)
 
-original_init_optim_state = torchtitan.components.checkpoint_utils.init_optim_state
 original_optimizers_state_dict = torchtitan.components.optimizer.OptimizersContainer.state_dict
 original_optimizers_load_state_dict = torchtitan.components.optimizer.OptimizersContainer.load_state_dict
-
-
-@functools.wraps(original_init_optim_state)
-def patched_init_optim_state(optim: torch.optim.Optimizer) -> None:
-    """Materialize missing optimizer state while preserving existing state."""
-    params = [param for param_group in optim.param_groups for param in param_group["params"]]
-    params_to_initialize = [param for param in params if param.requires_grad and not optim.state.get(param)]
-    if not params_to_initialize:
-        return
-
-    saved_grads = [param.grad for param in params]
-    for param in params:
-        param.grad = None
-    for param in params_to_initialize:
-        param.grad = torch.zeros_like(param)
-
-    saved_lrs = []
-    for param_group in optim.param_groups:
-        if "lr" in param_group:
-            saved_lrs.append(param_group["lr"])
-            param_group["lr"] = torch.tensor(0.0) if isinstance(param_group["lr"], torch.Tensor) else 0.0
-    optim.step(closure=None)
-
-    if isinstance(optim, (torch.optim.Adam, torch.optim.AdamW)):
-        for param in params_to_initialize:
-            state = optim.state[param]
-            state["step"].zero_()
-            state["exp_avg"].zero_()
-            state["exp_avg_sq"].zero_()
-            if "max_exp_avg_sq" in state:
-                state["max_exp_avg_sq"].zero_()
-
-    for param_group in optim.param_groups:
-        if "lr" in param_group:
-            param_group["lr"] = saved_lrs.pop(0)
-    for param, grad in zip(params, saved_grads, strict=True):
-        param.grad = grad
 
 
 def _replica_dedup_contexts(optimizers: list[torch.optim.Optimizer], name: str) -> ExitStack:
@@ -90,14 +48,7 @@ def patched_optimizers_load_state_dict(self: Any, state_dict: dict[str, Any]) ->
 
 
 def apply() -> None:
-    logger.info("[PATCH] checkpoint_utils.init_optim_state and optimizer.init_optim_state -> patched_init_optim_state")
-    # torchtitan v0.3.0 moved init_optim_state into the components.optimizer
-    # package (optimizer/utils.py) and stopped re-exporting it from the package
-    # root. The sole runtime caller binds it in optimizer/optimizer.py via
-    # "from .utils import init_optim_state", so patch every consumer namespace.
-    torchtitan.components.optimizer.utils.init_optim_state = patched_init_optim_state
-    torchtitan.components.optimizer.optimizer.init_optim_state = patched_init_optim_state
-    torchtitan.components.checkpoint_utils.init_optim_state = patched_init_optim_state
+    logger.info("[PATCH] OptimizersContainer save/load -> replica-dedup layout contexts (upstream #4411)")
     torchtitan.components.optimizer.OptimizersContainer.state_dict = patched_optimizers_state_dict
     torchtitan.components.optimizer.OptimizersContainer.load_state_dict = patched_optimizers_load_state_dict
 

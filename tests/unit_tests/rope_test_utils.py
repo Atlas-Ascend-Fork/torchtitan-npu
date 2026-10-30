@@ -66,7 +66,7 @@ def reset_kernel_counts() -> None:
 
 def split_workaround_reference(x, split, rotary_dim, positions, *, inverse=False):
     """The pre-split model path: slice, interleave-rotate the tail, cat back."""
-    plain = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=rotary_dim, max_seq_len=16))
+    plain = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=rotary_dim, max_context_length=16))
     prefix, rotary = x[..., :split], x[..., split:]
     cos, sin = plain._reshape_cache(rotary, positions)
     if inverse:

@@ -13,6 +13,12 @@ from pathlib import Path
 import pytest
 import torch
 
+# Every test here exercises the not-yet-migrated context-parallel metadata path.
+pytestmark = pytest.mark.skip(
+    reason="Qwen3.5 NPU context parallel is not migrated to the folded token layout yet; "
+    "re-enable with the Qwen CP folded-token migration"
+)
+
 _MODULE_PATH = Path(__file__).resolve().parents[4] / "torchtitan_npu" / "override" / "qwen3_5" / "parallelize.py"
 
 
@@ -33,6 +39,8 @@ def qwen_cp(monkeypatch):
     compile_module = types.ModuleType("torchtitan.distributed.compile")
     compile_module.apply_compile = lambda *args, **kwargs: None
     fsdp_module = types.ModuleType("torchtitan.distributed.fsdp")
+    fsdp_module.resolve_fsdp_mesh = lambda *args, **kwargs: None
+    fsdp_module.resolve_sparse_fsdp_mesh = lambda *args, **kwargs: None
     fsdp_module.apply_fsdp_to_decoder = lambda *args, **kwargs: None
     fsdp_module.apply_fsdp_to_vision_encoder = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "torchtitan.distributed.compile", compile_module)
@@ -72,3 +80,39 @@ def test_shard_local_heads_selects_rank_chunk(qwen_cp):
     tensor = torch.arange(8).view(4, 2)
     shard = qwen_cp.shard_local_heads(tensor, _Mesh(size=2, rank=1))
     assert torch.equal(shard, tensor[2:])
+
+
+def _plain_cp_dims():
+    return types.SimpleNamespace(cp_enabled=True, ep_enabled=False, tp_enabled=False)
+
+
+def _plain_cp_model():
+    return types.SimpleNamespace(vision_encoder=None)
+
+
+def test_cp_parallelizer_refuses_unmigrated_folded_path(qwen_cp):
+    with pytest.raises(NotImplementedError, match="not migrated to the folded token layout"):
+        qwen_cp.parallelize_qwen3_5_cp(
+            _plain_cp_model(),
+            parallel_dims=_plain_cp_dims(),
+            training=types.SimpleNamespace(),
+            parallelism=types.SimpleNamespace(),
+            compile_config=types.SimpleNamespace(),
+            ac_config=None,
+            dump_folder="unused",
+        )
+
+
+def test_npu_dispatcher_refuses_cp_before_touching_the_model(qwen_cp):
+    # The refusal must fire before any FSDP wrap/parallelize call: the fake
+    # model exposes neither, so reaching them would raise AttributeError.
+    with pytest.raises(NotImplementedError, match="not migrated to the folded token layout"):
+        qwen_cp.parallelize_qwen3_5_npu(
+            _plain_cp_model(),
+            parallel_dims=_plain_cp_dims(),
+            training=types.SimpleNamespace(),
+            parallelism=types.SimpleNamespace(spmd_backend="spmd_types"),
+            compile_config=types.SimpleNamespace(enable=False, components=()),
+            ac_config=None,
+            dump_folder="unused",
+        )

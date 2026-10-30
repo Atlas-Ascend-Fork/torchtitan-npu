@@ -34,7 +34,7 @@ _INDEX_N_HEADS, _INDEX_HEAD_DIM, _INDEX_TOPK, _WINDOW = 2, 8, 16, 128
 
 
 def _positions_for(doc_lens) -> torch.Tensor:
-    return torch.cat([torch.arange(length) for length in doc_lens]).unsqueeze(0)
+    return torch.cat([torch.arange(length) for length in doc_lens])
 
 
 def _model_config(ratios: tuple[int, ...], *, ascendc: bool, geometry: dict | None = None):
@@ -100,6 +100,19 @@ def _entry(model, ratio: int = 4, positions=None):
     return matches[0]
 
 
+def test_model_config_accepts_cp_with_aligned_documents():
+    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+
+    config = deepseek_v4_debugmodel()
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.spmd_backend = "spmd_types"
+    config.dataloader.dataset.dataset.processor.per_doc_alignment = 256
+
+    config.model_spec.model.update_from_config(config=config)
+
+    assert all(layer.attention.inner_attention.sharding_config is not None for layer in config.model_spec.model.layers)
+
+
 def test_entries_are_built_per_geometry():
     """One entry per (backend class, ratio), and every layer dispatches by its own key."""
     model = _model_config((1, 1, 4, 128), ascendc=False).build()
@@ -122,7 +135,11 @@ def test_entries_are_built_per_geometry():
 
 @pytest.mark.parametrize("batch_size", [1, 2], ids=["batch1", "batch2"])
 def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatch):
-    """No-CP attention must preserve independent batch rows and their gradients."""
+    """No-CP attention must preserve independent document rows and their gradients.
+
+    The folded row packs what used to be batch samples as documents, so the
+    oracle applies the same initialized layer to each document separately.
+    """
     seq_len = 8
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(42)
@@ -132,45 +149,52 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
 
     def cpu_window_attention(q, swa_k, attn_sink, *, attention_metadata, **kwargs):
         # The fused kernel is unavailable on CPU, while attn-gym's packed reference
-        # explicitly rejects B > 1. Isolate only that kernel with dense causal math;
-        # RoPE and all input/output projections remain production code.
+        # addresses one row. Isolate only that kernel with per-document dense
+        # causal math; RoPE and all input/output projections remain production code.
         del kwargs
         assert attention_metadata.cp is None
-        scores = torch.einsum("bshd,btd->bhst", q, swa_k) * attention.inner_attention.softmax_scale
-        causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
-        scores = scores.masked_fill(~causal, float("-inf"))
-        sink = attn_sink[None, :, None, None].expand(*scores.shape[:-1], 1)
+        cu = attention_metadata.q.cu_seqlens.to(torch.long).tolist()
+        total = q.size(0)
+        scores = torch.einsum("thd,sd->ths", q.float(), swa_k.float()) * attention.inner_attention.softmax_scale
+        allow = torch.zeros(total, total, dtype=torch.bool)
+        for start, end in zip(cu[:-1], cu[1:], strict=False):
+            allow[start:end, start:end] = torch.ones(end - start, end - start, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~allow[:, None, :], float("-inf"))
+        sink = attn_sink[None, :, None].expand(*scores.shape[:-1], 1)
         probabilities = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
-        return torch.einsum("bhst,btd->bshd", probabilities, swa_k)
+        return torch.einsum("ths,sd->thd", probabilities, swa_k)
 
     monkeypatch.setattr(attention.inner_attention, "forward", cpu_window_attention)
-    values = torch.linspace(-1.0, 1.0, batch_size * seq_len * _DIM).reshape(batch_size, seq_len, _DIM)
+    values = torch.linspace(-1.0, 1.0, batch_size * seq_len * _DIM).reshape(batch_size * seq_len, _DIM)
     x = values.clone().requires_grad_()
-    positions = torch.arange(seq_len).expand(batch_size, -1)
+    positions = _positions_for((seq_len,) * batch_size)
     entry = model._get_attention_metadata(positions)[attention.attention_metadata_key]
-    assert entry.batch_size == batch_size
-    # At one degree the query frame is the row's own grid and every row is a document here;
-    # the KV frame addresses that same row.
+    # The folded row is one packed row: ``batch_size`` is its own count, not the
+    # number of documents that were packed into it.
+    assert entry.batch_size == 1
+    # At one degree the query frame is the row's own grid and every document is a
+    # batch sample here; the KV frame addresses that same row.
     assert entry.q.cu_seqlens.tolist() == [row * seq_len for row in range(batch_size + 1)]
     assert entry.swa_k.cu_seqlens.tolist() == entry.q.cu_seqlens.tolist()
     parameters = tuple(attention.parameters())
     upstream = torch.linspace(0.25, 1.25, x.numel()).reshape_as(x)
 
     output = attention(x, entry, positions)
-    assert output.shape == (batch_size, seq_len, _DIM)
+    assert output.shape == (batch_size * seq_len, _DIM)
     gradients = torch.autograd.grad((output * upstream).sum(), (x, *parameters))
 
-    # Distinct batch samples have no cross-row attention. Applying the same initialized
+    # Distinct documents have no cross-row attention. Applying the same initialized
     # layer to each document separately supplies the batch-composition oracle, including
     # the sum of the individual parameter gradients for the same scalar objective.
     expected_outputs, expected_input_gradients = [], []
     expected_parameter_gradients = [torch.zeros_like(parameter) for parameter in parameters]
     for row in range(batch_size):
-        sample = values[row : row + 1].clone().requires_grad_()
-        sample_positions = positions[row : row + 1]
+        slab = slice(row * seq_len, (row + 1) * seq_len)
+        sample = values[slab].clone().requires_grad_()
+        sample_positions = _positions_for((seq_len,))
         sample_entry = model._get_attention_metadata(sample_positions)[attention.attention_metadata_key]
         expected = attention(sample, sample_entry, sample_positions)
-        sample_gradients = torch.autograd.grad((expected * upstream[row : row + 1]).sum(), (sample, *parameters))
+        sample_gradients = torch.autograd.grad((expected * upstream[slab]).sum(), (sample, *parameters))
         expected_outputs.append(expected)
         expected_input_gradients.append(sample_gradients[0])
         for accumulated, gradient in zip(expected_parameter_gradients, sample_gradients[1:], strict=True):

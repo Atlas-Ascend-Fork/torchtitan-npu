@@ -67,14 +67,14 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
         index_num_heads=2,
         index_head_dim=4,
     ).build()
-    q = torch.zeros((1, length, 2, 4), dtype=torch.bfloat16)
+    q = torch.zeros((length, 2, 4), dtype=torch.bfloat16)
     topk_before = indices.clone()
     out = attention(
         q,
-        torch.zeros((1, length, 4), dtype=torch.bfloat16),
+        torch.zeros((length, 4), dtype=torch.bfloat16),
         torch.zeros(2),
         metadata,
-        cmp_k=torch.zeros((1, int(cu_cmp[-1]), 4), dtype=torch.bfloat16),
+        cmp_k=torch.zeros((int(cu_cmp[-1]), 4), dtype=torch.bfloat16),
         topk_indices=indices,
         # A training-mode layer with a compressed pool carries the teacher on this
         # tensor's gradient, so the port requires the selection's student logits.

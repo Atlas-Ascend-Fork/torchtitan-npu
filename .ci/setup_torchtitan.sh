@@ -3,30 +3,62 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Shared torchtitan setup for CI scripts.
-# Usage: source .ci/setup_torchtitan.sh
+# Shared torchtitan revision resolution and checkout for CI scripts.
+# Usage: source .ci/setup_torchtitan.sh; _setup_torchtitan <target_dir>
 
-TORCHTITAN_BRANCH="main"
-TORCHTITAN_REPOSITORY="https://gitcode.com/GitHub_Trending/to/torchtitan.git"
+TORCHTITAN_REPOSITORY="${TORCHTITAN_REPOSITORY:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
+
+_torchtitan_revision() {
+    if [[ -n "${TORCHTITAN_COMMIT:-}" ]]; then
+        printf '%s\n' "${TORCHTITAN_COMMIT}"
+        return
+    fi
+    local requirements_file="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/requirements.txt}"
+    local line requirement revision="" count=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        requirement="${line//[[:space:]]/}"
+        if [[ "$requirement" =~ ^torchtitan==([0-9][0-9A-Za-z.+-]*)$ ]]; then
+            revision="v${BASH_REMATCH[1]}"
+            count=$((count + 1))
+        elif [[ "$requirement" =~ ^torchtitan@git\+.+@([[:xdigit:]]{40})$ ]]; then
+            revision="${BASH_REMATCH[1]}"
+            count=$((count + 1))
+        fi
+    done < "$requirements_file"
+    if [[ "$count" != 1 ]]; then
+        echo "Expected exactly one TorchTitan release or full Git SHA requirement in ${requirements_file}." >&2
+        return 1
+    fi
+    printf '%s\n' "$revision"
+}
 
 _setup_torchtitan() {
     local target_dir="${1:-/tmp/torchtitan}"
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local requirements_file="${script_dir}/../requirements.txt"
-    local requirement_pattern='^[[:space:]]*torchtitan==[0-9][0-9A-Za-z.+-]*[[:space:]]*$'
-    local torchtitan_requirement
-    torchtitan_requirement="$(grep -E "${requirement_pattern}" "${requirements_file}")"
-    local torchtitan_version="${torchtitan_requirement##*==}"
-    torchtitan_version="${torchtitan_version//[[:space:]]/}"
-    local torchtitan_commit="v${torchtitan_version}"
+    local revision repository
+    revision="$(_torchtitan_revision)" || return
+    repository="${TORCHTITAN_REPO:-${TORCHTITAN_REPOSITORY}}"
 
-    echo "Preparing torchtitan at ${torchtitan_commit}..."
+    echo "Preparing torchtitan at ${revision}..."
+    if [[ ! -e "$target_dir" ]]; then
+        mkdir -p "$(dirname "$target_dir")"
+        git clone --filter=blob:none --no-checkout "$repository" "$target_dir" || return
+    elif ! git -C "$target_dir" rev-parse --git-dir >/dev/null 2>&1 \
+        || [[ "$(git -C "$target_dir" rev-parse --show-toplevel)" != "$(cd "$target_dir" && pwd -P)" ]]; then
+        echo "TorchTitan target exists and is not a Git checkout: ${target_dir}" >&2
+        return 1
+    elif [[ -n "$(git -C "$target_dir" status --porcelain)" ]]; then
+        echo "Refusing to change a dirty TorchTitan checkout: ${target_dir}" >&2
+        return 1
+    fi
 
-    echo "Cloning torchtitan source..."
-    mkdir -p "$(dirname "$target_dir")"
-    git clone --branch "$TORCHTITAN_BRANCH" \
-        "$TORCHTITAN_REPOSITORY" "$target_dir"
-
-    git -C "$target_dir" checkout "$torchtitan_commit"
+    # Mirrors may reject fetch-by-SHA while retaining the object in branch history.
+    if ! git -C "$target_dir" cat-file -e "${revision}^{commit}" 2>/dev/null; then
+        git -C "$target_dir" fetch --filter=blob:none origin \
+            '+refs/heads/*:refs/remotes/origin/*' 'refs/tags/*:refs/tags/*' || return
+        if ! git -C "$target_dir" cat-file -e "${revision}^{commit}" 2>/dev/null; then
+            git -C "$target_dir" fetch --depth 1 origin "$revision" || return
+        fi
+    fi
+    git -C "$target_dir" checkout --detach --quiet "$revision" || return
+    git -C "$target_dir" rev-parse HEAD
 }

@@ -11,7 +11,6 @@ import torch
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 
 from tests.unit_tests.models.mtp_test_utils import (
-    BATCH_SIZE,
     PACKED_POSITIONS,
     SEQ_LEN,
     VOCAB_SIZE,
@@ -81,9 +80,9 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
             original_seq_len=65536,
         )
     )
-    tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     labels = (tokens + 1) % VOCAB_SIZE
-    positions = torch.arange(SEQ_LEN).view(BATCH_SIZE, -1)
+    positions = torch.arange(SEQ_LEN)
 
     _, _, extra_kwargs = preprocess(model, tokens, labels, positions)
 
@@ -98,7 +97,7 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
 
 def test_deepseek_v4_mtp_model_supports_chunked_loss():
     model = build_cpu_model(_build_model_config())
-    tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
     tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
@@ -107,7 +106,7 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
     output = model(tokens, **extra_kwargs)
 
     assert isinstance(output, list) and len(output) == 2
-    assert output[0].shape[:2] == (BATCH_SIZE, SEQ_LEN)
+    assert output[0].shape[0] == SEQ_LEN
 
     loss_fn = MTPChunkedLossWrapper(
         MTPChunkedLossWrapper.Config(
@@ -165,11 +164,11 @@ def test_deepseek_v4_mtp_isolation_rejects_incompatible_loss_head(missing_head):
         head = torch.nn.Linear(4, VOCAB_SIZE, bias=False)
         if not missing_head:
             loss_fn.set_lm_head(head)
-        hidden = [torch.ones(1, 4, 4, requires_grad=True) for _ in range(2)]
-        labels = torch.zeros(1, 4, dtype=torch.long)
+        hidden = [torch.ones(4, 4, requires_grad=True) for _ in range(2)]
+        labels = torch.zeros(4, dtype=torch.long)
 
         with pytest.raises(ValueError, match="mtp_isolate_gradients requires a SharedLinear LM head"):
-            loss_fn(hidden, labels, positions=torch.arange(4).unsqueeze(0))
+            loss_fn(hidden, labels, positions=torch.arange(4))
 
         assert head.weight.grad is None
         assert all(item.grad is None for item in hidden)
@@ -181,7 +180,7 @@ def test_deepseek_v4_mtp_isolation_rejects_replaced_model_head():
         config.mtp_isolate_gradients = True
         model = build_cpu_model(config)
         model.lm_head = torch.nn.Linear(32, VOCAB_SIZE, bias=False)
-        tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
         tokens, _, extra_kwargs = preprocess(model, tokens, (tokens + 1) % VOCAB_SIZE, PACKED_POSITIONS.clone())
 
         with pytest.raises(ValueError, match="mtp_isolate_gradients requires a SharedLinear LM head"):
@@ -194,7 +193,7 @@ def test_deepseek_v4_mtp_detaches_all_shared_parameters(num_mtp_layers):
         config = _build_model_config(num_mtp_layers=num_mtp_layers)
         config.mtp_isolate_gradients = True
         model = build_cpu_model(config)
-        tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
         labels = (tokens + 1) % VOCAB_SIZE
         tokens, _, extra_kwargs = preprocess(model, tokens, labels, PACKED_POSITIONS.clone())
 
@@ -219,7 +218,7 @@ def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_thre
         isolated_config.mtp_isolate_gradients = True
         model = build_cpu_model(isolated_config)
         model.load_state_dict(reference.state_dict(), strict=True)
-        tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
         labels = (tokens + 1) % VOCAB_SIZE
         positions = PACKED_POSITIONS.clone()
         tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
@@ -332,7 +331,7 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     from torchtitan_npu.models.deepseek_v4 import model as model_mod
 
     model = build_cpu_model(_build_model_config())
-    tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     labels = (tokens + 1) % VOCAB_SIZE
     positions = PACKED_POSITIONS.clone()
 
@@ -367,14 +366,15 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     row_entry = build_v4_metadata(positions, 1)
     local_entry = doc_chunk_entry(row_entry, cp_size=cp_size, cp_rank=rank, slab_len=shard_len)
 
-    def fake_base(self, input_dict, labels, **kwargs):
-        base_calls.append((input_dict["input"].shape, labels.shape))
+    def fake_base(self, input_dict, *, parallel_dims, parallelism, **kwargs):
+        del parallel_dims, parallelism, kwargs
+        base_calls.append((input_dict["input"].shape, input_dict["labels"].shape))
         cut, _ = model_mod.cp_shard(
             mesh,
-            (input_dict["input"], labels, input_dict["positions"]),
+            (input_dict["input"], input_dict["labels"], input_dict["positions"]),
             None,
             None,
-            1,
+            0,
             positions=input_dict["positions"],
         )
         return cut[0], cut[1], {"positions": cut[2], "attention_metadata": {("debug", 1): local_entry}}
@@ -388,10 +388,8 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
         context_parallel_ptrr_mask_key=None,
     )
     inputs, out_labels, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "positions": positions},
-        labels,
+        {"input": tokens, "labels": labels, "positions": positions},
         parallel_dims=parallel_dims,
-        device=tokens.device,
         parallelism=parallelism,
     )
 
@@ -419,11 +417,11 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
 
     # What the forward reads is the shard's answer, not the global row.
     slab = slice(rank * shard_len, (rank + 1) * shard_len)
-    assert torch.equal(inputs, tokens[:, slab]) and torch.equal(out_labels, labels[:, slab])
-    assert torch.equal(extra_kwargs["positions"], positions[:, slab])
+    assert torch.equal(inputs, tokens[slab]) and torch.equal(out_labels, labels[slab])
+    assert torch.equal(extra_kwargs["positions"], positions[slab])
     # The mask is the global row's own (a shift across a shard boundary is not a shift): the
     # local copy is exactly its slab, so the row's last token still has no successor.
     local_batch = extra_kwargs["mtp_batch"]
-    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[:, slab])
-    assert not bool(local_batch.input_valid_mask[:, -1].all())
+    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[slab])
+    assert not bool(local_batch.input_valid_mask[-1].all())
     assert extra_kwargs["attention_metadata"][("debug", 1)] is local_entry

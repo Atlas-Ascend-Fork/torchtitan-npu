@@ -78,9 +78,12 @@ class AscHcPre(HcPre):
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Once A5's fused mhc_pre_sinkhorn is performance-optimized, route A3/A5 through it uniformly.
-        h_in, h_post, h_res = self._forward_split(x) if self._use_split_backend else self._forward_fused(x)
-        h_res = h_res.reshape(*x.shape[:2], self.hc_mult, self.hc_mult)
-        return h_in, h_post, h_res
+        kernel_x = x.unsqueeze(0)
+        h_in, h_post, h_res = (
+            self._forward_split(kernel_x) if self._use_split_backend else self._forward_fused(kernel_x)
+        )
+        h_res = h_res.reshape(x.shape[0], self.hc_mult, self.hc_mult)
+        return h_in.squeeze(0), h_post.squeeze(0), h_res
 
 
 class AscHcPost(HcPost):
@@ -97,4 +100,9 @@ class AscHcPost(HcPost):
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
+        return torch.ops.cann_ops_transformer.mhc_post(
+            residual.unsqueeze(0),
+            comb.unsqueeze(0),
+            x.unsqueeze(0),
+            post.unsqueeze(0),
+        ).squeeze(0)

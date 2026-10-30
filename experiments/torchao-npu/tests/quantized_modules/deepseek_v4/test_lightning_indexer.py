@@ -19,9 +19,9 @@ from torchao_npu.quantized_modules.deepseek_v4 import lightning_indexer
 @pytest.mark.parametrize("batch", [1, 2])
 def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     tokens, heads, dim, topk = 8, 2, 4, 4
-    query = torch.zeros(batch, tokens, heads, dim, dtype=torch.bfloat16, requires_grad=True)
-    key = torch.zeros(batch, 2, dim, dtype=torch.bfloat16, requires_grad=True)
-    weights = torch.zeros(batch, tokens, heads, dtype=torch.bfloat16, requires_grad=True)
+    query = torch.zeros(batch * tokens, heads, dim, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros(batch * 2, dim, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.zeros(batch * tokens, heads, dtype=torch.bfloat16, requires_grad=True)
     forward_record = torch.tensor([7], dtype=torch.int32)
     backward_record = torch.tensor([9], dtype=torch.int32)
     cu_q = torch.arange(batch + 1, dtype=torch.int32) * tokens
@@ -36,9 +36,9 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
         # The host adapter establishes packed TND operands before the autograd node.
         assert md is metadata
         return lightning_indexer.QuantizedLightningIndexerInputs(
-            query=q.flatten(0, 1),
-            key=k.flatten(0, 1).unsqueeze(1).contiguous(),
-            weights=w.flatten(0, 1).float(),
+            query=q,
+            key=k.unsqueeze(1).contiguous(),
+            weights=w.float(),
             topk=topk,
             metadata=md.forward,
             cu_seqlens_q=cu_q,
@@ -73,11 +73,11 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     indices, scores = selector(query, key, weights, attention_metadata=metadata)
 
     assert selector.forward.__func__ is lightning_indexer.quantized_lightning_indexer_forward
-    assert indices.shape == (batch, tokens, topk) and indices.dtype == torch.int32
+    assert indices.shape == (batch * tokens, topk) and indices.dtype == torch.int32
     assert not indices.requires_grad
     assert scores.shape == indices.shape and scores.dtype == torch.float32
     assert scores.grad_fn is not None
-    torch.testing.assert_close(indices[0, 0], torch.tensor([1, 0, -1, -1], dtype=torch.int32))
+    torch.testing.assert_close(indices[0], torch.tensor([1, 0, -1, -1], dtype=torch.int32))
     assert seen["forward"]["metadata"] is forward_record
     assert seen["forward"]["quant_mode"] == 5
     assert seen["forward"]["topk"] == topk
@@ -87,7 +87,7 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
         assert operands.shape == expected_shape
 
     # The real attention emits teacher mass with padding zeroed and softmax_scale applied.
-    teacher = torch.tensor([8.0, 4.0, 0.0, 0.0]).expand(batch, tokens, topk)
+    teacher = torch.tensor([8.0, 4.0, 0.0, 0.0]).expand(batch * tokens, topk)
     scores.data.fill_(float("nan"))
     scores.backward(teacher)
 
@@ -112,16 +112,16 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
 
 
 def test_module_swap_rejects_missing_teacher_gradient(monkeypatch):
-    query = torch.ones(1, 2, 1, 4, dtype=torch.bfloat16, requires_grad=True)
-    key = torch.ones(1, 1, 4, dtype=torch.bfloat16, requires_grad=True)
-    weights = torch.ones(1, 2, 1, dtype=torch.bfloat16, requires_grad=True)
+    query = torch.ones(2, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.ones(1, 4, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.ones(2, 1, dtype=torch.bfloat16, requires_grad=True)
     record = torch.tensor([7], dtype=torch.int32)
 
     def input_adapter(module, q, k, w, metadata):
         return lightning_indexer.QuantizedLightningIndexerInputs(
-            query=q.flatten(0, 1),
-            key=k.flatten(0, 1).unsqueeze(1),
-            weights=w.flatten(0, 1).float(),
+            query=q,
+            key=k.unsqueeze(1),
+            weights=w.float(),
             topk=1,
             metadata=metadata,
             cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),

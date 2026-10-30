@@ -20,12 +20,12 @@ import torch.distributed as dist
 import torch_npu
 from torch.distributed._tensor import DTensor
 from torch.optim.optimizer import Optimizer, _get_scalar_dtype, _use_grad_for_differentiable
-from torchtitan.components.checkpoint_utils import (
+from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
     load_flat_optim_state_dict,
 )
-from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import derive, override
 from torchtitan.distributed.flex_shard.dist_muon import DistMuon
 from torchtitan.tools.logging import logger

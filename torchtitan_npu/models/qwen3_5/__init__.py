@@ -6,10 +6,6 @@
 
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
-from torchtitan_npu.models.qwen3_5._fla_compat import ensure_qwen3_5_importable
-
-ensure_qwen3_5_importable()
-
 from torchtitan_npu.patches.torchtitan.hf_datasets.multimodal import (
     mm_collator as _mm_collator_patch,
 )

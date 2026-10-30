@@ -46,9 +46,9 @@ from dataclasses import dataclass, replace
 import torch
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
 
+from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.packing import require_document_alignment
 from torchtitan_npu.models.common.restore import (
     DOC_CHUNK_LAYOUT,
     RestorePlan,
@@ -112,7 +112,7 @@ class DeepSeekV4Metadata:
     trailing partial group."""
 
     position_k: torch.Tensor
-    """The key stream's own document-relative positions (``[B, C]``, ``C`` the row under one degree).
+    """The key stream's own document-relative positions (``[C]``, ``C`` the row under one degree).
 
     They belong to the stream the key projections read, so they are a property of the geometry, not
     of any module: at one degree they are the input's ``positions``; under context parallelism they
@@ -160,7 +160,7 @@ class DeepSeekV4Metadata:
         """
         if self.cp is None:
             return x
-        return self.cp.restore.apply(x, group=group)
+        return self.cp.restore.apply(x.unsqueeze(0), group=group).squeeze(0)
 
     @staticmethod
     def prepare_cp_metadata(
@@ -268,9 +268,8 @@ def build_v4_metadata(
     builder.
 
     Args:
-        positions: Per-token positions (``[B, S]``, document-relative: each row starts at zero
-            and positions reset at every document start), the convention upstream's
-            ``create_varlen_metadata_for_document`` reads the boundaries from.
+        positions: Per-token positions (``[T]``), resetting at every document start. Upstream
+            ``create_varlen_metadata_for_document`` reads the boundaries from them.
         ratio: The compression ratio this entry describes -- the layer's own.
         cu_seq_q: The row's boundaries, when the caller already has them.  ``None`` derives them
             from ``positions``.
@@ -281,8 +280,8 @@ def build_v4_metadata(
     """
     if ratio < 1:
         raise ValueError(f"a compression ratio must be positive, got {ratio}.")
-    if positions.dim() != 2:
-        raise ValueError(f"positions must be [B, S], got shape {tuple(positions.shape)}.")
+    if positions.dim() != 1:
+        raise ValueError(f"positions must be [T], got shape {tuple(positions.shape)}.")
     if cu_seq_q is None:
         cu_seq_q = create_varlen_metadata_for_document(positions).cu_seq_q
     cu_seq_q = cu_seq_q.to(torch.int32)
@@ -307,7 +306,7 @@ def build_v4_metadata(
         swa_k=swa_k,
         cmp_k=cmp_k,
         position_k=positions,
-        batch_size=positions.size(0),
+        batch_size=1,
         slots=slots,
     )
 
@@ -351,7 +350,7 @@ def doc_chunk_entry(
         q=q,
         swa_k=swa_k,
         cmp_k=cmp_k,
-        position_k=slab_positions(row, cp_size, cp_rank, slab_len),
+        position_k=slab_positions(row, cp_size, cp_rank, slab_len).squeeze(0),
         slots=None,
         cp=CPDeepSeekMetadata(restore=restore),
     )

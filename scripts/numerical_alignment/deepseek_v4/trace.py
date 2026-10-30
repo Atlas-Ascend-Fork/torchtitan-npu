@@ -101,15 +101,18 @@ def _register(core, trace, *, transformers: bool) -> trace_hooks.TraceHookRegist
             inner_attention = _require_attr(attention, "inner_attention")
 
             def attention_core_pre_hook(_module, args, *, prefix=prefix):
-                trace_hooks.record_trace(trace, f"{prefix}.attention.q", args[0])
-                batch = args[0].shape[0]
-                kv = args[1].reshape(batch, -1, args[1].shape[-1])
+                trace_hooks.record_trace(trace, f"{prefix}.attention.q", args[0].unsqueeze(0))
+                kv = args[1]
                 if len(args) > 2 and args[2] is not None and args[2].numel() > 0:
-                    kv = torch.cat([kv, args[2].reshape(batch, -1, args[2].shape[-1])], dim=1)
-                trace_hooks.record_trace(trace, f"{prefix}.attention.kv", kv)
+                    kv = torch.cat([kv, args[2]], dim=0)
+                trace_hooks.record_trace(trace, f"{prefix}.attention.kv", kv.unsqueeze(0))
 
             registry.callback(inner_attention, attention_core_pre_hook, pre=True)
-            registry.forward(inner_attention, f"{prefix}.attention.core")
+            registry.forward(
+                inner_attention,
+                f"{prefix}.attention.core",
+                lambda output: (output[0] if isinstance(output, tuple) else output).unsqueeze(0),
+            )
         registry.forward(moe, f"{prefix}.moe")
         registry.callback(_require_attr(moe, "gate" if transformers else "router"), router_hook)
         # Record the routed output after token combine, rather than the expanded

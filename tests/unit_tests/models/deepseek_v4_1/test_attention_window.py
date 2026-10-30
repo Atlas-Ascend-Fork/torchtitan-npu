@@ -27,7 +27,7 @@ def _window_metadata(bounds: list[int]):
     ``cu_seq_k`` there to the row's own boundaries: the core addresses the row with these
     offsets and never reaches for a pooled axis, so this is the whole contract it consumes.
     """
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
     # Only the row matters here: the builder reads the positions, not this geometry.
     config = CompressedSparseInnerAttention2.Config(window_size=8, softmax_scale=0.5, compress_ratio=0)
     metadata = config.build_attention_metadata(positions)
@@ -43,16 +43,16 @@ def _dense_window_reference(q, kv, sink, bounds, window, scale):
     Written out longhand, independent of the core's helpers: the sink is one more logit in
     the denominator and contributes nothing to the value.
     """
-    _, tokens, heads, dim = q.shape
+    tokens, heads, dim = q.shape
     out = torch.zeros(tokens, heads, dim, dtype=q.dtype)
     for begin, end in pairwise(bounds):
         for position in range(begin, end):
             first = max(begin, position - window + 1)
-            keys = kv[0, first : position + 1]
-            scores = (q[0, position] @ keys.transpose(0, 1)) * scale
+            keys = kv[first : position + 1]
+            scores = (q[position] @ keys.transpose(0, 1)) * scale
             probs = torch.cat((scores, sink[:, None]), dim=1).softmax(dim=1)
             out[position] = probs[:, : keys.shape[0]] @ keys
-    return out.unsqueeze(0)
+    return out
 
 
 @pytest.mark.parametrize("window", [1, 2, 8], ids=["self-only", "partial", "whole-document"])
@@ -60,10 +60,10 @@ def test_window_only_layer_matches_an_explicit_reference(window):
     bounds = [0, 4, 10, 12]  # three documents of 4, 6 and 2 tokens
     metadata = _window_metadata(bounds)
     scale, heads, head_dim = 0.5, 2, 4
-    torch.manual_seed(0)
-    q = torch.randn(1, bounds[-1], heads, head_dim)
-    kv = torch.randn(1, bounds[-1], head_dim)
-    sink = torch.randn(heads)
+    generator = torch.Generator().manual_seed(0)
+    q = torch.randn(bounds[-1], heads, head_dim, generator=generator)
+    kv = torch.randn(bounds[-1], head_dim, generator=generator)
+    sink = torch.randn(heads, generator=generator)
 
     core = attention.CompressedSparseInnerAttention2.Config(
         window_size=window,
@@ -81,10 +81,10 @@ def test_window_only_layer_does_not_leak_across_documents():
     bounds = [0, 4, 10]
     metadata = _window_metadata(bounds)
     window, scale, heads, head_dim = 8, 0.5, 2, 4  # window >= every document: nothing is truncated
-    torch.manual_seed(1)
-    q = torch.randn(1, bounds[-1], heads, head_dim)
-    kv = torch.randn(1, bounds[-1], head_dim)
-    sink = torch.randn(heads)
+    generator = torch.Generator().manual_seed(1)
+    q = torch.randn(bounds[-1], heads, head_dim, generator=generator)
+    kv = torch.randn(bounds[-1], head_dim, generator=generator)
+    sink = torch.randn(heads, generator=generator)
 
     core = attention.CompressedSparseInnerAttention2.Config(
         window_size=window,
@@ -94,8 +94,48 @@ def test_window_only_layer_does_not_leak_across_documents():
     out = core(q, kv, sink, metadata, cmp_k=None, topk_indices=None)
 
     bumped = kv.clone()
-    bumped[0, bounds[1] :] += 10.0  # disturb every later document
+    bumped[bounds[1] :] += 10.0  # disturb every later document
     out_bumped = core(q, bumped, sink, metadata, cmp_k=None, topk_indices=None)
 
     first_document = slice(0, bounds[1])
-    torch.testing.assert_close(out[0, first_document], out_bumped[0, first_document], rtol=0, atol=0)
+    torch.testing.assert_close(out[first_document], out_bumped[first_document], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", (1, 2), ids=("uncompressed-pool", "compressed-pool"))
+def test_sparse_attention_outputs_and_gradients_match_dense_document_reference(ratio):
+    generator = torch.Generator().manual_seed(71)
+    bounds = [0, 4, 8]
+    positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+    config = CompressedSparseInnerAttention2.Config(window_size=2, softmax_scale=0.5, compress_ratio=ratio)
+    core = config.build()
+    metadata = config.build_attention_metadata(positions)
+    q = torch.randn(8, 2, 4, generator=generator, requires_grad=True)
+    local = torch.randn(8, 4, generator=generator, requires_grad=True)
+    compressed = torch.randn(8 // ratio, 4, generator=generator, requires_grad=True)
+    sink = torch.randn(2, generator=generator, requires_grad=True)
+    picks = torch.full((8, 2), -1, dtype=torch.long)
+    for begin, end in pairwise(bounds):
+        for token in range(begin, end):
+            complete = (token - begin + 1) // ratio
+            visible = list(range(max(0, complete - 2), complete))[::-1]
+            picks[token, : len(visible)] = torch.tensor(visible, dtype=torch.long)
+
+    actual = core(q, local, sink, metadata, cmp_k=compressed, topk_indices=picks)
+    reference_inputs = [x.detach().double().requires_grad_() for x in (q, local, compressed, sink)]
+    rq, rl, rc, rs = reference_inputs
+    outputs = []
+    for begin, end in pairwise(bounds):
+        for token in range(begin, end):
+            selected = [begin // ratio + int(i) for i in picks[token] if i >= 0]
+            keys = torch.cat((rl[max(begin, token - 1) : token + 1], rc[selected]))
+            scores = rq[token] @ keys.t() * 0.5
+            probabilities = torch.cat((scores, rs[:, None]), dim=-1).softmax(-1)
+            outputs.append(probabilities[:, :-1] @ keys)
+    expected = torch.stack(outputs)
+    upstream = torch.randn(actual.shape, generator=generator)
+    gradients = torch.autograd.grad(actual, (q, local, compressed, sink), upstream)
+    reference_gradients = torch.autograd.grad(expected, reference_inputs, upstream.double())
+
+    torch.testing.assert_close(actual, expected.float(), rtol=2e-5, atol=2e-6)
+    for gradient, reference in zip(gradients, reference_gradients, strict=True):
+        torch.testing.assert_close(gradient, reference.float(), rtol=2e-5, atol=2e-6)

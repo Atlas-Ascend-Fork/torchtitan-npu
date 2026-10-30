@@ -3,7 +3,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
+
 import torch
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    SingleDatasetConfig,
+)
+
+from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor
+from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
 
 
 def test_debugmodel_uses_the_documented_per_layer_compression_ratios():
@@ -95,43 +107,49 @@ def test_dataloader_pads_documents_to_the_compression_alignment():
     from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
-    assert config.dataloader.per_doc_alignment == 128
-    assert config.training.seq_len % config.dataloader.per_doc_alignment == 0
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    assert isinstance(config.dataloader.dataset, ConcatThenSplitPackingConfig)
+    assert isinstance(config.dataloader.dataset.dataset, SingleDatasetConfig)
+    assert isinstance(config.dataloader.dataset.dataset.processor, AlignedTextProcessor.Config)
+    alignment = config.dataloader.dataset.dataset.processor.per_doc_alignment
+    assert alignment == 128
+    assert config.training.max_context_length % alignment == 0
 
 
-def test_aligned_dataloader_only_inserts_pads():
-    """Alignment must not drop, reorder or rewrite real tokens.
+def test_aligned_dataloader_only_inserts_pads(tmp_path):
+    path = tmp_path / "text.jsonl"
+    path.write_text('{"text":"3 4"}\n{"text":"5"}\n')
+    recipe = deepseek_v4_debugmodel()
+    assert isinstance(recipe.dataloader, GrainDataLoader.Config)
+    recipe.dataloader.shuffle = False
+    recipe.dataloader.repeat = False
+    packing = recipe.dataloader.dataset
+    assert isinstance(packing, ConcatThenSplitPackingConfig)
+    assert isinstance(packing.dataset, SingleDatasetConfig)
+    recipe.dataloader.dataset = replace(
+        packing,
+        dataset=replace(
+            packing.dataset,
+            source=HuggingFaceRandomAccessSource.Config(
+                path="json", split="train", load_dataset_kwargs={"data_files": str(path)}
+            ),
+        ),
+    )
+    loader = recipe.dataloader.build(
+        tokenizer=IntegerTextTokenizer(),
+        dp_world_size=1,
+        dp_rank=0,
+        max_context_length=128,
+        num_tokens_per_batch=256,
+    )
+    try:
+        batches = list(loader)
+    finally:
+        loader.close()
 
-    The aligned loader is the plain loader plus per-document padding: stripping
-    the pads (their labels are ``IGNORE_INDEX``) must give the plain loader's
-    stream, token for token.  That makes the ST loss shift a packing-density
-    (and row-cut placement) effect rather than a data rewrite.
-    """
-    import torch
-    from torchtitan.components.loss import IGNORE_INDEX
-    from torchtitan.components.tokenizer import HuggingFaceTokenizer
-    from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedTextDataset
-
-    tokenizer = HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3")
-
-    def rows(alignment):
-        dataset = AlignedTextDataset(
-            dataset_name="c4_test",
-            dataset_path="tests/assets/c4_test",
-            tokenizer=tokenizer,
-            seq_len=1024,
-            per_doc_alignment=alignment,
-            infinite=True,
-        )
-        rows_out = []
-        for index, (sample, labels) in enumerate(dataset):
-            if index == 2:
-                break
-            rows_out.append((sample["input"], labels))
-        return torch.cat([row[0] for row in rows_out]), torch.cat([row[1] for row in rows_out])
-
-    plain_ids, _ = rows(1)
-    aligned_ids, aligned_labels = rows(128)
-    real_ids = aligned_ids[aligned_labels != IGNORE_INDEX]
-    assert (aligned_labels == IGNORE_INDEX).sum() > 0
-    assert torch.equal(real_ids, plain_ids[: real_ids.numel()])
+    assert len(batches) == 1
+    inputs, labels = batches[0]
+    assert inputs["input"].tolist() == [1, 3, 4] + [0] * 125 + [1, 5] + [0] * 126
+    assert labels.tolist() == [3, 4, 2] + [-100] * 125 + [5, 2] + [-100] * 126
+    assert inputs["positions"].tolist() == list(range(128)) * 2
+    assert inputs["num_valid_tokens"] == 5

@@ -19,11 +19,13 @@ r"""比较两个训练脚本或 Git 版本的 loss 和 grad norm。
 TensorBoard 读取每个 step 的 loss 和 grad_norm → 按 bitwise 或 close 模式判定
 → 将结果写入 comparison.json。
 
-默认在创建 seed checkpoint 和两次训练时设置 `--training.seq-len=4096`、
+默认在创建 seed checkpoint 和两次训练时设置 `--training.max-context-length=4096`、
 `--debug.seed=42`，并启用 `--debug.deterministic`。其他序列长度通过 `--seq-len` 统一指定，
 步数通过 `--steps` 指定，`--no-deterministic` 可关闭确定性算法。这些由脚本控制的选项及固定的
 随机种子、TensorBoard 配置不能放入 `--baseline-options` / `--test-options`。
 `--no-seed-checkpoint` 可跳过共享 checkpoint。
+旧版本可使用 `--baseline-training-api legacy`，将 baseline 的长度参数改为 `--training.seq-len`。
+`--baseline-upstream` / `--test-upstream` 分别指定独立的 TorchTitan 源码目录。
 
 Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-mode distributed`。
 该模式按 baseline 的 NPU 数、入口配置及额外选项构建模型，在训练前保存 step-0，
@@ -132,6 +134,7 @@ import os
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -320,9 +323,9 @@ def resolve_runner(repo_root: Path, runner: Path) -> Path:
     return path
 
 
-def _fixed_training_options(*, deterministic: bool, seq_len: int) -> list[str]:
+def _fixed_training_options(*, deterministic: bool, seq_len: int, training_api: str = "tokens") -> list[str]:
     return [
-        f"--training.seq-len={seq_len}",
+        f"--training.{'max-context-length' if training_api == 'tokens' else 'seq-len'}={seq_len}",
         *(option for option in FIXED_TRAINING_OPTIONS if deterministic or option != "--debug.deterministic"),
     ]
 
@@ -333,6 +336,7 @@ def build_seed_command(
     *,
     deterministic: bool = True,
     seq_len: int = DEFAULT_SEQ_LEN,
+    training_api: str = "tokens",
     distributed: bool = False,
     options: str = "",
 ) -> list[str]:
@@ -361,7 +365,7 @@ def build_seed_command(
         "--checkpoint.no-load-only",
         f"--checkpoint.folder={dump_folder / 'checkpoint'}",
         "--checkpoint.last-save-model-only",
-        *_fixed_training_options(deterministic=deterministic, seq_len=seq_len),
+        *_fixed_training_options(deterministic=deterministic, seq_len=seq_len, training_api=training_api),
     ]
 
 
@@ -374,12 +378,13 @@ def build_training_command(
     seed_checkpoint: Path | None,
     deterministic: bool = True,
     seq_len: int = DEFAULT_SEQ_LEN,
+    training_api: str = "tokens",
 ) -> list[str]:
     command = [
         str(runner),
         f"--dump_folder={dump_folder}",
         *shlex.split(options),
-        *_fixed_training_options(deterministic=deterministic, seq_len=seq_len),
+        *_fixed_training_options(deterministic=deterministic, seq_len=seq_len, training_api=training_api),
         f"--training.steps={steps}",
         f"--metrics.save_tb_folder={TENSORBOARD_FOLDER}",
     ]
@@ -470,13 +475,17 @@ def run_with_realtime_output(
         raise subprocess.CalledProcessError(return_code, command)
 
 
-def training_env(ngpus: int | None, extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
+def training_env(
+    ngpus: int | None, extra_env: Mapping[str, str] | None = None, *, upstream: Path | None = None
+) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
     if ngpus is not None:
         env["NGPU"] = str(ngpus)
+    if upstream is not None:
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(upstream.resolve()), env.get("PYTHONPATH", ""))))
     return env
 
 
@@ -558,7 +567,11 @@ def compare_metric(
         rel_diff = abs_diff / denominator
         errors.append((step, baseline_value, test_value, abs_diff, rel_diff))
 
-        if mode == "bitwise" and first_mismatch is None and not (finite and test_value == baseline_value):
+        if (
+            mode == "bitwise"
+            and first_mismatch is None
+            and not (finite and struct.pack("!d", test_value) == struct.pack("!d", baseline_value))
+        ):
             first_mismatch = {
                 "step": step,
                 "baseline": baseline_value,
@@ -605,7 +618,12 @@ def compare_metric(
         max_re=max_re,
         mean_re=mean_re,
         passed=not (
-            baseline_missing_steps or baseline_extra_steps or test_missing_steps or test_extra_steps or failed_metrics
+            baseline_missing_steps
+            or baseline_extra_steps
+            or test_missing_steps
+            or test_extra_steps
+            or failed_metrics
+            or (mode == "bitwise" and first_mismatch is not None)
         ),
         failed_metrics=failed_metrics,
         missing_steps=missing_steps,
@@ -686,6 +704,7 @@ def write_report(
     thresholds: MetricThresholds,
     comparisons: Sequence[MetricComparison],
     seed_mode: str = "unsharded",
+    runtime_options: Mapping[str, Any] | None = None,
 ) -> None:
     report: dict[str, Any] = {
         "baseline": {
@@ -707,6 +726,7 @@ def write_report(
         "thresholds": asdict(thresholds),
         "passed": all(result.passed for result in comparisons),
         "metrics": [asdict(result) for result in comparisons],
+        "runtime_options": dict(runtime_options or {}),
     }
     with (output_dir / "comparison.json").open("w") as output:
         json.dump(report, output, indent=2)
@@ -806,6 +826,15 @@ def parse_args() -> argparse.Namespace:
         "keep baseline/test training outputs and the comparison report "
         "(default: enabled; --no-cleanup-after-test keeps all artifacts)",
     )
+    for side in ("baseline", "test"):
+        parser.add_argument(
+            f"--{side}-training-api",
+            choices=("legacy", "tokens"),
+            default="tokens",
+            help="sequence-length CLI: legacy seq-len or folded max-context-length; "
+            "pass batch/token budgets in side options",
+        )
+        parser.add_argument(f"--{side}-upstream", type=Path, help="independent TorchTitan source root for this side")
     parser.add_argument("--baseline-options", default="")
     parser.add_argument("--test-options", default="")
     parser.add_argument(
@@ -852,9 +881,10 @@ def parse_args() -> argparse.Namespace:
         option.partition("=")[0].replace("_", "-")
         for option in _fixed_training_options(deterministic=True, seq_len=args.seq_len)
     }
-    managed_keys.update(("--training.steps", "--metrics.save-tb-folder"))
+    managed_keys.update(("--training.steps", "--metrics.save-tb-folder", "--training.seq-len"))
     option_hints = {
         "--training.seq-len": "use --seq-len for seed and both runs",
+        "--training.max-context-length": "use --seq-len for seed and both runs",
         "--training.steps": "use --steps for both runs",
         "--debug.deterministic": "use --no-deterministic to disable deterministic algorithms for both runs",
         "--debug.seed": "the seed is fixed at 42 for seed creation and both runs",
@@ -904,8 +934,8 @@ def main() -> None:
     log_info(f"Test: {test_ref} ({test_commit})")
     base_n = args.baseline_ngpus if args.baseline_ngpus is not None else args.ngpus
     test_n = args.test_ngpus if args.test_ngpus is not None else args.ngpus
-    baseline_env = training_env(base_n, _merged_env(args.baseline_env))
-    test_env = training_env(test_n, _merged_env(args.test_env))
+    baseline_env = training_env(base_n, _merged_env(args.baseline_env), upstream=args.baseline_upstream)
+    test_env = training_env(test_n, _merged_env(args.test_env), upstream=args.test_upstream)
     baseline_npu_processes = describe_npu_processes(base_n, baseline_env)
     test_npu_processes = describe_npu_processes(test_n, test_env)
     log_info(f"Mode: {args.mode}; steps: {args.steps}")
@@ -965,7 +995,9 @@ def main() -> None:
             log_step("Creating shared seed checkpoint")
             seed_dump = output_dir / "seed"
             distributed_seed = args.seed_mode == "distributed"
-            seed_env = training_env(base_n if distributed_seed else 1, _merged_env(args.baseline_env))
+            seed_env = training_env(
+                base_n if distributed_seed else 1, _merged_env(args.baseline_env), upstream=args.baseline_upstream
+            )
             if distributed_seed:
                 # Use this CLI's helper even when the baseline ref predates it.
                 # Expose only the helper, not sibling modules such as utils.
@@ -982,6 +1014,7 @@ def main() -> None:
                     seed_dump,
                     deterministic=not args.no_deterministic,
                     seq_len=args.seq_len,
+                    training_api=args.baseline_training_api,
                     distributed=distributed_seed,
                     options=args.baseline_options,
                 ),
@@ -1005,6 +1038,7 @@ def main() -> None:
                 baseline_dump,
                 steps=args.steps,
                 options=args.baseline_options,
+                training_api=args.baseline_training_api,
                 seed_checkpoint=seed_checkpoint,
                 deterministic=not args.no_deterministic,
                 seq_len=args.seq_len,
@@ -1030,6 +1064,7 @@ def main() -> None:
                 test_dump,
                 steps=args.steps,
                 options=args.test_options,
+                training_api=args.test_training_api,
                 seed_checkpoint=seed_checkpoint,
                 deterministic=not args.no_deterministic,
                 seq_len=args.seq_len,
@@ -1073,6 +1108,14 @@ def main() -> None:
             thresholds=(thresholds if args.mode == "close" else BITWISE_THRESHOLDS),
             comparisons=comparisons,
             seed_mode="none" if args.no_seed_checkpoint else args.seed_mode,
+            runtime_options={
+                side: {
+                    "training_api": getattr(args, f"{side}_training_api"),
+                    "upstream": str(getattr(args, f"{side}_upstream")) if getattr(args, f"{side}_upstream") else None,
+                    "options": getattr(args, f"{side}_options"),
+                }
+                for side in ("baseline", "test")
+            },
         )
         log_success(f"Report written: {output_dir / 'comparison.json'}")
         if not all(result.passed for result in comparisons):

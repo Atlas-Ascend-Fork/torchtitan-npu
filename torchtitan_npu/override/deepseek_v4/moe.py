@@ -55,12 +55,12 @@ class TilelangGroupedExperts(GroupedExperts):
 
         gate_RF = self._grouped_mm(
             A=x_RD.bfloat16(),
-            B_t=self.w1_EFD.bfloat16().transpose(-2, -1),
+            weight_EOI=self.w1_EFD.bfloat16(),
             offs=offsets_E,
         )
         up_RF = self._grouped_mm(
             A=x_RD.bfloat16(),
-            B_t=self.w3_EFD.bfloat16().transpose(-2, -1),
+            weight_EOI=self.w3_EFD.bfloat16(),
             offs=offsets_E,
         )
         swiglu_limit = cast("float", self.swiglu_limit)
@@ -70,7 +70,7 @@ class TilelangGroupedExperts(GroupedExperts):
             h_RF = (h_RF.float() * routed_scores_R.float().reshape(-1, 1)).to(h_RF.dtype)
         return self._grouped_mm(
             A=h_RF,
-            B_t=self.w2_EDF.bfloat16().transpose(-2, -1),
+            weight_EOI=self.w2_EDF.bfloat16(),
             offs=offsets_E,
         ).type_as(x_RD)
 

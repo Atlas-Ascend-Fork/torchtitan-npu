@@ -34,8 +34,6 @@ MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
 CONFIG="${CONFIG:-deepseek_v4_pro_61layers_32experts}"
 
 # Dataloader & Checkpoint
-DATASET="${DATASET:-c4_test}"
-DATASET_PATH="${DATASET_PATH:-tests/assets/c4_test}" # your data path
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
 CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
 CKPT_INIT_LOAD_PATH="${CKPT_INIT_LOAD_PATH:-/path/to/init_load_ckpt}" # your model initial load ckpt path
@@ -50,9 +48,9 @@ DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
 
 # Training
-SEQ_LEN="${SEQ_LEN:-4096}"
-MBS=1
-GBS="${GBS:-256}"
+SEQ_LEN=4096
+NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=4096
+NUM_TOKENS_PER_TRAIN_STEP=1048576
 STEPS="${STEPS:-100}"
 
 # Debug
@@ -74,13 +72,6 @@ HF_ASSETS_ARGS="
     --hf-assets-path ${HF_ASSETS_PATH}
 "
 
-# Dataloader
-DATALOADER_ARGS="
-    --dataloader.dataset ${DATASET}
-    --dataloader.per_doc_alignment $((128 * CP))
-    --dataloader.dataset-path ${DATASET_PATH}
-"
-
 # Parallelism
 PARALLELISM_ARGS="
     --parallelism.spmd-backend ${SPMD_BACKEND}
@@ -95,9 +86,9 @@ PARALLELISM_ARGS="
 
 # Training
 TRAINING_ARGS="
-    --training.local-batch-size ${MBS}
-    --training.global-batch-size ${GBS}
-    --training.seq-len ${SEQ_LEN}
+    --training.num-tokens-per-microbatch-per-dp-rank ${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}
+    --training.num-tokens-per-train-step ${NUM_TOKENS_PER_TRAIN_STEP}
+    --training.max-context-length ${SEQ_LEN}
     --training.steps ${STEPS}
     --training.disable-cuda-graphs
 "
@@ -173,6 +164,7 @@ else
     )
 fi
 
+DSV4_PER_DOC_ALIGNMENT="${DSV4_PER_DOC_ALIGNMENT:-$((128 * CP))}" \
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NODE_IPS="${NODE_IPS}" \
@@ -180,7 +172,6 @@ NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train_multinodes.sh \
     $HF_ASSETS_ARGS \
-    $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
     $DEBUG_ARGS \

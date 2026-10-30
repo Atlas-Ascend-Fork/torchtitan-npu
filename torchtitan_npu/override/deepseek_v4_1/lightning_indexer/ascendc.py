@@ -251,12 +251,12 @@ class AscSelector(Selector):
         topk_indices, topk_scores = _LightningIndexerTND.apply(
             # The batch axis is the packed row, so it is squeezed rather than indexed: every
             # kernel in this path addresses one row.
-            idx_q_BLHiDi.squeeze(0),
+            idx_q_BLHiDi,
             # The keys enter the Function already compacted (arch22): the gather is
             # differentiable, so the teacher's gradient scatters back onto the gathered row and
             # the wrapper's ``S(1) -> R`` reduce-scatter then lands it on the compressor.
-            A3KeyWorkaround.indexer_keys(idx_k_BNDi.squeeze(0), attention_metadata, a5=_IS_A5).unsqueeze(1),
-            weights_BLHi.squeeze(0).float(),
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi, attention_metadata, a5=_IS_A5).unsqueeze(1),
+            weights_BLHi.float(),
             topk,
             self.compress_ratio,
             attention_metadata,
@@ -266,6 +266,6 @@ class AscSelector(Selector):
         # emitted the selection sorted, in the kernels' ``[T, 1, K]`` layout, and the model
         # contract is ``[1, L, K]``.  Sorting at this level instead would desynchronise the
         # saved indices from the teacher (see the Function).
-        topk_indices_BLK = topk_indices.reshape(1, -1, topk)
-        topk_scores_BLK = topk_scores.reshape(1, -1, topk)
+        topk_indices_BLK = topk_indices.reshape(-1, topk)
+        topk_scores_BLK = topk_scores.reshape(-1, topk)
         return topk_indices_BLK, topk_scores_BLK, None

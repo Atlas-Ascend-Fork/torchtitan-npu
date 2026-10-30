@@ -86,10 +86,8 @@ def preprocess(model, tokens, labels, positions, *, parallel_dims=None, parallel
     ``input_dict``, exactly as the trainer hands them over.
     """
     inputs, labels, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "positions": positions, **batch},
-        labels,
+        {"input": tokens, "labels": labels, "positions": positions, **batch},
         parallel_dims=_NO_CP_DIMS if parallel_dims is None else parallel_dims,
-        device=tokens.device,
         parallelism=_NO_SPMD if parallelism is None else parallelism,
     )
     assert "attention_metadata" in extra_kwargs, "expected the attention backends to build the metadata map"
@@ -136,24 +134,20 @@ def install_doc_chunk_cp_shard(monkeypatch) -> None:
     """
     import torchtitan_npu.patches.torchtitan.models.common.decoder as decoder_patch
 
-    def shard(
-        cp_mesh,
-        inputs,
-        attention_masks,
-        load_balancer_type=None,
-        input_seq_dim=1,
-        ptrr_mask_key=None,
-        *,
-        positions=None,
-    ):
-        del attention_masks, ptrr_mask_key
+    def shard(batch, input_sharding, cp_mesh, load_balancer_type=None, ptrr_mask_key=None):
+        del input_sharding, ptrr_mask_key
+        positions = batch.get("positions")
         if load_balancer_type != DOC_CHUNK_LAYOUT or positions is None:
             raise AssertionError("the CPU stand-in only reproduces the doc-chunk layout")
-        slab = inputs[0].size(input_seq_dim) // cp_mesh.size()
+        slab = positions.numel() // cp_mesh.size()
         permutation = doc_chunk_permutation(document_starts(positions), cp_mesh.size(), slab)
         lo = cp_mesh.get_local_rank() * slab
         held = permutation[0][lo : lo + slab]
-        moved = tuple(torch.index_select(tensor, input_seq_dim, held) for tensor in inputs)
-        return moved, None
+        return {
+            key: torch.index_select(value, 0, held)
+            if isinstance(value, torch.Tensor) and value.ndim and value.size(0) == positions.numel()
+            else value
+            for key, value in batch.items()
+        }
 
-    monkeypatch.setattr(decoder_patch, "cp_shard", shard)
+    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", shard)

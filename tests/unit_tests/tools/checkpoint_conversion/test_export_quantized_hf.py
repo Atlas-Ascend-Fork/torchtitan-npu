@@ -578,10 +578,10 @@ def _dsv4_like_config():
             indexer=_NS(num_index_heads=8, index_head_dim=16) if ratio == 4 else None,
         )
 
-    def moe(hash_layer):
+    def moe(layer_id):
         return _NS(
             num_experts=4,
-            router=_NS(top_k=2, hash=hash_layer, score_func="sigmoid", route_scale=2.5, route_norm=True),
+            router=_NS(top_k=2, layer_id=layer_id, n_hash_layers=2, score_func="sigmoid", route_scale=2.5, route_norm=True),
             routed_experts=_NS(inner_experts=_NS(hidden_dim=128, swiglu_limit=10.0)),
             shared_experts=_NS(),
         )
@@ -589,7 +589,7 @@ def _dsv4_like_config():
     layers = [
         _NS(
             attention=attn(ratio),
-            moe=moe(i < 2),
+            moe=moe(i),
             hc_attn_pre=_NS(hc_mult=4, sinkhorn_iters=20, eps=1e-6),
         )
         for i, ratio in enumerate([1, 1, 4, 128])

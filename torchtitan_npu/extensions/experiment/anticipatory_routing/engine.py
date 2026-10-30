@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-from torchtitan.components.checkpoint import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+from torchtitan.components.checkpointer import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import filesystem
 from torchtitan.tools.logging import logger
@@ -142,7 +142,13 @@ class AnticipatoryTrainingEngine:
         # Preprocessing is allowed to mutate its input; keep queued data intact.
         with self._isolated_forward():
             inputs, labels = copy_batch(batch, device=self.device)
-            inputs, _, kwargs = self.trainer.post_dataloading_process(inputs, labels)
+            # The trainer consumes this metadata for loss normalization.
+            inputs.pop("num_valid_tokens", None)
+            inputs, _, kwargs = self.trainer.model_parts[0].preprocess_inputs(
+                {**inputs, "labels": labels},
+                parallel_dims=self.trainer.parallel_dims,
+                parallelism=self.trainer.config.parallelism,
+            )
             with self.trainer.train_context():
                 self.trainer.model_parts[0](inputs, **kwargs)
 

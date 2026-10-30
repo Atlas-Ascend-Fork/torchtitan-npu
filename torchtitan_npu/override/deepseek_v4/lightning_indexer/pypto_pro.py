@@ -143,17 +143,13 @@ class PyPTOProLightningIndexer(LightningIndexer):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("PyPTOProLightningIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOProIndexerTND.apply(
-            idx_q.flatten(0, 1),
+            idx_q,
             # index_select stays outside the Function so dk scatters back to
             # the gathered whole-row keys before the CP wrapper reduce-scatters.
             A3KeyWorkaround.indexer_keys(idx_k, attention_metadata).unsqueeze(1).contiguous(),
-            idx_w.flatten(0, 1).float(),
+            idx_w.float(),
             self.index_topk,
             attention_metadata.ratio,
             attention_metadata,
         )
-        batch, seqlen = idx_q.shape[:2]
-        return (
-            topk_indices.reshape(batch, seqlen, -1),
-            topk_scores.reshape(batch, seqlen, -1),
-        )
+        return topk_indices.squeeze(1), topk_scores.squeeze(1)

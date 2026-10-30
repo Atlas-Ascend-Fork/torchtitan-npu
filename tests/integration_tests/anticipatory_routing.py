@@ -9,12 +9,15 @@ from functools import wraps
 
 
 def main():
-    import torchtitan_npu  # noqa: F401
+    import torchtitan_npu  # noqa: F401, I001
+
+    # Initialize the NPU backend before importing upstream trainer modules.
+    from torchtitan.models.common.moe import TokenChoiceTopKRouter
     from torchtitan.train import main as train_main
-    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-    from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
-    from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
+
     from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import Phase
+    from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
+    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
     original_init, original_step, original_train = TrainerEx.__init__, TrainerEx.train_step, TrainerEx.train
 
@@ -24,7 +27,12 @@ def main():
         assert isinstance(config, TrainerEx.Config)
         assert isinstance(self.checkpointer, CheckpointManager)
         assert self.anticipatory_schedule is not None
-        routers = [m for part in self.model_parts for m in part.modules() if isinstance(m, AnticipatoryHashRouter)]
+        routers = [
+            m
+            for part in self.model_parts
+            for m in part.modules()
+            if isinstance(m, TokenChoiceTopKRouter) and hasattr(m, "_anticipatory_cache")
+        ]
         assert routers, "CLI router override did not construct dynamic anticipatory routers"
         assert all(m._anticipatory_cache is self.anticipatory_schedule.cache for m in routers)
         self._test_injected = False

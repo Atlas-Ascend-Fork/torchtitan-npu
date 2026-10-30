@@ -29,7 +29,7 @@ _WINDOW, _SCALE, _TOPK = 8, 0.25, 8
 
 def _metadata(dsv4, cu):
     """One entry per geometry, the way each layer's own config builds it."""
-    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(cu.tolist())]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(cu.tolist())])
     return {ratio: dsv4.metadata.build_v4_metadata(positions, ratio, cu_seq_q=cu) for ratio in _RATIOS}
 
 
@@ -50,9 +50,9 @@ def _inputs(ratio, cu, seed=0):
     torch.manual_seed(seed)
     seqlen, heads = int(cu[-1]), 3
     n_cmp = 0 if ratio == 1 else seqlen // ratio
-    q = torch.randn(1, seqlen, heads, HD)
-    swa_k = torch.randn(1, seqlen, HD)
-    cmp_k = None if n_cmp == 0 else torch.randn(1, n_cmp, HD)
+    q = torch.randn(seqlen, heads, HD)
+    swa_k = torch.randn(seqlen, HD)
+    cmp_k = None if n_cmp == 0 else torch.randn(n_cmp, HD)
     return q, swa_k, cmp_k, torch.randn(heads)
 
 
@@ -80,9 +80,9 @@ def test_the_core_reads_only_the_packed_offsets(dsv4):
     q, swa_k, cmp_k, sink = _inputs(4, _SHORT)
     torch.manual_seed(2)
     picks = dsv4.compressor.select_compressed_slots(
-        torch.randn(1, seqlen, 4, 8),
-        torch.randn(1, seqlen // 4, 8),
-        torch.randn(1, seqlen, 4),
+        torch.randn(seqlen, 4, 8),
+        torch.randn(seqlen // 4, 8),
+        torch.randn(seqlen, 4),
         common[4].swa_k.cu_seqlens,
         common[4].cmp_k.cu_seqlens,
         _TOPK,
@@ -91,7 +91,7 @@ def test_the_core_reads_only_the_packed_offsets(dsv4):
     with torch.no_grad():
         out = _core(dsv4, 4)(q, swa_k, sink, cmp_k=cmp_k, topk_indices=picks, attention_metadata=common[4])
 
-    assert out.shape == (1, seqlen, 3, HD) and torch.isfinite(out).all()
+    assert out.shape == (seqlen, 3, HD) and torch.isfinite(out).all()
 
 
 def test_hca_slots_stay_inside_the_query_document(dsv4):
@@ -124,7 +124,7 @@ def test_the_teacher_exit_is_reserved_and_inert(dsv4):
         with_lse, lse = _core(dsv4, 128, return_lse=True)(q, swa_k, sink, cmp_k=cmp_k, attention_metadata=metadata[128])
 
     assert torch.equal(plain, with_lse)
-    assert lse.shape == (1, 3, seqlen) and torch.isfinite(lse).all()
+    assert lse.shape == (3, seqlen) and torch.isfinite(lse).all()
 
 
 def test_the_reference_core_ignores_the_selector_scores(dsv4):
@@ -134,14 +134,14 @@ def test_the_reference_core_ignores_the_selector_scores(dsv4):
     q, swa_k, cmp_k, sink = _inputs(4, _SHORT)
     torch.manual_seed(3)
     picks = dsv4.compressor.select_compressed_slots(
-        torch.randn(1, seqlen, 4, 8),
-        torch.randn(1, seqlen // 4, 8),
-        torch.randn(1, seqlen, 4),
+        torch.randn(seqlen, 4, 8),
+        torch.randn(seqlen // 4, 8),
+        torch.randn(seqlen, 4),
         common[4].swa_k.cu_seqlens,
         common[4].cmp_k.cu_seqlens,
         _TOPK,
     )
-    scores = torch.randn(1, seqlen, picks.shape[-1], requires_grad=True)
+    scores = torch.randn(seqlen, picks.shape[-1], requires_grad=True)
 
     with torch.no_grad():
         without = _core(dsv4, 4)(q, swa_k, sink, cmp_k=cmp_k, topk_indices=picks, attention_metadata=common[4])

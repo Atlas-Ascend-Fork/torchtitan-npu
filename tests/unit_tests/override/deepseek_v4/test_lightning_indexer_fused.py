@@ -40,7 +40,7 @@ _GEOMETRY = dict(
 
 
 def _metadata():
-    positions = torch.arange(_TOKENS).unsqueeze(0)
+    positions = torch.arange(_TOKENS)
     config = AscCompressedSparseInnerAttention.Config(
         window_size=_WINDOW,
         compress_ratio=4,
@@ -98,18 +98,18 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch):
     )
 
     torch.manual_seed(0)
-    idx_q = torch.randn(1, _TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)
-    idx_k = torch.randn(1, _TOKENS // 4, _HEAD_DIM, requires_grad=True)
-    idx_w = torch.randn(1, _TOKENS, _HEADS, requires_grad=True)
+    idx_q = torch.randn(_TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)
+    idx_k = torch.randn(_TOKENS // 4, _HEAD_DIM, requires_grad=True)
+    idx_w = torch.randn(_TOKENS, _HEADS, requires_grad=True)
     picks, scores = _indexer()(idx_q, idx_k, idx_w, attention_metadata=md)
 
-    assert picks.shape == (1, _TOKENS, _TOPK) and picks.dtype == torch.int32
+    assert picks.shape == (_TOKENS, _TOPK) and picks.dtype == torch.int32
     assert scores.shape == picks.shape and scores.dtype == torch.float32
     assert torch.equal(
         picks,
-        _kernel_indices().sort(dim=-1, descending=True).values.reshape(1, _TOKENS, _TOPK),
+        _kernel_indices().sort(dim=-1, descending=True).values.reshape(_TOKENS, _TOPK),
     )
-    for row in picks[0]:
+    for row in picks:
         first_pad = (row < 0).nonzero()
         if first_pad.numel():
             assert (row[first_pad[0] :] < 0).all()
@@ -150,9 +150,9 @@ def test_the_carrier_is_a_function_output(monkeypatch):
         lambda *a, **k: (_kernel_indices(), None),
         raising=False,
     )
-    idx_q = torch.zeros(1, _TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)
-    idx_k = torch.zeros(1, _TOKENS // 4, _HEAD_DIM, requires_grad=True)
-    idx_w = torch.zeros(1, _TOKENS, _HEADS, requires_grad=True)
+    idx_q = torch.zeros(_TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)
+    idx_k = torch.zeros(_TOKENS // 4, _HEAD_DIM, requires_grad=True)
+    idx_w = torch.zeros(_TOKENS, _HEADS, requires_grad=True)
     picks, scores = _indexer()(idx_q, idx_k, idx_w, attention_metadata=md)
     assert scores.requires_grad and scores.grad_fn is not None
     assert not picks.requires_grad

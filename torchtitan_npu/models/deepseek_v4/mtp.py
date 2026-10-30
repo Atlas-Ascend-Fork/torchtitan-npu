@@ -114,8 +114,12 @@ def prepare_mtp_batch(
 def _annotate_mtp_batch(batch: MTPBatch) -> None:
     if get_spmd_backend() != "spmd_types":
         return
-    token_layout = {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R}
-    label_layout = {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.I}
+    token_layout = spmd.SpmdType(
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R}, partition_spec=spmd.PartitionSpec(("dp", "cp"), None)
+    )
+    label_layout = spmd.SpmdType(
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.I}, partition_spec=spmd.PartitionSpec(("dp", "cp"), None)
+    )
     spmd.assert_type(batch.input_tokens, token_layout)
     spmd.assert_type(batch.input_valid_mask, token_layout)
     spmd.assert_type(batch.labels, label_layout)
@@ -302,17 +306,17 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         mtp_input_valid_mask: torch.Tensor,
         attention_context: _MTPAttentionContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if prev_hc_hidden.ndim != 4:
+        if prev_hc_hidden.ndim != 3:
             raise ValueError(
                 "DeepSeek-V4 MTP expects an mHC hidden state with shape "
-                "[batch, sequence, hc_mult, hidden], got "
+                "[tokens, hc_mult, hidden], got "
                 f"{tuple(prev_hc_hidden.shape)}."
             )
 
         valid_mask = mtp_input_valid_mask.unsqueeze(-1).unsqueeze(-1).to(dtype=prev_hc_hidden.dtype)
         prev_hc_hidden = prev_hc_hidden * valid_mask
 
-        hidden = self.e_proj(self.enorm(mtp_input_embed)).unsqueeze(2)
+        hidden = self.e_proj(self.enorm(mtp_input_embed)).unsqueeze(1)
         hidden = hidden + self.h_proj(self.hnorm(prev_hc_hidden))
         residual = hidden
         hidden, post, comb = self.hc_attn_pre(hidden)
@@ -325,7 +329,7 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
 
         residual = hidden
         hidden, post, comb = self.hc_ffn_pre(hidden)
-        hidden = self.moe(self.ffn_norm(hidden), input_ids=mtp_input_ids)
+        hidden = self.moe(self.ffn_norm(hidden), input_ids_T=mtp_input_ids)
         next_hc_hidden = self.hc_post(hidden, residual, post, comb)
 
         prediction_hidden = self.hc_head(next_hc_hidden)
@@ -432,7 +436,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
         hidden = tok_embeddings(tokens) if tok_embeddings is not None else tokens
-        hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        hidden = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         for layer in self.layers.values():
             hidden = layer(

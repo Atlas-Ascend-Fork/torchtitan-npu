@@ -71,7 +71,9 @@ def _worker(rank: int, port: int) -> None:
 
         group = dist.group.WORLD
         tokens = torch.arange(_ROW).reshape(1, -1) + 100
-        positions = torch.cat([torch.arange(length) for length in _LENGTHS]).reshape(1, -1)
+        # The folded row's positions are flat; the exchanged streams keep the
+        # packed row's ``[1, ...]`` container the production restore addresses.
+        positions = torch.cat([torch.arange(length) for length in _LENGTHS])
         labels = tokens + 1
         slab = slice(rank * _SLAB, (rank + 1) * _SLAB)
 
@@ -91,12 +93,12 @@ def _worker(rank: int, port: int) -> None:
         expected_positions = torch.cat(
             [torch.arange(rank * (length // _CP), (rank + 1) * (length // _CP)) for length in _LENGTHS]
         ).reshape(1, -1)
-        assert torch.equal(_to_chunks(positions[:, slab], plan, group=group), expected_positions)
+        assert torch.equal(_to_chunks(positions[slab], plan, group=group), expected_positions)
 
         # The restore is the exact inverse, its positions come from the entry, and its backward is
         # the reverse exchange.
         assert torch.equal(to_slab(moved, plan, group=group), tokens[:, slab])
-        assert torch.equal(entry.position_k, slab_positions(row.swa_k.cu_seqlens, _CP, rank, _SLAB))
+        assert torch.equal(entry.position_k, slab_positions(row.swa_k.cu_seqlens, _CP, rank, _SLAB).squeeze(0))
 
         x = (torch.randn(1, _SLAB, 3, dtype=torch.float64) + 10.0 * rank).requires_grad_()
         slabbed = to_slab(x, plan, group=group)

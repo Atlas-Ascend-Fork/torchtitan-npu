@@ -23,15 +23,15 @@ import torchtitan_npu.patches.torchtitan.models.common.rope  # noqa: F401
 @pytest.mark.parametrize("split", [0, 12])
 def test_split_cossin_matches_manual_tail_rotation(split):
     rotary_dim = 8
-    split_rope = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_seq_len=16, split=split))
-    plain = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_seq_len=16))
+    split_rope = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_context_length=16, split=split))
+    plain = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_context_length=16))
 
     torch.manual_seed(7)
     width = split + rotary_dim
     # Different head counts: the broadcasted cache must serve both sites.
-    q = torch.randn(2, 5, 3, width)
-    k = torch.randn(2, 5, 7, width)
-    positions = torch.arange(5).unsqueeze(0)
+    q = torch.randn(10, 3, width)
+    k = torch.randn(10, 7, width)
+    positions = torch.arange(5).repeat(2)
 
     out_q, out_k = split_rope(q, k, positions=positions)
     out_q_only = split_rope(q, positions=positions)
@@ -49,14 +49,14 @@ def test_split_cossin_matches_manual_tail_rotation(split):
 
 def test_split_cossin_forward_and_grad_flow():
     split, rotary_dim = 4, 8
-    rope = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_seq_len=16, split=split))
-    plain = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_seq_len=16))
+    rope = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_context_length=16, split=split))
+    plain = CosSinRoPE(CosSinRoPE.Config(dim=rotary_dim, max_context_length=16))
 
     torch.manual_seed(11)
-    q = torch.randn(2, 5, 3, split + rotary_dim, requires_grad=True)
-    k = torch.randn(2, 5, 3, split + rotary_dim, requires_grad=True)
+    q = torch.randn(10, 3, split + rotary_dim, requires_grad=True)
+    k = torch.randn(10, 3, split + rotary_dim, requires_grad=True)
     q_ref, k_ref = q.detach().clone().requires_grad_(True), k.detach().clone().requires_grad_(True)
-    positions = torch.arange(5).unsqueeze(0)
+    positions = torch.arange(5).repeat(2)
 
     out_q, out_k = rope(q, k, positions=positions)
     ref_q_tail, ref_k_tail = plain(q_ref[..., split:], k_ref[..., split:], positions=positions)
@@ -71,7 +71,7 @@ def test_split_cossin_forward_and_grad_flow():
 
 
 def test_cossin_inverse_is_explicitly_unsupported():
-    rope = CosSinRoPE(CosSinRoPE.Config(dim=8, max_seq_len=16, split=4))
-    cache = rope._reshape_cache(torch.randn(1, 4, 2, 12), None)
+    rope = CosSinRoPE(CosSinRoPE.Config(dim=8, max_context_length=16, split=4))
+    cache = rope._reshape_cache(torch.randn(4, 2, 12), None)
     with pytest.raises(NotImplementedError):
-        CosSinRoPE.apply_rotary_emb(torch.randn(1, 4, 2, 8), torch.randn(1, 4, 2, 8), cache, inverse=True)
+        CosSinRoPE.apply_rotary_emb(torch.randn(4, 2, 8), torch.randn(4, 2, 8), cache, inverse=True)

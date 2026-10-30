@@ -19,6 +19,7 @@ import importlib
 
 import pytest
 import torch.nn as nn
+from torchtitan.components.data import GrainDataLoader
 from torchtitan.config.override import OverrideConfig, apply_overrides
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
@@ -64,7 +65,23 @@ def test_only_the_multimodal_half_carries_vision_parameters(registry):
 def _with_cp(trainer, degree: int):
     # The sequence length is part of a CP config: torchtitan's rope budget is checked
     # against it inside ``update_from_config``, before the attention the gate is about.
-    trainer.training = dataclasses.replace(trainer.training, global_batch_size=8, seq_len=512)
+    trainer.training = dataclasses.replace(
+        trainer.training,
+        num_tokens_per_microbatch_per_dp_rank=512,
+        num_tokens_per_train_step=4096,
+        max_context_length=512,
+    )
+    if isinstance(trainer.dataloader, GrainDataLoader.Config):
+        packing = trainer.dataloader.dataset
+        trainer.dataloader.dataset = dataclasses.replace(
+            packing,
+            dataset=dataclasses.replace(
+                packing.dataset,
+                processor=dataclasses.replace(packing.dataset.processor, per_doc_alignment=2 * degree),
+            ),
+        )
+    else:
+        trainer.dataloader = dataclasses.replace(trainer.dataloader, per_doc_alignment=2 * degree)
     trainer.parallelism = dataclasses.replace(trainer.parallelism, context_parallel_degree=degree)
     return trainer
 
@@ -107,7 +124,8 @@ def test_text_recipe_builds_the_text_stack_and_loader(recipes):
     assert isinstance(trainer.model_spec.model, DeepSeekV41Model.Config)
     assert not isinstance(trainer.model_spec.model, DeepSeekV41MultimodalModel.Config)
     assert type(trainer.dataloader).__name__ == "Config"
-    assert trainer.dataloader.per_doc_alignment == 2
+    assert isinstance(trainer.dataloader, GrainDataLoader.Config)
+    assert trainer.dataloader.dataset.dataset.processor.per_doc_alignment == 2
 
     multimodal = recipes.deepseek_v4_1_debugmodel_multimodal()
     assert isinstance(multimodal.model_spec.model, DeepSeekV41MultimodalModel.Config)

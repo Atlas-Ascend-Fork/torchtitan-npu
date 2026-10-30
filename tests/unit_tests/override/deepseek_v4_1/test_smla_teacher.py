@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import pytest
 import torch
 
@@ -91,15 +96,15 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     scores = torch.tensor([[[float("-inf"), 1.0, 0.0]] * 4], dtype=torch.float32, requires_grad=True)
     indices = torch.tensor([[[-1, 0, 1]] * 4])
     indices[:, 3] = -1
-    q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    q = torch.zeros(4, 1, 4, dtype=torch.bfloat16, requires_grad=True)
 
     def consume(q, scores):
         return attn(
             q,
-            q.squeeze(2),
+            q.squeeze(1),
             torch.zeros(1),
             metadata,
-            cmp_k=q.squeeze(2),
+            cmp_k=q.squeeze(1),
             topk_indices=indices,
             topk_scores=scores,
         )
@@ -169,14 +174,14 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
     )
     attention = build_cpu_model(config)
     attention.train(training)
-    q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16)
+    q = torch.zeros(4, 1, 4, dtype=torch.bfloat16)
     # The port pairs the pool and its selection: one without the other is a contract
     # violation, so the no-pool case carries neither.
     indices = torch.zeros(1, 4, 1, dtype=torch.long) if with_pool else None
-    shared = torch.zeros(1, 4 // ratio, 4, dtype=torch.bfloat16) if with_pool else None
+    shared = torch.zeros(4 // ratio, 4, dtype=torch.bfloat16) if with_pool else None
     out = attention(
         q,
-        q.squeeze(2),
+        q.squeeze(1),
         torch.zeros(1),
         v41_metadata([0, 4], port=config),
         cmp_k=shared,

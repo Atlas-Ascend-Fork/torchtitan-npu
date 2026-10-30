@@ -148,18 +148,14 @@ class PyPTOLightningIndexer(LightningIndexer):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("PyPTOLightningIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOIndexerTND.apply(
-            idx_q.flatten(0, 1),
+            idx_q,
             # The keys enter the Function already compacted (arch22): the gather is
             # differentiable, so the teacher's gradient scatters back onto the gathered row and
             # the wrapper's ``S(1) -> R`` reduce-scatter then lands it on the compressor.
-            A3KeyWorkaround.indexer_keys(idx_k.flatten(0, 1), attention_metadata, a5=_IS_A5).unsqueeze(1).contiguous(),
-            idx_w.flatten(0, 1).float(),
+            A3KeyWorkaround.indexer_keys(idx_k, attention_metadata, a5=_IS_A5).unsqueeze(1).contiguous(),
+            idx_w.float(),
             self.index_topk,
             attention_metadata.ratio,
             attention_metadata,
         )
-        batch, seqlen = idx_q.shape[:2]
-        return (
-            topk_indices.reshape(batch, seqlen, -1),
-            topk_scores.reshape(batch, seqlen, -1),
-        )
+        return topk_indices.squeeze(1), topk_scores.squeeze(1)

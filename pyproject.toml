@@ -7,7 +7,12 @@ name = "torchtitan-npu"
 version = "0.1.0"
 description = "Huawei Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
-dependencies = ["torchtitan", "torch-npu", "attn-gym==0.0.16", "torchvision"]
+dependencies = [
+    "torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@dc3985ad4912f67f71d5a125f2fdf40144ec8354",
+    "torch-npu",
+    "attn-gym==0.0.16",
+    "torchvision",
+]
 
 [project.optional-dependencies]
 multimodal = [
@@ -34,7 +39,19 @@ markers = [
 ]
 
 [tool.pyrefly]
-project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts"]
+project-excludes = [
+    "**/tests/**", "CI", "scripts",
+    # torch.compile debug dumps written by the rope-compile unit tests.
+    "torch_compile_debug",
+    # Kernel DSL tensor annotations are not Python type annotations.
+    "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/pypto_pro",
+    "torchtitan_npu/ops/triton", "torchtitan_npu/ops/tilelang",
+    # Re-enable with the DeepSeek-V3.2 folded-token model migration.
+    "torchtitan_npu/models/deepseek_v3_2/sharding.py",
+    # TorchFT still targets the trainer before the folded-token migration.
+    "torchtitan_npu/patches/torchtitan/experiments/torchft",
+    "torchtitan_npu/extensions/torchtitan/experiments/torchft",
+]
 ignore-missing-imports = [
     "attn_gym",
     "attn_gym.*",

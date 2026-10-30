@@ -45,9 +45,9 @@ SPMD_BACKEND="spmd_types"
 
 # Training
 # Full Flash uses eager execution and the recipe-owned FullAC policy.
-SEQ_LEN="${SEQ_LEN:-1048576}"
-MBS="${MBS:-1}"
-GBS="${GBS:-1}"
+SEQ_LEN=1048576
+NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=1048576
+NUM_TOKENS_PER_TRAIN_STEP=1048576
 STEPS="${STEPS:-10}"
 
 # Debug
@@ -96,9 +96,9 @@ COMPILE_ARGS="
 
 # Training
 TRAINING_ARGS="
-    --training.local-batch-size ${MBS}
-    --training.global-batch-size ${GBS}
-    --training.seq-len ${SEQ_LEN}
+    --training.num-tokens-per-microbatch-per-dp-rank ${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}
+    --training.num-tokens-per-train-step ${NUM_TOKENS_PER_TRAIN_STEP}
+    --training.max-context-length ${SEQ_LEN}
     --training.steps ${STEPS}
     --training.disable-cuda-graphs
     --metrics.log-freq 1

@@ -11,8 +11,9 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import apply_fsdp_to_decoder, apply_fsdp_to_vision_encoder
-from torchtitan.distributed.full_dtensor import (
+from torchtitan.distributed.fsdp import (
+    apply_fsdp_to_decoder,
+    apply_fsdp_to_vision_encoder,
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
@@ -71,6 +72,15 @@ class QwenCPMetadata:
     cu_seqlens: torch.Tensor
     cu_seqlens_cpu: torch.Tensor
     actual_seq_qlen: torch.Tensor
+
+
+QWEN_CONTEXT_PARALLEL_UNSUPPORTED = (
+    "Qwen3.5/3.6 NPU Context Parallel is not migrated to the folded token layout yet: "
+    "the CP GatedDeltaNet and varlen-attention forwards still target the pre-fold "
+    "[B, L, ...] interface, and upstream 0.4.0 moved the GatedDeltaNet seam under "
+    "inner_gated_delta_net. Keep context_parallel_degree at 1 until the CP NPU "
+    "validation pass lands."
+)
 
 
 def parallelize_qwen3_5_npu(model, *, parallel_dims, **kwargs):
@@ -220,9 +230,20 @@ def prepare_sequence_metadata(module, args, kwargs):
 
 
 def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
-    # Keep this guard here as well as in the public dispatcher: recipes may
-    # call the CP helper directly, and VL's mixed multimodal mask path is not
-    # compatible with the sequence-metadata adapter yet.
+    """Refuse the not-yet-migrated Qwen3.5 NPU context-parallel path.
+
+    The CP graph (rank-local ``QwenCPMetadata`` pre-hook, head exchange in the
+    GatedDeltaNet/varlen-attention forwards, and the FSDP2 wrap over the CP
+    storage mesh) still targets the pre-fold ``[B, L, ...]`` modules, while the
+    pinned trainer hands folded ``[T, ...]`` rows to folded attention seams.
+    Wiring the old modules into that contract would train on mis-sharded
+    activations, so the path is disabled until its NPU validation pass lands.
+    The CPU-safe metadata helpers above are kept for that migration and for
+    their unit tests.
+    """
+    # Keep the mode-specific refusals first: recipes may call the CP helper
+    # directly, and those combinations are rejected for their own reasons even
+    # after the folded migration.
     if parallel_dims.ep_enabled:
         raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Expert Parallel yet.")
     if parallel_dims.tp_enabled:
@@ -231,104 +252,7 @@ def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
         raise NotImplementedError(
             "Qwen3.5-VL NPU Context Parallel is not supported for multimodal attention masks yet."
         )
-    mesh = parallel_dims.get_mesh("cp")
-    model.context_parallel_mesh = mesh
-    model.register_forward_pre_hook(prepare_sequence_metadata, with_kwargs=True)
-    for block in model.layers.values():
-        module = block.attn.inner_attention if block.full_attn else block.attn
-        module.context_parallel_mesh = mesh
-
-    training, parallelism = kwargs["training"], kwargs["parallelism"]
-    if parallelism.spmd_backend == "spmd_types":
-        # FSDP2 with dp_mesh_dims (cp axis included when CP is enabled)
-        # requires params to be DTensors on the dense storage mesh;
-        # distribute them before wrapping, mirroring the dispatcher.
-        model.parallelize(parallel_dims)
-    compile_config, ac_config = kwargs["compile_config"], kwargs["ac_config"]
-    model_compile_enabled = compile_config.enable and "model" in compile_config.components
-    ac_policy = None if ac_config is None else ac_config.build(dump_folder=kwargs["dump_folder"])
-    modules = (model,) if model.vision_encoder is None else (model, model.vision_encoder)
-    for module in modules:
-        if ac_policy is not None:
-            ac_policy.apply(module)
-        if model_compile_enabled:
-            _apply_qwen_compile(module, parallel_dims=parallel_dims, compile_config=compile_config)
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-    param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
-    reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
-    if model.vision_encoder is not None:
-        apply_fsdp_to_vision_encoder(
-            model.vision_encoder,
-            dp_mesh,
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-            pp_enabled=False,
-            dp_mesh_dims=dp_mesh_dims,
-        )
-    apply_fsdp_to_decoder(
-        model,
-        dp_mesh,
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        pp_enabled=False,
-        cpu_offload=training.enable_cpu_offload,
-        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=1,
-        edp_mesh=None,
-        dp_mesh_dims=dp_mesh_dims,
-        edp_mesh_dims=None,
-    )
-    return model
-
-
-def _patch_spmd_type_annotation() -> None:
-    """Let rank-local CP masks pass the spmd_types input annotation.
-
-    ``annotate_qwen35_input_spmd_types`` asserts the "deltanet" mask is the
-    global VarlenMetadata; under CP the model pre-hook already replaced the
-    dict entries with rank-local QwenCPMetadata, whose cu_seqlens are ragged
-    across cp ranks and carry no global SPMD type. Strip them (only for the
-    annotation call) instead of failing the assert.
-    """
-    import functools
-
-    try:
-        from torchtitan.models.qwen3_5 import model as qwen3_5_model
-        from torchtitan.models.qwen3_5 import sharding as qwen3_5_sharding
-    except ImportError:
-        return
-
-    original = getattr(
-        qwen3_5_sharding,
-        "_annotate_qwen35_input_spmd_types_original",
-        qwen3_5_sharding.annotate_qwen35_input_spmd_types,
-    )
-    if getattr(qwen3_5_sharding.annotate_qwen35_input_spmd_types, "_cp_patched", False):
-        return
-    qwen3_5_sharding._annotate_qwen35_input_spmd_types_original = original  # pyrefly: ignore [missing-attribute]
-
-    @functools.wraps(original)
-    def _annotated(*args, **kwargs):
-        masks = kwargs.get("attention_masks")
-        if isinstance(masks, dict) and any(isinstance(v, QwenCPMetadata) for v in masks.values()):
-            local = {k: None if isinstance(v, QwenCPMetadata) else v for k, v in masks.items()}
-            kwargs = dict(kwargs)
-            kwargs["attention_masks"] = None if all(v is None for v in local.values()) else local
-        return original(*args, **kwargs)
-
-    _annotated._cp_patched = True  # pyrefly: ignore [missing-attribute]
-    qwen3_5_sharding.annotate_qwen35_input_spmd_types = _annotated
-    if getattr(qwen3_5_model, "annotate_qwen35_input_spmd_types", None) is original:
-        qwen3_5_model.annotate_qwen35_input_spmd_types = _annotated
-
-
-_patch_spmd_type_annotation()
+    raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
 
 
 __all__ = ["QwenCPMetadata", "parallelize_qwen3_5_cp", "parallelize_qwen3_5_npu"]

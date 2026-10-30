@@ -30,7 +30,7 @@ def _masks(num_tokens: int):
     Positions that reset to zero start a document, hence the increasing positions here: the
     selection's numbering and the keys' rows then coincide, which is what these cases compare.
     """
-    return create_varlen_metadata_for_document(torch.arange(num_tokens).unsqueeze(0))
+    return create_varlen_metadata_for_document(torch.arange(num_tokens))
 
 
 _COEFF = 2.0

@@ -1,8 +1,12 @@
 ### V4.1 独立训练基线与融合栈
 
+本分支正在迁移至上游 `dc3985ad4912f67f71d5a125f2fdf40144ec8354`。当前已验证配置构造、HF map 纯文本输入链路（CP=TP=PP=1、partial_dtensor）和 folded 主干/mHC 的局部前反向；真实 attention、MoE、Engram、分布式训练和图文链路尚待后续验收。下文融合与并行配方记录已有设计，不代表迁移后已全部可运行。
+
+训练参数在基础脚本中直接设置；派生入口通过 CLI 覆盖不同的默认值。命令末尾的 `--training.max-context-length`、`--training.num-tokens-per-microbatch-per-dp-rank` 和 `--training.num-tokens-per-train-step` 可覆盖相应参数。单独修改上下文长度不会重算 microbatch，单独修改 microbatch 也不会重算每步预算；需要调整时应同时指定相关参数。预算包括 padding，每步预算须能被「每 rank microbatch token 数 × 有效 DP 度 × PP microbatch 数」整除；CP/EP 不重复计入 DP 度。
+
 V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v4_1` 持有，不依赖 V4 模型或其专属 override。模型默认算子是 Attention Gym 的 eager `gather_attn`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂；模型目录不含 indexer 训练目标，eager 路径也没有：它只在 A5 的两个融合 override 同开时由两者的反向传递，见下文。
 
-当前支持 **FSDP + EP、TP1 / CP1 / PP1、eager 执行与 torch.compile**，保留 FullAC 与图文输入。A3 脚本组织公共实验参数与融合列表，A5 调用 A3 并追加 CPU 亲和性、partial 文本 RoPE、两项 SwiGLUGroup、sparse attention 与 mHC Sinkhorn；两种入口均通过 `USE_GOLDEN=1` 选择 reference。A3 默认融合包含 RMSNorm、文本（`asc_complex`）与视觉 RoPE、MoE token dispatcher 和 mHC post；A5 将文本 RoPE 换为 `asc_partial` 并追加 routed/shared SwiGLUGroup、sparse 与 Sinkhorn。routed experts 的 grouped GEMM 是 reference 与融合共用的公共路径，不再作为独立融合开关。已接入量化入口及 Host Engram；不支持 MTP、DSpark、GraphTrainer；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
+既有配方覆盖 **FSDP + EP、TP1 / CP1 / PP1、eager 执行与 torch.compile**，包含 FullAC 与图文输入；迁移验收范围见开头说明。A3 脚本组织公共实验参数与融合列表，A5 调用 A3 并追加 CPU 亲和性、partial 文本 RoPE、两项 SwiGLUGroup、sparse attention 与 mHC Sinkhorn；两种入口均通过 `USE_GOLDEN=1` 选择 reference。A3 默认融合包含 RMSNorm、文本（`asc_complex`）与视觉 RoPE、MoE token dispatcher 和 mHC post；A5 将文本 RoPE 换为 `asc_partial` 并追加 routed/shared SwiGLUGroup、sparse 与 Sinkhorn。routed experts 的 grouped GEMM 是 reference 与融合共用的公共路径，不再作为独立融合开关。已接入量化入口及 Host Engram；不支持 MTP、DSpark、GraphTrainer；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
 
 **torch.compile 已支持**（每个 TransformerBlock 整图编译，跨层状态为显式前向参数），通过脚本 `"$@"` 透传超参开启：
 
@@ -40,9 +44,9 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
 ```
 
-单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家；均使用 seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
+单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家；上下文上限均为 4096，每 rank microbatch 为 4096 tokens，每步全局为 32768 tokens，使用 FSDP8/EP8、Muon（NS steps=10）、eager 和 FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
-关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
+关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机可通过末尾 CLI 参数调整上下文、microbatch 和每步 token 预算；默认每步预算为 32768 tokens。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
 
 A5 的 `CPU_AFFINITY_CONF` 应按主机拓扑覆盖。通过 `CLI_OVERRIDES` 扩展融合列表：A3 基础列表之外，文本 RoPE 经该通道按硬件选择（A3 默认 `asc_complex`，A5 换为 `asc_partial`），A5 默认追加 SwiGLUGroup、sparse attention、融合 LI 选分与 Sinkhorn，不重复传入 `--override.imports`。显式传 `--override.imports` 会替换整个集合，需自行包含所需的 RoPE 与 swap optimizer。最终选择随 Trainer Config 打印。
 
@@ -65,9 +69,9 @@ DATASET_PATH=/path/to/cc12m_tar_dir \
 bash examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a5.sh
 ```
 
-A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、Muon、eager/FullAC、强制负载均衡，默认开启 SMLA/LI 及 block-FP8 训练。A3 对应 `deepseek_v4_1_flash_cpt_4k_a3.sh`，默认每机 16 卡、其余并行度相同，使用 A3 融合列表且不默认量化。
+A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、每 rank microbatch 4096 tokens、每步全局 4194304 tokens、100 步、Muon、eager/FullAC、强制负载均衡，默认开启 SMLA/LI 及 block-FP8 训练。A3 对应 `deepseek_v4_1_flash_cpt_4k_a3.sh`，默认每机 16 卡、其余并行度相同，使用 A3 融合列表且不默认量化。
 
-`NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 必须为 1。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
+`NGPU`、`EP`、`DP_SHARD`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
 
 初始权重不会因设置 `HF_ASSETS_PATH` 自动加载：需要时设置 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint；保存 checkpoint 另加 `--checkpoint.no-load-only`。默认不启用参数/梯度 CPU offload，保留 `swap_optimizer` 对 Engram 的适配。`USE_GOLDEN=1` 切换 reference override；A5 若还要关闭量化，追加 `--extension.quantization.no-enable-quantized-training`。
 
@@ -83,6 +87,18 @@ Engram HF 表以全局逻辑行保存，不包含本地 padding，支持 EP 分�
 
 当前补齐的是 Engram 表及 gate 的 HF 映射和 MXFP8 读取；V4.1 主线尚不能直接读取官方整包的所有非 Engram 量化权重（例如 Attention），因此开启 quantized 选项不意味着官方整包可以直接开始训练。HF 导出遵循 `export_dtype`，不导出优化器状态，也不生成官方 MXFP8 发布格式。
 
+### 纯文本 Grain 数据入口
+
+纯文本和纯文本 LoRA recipe 使用上游 `GrainDataLoader`、`SingleDatasetConfig` 和
+`ConcatThenSplitPackingConfig`。`AlignedTextProcessor` 在 next-token shift 后按模型压缩比补齐文档，
+默认对齐值为 `2`；CP recipe 可通过 `DSV41_PER_DOC_ALIGNMENT` 指定更大的对齐值。
+默认数据源为 `tests/assets/c4_test/data.json`，自定义源在 Python recipe 中配置。
+
+纯文本 recipe 使用通用 `scripts/run_train.sh` 启动，不传入图文入口的
+`--dataloader.dataset` / `--dataloader.dataset-path`。排序、DP 分片、长文档位置边界和状态恢复均遵循
+当前固定 TorchTitan 的 Grain 管线；旧 loader 的排序和续行规则不再保留，旧数据加载状态不能直接续用，
+模型权重可单独初始化。图像数据入口保持独立。
+
 ### 真实 CC12M 数据入口（图像条件 caption 预测）
 
 数据入口与 GitHub TorchTitan 的 Qwen/Kimi 多模态训练一致，使用 CC12M WebDataset tar（同名 `.jpg` / `.txt` 样本对）。默认 `dataset=cc12m-test`，读取仓内 `tests/assets/cc12m_test/`，无需传入 dataloader 参数；其他本地 tar 目录通过 `--dataloader.dataset-path <cc12m_tar_dir>` 指定。不提供 manifest、离线准备或 digest 专用脚本。
@@ -94,7 +110,7 @@ Engram HF 表以全局逻辑行保存，不包含本地 padding，支持 EP 分�
 
 `cc12m-train-0000.tar` 原样复用 [GitHub TorchTitan v0.3.0 测试资产](https://github.com/pytorch/torchtitan/blob/v0.3.0/tests/assets/cc12m_test/cc12m-train-0000.tar)，包含 32 条图文样本，仅用于测试。完整在线数据源通过 `--dataloader.dataset cc12m` 选择；指定本地目录后，读取的是该目录的数据，而非仓内测试资产。
 
-直接复用上游 `HuggingFaceMultiModalDataset` 的 DP 分片、`MMSamplePacker` 和状态恢复，以及 `ParallelAwareDataloader`。针对 TorchTitan 0.3.0 的 HF 恢复起点跨 epoch 重放问题，按上游文本 loader 的方式补齐 `set_epoch`；packing 缓冲满时调用上游 `flush()`。DSV4.1 只适配协议层：`BOS + 完整图片协议 + caption + EOS`；只有 caption 与 EOS 参与监督，图片特征索引按 pack 中的图片顺序连续编号，每篇文档的位置从零开始。每篇文档按 dataloader 的 `per_doc_alignment`（recipe 由模型压缩比取 LCM 得到，当前为 2）在 EOS 后补至整数个池化组：pad 的 label 为 `-100`，位置继续累加，因此它留在本文档内、既不被监督也不改变下一篇文档的起点。注意 pad 会顶掉奇数长度文档 EOS 的目标（label 在文档内右移，EOS 的下一个位置变成了 pad，而 pad 的 label 是 `-100`），即每篇奇数长度文档少一个监督目标；对齐不覆盖行切分，长于 `seq_len` 的文档仍按行切开，续行另起一套池化组。
+图文 CPT loader 使用上游 Grain 的数据源、packing 和恢复机制，保留 `BOS + 完整图片协议 + caption + EOS`、caption/EOS 监督和逐文档压缩对齐。当前 collator 仍返回 `[1,T]`，图文到 folded decoder 的协议迁移尚未完成。文本 loader 使用 `AlignedTextDataLoader`：逐文档 shift labels、补齐压缩组，再交给 Grain concat-then-split；positions 在切行后归零，再按上下文上限切分。HF map 数据先按 DP 分片，首轮保持原顺序，后续 epoch 按 `seed + epoch` 重排；Grain 负责打包缓冲与恢复。有限数据集结束时，丢弃不足一个 token batch 的尾部；文档内部的对齐 padding 保留在输入中，但 labels 为 `IGNORE_INDEX`，不计入有效 token 数。纯文本已验证从 loader 到公共 Decoder 的 metadata map；streaming 的旧新顺序一致性、CP>1 和 `spmd_types` 输入链路尚未验收。旧 loader 状态格式不与 Grain 状态互通，跨版本对照应从同一 model-only checkpoint 和数据起点开始。
 
 与上游一致，`--dataloader.packing-buffer-size 0` 默认关闭 packing；设置正值（例如 `128`）启用。一个 rank 的 local batch 仍为 1，但一个 packed 序列可以包含多篇图文样本。装箱和合并仍调用上游实现；缓冲量还包括待输出的 packed 队列及 loader 预取，不是进程内存的硬上限。
 
@@ -120,7 +136,7 @@ SFT 复用同目录的 CPT launcher，只替换 dataloader；不另设 checkpoin
 
 图片相对路径默认以数据文件所在目录为根；也可以通过 override 的 `image_root` 指定统一根目录。普通 HTTP(S) URL 不在训练 worker 中下载，需先落盘；data URI 可以直接使用。无图片的纯文本样本沿用同一官方 chat encoding。
 
-默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。超过 `training.seq_len` 的样本被跳过。与 CPT 一样，每个数据并行 rank 处理一条序列（`training.local_batch_size=1`）；这不限制节点数，global batch 由有效 DP 度和梯度累积扩展。`dataloader.num_workers` 等 worker 配置与 tensor batch 独立并正常透传，DP shard 和恢复状态沿用公共 V4.1 数据生命周期。
+默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。SFT loader 仍使用旧上游接口，尚未完成本分支的 Grain 和 folded-token 迁移；本节描述原有监督规则，不作为当前可运行入口。迁移后的长度上限使用 `training.max_context_length`，token 预算由 `training.num_tokens_per_microbatch_per_dp_rank` 和 `training.num_tokens_per_train_step` 指定。
 
 ```sh
 DATASET_PATH=/path/to/vqa.jsonl \
@@ -199,4 +215,6 @@ CPU 单测覆盖模型与融合配置选择、RoPE 输出/梯度等核心行为�
 
 ## LoRA
 
-通过 [LoRA 脚本](deepseek_v4_1_flash_lora_4k_a3.sh) 复用 CPT 入口。默认配置为多模态 `deepseek_v4_1_flash_lora`，设置 `CONFIG=deepseek_v4_1_flash_text_lora` 可选择纯文本模型。AdamW/Muon、Engram 冻结、native DCP 恢复和 PEFT 导出/合并方式见 [V4.1 LoRA 指南](../../docs/feature_guides/deepseek_v4_1_lora.md)。
+通过 [LoRA 脚本](deepseek_v4_1_flash_lora_4k_a3.sh) 复用多模态 CPT 入口，默认配置为 `deepseek_v4_1_flash_lora`。
+纯文本选择 `deepseek_v4_1_flash_text_lora` recipe，并通过通用 `scripts/run_train.sh` 启动。
+AdamW/Muon、Engram 冻结、native DCP 恢复和 PEFT 导出/合并方式见 [V4.1 LoRA 指南](../../docs/feature_guides/deepseek_v4_1_lora.md)。

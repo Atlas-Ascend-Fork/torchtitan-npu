@@ -22,20 +22,20 @@ _RATIO = 4
 _DOC = 8  # three documents of eight tokens: two compressed slots each
 _CU = torch.tensor([0, _DOC, 2 * _DOC, 3 * _DOC], dtype=torch.int32)
 # Per row, the picks in the selection's own numbering; the middle document pads its second slot.
-_PICKS = torch.tensor([[0, 1]] * _DOC + [[0, -1]] * _DOC + [[1, -1]] * _DOC, dtype=torch.int64).view(1, -1, 2)
+_PICKS = torch.tensor([[0, 1]] * _DOC + [[0, -1]] * _DOC + [[1, -1]] * _DOC, dtype=torch.int64).view(-1, 2)
 
 
 def _metadata(dsv4):
-    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())])
     return dsv4.metadata.build_v4_metadata(positions, _RATIO, cu_seq_q=_CU)
 
 
 def _inputs(seqlen, seed=0):
     torch.manual_seed(seed)
     return (
-        torch.randn(1, seqlen, 2, DIM, dtype=torch.float64),
-        torch.randn(1, seqlen // _RATIO, DIM, dtype=torch.float64),
-        torch.randn(1, seqlen, 2, dtype=torch.float64),
+        torch.randn(seqlen, 2, DIM, dtype=torch.float64),
+        torch.randn(seqlen // _RATIO, DIM, dtype=torch.float64),
+        torch.randn(seqlen, 2, dtype=torch.float64),
     )
 
 
@@ -54,21 +54,21 @@ def test_student_logits_rescore_a_document_local_selection(dsv4):
 
     scores = _rescore(dsv4, metadata, idx_q, idx_k, idx_w, _PICKS)
 
-    expected = torch.full((1, seqlen, 2), -torch.inf, dtype=torch.float64)
+    expected = torch.full((seqlen, 2), -torch.inf, dtype=torch.float64)
     for token in range(seqlen):
         start = int(starts[token // _DOC])
-        for slot, local in enumerate(_PICKS[0, token].tolist()):
+        for slot, local in enumerate(_PICKS[token].tolist()):
             if local < 0:
                 continue
-            dot = torch.einsum("hd,d->h", idx_q[0, token], idx_k[0, start + local])
-            expected[0, token, slot] = (dot.relu() * idx_w[0, token]).sum()
+            dot = torch.einsum("hd,d->h", idx_q[token], idx_k[start + local])
+            expected[token, slot] = (dot.relu() * idx_w[token]).sum()
 
     torch.testing.assert_close(scores, expected, rtol=1e-12, atol=1e-12)
     # The marking agrees with the selection slot for slot: only -1 is un-scored.
     assert torch.equal(torch.isfinite(scores), _PICKS >= 0)
     # Reading the same pick row-wide would score document 0's entry instead.
-    row_wide = (torch.einsum("hd,d->h", idx_q[0, _DOC], idx_k[0, 0]).relu() * idx_w[0, _DOC]).sum()
-    assert not torch.isclose(scores[0, _DOC, 0], row_wide)
+    row_wide = (torch.einsum("hd,d->h", idx_q[_DOC], idx_k[0]).relu() * idx_w[_DOC]).sum()
+    assert not torch.isclose(scores[_DOC, 0], row_wide)
 
 
 def test_the_rescore_carries_the_indexer_gradient(dsv4):
@@ -95,7 +95,7 @@ def test_a_document_without_a_pick_gets_no_indexer_gradient(dsv4):
     metadata = _metadata(dsv4)
     seqlen = int(_CU[-1])
     picks = torch.full_like(_PICKS, -1)
-    picks[:, :_DOC] = 0
+    picks[:_DOC] = 0
     idx_q, idx_k, idx_w = (tensor.clone().requires_grad_(True) for tensor in _inputs(seqlen))
 
     _rescore(dsv4, metadata, idx_q, idx_k, idx_w, picks).sum().backward()
@@ -128,7 +128,7 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
 
     picks, scores = module(idx_q, idx_k, idx_w, attention_metadata=metadata)
 
-    assert picks.shape == (1, seqlen, 2) and picks.dtype == torch.int32
+    assert picks.shape == (seqlen, 2) and picks.dtype == torch.int32
     assert scores.shape == picks.shape
     # The reference emits the selection operator's order; only the set and the ``-1``
     # marking are part of the shared contract.
@@ -155,7 +155,7 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
 
 
 def test_lightning_indexer_refuses_a_geometry_without_a_compressed_pool(dsv4):
-    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
+    positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())])
     metadata = dsv4.metadata.build_v4_metadata(positions, 1)
     module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
     idx_q, idx_k, idx_w = _inputs(int(_CU[-1]))

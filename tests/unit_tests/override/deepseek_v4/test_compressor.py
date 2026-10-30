@@ -46,7 +46,7 @@ _FUSED_GEOMETRY = AicpuGeometry(
 
 def _positions(cu: torch.Tensor) -> torch.Tensor:
     """A packed row's document-relative positions, from its boundaries."""
-    return torch.cat([torch.arange(end - start) for start, end in pairwise(cu.tolist())]).unsqueeze(0)
+    return torch.cat([torch.arange(end - start) for start, end in pairwise(cu.tolist())])
 
 
 def _entry(cu: torch.Tensor, ratio: int):
@@ -142,7 +142,7 @@ def _document_pool(x, wkv, wgate, ape, cu, ratio):
 
 def _postprocess(module, pooled, positions):
     normalized = F.rms_norm(pooled, (module.head_dim,), module.norm.weight, module.norm.eps)
-    return module.rope(normalized[None, :, None, :], positions=positions[None, :])[0, :, 0, :]
+    return module.rope(normalized[:, None, :], positions=positions)[:, 0, :]
 
 
 @pytest.fixture
@@ -239,11 +239,11 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
     for length in lengths:
         cu.append(cu[-1] + length)
     boundaries = torch.tensor(cu, dtype=torch.int32)
-    positions = _positions(boundaries).reshape(batch_size, -1)
+    positions = _positions(boundaries)
     metadata = _entry(boundaries, ratio)
     generator = torch.Generator().manual_seed(21)
     x = (
-        (torch.randn(batch_size, cu[-1] // batch_size, module.wkv.in_features, generator=generator) * 0.1)
+        (torch.randn(cu[-1], module.wkv.in_features, generator=generator) * 0.1)
         .half()
         .requires_grad_()
     )
@@ -254,11 +254,9 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
     # Match the operator boundary: accumulate APE gradients in FP32, then cast
     # once back to the BF16 parameter instead of rounding each sliced contribution.
     raw = _document_pool(
-        reference_x.flatten(0, 1), reference.wkv.weight, reference.wgate.weight, reference.ape.float(), cu, ratio
+        reference_x, reference.wkv.weight, reference.wgate.weight, reference.ape.float(), cu, ratio
     )
-    expected = _postprocess(reference, (2 * raw + perturbation).half(), positions.reshape(1, -1)[..., ::ratio]).reshape(
-        batch_size, -1, module.head_dim
-    )
+    expected = _postprocess(reference, (2 * raw + perturbation).half(), positions[::ratio])
     upstream_grad = torch.randn(actual.shape, generator=generator).half()
     actual.backward(upstream_grad)
     expected.backward(upstream_grad)
@@ -294,9 +292,9 @@ def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api,
     module = compressor_factory(4).float()
     reference = copy.deepcopy(module)
     boundaries = torch.arange(batch_size + 1, dtype=torch.int32) * 8
-    positions = _positions(boundaries).reshape(batch_size, 8)
+    positions = _positions(boundaries)
     metadata = _entry(boundaries, 4)
-    x = torch.randn(batch_size, 8, module.wkv.in_features, generator=torch.Generator().manual_seed(17)).requires_grad_()
+    x = torch.randn(batch_size * 8, module.wkv.in_features, generator=torch.Generator().manual_seed(17)).requires_grad_()
     reference_x = x.detach().clone().requires_grad_()
 
     actual = torch.compile(module, backend="aot_eager", fullgraph=True, dynamic=True)(
@@ -403,12 +401,12 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
         exchange.group = _FakeMesh(rank, cp_size)
         carry = exchange(
             shards[rank : rank + 1],
-            positions[..., rank * slab : (rank + 1) * slab],
+            positions[None, rank * slab : (rank + 1) * slab],
             boundaries,
         )
-        pooled = module(carry.x, carry.positions, cu_seqlens=carry.cu_seqlens)
-        pooled = pooled.narrow(1, carry.trim, pooled.size(1) - carry.trim)
-        actual = pooled.squeeze(0)
+        pooled = module(carry.x.squeeze(0), carry.positions.squeeze(0), cu_seqlens=carry.cu_seqlens)
+        pooled = pooled.narrow(0, carry.trim, pooled.size(0) - carry.trim)
+        actual = pooled
         expected = global_expected[rank * (slab // ratio) : (rank + 1) * (slab // ratio)]
         # The CP segments and full documents use different CPU GEMM batch shapes.
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)

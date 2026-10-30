@@ -56,17 +56,15 @@ class TestMHcAdapters:
 
         reference = HcPost.Config().build()
         fused_module = fused.AscV41HcPost.Config().build()
-        # Block-level contract: ``y`` is the collapsed single stream [B, T, D];
-        # ``residual`` is the multi-stream [B, T, n, D].
-        B, T, D, n = 2, 5, 8, 4
-        y = torch.randn(B, T, D, dtype=torch.bfloat16)
-        residual = torch.randn(B, T, n, D, dtype=torch.bfloat16)
-        post = torch.rand(B, T, n, dtype=torch.float32)
-        comb = torch.rand(B, T, n, n, dtype=torch.float32)
+        T, D, n = 5, 8, 4
+        y = torch.randn(T, D, dtype=torch.bfloat16)
+        residual = torch.randn(T, n, D, dtype=torch.bfloat16)
+        post = torch.rand(T, n, dtype=torch.float32)
+        comb = torch.rand(T, n, n, dtype=torch.float32)
 
         def mhc_post(residual, comb, y, post):
             out = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(
-                comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
+                comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
             )
             return out.type_as(y)
 
@@ -86,33 +84,31 @@ class TestMHcAdapters:
             assert ref_t.grad is not None and fused_t.grad is not None, name
             torch.testing.assert_close(fused_t.grad, ref_t.grad, rtol=1e-5, atol=1e-6)
 
-    def test_hc_post_unfolds_the_batch_folded_stream(self, monkeypatch):
-        """Sequence-parallel linears return the collapsed stream as ``[T, D]``;
-        the reference broadcasts that silently, the kernel needs ``[B, T, D]``."""
+    def test_hc_post_passes_folded_token_shapes_to_kernel(self, monkeypatch):
         import torch as torch_mod
 
         from torchtitan_npu.override.deepseek_v4_1 import mhc as fused
 
         fused_module = fused.AscV41HcPost.Config().build()
-        B, T, D, n = 1, 5, 8, 4
+        T, D, n = 5, 8, 4
         y_folded = torch.randn(T, D, dtype=torch.bfloat16)
-        residual = torch.randn(B, T, n, D, dtype=torch.bfloat16)
-        post = torch.rand(B, T, n, dtype=torch.float32)
-        comb = torch.rand(B, T, n, n, dtype=torch.float32)
-        expected = HcPost.Config().build()(y_folded.unsqueeze(0), residual, post, comb)
+        residual = torch.randn(T, n, D, dtype=torch.bfloat16)
+        post = torch.rand(T, n, dtype=torch.float32)
+        comb = torch.rand(T, n, n, dtype=torch.float32)
+        expected = HcPost.Config().build()(y_folded, residual, post, comb)
 
         received = []
 
         def mhc_post(x, h_res, h_out, h_post):
             received.append(tuple(t.dim() for t in (x, h_res, h_out, h_post)))
             out = h_post.unsqueeze(-1) * h_out.unsqueeze(-2) + torch.sum(
-                h_res.unsqueeze(-1) * x.unsqueeze(-2), dim=2
+                h_res.unsqueeze(-1) * x.unsqueeze(-2), dim=-3
             )
             return out.type_as(h_out)
 
         monkeypatch.setattr(torch_mod.ops.cann_ops_transformer, "mhc_post", mhc_post)
         actual = fused_module(y_folded, residual, post, comb)
-        assert received[0] == (4, 4, 3, 3)
+        assert received[0] == (3, 3, 2, 2)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_split_sinkhorn_matches_reference_and_feeds_kernel(self, monkeypatch):

@@ -74,15 +74,15 @@ class HostEngramTable(EngramTable):
 
     def forward(
         self,
-        input_ids_BL: torch.Tensor,
-        positions_BL: torch.Tensor | None = None,
+        input_ids_T: torch.Tensor,
+        positions_T: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # EngramTable flattens the token/head axes with ``view``. Nested FSDP
         # warns that returning a view can lose its pre-backward hook if a
         # caller later performs an in-place op, so end the view chain at this
         # module boundary.
-        return super().forward(input_ids_BL, positions_BL, **kwargs).clone()
+        return super().forward(input_ids_T, positions_T, **kwargs).clone()
 
     def _mark_host_weight(self) -> None:
         # Optimizer construction follows parallelize/to_empty, so preserve the

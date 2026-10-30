@@ -27,19 +27,20 @@ from torchtitan_npu.override.common.rope import AscPartialComplexRoPE
 
 SPLIT, ROTARY_DIM = 4, 4
 # Positions are non-zero so a lost rotation cannot hide behind identity.
-POSITIONS = torch.arange(1, 4).unsqueeze(0)
+# Flat per-token positions, as the folded-token attention hands them over.
+POSITIONS = torch.arange(1, 4)
 
 
 def _fresh_pair():
     torch.manual_seed(1234)
-    x = torch.randn(1, 3, 2, SPLIT + ROTARY_DIM, dtype=torch.float32, requires_grad=True)
+    x = torch.randn(3, 2, SPLIT + ROTARY_DIM, dtype=torch.float32, requires_grad=True)
     return x, x.detach().clone().requires_grad_(True)
 
 
 @pytest.mark.parametrize("inverse", [False, True])
 def test_partial_rope_aot_eager_matches_reference(inverse):
     register_cpu_kernels()
-    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_seq_len=16, split=SPLIT))
+    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_context_length=16, split=SPLIT))
     compiled = torch.compile(
         lambda q: fused(q, positions=POSITIONS, inverse=inverse),
         backend="aot_eager",
@@ -71,8 +72,8 @@ def test_partial_rope_compile_preserves_saved_activation(inverse):
     through a view — the recomputed/replayed forward must see the same
     activation the eager pass saw."""
     register_cpu_kernels()
-    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_seq_len=16, split=SPLIT))
-    weight = torch.randn(1, 3, 2, SPLIT + ROTARY_DIM)
+    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_context_length=16, split=SPLIT))
+    weight = torch.randn(3, 2, SPLIT + ROTARY_DIM)
 
     def model(x):
         y = x.exp()
@@ -82,7 +83,7 @@ def test_partial_rope_compile_preserves_saved_activation(inverse):
     compiled_model = torch.compile(model, backend="aot_eager", fullgraph=True)
 
     torch.manual_seed(4321)
-    x = torch.randn(1, 3, 2, SPLIT + ROTARY_DIM, dtype=torch.float32, requires_grad=True)
+    x = torch.randn(3, 2, SPLIT + ROTARY_DIM, dtype=torch.float32, requires_grad=True)
 
     loss = compiled_model(x)
     grad = torch.autograd.grad(loss, x)[0]

@@ -37,7 +37,8 @@ ARGS=(
     --checkpoint.initial-load-in-hf
     --checkpoint.initial-load-model-only
     --dump-folder "${DUMP_FOLDER:-./outputs/qwen3_6_4k_sft}"
-    --training.seq-len "${SEQ_LEN}"
+    --training.max-context-length "${SEQ_LEN}"
+    --training.num-tokens-per-microbatch-per-dp-rank "${SEQ_LEN}"
     "$@"
 )
 

@@ -6,11 +6,12 @@
 
 from dataclasses import dataclass
 
+import cann_ops_transformer  # noqa: F401  (registers the fused operators)
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
+from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.packing import require_document_alignment
 from torchtitan_npu.models.common.restore import (
     DOC_CHUNK_LAYOUT,
     RestorePlan,
@@ -166,7 +167,7 @@ class AscV41Metadata(DeepSeekV41Metadata):
                 f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
                 f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
             )
-        batch_size, row_len = context.positions.shape[0], context.positions.shape[-1]
+        batch_size, row_len = 1, context.positions.shape[0]
         return shard_asc_v41_metadata(
             attention_metadata,
             cp_size=context.cp_mesh.size(),
@@ -295,7 +296,7 @@ def shard_asc_v41_metadata(
     return AscV41Metadata(
         cu_seq_q=cu_seqlens,
         cu_seq_k=attention_metadata.cu_seq_k,
-        position_k=slab_positions(cu_seqlens, cp_size, cp_rank, slab_len),
+        position_k=slab_positions(cu_seqlens, cp_size, cp_rank, slab_len).squeeze(0),
         restore=restore,
         ratio=ratio,
         q=q,
@@ -600,15 +601,10 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
             # identity and no row is copied.
             workaround = attention_metadata.a3_workaround
             assert workaround is not None, "an arch22 entry states the key workaround"
-            swa_k = swa_k.squeeze(0)
             if workaround.swa_k_gather is not None:
                 swa_k = swa_k.index_select(0, workaround.swa_k_gather)
-            swa_k = swa_k.unsqueeze(0)
-            if cmp_k is not None:
-                cmp_k = cmp_k.squeeze(0)
-                if workaround.cmp_k_gather is not None:
-                    cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
-                cmp_k = cmp_k.unsqueeze(0)
+            if cmp_k is not None and workaround.cmp_k_gather is not None:
+                cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
         # Shapes, dtypes and the ratio's KV pairing are the kernels' own contract, checked
         # at the operator boundary rather than restated here.
         # The selection arrives document-local from the selector, which chose it with the
@@ -623,9 +619,9 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
         # is both what SLIKG requires next to ``sparse_indices`` and what SMLA's teacher
         # gradient arrives on.
         output, _lse = _SparseMLA.apply(
-            q.squeeze(0),
-            swa_k.squeeze(0).unsqueeze(1),
-            None if cmp_k is None else cmp_k.squeeze(0).unsqueeze(1),
+            q,
+            swa_k.unsqueeze(1),
+            None if cmp_k is None else cmp_k.unsqueeze(1),
             None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1]),
             attn_sink.float(),
             attention_metadata,

@@ -15,10 +15,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.distributed.parallel_dims import ParallelDims
 
+from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
-from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import DeepSeekV41DataLoader
+from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import DeepSeekV41DataLoader, _process_mm_sample
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -35,26 +38,34 @@ def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=
         packing_buffer_size=packing,
         infinite=infinite,
         per_doc_alignment=alignment,
-    ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, seq_len=512, local_batch_size=1)
+    ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, max_context_length=512, num_tokens_per_batch=512)
 
 
 def _captions(loader):
-    return [tuple(labels[labels != -100].tolist()) for _, labels in loader]
+    try:
+        return [tuple(labels[labels != -100].tolist()) for _, labels in loader]
+    finally:
+        loader.close()
 
 
 def test_packed_images_supervision_and_positions(tokenizer):
     unpacked = _captions(_loader(tokenizer))
     loader = _loader(tokenizer, packing=4)
-    iterator = iter(loader)
-    first = next(iterator)
-    assert loader.dataset._sample_idx == 4  # produce before EOF without an exact-length fit
-    packed = [first, *iterator]
+    try:
+        iterator = iter(loader)
+        first = next(iterator)
+        packed = [first, *iterator]
+    finally:
+        loader.close()
     assert len(packed) < len(unpacked)
     actual_captions = []
     for inputs, labels in packed:
         tokens, positions, types, indices = [
-            inputs[k][0] for k in ("input", "positions", "token_types", "image_feature_indices")
+            inputs[k] for k in ("input", "positions", "token_types", "image_feature_indices")
         ]
+        assert tokens.ndim == labels.ndim == positions.ndim == 1
+        assert type(inputs["num_valid_tokens"]) is int
+        assert inputs["num_valid_tokens"] == (labels != -100).sum()
         starts = (tokens == tokenizer.bos_id).nonzero().flatten().tolist()
         ends = (tokens == tokenizer.eos_id).nonzero().flatten().tolist()
         assert len(starts) == len(ends) == inputs["pixel_values"].shape[0]
@@ -62,33 +73,46 @@ def test_packed_images_supervision_and_positions(tokenizer):
         assert torch.equal(indices[indices >= 0], torch.arange((indices >= 0).sum()))
         for start, end in zip(starts, ends, strict=True):
             assert torch.equal(positions[start : end + 1], torch.arange(end - start + 1))
-            actual_captions.append(tuple(labels[0, start:end][labels[0, start:end] != -100].tolist()))
-            assert labels[0, end] == -100  # no cross-document BOS prediction
-        assert (labels[0, :-1][types[1:] >= 0] == -100).all()
-        mask = labels[0, :-1] != -100
-        assert torch.equal(labels[0, :-1][mask], tokens[1:][mask])
-        assert (labels[0, int(ends[-1]) :] == -100).all()
+            actual_captions.append(tuple(labels[start:end][labels[start:end] != -100].tolist()))
+            assert labels[end] == -100  # no cross-document BOS prediction
+        assert (labels[:-1][types[1:] >= 0] == -100).all()
+        mask = labels[:-1] != -100
+        assert torch.equal(labels[:-1][mask], tokens[1:][mask])
+        assert (labels[int(ends[-1]) :] == -100).all()
+        # All document and padding boundaries must preserve compressor groups.
+        boundaries = (positions == 0).nonzero().flatten()
+        assert (boundaries % 2 == 0).all()
+        tail_start = ((ends[-1] + 2) // 2) * 2
+        assert torch.equal(positions[tail_start:], torch.arange(positions.numel() - tail_start))
     assert sorted(actual_captions) == sorted(unpacked)
 
 
 @pytest.mark.parametrize("consumed", [1, 33])
 def test_packed_loader_resume_pending_samples(tokenizer, consumed):
     original = _loader(tokenizer, packing=8, infinite=True)
-    iterator = iter(original)
-    for _ in range(consumed):
-        next(iterator)
-    state = deepcopy(original.state_dict())
     restored = _loader(tokenizer, packing=8, infinite=True)
-    restored.load_state_dict(state)
-    resumed = iter(restored)
-    # Restore buffered packs both in the first epoch and after all 32 source samples.
-    for _ in range(5):
-        expected, expected_labels = next(iterator)
-        actual, actual_labels = next(resumed)
-        assert torch.equal(actual_labels, expected_labels)
-        assert actual.keys() == expected.keys()
-        for key in expected:
-            assert torch.equal(actual[key], expected[key]), key
+    try:
+        iterator = iter(original)
+        for _ in range(consumed):
+            next(iterator)
+        state = deepcopy(original.state_dict())
+        restored.load_state_dict(state)
+        resumed = iter(restored)
+        # Restore buffered packs both in the first epoch and after all 32 source samples.
+        for _ in range(5):
+            expected, expected_labels = next(iterator)
+            actual, actual_labels = next(resumed)
+            assert torch.equal(actual_labels, expected_labels)
+            assert actual.keys() == expected.keys()
+            for key in expected:
+                # ``num_valid_tokens`` rides the batch as the int the trainer pops.
+                if isinstance(expected[key], torch.Tensor):
+                    assert torch.equal(actual[key], expected[key]), key
+                else:
+                    assert actual[key] == expected[key], key
+    finally:
+        original.close()
+        restored.close()
 
 
 def test_target_grid_fixed_oracle():
@@ -107,8 +131,6 @@ def test_target_grid_fixed_oracle():
 def test_mm_sample_is_padded_to_the_alignment(tokenizer):
     """The multimodal sample parser rounds each document up to the alignment."""
     import tarfile
-
-    from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sample
 
     with tarfile.open(ASSETS / "cc12m_test" / "cc12m-train-0000.tar") as tar:
         members = {name: tar.extractfile(name).read() for name in tar.getnames()}
@@ -134,7 +156,7 @@ def test_mm_sample_is_padded_to_the_alignment(tokenizer):
     assert torch.equal(aligned["positions"], torch.arange(aligned["input_ids"].numel()))
 
 
-def test_mm_loader_rejects_an_alignment_that_does_not_divide_seq_len(tokenizer):
+def test_mm_loader_rejects_an_alignment_that_does_not_divide_context_length(tokenizer):
     with pytest.raises(ValueError, match="per_doc_alignment"):
         _loader(tokenizer, alignment=3)
     with pytest.raises(ValueError, match="per_doc_alignment"):
@@ -149,3 +171,34 @@ def test_recipe_passes_the_model_alignment_to_the_loader():
 
     trainer = cr.deepseek_v4_1_debugmodel_multimodal()
     assert trainer.dataloader.per_doc_alignment == cr._per_doc_alignment(trainer.model_spec) == 2
+
+
+def test_empty_caption_is_filtered_before_packing(tokenizer):
+    assert _process_mm_sample({"jpg": Image.new("RGB", (20, 40)), "txt": ""}, tokenizer) is None
+
+
+def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer):
+    recipe = deepseek_v4_1_debugmodel_multimodal()
+    recipe.parallelism.spmd_backend = "partial_dtensor"
+    with torch.device("meta"):
+        model = recipe.model_spec.model.build()
+    loader = _loader(tokenizer, packing=4)
+    try:
+        batch, labels = next(iter(loader))
+    finally:
+        loader.close()
+    valid = batch.pop("num_valid_tokens")
+    dimensions = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
+    tokens, targets, kwargs = model.preprocess_inputs(
+        {**batch, "labels": labels}, parallel_dims=dimensions, parallelism=recipe.parallelism
+    )
+    assert tokens.ndim == targets.ndim == 1
+    assert valid == (targets != -100).sum()
+    for key in ("positions", "token_types", "image_feature_indices", "pixel_values", "image_grid"):
+        torch.testing.assert_close(kwargs[key], batch[key], rtol=0, atol=0)
+    boundaries = torch.cat(((batch["positions"] == 0).nonzero().flatten(), torch.tensor([512]))).int()
+    for layer in recipe.model_spec.model.layers:
+        attention = layer.attention.inner_attention
+        metadata = kwargs["attention_metadata"][attention.attention_metadata_key]
+        torch.testing.assert_close(metadata.cu_seq_q, boundaries, rtol=0, atol=0)
+        torch.testing.assert_close(metadata.cu_seq_k, boundaries // max(attention.compress_ratio, 1), rtol=0, atol=0)

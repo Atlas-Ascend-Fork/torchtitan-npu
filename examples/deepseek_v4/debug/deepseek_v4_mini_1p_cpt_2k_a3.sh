@@ -7,7 +7,7 @@
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
 #   ./examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --training.steps 5
-# USE_GOLDEN=1 selects the reference combination (the model's default attention).
+# USE_GOLDEN=1 selects reference attention, the RoPE workaround and AdamW.
 # For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
@@ -21,8 +21,7 @@ MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
 CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
 
 # Dataloader & Checkpoint
-DATASET="${DATASET:-c4_test}"
-DATASET_PATH="${DATASET_PATH:-tests/assets/c4_test}" # your data path
+# Dataset selection and source paths belong to the selected MODULE/CONFIG recipe.
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
 CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
 
@@ -37,8 +36,8 @@ SPMD_BACKEND="spmd_types"
 
 # Training
 SEQ_LEN=2048
-MBS=1
-GBS=-1
+NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=2048
+NUM_TOKENS_PER_TRAIN_STEP=-1
 STEPS=100
 
 # Debug
@@ -50,13 +49,6 @@ DEBUG_ARGS="
 # HF assets
 HF_ASSETS_ARGS="
     --hf-assets-path ${HF_ASSETS_PATH}
-"
-
-# Dataloader
-DATALOADER_ARGS="
-    --dataloader.dataset ${DATASET}
-    --dataloader.per_doc_alignment $((128 * CP))
-    --dataloader.dataset-path ${DATASET_PATH}
 "
 
 # Parallelism
@@ -73,9 +65,9 @@ PARALLELISM_ARGS="
 
 # Training
 TRAINING_ARGS="
-    --training.local-batch-size ${MBS}
-    --training.global-batch-size ${GBS}
-    --training.seq-len ${SEQ_LEN}
+    --training.num-tokens-per-microbatch-per-dp-rank ${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}
+    --training.num-tokens-per-train-step ${NUM_TOKENS_PER_TRAIN_STEP}
+    --training.max-context-length ${SEQ_LEN}
     --training.steps ${STEPS}
     --training.disable-cuda-graphs
 "
@@ -124,6 +116,8 @@ OPTIMIZER_OVERRIDES="
 "
 
 if [[ "${USE_GOLDEN}" == "1" ]]; then
+    OPTIMIZER_ARGS="--optimizer.name AdamW --optimizer.lr 1.0e-5"
+    OPTIMIZER_OVERRIDES=""
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
     )
@@ -150,7 +144,6 @@ NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train.sh \
     $HF_ASSETS_ARGS \
-    $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
     $DEBUG_ARGS \

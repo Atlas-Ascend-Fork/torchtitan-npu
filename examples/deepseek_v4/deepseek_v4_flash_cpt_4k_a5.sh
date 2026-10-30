@@ -64,7 +64,7 @@ QUANTIZATION_ARGS=(
 export OPTIMIZER_OVERRIDES=""
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh" \
-    --training.local-batch-size 2 \
+    --training.num-tokens-per-microbatch-per-dp-rank 8192 \
     "${QUANTIZATION_ARGS[@]}" \
     "$@" \
     activation-checkpoint:selective

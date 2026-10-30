@@ -38,8 +38,8 @@ SPMD_BACKEND="spmd_types"
 # Training
 # Retain the validated eager / Muon / FullAC resource crop.
 SEQ_LEN=4096
-MBS=1
-GBS=8
+NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=4096
+NUM_TOKENS_PER_TRAIN_STEP=32768
 STEPS=40
 
 # Debug
@@ -87,9 +87,9 @@ COMPILE_ARGS="
 
 # Training
 TRAINING_ARGS="
-    --training.local-batch-size ${MBS}
-    --training.global-batch-size ${GBS}
-    --training.seq-len ${SEQ_LEN}
+    --training.num-tokens-per-microbatch-per-dp-rank ${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}
+    --training.num-tokens-per-train-step ${NUM_TOKENS_PER_TRAIN_STEP}
+    --training.max-context-length ${SEQ_LEN}
     --training.steps ${STEPS}
     --training.disable-cuda-graphs
     --metrics.log-freq 1

@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import re
 from collections.abc import Callable
 from dataclasses import fields
@@ -10,7 +11,14 @@ from importlib import import_module
 from typing import Any, cast
 
 from torch.distributed.tensor import Shard
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data import (
+    ConcatThenSplitPackingConfig,
+    FirstFitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    SingleDatasetConfig,
+)
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
@@ -40,16 +48,17 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.common.packing import compression_alignment
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
-from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedHuggingfaceDataloader
 
 from . import (
     memory_policy,  # noqa: F401
     model_registry,
 )
+from .chat_encoder import DSV4EncoderConfig
+from .chat_processor import DeepSeekV4ChatProcessor
 from .lora import DEEPSEEK_V4_LORA_TARGETS, DeepSeekV4LoRAConverter
 from .model import DeepSeekV4Model, GraphTrainerDeepSeekV4Model
 from .mtp import MTPChunkedLossWrapper
@@ -264,7 +273,8 @@ def _dsv4_optimizer_config(
 
 def _per_doc_alignment(model_spec: ModelSpec) -> int:
     """The pooling granularity the loader pads every packed document to (V4: 128)."""
-    return compression_alignment(model_spec.model.compress_ratios)  # pyrefly: ignore [missing-attribute]
+    alignment = compression_alignment(cast("DeepSeekV4Model.Config", model_spec.model).compress_ratios)
+    return int(os.environ.get("DSV4_PER_DOC_ALIGNMENT", alignment))
 
 
 def _make_trainer_config(
@@ -275,7 +285,7 @@ def _make_trainer_config(
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> Trainer.Config:
-    model_spec = model_registry(flavor, num_mtp_layers=num_mtp_layers, converters=converters)
+    model_spec = model_registry(flavor, seq_len=seq_len, num_mtp_layers=num_mtp_layers, converters=converters)
     if num_mtp_layers > 0:
         loss = MTPChunkedLossWrapper.Config(
             mtp_scale=0.3,
@@ -299,9 +309,16 @@ def _make_trainer_config(
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
-        dataloader=AlignedHuggingfaceDataloader.Config(
-            dataset="c4_test",
-            per_doc_alignment=_per_doc_alignment(model_spec),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(
+                dataset=SingleDatasetConfig(
+                    source=HuggingFaceRandomAccessSource.Config(
+                        path="json", split="train", load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"}
+                    ),
+                    processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model_spec)),
+                    post_filters=(lambda sample: sample is not None,),
+                ),
+            ),
         ),
         optimizer=_dsv4_optimizer_config(model_spec, lr=1e-5),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -311,8 +328,9 @@ def _make_trainer_config(
             min_lr_factor=0.01,
         ),
         training=TrainingConfig(
-            local_batch_size=local_batch_size,
-            seq_len=seq_len,
+            num_tokens_per_microbatch_per_dp_rank=local_batch_size * model_spec.max_context_length,
+            num_tokens_per_train_step=-1,
+            max_context_length=model_spec.max_context_length,
             steps=100,
         ),
         parallelism=ParallelismConfig(
@@ -373,6 +391,54 @@ def deepseek_v4_flash_lora() -> Trainer.Config:
     )
 
 
+def deepseek_v4_flash_sft(
+    *,
+    dataset_path: str | None = None,
+    flavor: str = "deepseek_v4_flash",
+    seq_len: int = 4096,
+    num_packing_bins: int = 1,
+    chat_encoder: DSV4EncoderConfig | None = None,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    if dataset_path is None:
+        dataset_path = os.environ.get("DSV4_SFT_DATASET", "/path/to/train.jsonl")
+    if not dataset_path:
+        raise ValueError("SFT requires a non-empty dataset_path")
+    config = _make_trainer_config(
+        flavor,
+        local_batch_size=1,
+        seq_len=seq_len,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+    )
+    assert config.model_spec is not None
+    config.dataloader = GrainDataLoader.Config(
+        dataset=FirstFitPackingConfig(
+            dataset=SingleDatasetConfig(
+                source=HuggingFaceRandomAccessSource.Config(
+                    path="json", split="train", load_dataset_kwargs={"data_files": dataset_path}
+                ),
+                processor=DeepSeekV4ChatProcessor.Config(
+                    per_doc_alignment=_per_doc_alignment(config.model_spec),
+                    chat_encoder=DSV4EncoderConfig() if chat_encoder is None else chat_encoder,
+                ),
+                post_filters=(lambda sample: sample is not None,),
+            ),
+            num_packing_bins=num_packing_bins,
+        ),
+    )
+    return config
+
+
+def deepseek_v4_debugmodel_sft() -> Trainer.Config:
+    return deepseek_v4_flash_sft(flavor="debugmodel", seq_len=2048)
+
+
+def deepseek_v4_flash_43layers_16experts_sft() -> Trainer.Config:
+    return deepseek_v4_flash_sft(flavor="deepseek_v4_flash_43layers_16experts")
+
+
 def deepseek_v4_flash_43layers_16experts(
     *,
     num_mtp_layers: int = 0,
@@ -415,9 +481,10 @@ def _torchft_flash_config(
         **config_values(base.optimizer, TorchFTOptimizersContainerEx.Config)
     )
     config = FaultTolerantTrainerEx.Config(**values)
+    assert config.model_spec is not None
     config.fault_tolerance.group_size = 2
     config.fault_tolerance.min_replica_size = 2
-    config.training.global_batch_size = global_batch_size
+    config.training.num_tokens_per_train_step = global_batch_size * config.model_spec.max_context_length
     config.training.disable_cuda_graphs = True
     config.parallelism.expert_parallel_degree = expert_parallel_degree
     config.parallelism.data_parallel_shard_degree = data_parallel_shard_degree
@@ -451,7 +518,9 @@ def deepseek_v4_flash_8p_torchft() -> Trainer.Config:
         data_parallel_shard_degree=4,
         global_batch_size=16,
     )
-    config.training.seq_len = 256
+    config.training.num_tokens_per_microbatch_per_dp_rank = 256
+    assert config.model_spec is not None
+    config.model_spec.max_context_length = 256
     config.debug.seed = 42
     return config
 
@@ -529,6 +598,7 @@ def _graph_trainer_model_registry(flavor: str) -> ModelSpec:
         name=spec.name,
         flavor=flavor,
         model=graph_model,
+        max_context_length=spec.max_context_length,
         parallelize_fn=parallelize_graph_trainer_deepseek_v4,
         pipelining_fn=spec.pipelining_fn,
         post_optimizer_build_fn=spec.post_optimizer_build_fn,

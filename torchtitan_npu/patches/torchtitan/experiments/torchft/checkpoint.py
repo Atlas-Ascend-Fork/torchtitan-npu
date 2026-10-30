@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING, Any, cast
 import torch.distributed as dist
 import torch.nn as nn
 import torchtitan.experiments.torchft.checkpoint
-from torchtitan.components.checkpoint import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+from torchtitan.components.checkpointer import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 from torchtitan.tools.logging import logger
 
 if TYPE_CHECKING:
-    from torchtitan.components.dataloader import BaseDataLoader
+    from torchtitan.components.data.loader import BaseDataLoader
     from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
     from torchtitan.experiments.torchft.manager import TorchFTManager
     from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter

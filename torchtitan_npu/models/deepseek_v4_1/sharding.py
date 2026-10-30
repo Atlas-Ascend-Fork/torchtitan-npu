@@ -23,7 +23,7 @@ from torchtitan.models.common.decoder_sharding import (
     set_decoder_sharding_config,
 )
 from torchtitan.models.common.moe_sharding import expert_param_placement_sparse, set_moe_sharding_config
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 DP, CP, TP = MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP
 
@@ -48,16 +48,16 @@ _replicate_weight = ShardingConfig(
 )
 
 
-def _engram_hidden_placement(*, enable_sp: bool) -> SpmdLayout:
+def _engram_hidden_placement(*, enable_sp: bool) -> spmd.SpmdType:
     if not enable_sp:
-        return dense_activation_placement(tp=spmd.I)
-    return SpmdLayout(
+        return dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    return spmd.SpmdType(
         {
             DP: spmd.V,
             CP: spmd.V,
             TP: spmd.V,
         },
-        partition_spec=(DP, (CP, TP), None, None),
+        partition_spec=spmd.PartitionSpec((DP, CP, TP), None, None),
     )
 
 
@@ -82,20 +82,20 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
         }
     )
     hidden = _engram_hidden_placement(enable_sp=enable_sp)
-    token_src = dense_activation_placement(tp=spmd.R)
+    token_src = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     token_dst = dense_token_ids_sequence_parallel_placement() if enable_sp else token_src
     engram_cfg.sharding_config = ShardingConfig(
         in_src_shardings={
-            "hidden_states_BLMD": hidden,
-            "input_ids_BL": token_src,
-            "positions_BL": token_src,
+            "hidden_states_TMD": hidden,
+            "input_ids_T": token_src,
+            "positions_T": token_src,
             "image_mask": token_src,
             "token_history": token_src,
         },
         in_dst_shardings={
-            "hidden_states_BLMD": hidden,
-            "input_ids_BL": token_dst,
-            "positions_BL": token_dst,
+            "hidden_states_TMD": hidden,
+            "input_ids_T": token_dst,
+            "positions_T": token_dst,
             "image_mask": token_dst,
             "token_history": token_src,
         },
@@ -109,13 +109,13 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
 
 def dense_token_ids_sequence_parallel_placement():
     DP, CP, TP = MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP
-    return SpmdLayout(
+    return spmd.SpmdType(
         {
             DP: spmd.V,
             CP: spmd.V,
             TP: spmd.V,
         },
-        partition_spec=(DP, (CP, TP)),
+        partition_spec=spmd.PartitionSpec((DP, CP, TP)),
     )
 
 
@@ -127,11 +127,11 @@ def set_inner_attention_sharding(inner_cfg) -> None:
     sink keep the placements they have at every degree: the model does the query side's slicing
     and movement itself, so a producer needs no ``S(1)`` source declaration.
     """
-    replicated_activation = dense_activation_placement(tp=spmd.R)
+    replicated_activation = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     row = dense_activation_placement(tp=spmd.R, cp=spmd.R)
 
     placements = {
-        "q": dense_activation_placement(tp=spmd.S(2)),
+        "q": dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0)),
         "swa_k": replicated_activation,
         "cmp_k": replicated_activation,
         "topk_indices": replicated_activation,
@@ -159,7 +159,7 @@ def set_compressor_sharding(compressor_cfg):
 
 
 def set_indexer_sharding(indexer_cfg):
-    replicated_activation = dense_activation_placement(tp=spmd.R)
+    replicated_activation = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     indexer_cfg.sharding_config = ShardingConfig(
         in_src_shardings={
             "x": replicated_activation,
@@ -202,14 +202,16 @@ def set_indexer_sharding(indexer_cfg):
 
 def set_v41_attention_sharding(attention_cfg, *, enable_sp: bool):
     at = attention_cfg
-    attn_x_layout = dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I)
+    attn_x_layout = (
+        dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    )
 
     at.sharding_config = ShardingConfig(
         in_src_shardings={
             "x": attn_x_layout,
         },
         in_dst_shardings={
-            "x": dense_activation_placement(tp=spmd.R),
+            "x": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         },
         state_shardings={"attn_sink": _attn_sink_placement},
     )
@@ -256,30 +258,20 @@ def set_v41_layer_sharding(layer_cfg, *, enable_sp: bool, enable_ep: bool) -> No
         enable_sp=enable_sp,
         expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
     )
-    # Both router extensions are placement contracts as well as parameters: the hash
-    # table reads ``input_ids`` and the vision bias reads ``image_mask``, so each is
-    # declared only where the stack has it.  No V4.1 layer hashes, so its MoE receives no
-    # ``input_ids``; only the multimodal flavor receives an ``image_mask``.
-    if getattr(layer_cfg.moe.router, "hash", False):
-        input_ids_src_placement = dense_activation_placement(tp=spmd.R)
-        input_ids_dst_placement = (
-            dense_token_ids_sequence_parallel_placement() if enable_ep else dense_activation_placement(tp=spmd.R)
+    if getattr(layer_cfg.moe.router, "vision_enabled", False):
+        router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
+        router_sharding.state_shardings["bias_vl"] = _dense_param_rep
+        layer_cfg.moe.router.sharding_config = router_sharding
+        image_mask_src_placement = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+        image_mask_dst_placement = (
+            dense_token_ids_sequence_parallel_placement() if enable_ep else image_mask_src_placement
         )
         layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
-            "input_ids"
-        ] = input_ids_src_placement
-        layer_cfg.moe.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
-            "input_ids"
-        ] = input_ids_dst_placement
-    if getattr(layer_cfg.moe.router, "vision_enabled", False):
-        layer_cfg.moe.router.sharding_config = ShardingConfig(state_shardings={"bias_vl": _dense_param_rep})
-        image_mask_placement = dense_activation_placement(tp=spmd.R)
-        layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
             "image_mask"
-        ] = image_mask_placement
+        ] = image_mask_src_placement
         layer_cfg.moe.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
             "image_mask"
-        ] = image_mask_placement
+        ] = image_mask_dst_placement
 
 
 def set_deepseek_v4_1_sharding_config(

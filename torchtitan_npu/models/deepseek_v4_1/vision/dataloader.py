@@ -11,19 +11,21 @@ the sample parser reads the CC12M WebDataset ``jpg``/``txt`` fields (``cc12m`` /
 alignment, so a compressor group never straddles a document edge (see the
 ``text_datasets`` patch)."""
 
+import copy
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
+from typing import Any
 
+import grain.python as grain
+import numpy as np
 import torch
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
-from torchtitan.components.dataloader import ParallelAwareDataloader
-from torchtitan.hf_datasets.multimodal.mm_datasets import HuggingFaceMultiModalDataset
-from torchtitan.hf_datasets.multimodal.utils.image import resize_to_pixel_budget
-from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
-
-from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import pad_segments_to_multiple
+from torchtitan.components.data import GrainDataLoader
+from torchtitan.components.data.collators import Collator
+from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, MMSamplePackingConfig
 
 from .data import TEXT, ImagePatchProcessor, build_image_token_layout
 
@@ -46,7 +48,9 @@ def _process_mm_sample(sample, tokenizer, *, per_doc_alignment: int = 1, **kwarg
     # pad stays inside its own document (positions continue; the next BOS still
     # resets) and is unsupervised, so it only rounds the document up to a whole
     # number of pooling groups.
-    ids, labels = pad_segments_to_multiple((ids, labels), multiple=per_doc_alignment)
+    padding = -ids.numel() % per_doc_alignment
+    ids = torch.nn.functional.pad(ids, (0, padding))
+    labels = torch.nn.functional.pad(labels, (0, padding), value=-100)
     return {
         "input_ids": ids,
         "labels": labels,
@@ -56,42 +60,22 @@ def _process_mm_sample(sample, tokenizer, *, per_doc_alignment: int = 1, **kwarg
     }
 
 
-class _BufferedSamplePacker(MMSamplePacker):
-    """Use upstream packing with bounded admission even without an exact fit."""
-
-    def add_sample(self, sample):
-        super().add_sample(sample)
-        if len(self._sample_buffer) >= self.buffer_size:
-            self.flush()
-
-
-class _MultiModalDataset(HuggingFaceMultiModalDataset):
-    """Advance HF streaming epochs as TorchTitan's text dataset does.
-
-    TorchTitan 0.3.0's multimodal iterator omits this step, so a restored
-    HF starting state would otherwise be replayed on every subsequent epoch.
-    """
-
-    def _get_data_iter(self):
-        yield from super()._get_data_iter()
-        self._data.set_epoch(self._data.epoch + 1)
-
-    def load_state_dict(self, state_dict):
-        self._data.set_epoch(state_dict["hf_dataset_state"]["epoch"])
-        super().load_state_dict(state_dict)
-
-
 @dataclass
 class _V41Collator:
     seq_len: int
     vocab_size: int
 
-    def __call__(self, batch):
+    def __call__(self, batch) -> tuple[dict[str, Any], torch.Tensor]:
         # The current model uses one document-packed stream per DP rank.
         (sample,) = batch
         ids, labels, positions = (sample[k] for k in ("input_ids", "labels", "positions"))
         images = sample["pixel_values"]
-        starts = (positions == 0).nonzero().flatten().tolist()
+        real_length = sample.get("packed_length", ids.numel())
+        # Grain zero-fills the packed row tail. Reconstruct one padding segment
+        # from its segment IDs rather than treating every zero as a document.
+        positions = positions.clone()
+        positions[real_length:] = torch.arange(ids.numel() - real_length)
+        starts = (positions[:real_length] == 0).nonzero().flatten().tolist()
         types = torch.full_like(ids, TEXT)
         indices = torch.full_like(ids, -1)
         feature_base = 0
@@ -110,28 +94,79 @@ class _V41Collator:
         # BOS labels are already masked, so shifting a pack never supervises
         # EOS -> the next document's BOS. Padding is a separate document.
         targets = torch.nn.functional.pad(labels[1:], (0, pad + 1), value=-100)
-        positions = torch.cat((positions, torch.arange(pad)))
+        positions = torch.cat((positions, torch.arange(ids.numel() - real_length, self.seq_len - real_length)))
         return {
-            "input": tokens.unsqueeze(0),
-            "positions": positions.unsqueeze(0),
-            "token_types": token_types.unsqueeze(0),
-            "image_feature_indices": feature_indices.unsqueeze(0),
+            "input": tokens,
+            "positions": positions,
+            "token_types": token_types,
+            "image_feature_indices": feature_indices,
             "pixel_values": pad_sequence([p for p, _ in images], batch_first=True),
             "image_grid": torch.stack([g for _, g in images]),
-        }, targets.unsqueeze(0)
+        }, targets
 
 
-class DeepSeekV41DataLoader(ParallelAwareDataloader):
-    """Reuse upstream HF sharding, packing, cycling and checkpoint state."""
+class _GrainV41Collator(Collator):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Collator.Config):
+        pass
+
+    def __init__(self, config: Config, *, context):
+        del config
+        self.collate = _V41Collator(context.num_tokens_per_batch, context.tokenizer.get_vocab_size())
+
+    def __call__(self, rows):
+        inputs, labels = self.collate(rows)
+        inputs["num_valid_tokens"] = int((labels != -100).sum())
+        return inputs, labels
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _V41PackingConfig(MMSamplePackingConfig):
+    def build(self, *, context, dataset_iteration_policy):
+        dataset = self.dataset.build(context=context, dataset_iteration_policy=dataset_iteration_policy)
+        dataset = dataset.filter(lambda sample: len(sample["input_ids"]) <= context.max_context_length)
+        dataset = dataset.map(_packing_input)
+        if isinstance(dataset, grain.MapDataset):
+            dataset = dataset.to_iter_dataset(read_options=context.read_options)
+        dataset = grain.experimental.FirstFitPackIterDataset(
+            dataset,
+            length_struct=dict.fromkeys(("input_ids", "labels", "positions"), context.num_tokens_per_batch),
+            padding_struct={"input_ids": 0, "labels": -100, "positions": 0},
+            num_packing_bins=self.num_packing_bins,
+            meta_features=("labels", "positions", "pixel_values"),
+            seed=dataset_iteration_policy.seed,
+            shuffle_bins=dataset_iteration_policy.shuffle,
+        )
+        return dataset.map(_packed_sample)
+
+
+def _packing_input(sample):
+    return {
+        **{key: np.asarray(sample[key]) for key in ("input_ids", "labels", "positions")},
+        "pixel_values": sample["pixel_values"],
+    }
+
+
+def _packed_sample(sample):
+    return {
+        **{key: torch.from_numpy(sample[key]) for key in ("input_ids", "labels", "positions")},
+        "pixel_values": [image for images in sample["pixel_values"] for image in images],
+        "packed_length": int(np.count_nonzero(sample["input_ids_segment_ids"])),
+    }
+
+
+class DeepSeekV41DataLoader(BaseDataLoader):
+    """V4.1 image-caption processing with native Grain ordering and state."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(ParallelAwareDataloader.Config):
+    class Config(BaseDataLoader.Config):
         dataset: str = "cc12m-test"
+        dataset_path: str | None = None
         packing_buffer_size: int = 0
         infinite: bool = True
         per_doc_alignment: int = 1
-        """Per-document pooling granularity (the model's compression alignment);
-        the recipe derives it from the model spec."""
+        seed: int = 42
+        shuffle: bool = False
 
     def __init__(
         self,
@@ -140,55 +175,50 @@ class DeepSeekV41DataLoader(ParallelAwareDataloader):
         tokenizer,
         dp_world_size: int,
         dp_rank: int,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ):
-        if local_batch_size != 1:
-            raise ValueError("DSV4.1 expects one packed sequence per rank (local_batch_size=1)")
         if config.per_doc_alignment < 1:
             raise ValueError("per_doc_alignment must be positive")
-        if seq_len % config.per_doc_alignment:
-            raise ValueError(
-                f"seq_len ({seq_len}) must be a multiple of per_doc_alignment ({config.per_doc_alignment})"
-            )
-        processor = ImagePatchProcessor()
-        dataset = _MultiModalDataset(
-            dataset_name=config.dataset,
-            dataset_path=config.dataset_path,
-            tokenizer=tokenizer,
-            batch_size=local_batch_size,
-            seq_len=seq_len,
-            patch_size=processor.patch_size,
-            temporal_patch_size=1,
-            spatial_merge_size=processor.downsample_ratio,
-            min_pixels=processor.min_pixels,
-            max_pixels=0,
-            image_mean=processor.mean,
-            image_std=processor.std,
-            packing_buffer_size=config.packing_buffer_size,
-            resize_fn=resize_to_pixel_budget,
-            max_patches=0,
-            max_patches_per_side=0,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=config.infinite,
-        )
-        # Instance-local adaptation: no global dataset registry mutation, and
-        # iteration/packing/state remain entirely owned by upstream TorchTitan.
-        dataset.sample_processor = functools.partial(_process_mm_sample, per_doc_alignment=config.per_doc_alignment)
-        if dataset.enable_packing:
-            dataset.packer = _BufferedSamplePacker(
-                max_seq_length=seq_len, buffer_size=config.packing_buffer_size, batch_size=local_batch_size
-            )
-        super().__init__(
+        if any(size % config.per_doc_alignment for size in (max_context_length, num_tokens_per_batch)):
+            raise ValueError("context and token batch sizes must be divisible by per_doc_alignment")
+        dataset = copy.deepcopy(MM_DATASETS[config.dataset])
+        if config.dataset_path is not None:
+            dataset = replace(dataset, source=replace(dataset.source, path=config.dataset_path))
+        dataset = replace(
             dataset,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            batch_size=local_batch_size,
-            collate_fn=_V41Collator(seq_len, tokenizer.get_vocab_size()),
-            num_workers=config.num_workers,
-            persistent_workers=config.persistent_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
+            processor=replace(
+                dataset.processor,
+                sample_processor=functools.partial(_process_mm_sample, per_doc_alignment=config.per_doc_alignment),
+            ),
         )
+        if config.packing_buffer_size > 0:
+            dataset = _V41PackingConfig(dataset=dataset, num_packing_bins=config.packing_buffer_size)
+        self._loader = GrainDataLoader(
+            GrainDataLoader.Config(
+                dataset=dataset,
+                collator=_GrainV41Collator.Config(),
+                seed=config.seed,
+                shuffle=config.shuffle,
+                repeat=config.infinite,
+            ),
+            tokenizer=tokenizer,
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
+            **kwargs,
+        )
+
+    def __iter__(self):
+        return iter(self._loader)
+
+    def state_dict(self):
+        return self._loader.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self._loader.load_state_dict(state_dict)
+
+    def close(self):
+        self._loader.close()

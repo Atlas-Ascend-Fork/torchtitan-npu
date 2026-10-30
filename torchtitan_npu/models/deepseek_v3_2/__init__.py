@@ -107,7 +107,7 @@ def _build_dsv3_2_layers(
                 ),
                 rope=CosSinRoPE.Config(
                     dim=qk_rope_head_dim,
-                    max_seq_len=rope.max_seq_len,
+                    max_context_length=rope.max_context_length,
                     theta=rope.theta,
                     scaling=rope.scaling,
                     rope_factor=rope.rope_factor,
@@ -136,6 +136,7 @@ def _debugmodel_v3_2(
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
+    max_context_length: int = 16384,
 ) -> DeepSeekV32Model.Config:
     dim = 7168
     n_layers = 1
@@ -176,7 +177,7 @@ def _debugmodel_v3_2(
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
             dim=qk_rope_head_dim,
-            max_seq_len=4096 * 4,
+            max_context_length=max_context_length,
             theta=10000.0,
             scaling="yarn",
             rope_factor=40.0,
@@ -223,11 +224,13 @@ def model_registry(
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
+    seq_len: int | None = None,
 ) -> ModelSpec:
     config = deepseekv3_2_configs[flavor](
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_layers=num_mtp_layers,
+        max_context_length=16384 if seq_len is None else seq_len,
     )
     if converters is not None:
         validate_converter_order(converters)
@@ -237,6 +240,7 @@ def model_registry(
         name="deepseek_v3_2",
         flavor=flavor,
         model=config,
+        max_context_length=16384 if seq_len is None else seq_len,
         parallelize_fn=parallelize_deepseek_v3_2,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_post_optimizer_build_fn,

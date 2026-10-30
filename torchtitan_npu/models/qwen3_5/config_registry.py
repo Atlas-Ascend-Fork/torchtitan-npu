@@ -9,8 +9,14 @@
 import os
 from dataclasses import replace
 
+from torchtitan.components.data import (
+    FirstFitPackingConfig,
+    GrainDataLoader,
+    HuggingFaceRandomAccessSource,
+    SingleDatasetConfig,
+)
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
-from torchtitan.hf_datasets.text_datasets import ChatDataLoader
+from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.models.qwen3_5 import config_registry as _upstream_config_registry
 from torchtitan.models.qwen3_5 import model_registry
 from torchtitan.models.qwen3_5.config_registry import qwen35_27b
@@ -64,19 +70,27 @@ def _parallelize_long_text(model, **kwargs):
 
 
 def qwen35_27b_4k_sft() -> Trainer.Config:
-    config = qwen35_27b()
+    config = qwen35_27b(seq_len=4096)
     assert config.model_spec is not None
     config.model_spec = replace(config.model_spec, parallelize_fn=_parallelize_text)
-    config.dataloader = ChatDataLoader.Config(
-        dataset_path="json",
-        load_dataset_kwargs={"data_files": os.environ["DATA_FILES"], "split": "train"},
-        sample_processor=_messages,
-        infinite=True,
+    config.dataloader = GrainDataLoader.Config(
+        dataset=FirstFitPackingConfig(
+            dataset=SingleDatasetConfig(
+                source=HuggingFaceRandomAccessSource.Config(
+                    path="json",
+                    split="train",
+                    load_dataset_kwargs={"data_files": os.environ["DATA_FILES"]},
+                ),
+                processor=ChatProcessor.Config(messages_fn=_messages),
+                post_filters=(lambda sample: sample is not None,),
+            ),
+            num_packing_bins=1,
+        ),
     )
     config.optimizer = default_adamw(lr=1e-4, weight_decay=0.0)
     config.lr_scheduler = LRSchedulersContainer.Config(warmup_steps=16, decay_ratio=1.0, min_lr_factor=0.1)
-    config.training.local_batch_size = 1
-    config.training.seq_len = 4096
+    config.training.num_tokens_per_microbatch_per_dp_rank = 4096
+    config.training.max_context_length = 4096
     config.training.steps = 256
     config.parallelism.data_parallel_shard_degree = -1
     config.parallelism.tensor_parallel_degree = 1
@@ -88,16 +102,27 @@ def qwen35_27b_4k_sft() -> Trainer.Config:
 
 def qwen35_27b_long_text_sft() -> Trainer.Config:
     config = qwen35_27b_4k_sft()
-    config.model_spec = replace(model_registry("27B", attn_backend="varlen"), parallelize_fn=_parallelize_long_text)
-    config.dataloader = ChatDataLoader.Config(
-        dataset_path="json",
-        load_dataset_kwargs={"data_files": os.environ["DATA_FILES"].split(","), "split": "train"},
-        sample_processor=_long_text_messages,
-        infinite=True,
+    config.model_spec = replace(
+        model_registry("27B", seq_len=32768, attn_backend="varlen"), parallelize_fn=_parallelize_long_text
+    )
+    config.dataloader = GrainDataLoader.Config(
+        dataset=FirstFitPackingConfig(
+            dataset=SingleDatasetConfig(
+                source=HuggingFaceRandomAccessSource.Config(
+                    path="json",
+                    split="train",
+                    load_dataset_kwargs={"data_files": os.environ["DATA_FILES"].split(",")},
+                ),
+                processor=ChatProcessor.Config(messages_fn=_long_text_messages),
+                post_filters=(lambda sample: sample is not None,),
+            ),
+            num_packing_bins=1,
+        ),
     )
     config.optimizer = default_adamw(lr=1e-4, weight_decay=0.1)
     config.training.max_norm = 1.0
-    config.training.seq_len = 32768
+    config.training.num_tokens_per_microbatch_per_dp_rank = 32768
+    config.training.max_context_length = 32768
     config.parallelism.context_parallel_degree = 4
     config.parallelism.context_parallel_load_balancer = None
     config.override.imports.extend(

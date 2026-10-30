@@ -352,7 +352,11 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `mhc.tilelang_hc_head` | `HcHead.Config` | `TilelangHcHead.Config` | 使用 `mhc_head_compute_mix_tilelang` (TileLang 融合 kernel) |
 | `moe.tilelang_swiglu_grouped` | `GroupedExperts.Config` | `TilelangGroupedExperts.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
 | `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `TilelangFeedForward.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
-| `moe_router.tilelang` | `HashRouter.Config`（精确匹配） | `TilelangHashRouter.Config` | 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
+| `moe_router.tilelang` | `TokenChoiceTopKRouter.Config`（精确匹配） | `TilelangRouter.Config` | 动态路由使用 TileKernels `topk_gate` |
+| `moe_router.tilelang_v4` | `DeepSeekV4Router.Config`（精确匹配） | `TilelangV4Router.Config` | V4 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
+| `moe_router.tilelang_v41` | `DeepSeekV41Router.Config`（精确匹配） | `TilelangV41Router.Config` | V4.1 动态路由使用 TileKernels `topk_gate` |
+
+DeepSeek-V4 的既有 `moe_router.tilelang` 配置需要改为 `moe_router.tilelang_v4`；V4.1 改用 `moe_router.tilelang_v41`，通用动态 router 使用 `moe_router.tilelang`。
 
 `sparse_attn.asc` 支持记录几何参数（`num_heads`/`head_dim`/`index_num_heads`/`index_head_dim`
 默认 `64`/`512`/`64`/`128`，即 V4-Flash 的发布形状；debug/pro 等其它宽度在同一个入口上给出，例如

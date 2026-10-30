@@ -17,6 +17,7 @@ smoke stays outside the default pool: it needs the vision fixture data and is
 selected explicitly.
 """
 
+import os
 from dataclasses import replace
 
 from tests.integration_tests import OverrideDefinitions
@@ -26,7 +27,8 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
     args = (
         "--override.imports", "torchtitan_npu.override.common.rope.workaround",
         "--hf-assets-path=tests/assets/deepseek_v3", "--training.steps=2",
-        "--training.seq-len=128", "--training.global-batch-size=2",
+        "--training.num-tokens-per-microbatch-per-dp-rank=128",
+        "--training.num-tokens-per-train-step=256", "--training.max-context-length=128",
         "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
         "--checkpoint.enable", "--checkpoint.no-last-save-model-only",
         "--checkpoint.keep-latest-k=0", "--debug.seed=42", "--debug.deterministic",
@@ -47,7 +49,69 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
             "CONFIG": "deepseek_v4_1_lora_multimodal_training",
         },
     )
-    return [text, multimodal]
+    no_engram = OverrideDefinitions(
+        test_name="dsv41_text_no_engram_adamw_1p",
+        test_descr="V4.1 text reference attention/indexer with eager AdamW on one NPU",
+        env_vars=GOLDEN_ENV,
+        override_args=[
+            (
+                "--override.imports",
+                "torchtitan_npu.override.common.rope.workaround",
+                "--hf-assets-path=tests/assets/deepseek_v3",
+                "--training.steps=3",
+                "--training.num-tokens-per-microbatch-per-dp-rank=128",
+                "--training.num-tokens-per-train-step=128",
+                "--training.max-context-length=128",
+                "--parallelism.data-parallel-shard-degree=1",
+                "--parallelism.expert-parallel-degree=1",
+                "--parallelism.data-parallel-replicate-degree=1",
+                "--parallelism.tensor-parallel-degree=1",
+                "--parallelism.context-parallel-degree=1",
+                "--parallelism.pipeline-parallel-degree=1",
+                "--parallelism.context-parallel-load-balancer=None",
+                "--parallelism.spmd-backend=partial_dtensor",
+                "--debug.no-moe-force-load-balance",
+                "--debug.seed=42",
+                "--debug.deterministic",
+                "--optimizer.name=AdamW",
+                "--compile.no-enable",
+                "--no-engram-enabled",
+                "--checkpoint.no-enable",
+                "activation-checkpoint:none",
+            )
+        ],
+        expected_steps=((1, 2, 3),),
+        ngpu=1,
+        use_golden=True,
+        check_loss=False,
+        timeout=1800,
+    )
+    engram_args = tuple(arg for arg in no_engram.override_args[0] if arg != "--no-engram-enabled")
+    # The override consumes values until the next option, so place virtual with RoPE.
+    engram_args = (engram_args[0], engram_args[1], "torchtitan_npu.override.common.optimizer.virtual", *engram_args[2:])
+    engram_1p = replace(
+        no_engram, test_name="dsv41_text_engram_adamw_1p",
+        test_descr="V4.1 Host Engram and virtual AdamW on one NPU",
+        override_args=[engram_args],
+    )
+    engram_2p_args = tuple({
+        "--training.num-tokens-per-train-step=128": "--training.num-tokens-per-train-step=256",
+        "--parallelism.data-parallel-shard-degree=1": "--parallelism.data-parallel-shard-degree=2",
+        "--parallelism.expert-parallel-degree=1": "--parallelism.expert-parallel-degree=2",
+        "activation-checkpoint:none": "activation-checkpoint:full",
+    }.get(arg, arg) for arg in engram_args)
+    engram_2p = replace(
+        engram_1p, test_name="dsv41_text_engram_adamw_ep2_fsdp2",
+        test_descr="V4.1 Host Engram, virtual AdamW, EP2/FSDP2 and FullAC",
+        override_args=[engram_2p_args], ngpu=2,
+    )
+    engram_2p_noac = replace(
+        engram_2p, test_name="dsv41_text_engram_adamw_ep2_fsdp2_noac",
+        test_descr="V4.1 Host Engram, virtual AdamW and EP2/FSDP2 without AC",
+        override_args=[tuple("activation-checkpoint:none" if arg == "activation-checkpoint:full" else arg
+                             for arg in engram_2p_args)],
+    )
+    return [text, multimodal, no_engram, engram_1p, engram_2p_noac, engram_2p]
 
 
 def build_deepseek_v4_1_checkpoint_test_list(
@@ -123,9 +187,11 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                 GOLDEN_OVERRIDES
                 + (
                     "--training.steps=30",
-                    "--training.local-batch-size=1",
-                    "--training.global-batch-size=2",
-                    "--training.seq-len=512",
+                    "--training.num-tokens-per-microbatch-per-dp-rank=512",
+                    "--training.num-tokens-per-train-step=1024",
+                    "--training.max-context-length=512",
+                    "--training.disable-cuda-graphs",
+                    "--compile.no-enable",
                     "--parallelism.spmd-backend=partial_dtensor",
                     "--parallelism.data-parallel-shard-degree=2",
                     "--parallelism.data-parallel-replicate-degree=1",
@@ -166,7 +232,7 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
 
     Restored from the case that was removed with the V4.1 refactor, with the two
     arguments the current config registry needs (``deepseek_v4_1_debugmodel_multimodal``
-    and ``--training.seq-len=512``, the debug model's RoPE limit).  It stays opt-in
+    and ``--training.max-context-length=512``, the debug model's RoPE limit).  It stays opt-in
     because it needs the vision fixture data and because the multimodal forward
     currently dies in ``aclnnIndex`` (DT_COMPLEX64 input) on the 2026-09-20 PTA
     build, which is independent of this case list.
@@ -176,11 +242,12 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
         "--dataloader.dataset-path=tests/assets/cc12m_test",
         "--hf-assets-path=tests/assets/deepseek_v3",
         "--training.steps=2",
-        "--training.seq-len=512",
+        "--training.max-context-length=512",
         "--dataloader.packing-buffer-size=4",
         "--debug.seed=42",
         "--debug.deterministic",
-        f"--training.global-batch-size={ngpu}",
+        "--training.num-tokens-per-microbatch-per-dp-rank=512",
+        f"--training.num-tokens-per-train-step={512 * ngpu}",
         f"--parallelism.data-parallel-shard-degree={ngpu}",
         "--parallelism.data-parallel-replicate-degree=1",
         f"--parallelism.expert-parallel-degree={ngpu}",
@@ -207,3 +274,44 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
             timeout=3600,
         )
     ]
+
+
+def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinitions]:
+    args = (
+        "--override.imports", "torchtitan_npu.override.common.rope.workaround",
+        "torchtitan_npu.override.common.optimizer.virtual",
+        "--dataloader.dataset=cc12m-test", "--dataloader.dataset-path=tests/assets/cc12m_test",
+        "--dataloader.packing-buffer-size=4", "--hf-assets-path=tests/assets/deepseek_v3",
+        "--training.steps=3", "--training.max-context-length=512",
+        "--training.num-tokens-per-microbatch-per-dp-rank=512",
+        "--training.num-tokens-per-train-step=1024",
+        "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
+        "--parallelism.data-parallel-replicate-degree=1", "--parallelism.tensor-parallel-degree=1",
+        "--parallelism.context-parallel-degree=1", "--parallelism.pipeline-parallel-degree=1",
+        "--parallelism.context-parallel-load-balancer=None", "--parallelism.spmd-backend=partial_dtensor",
+        "--debug.no-moe-force-load-balance", "--debug.seed=42", "--debug.deterministic",
+        "--optimizer.name=AdamW", "--compile.no-enable", "--checkpoint.no-enable",
+    )
+    cpt = OverrideDefinitions(
+        test_name="dsv41_multimodal_cpt_reference_ep2_fsdp2",
+        test_descr="V4.1 CPT reference attention with Host Engram, FullAC and virtual AdamW",
+        env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4_1", "CONFIG": "deepseek_v4_1_debugmodel_multimodal"},
+        override_args=[args], expected_steps=((1, 2, 3),), ngpu=2,
+        use_golden=True, check_loss=False, timeout=1800,
+    )
+    # The structured SFT encoder requires a matched official tokenizer/encoding pair.
+    tokenizer = os.environ.get("DSV41_SFT_TOKENIZER_PATH")
+    fixture = os.environ.get("DSV41_SFT_FIXTURE_PATH")
+    if not tokenizer or not fixture:
+        return [cpt]
+    sft_args = tuple({
+        "--dataloader.packing-buffer-size=4": "--dataloader.packing-buffer-size=0",
+        "--dataloader.dataset-path=tests/assets/cc12m_test": f"--dataloader.dataset-path={fixture}",
+        "--hf-assets-path=tests/assets/deepseek_v3": f"--hf-assets-path={tokenizer}",
+    }.get(arg, arg) for arg in args)
+    sft_args = (*sft_args[:3], "torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft", *sft_args[3:])
+    return [cpt, replace(
+        cpt, test_name="dsv41_multimodal_sft_reference_ep2_fsdp2",
+        test_descr="V4.1 official-encoding SFT with Host Engram, FullAC and virtual AdamW",
+        override_args=[sft_args],
+    )]

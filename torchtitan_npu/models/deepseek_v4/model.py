@@ -11,8 +11,7 @@ from torch import nn
 from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
-from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
+from torchtitan.models.utils import get_nparams_and_active_nparams
 
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import resolve_cp_layout
 
@@ -63,7 +62,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         x = self.hc_post(x, residual, post, comb)
         residual = x
         x, post, comb = self.hc_ffn_pre(x)
-        x = self.moe(self.ffn_norm(x), input_ids=input_ids)
+        x = self.moe(self.ffn_norm(x), input_ids_T=input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x
 
@@ -76,13 +75,14 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         n_layers: int
 
         def update_from_config(self, *, config, **kwargs):
-            if hasattr(config, "training"):
-                seq_len = config.training.seq_len
-                for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
-                    setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
-
             DeepSeekV4MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan_npu.models.common.alignment import require_dataloader_alignment
+
+                require_dataloader_alignment(
+                    config.dataloader, self.compress_ratios, parallelism.context_parallel_degree
+                )
 
             tp = parallelism.tensor_parallel_degree
             if tp > 1:
@@ -109,25 +109,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
 
-        # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4441
-        # Temporary backport of the upstream DeepSeek-V4 sparse FLOPs
-        # estimation, adapted to the pinned TorchTitan dependency.
-        # Remove this implementation after the TorchTitan dependency includes
-        # the PR.
-
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             deepseek_v4_model = cast("DeepSeekV4Model", model)
-            first_attention = self.layers[0].attention
-            head_dims = 2 * first_attention.head_dim
-            nparams, num_flops_per_token = get_moe_model_nparams_and_flops(
-                self,
-                deepseek_v4_model,
-                first_attention.n_heads,
-                head_dims,
-                seq_len,
-            )
-
-            num_flops_per_token -= 6 * len(self.layers) * first_attention.n_heads * head_dims * seq_len
+            nparams, active_nparams = get_nparams_and_active_nparams(deepseek_v4_model)
+            num_flops_per_token = 6 * active_nparams
 
             for layers in (self.layers, self.mtp_layers):
                 for layer in layers:
@@ -171,10 +156,8 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     def preprocess_inputs(
         self,
         input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
         *,
         parallel_dims: Any,
-        device: torch.device,
         parallelism: Any,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
@@ -196,6 +179,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         handed the same row's positions, so the two agree row for row by
         construction.  Without context parallel or without MTP depths nothing changes.
         """
+        labels = input_dict["labels"]
         cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
         positions = input_dict.get("positions")
         mtp_batch = None
@@ -209,12 +193,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
         inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
             input_dict,
-            labels,
             parallel_dims=parallel_dims,
-            device=device,
             parallelism=parallelism,
-            max_num_documents=max_num_documents,
-            max_context_length=max_context_length,
+            max_num_documents=max_num_documents,  # pyrefly: ignore [unexpected-keyword]
+            max_context_length=max_context_length,  # pyrefly: ignore [unexpected-keyword]
         )
         if mtp_batch is not None:
             # Narrowing for the type checker: the branch above only builds the batch with a mesh.
@@ -230,7 +212,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                     parallelism.context_parallel_load_balancer,
                     extra_kwargs.get("attention_metadata"),
                 ),
-                1,
+                0,
                 positions=positions,  # pyrefly: ignore [unexpected-keyword]
             )
             extra_kwargs["mtp_batch"] = MTPBatch(*tensors)

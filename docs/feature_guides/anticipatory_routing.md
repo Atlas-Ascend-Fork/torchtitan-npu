@@ -204,7 +204,7 @@ token 计数，并重置 FSDP 临时状态；编译本身不负责撤销额外�
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/cache.py`    | 管理路由模式、microbatch slot 和专家 ID 存储。                               |
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/data.py`     | 管理可恢复 iterator、完整 step 读取及仅前向工作副本。                                |
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/detector.py` | 维护 loss 趋势统计，判定 spike 并回溯 onset。                                        |
-| `torchtitan_npu/extensions/experiment/anticipatory_routing/router.py`     | 通过 HashRouter 配置 override 接入录制与重放，查找 router 并创建、绑定共享缓存。                                            |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/router.py`     | 查找 router 并绑定共享缓存，在实例选择专家后接入录制与重放。                                            |
 
 ## 验证范围
 
@@ -252,7 +252,7 @@ profiler 仍按实际执行的外层迭代推进，结构化日志的 step 标�
 
 真实入口集成用例 `dsv4_anticipatory_recovery` 注册到 models/deepseek_v4 suite，
 使用单卡真实 DeepSeek-V4 recipe、CLI 配置和原生 checkpointer，训练目标仅在测试入口中
-一次性放大以触发真实检测器，验证 override 生效及 WARMUP → ACTIVE → DRAIN → NORMAL。
+一次性放大以触发真实检测器，验证缓存接线及 WARMUP → ACTIVE → DRAIN → NORMAL。
 生产配置不增加手动触发参数。执行命令：
 
 ```bash

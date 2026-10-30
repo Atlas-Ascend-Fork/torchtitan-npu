@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
 
-from torchtitan_npu.models.common.packing import require_document_alignment
+from torchtitan_npu.models.common.alignment import require_document_alignment
 
 DOC_CHUNK_LAYOUT = "doc_chunk"
 """The layout's name on ``--parallelism.context-parallel-load-balancer``.

@@ -26,8 +26,8 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.planner import LoadItemType
 from torch.futures import Future
-from torchtitan.components.checkpoint import ModelWrapper
-from torchtitan.components.checkpoint_utils import canonical_fqn
+from torchtitan.components.checkpointer import ModelWrapper
+from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import TORCH_DTYPE_MAP
 
 _EMA_STATE_PREFIX = "ema_optimizer.state."

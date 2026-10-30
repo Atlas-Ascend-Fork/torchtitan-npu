@@ -48,8 +48,8 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
 )
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
-_TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
-_POSITIONS = torch.arange(128).unsqueeze(0)
+_TOKENS = torch.arange(128).remainder(32)
+_POSITIONS = torch.arange(128)
 
 # The geometry the fused recipes state, at the widths the tiny debug flavor runs.  Stated by
 # the override's arguments, not by the model: the port is the only thing that sizes metadata.
@@ -116,7 +116,7 @@ def _core_config(
 
 def _positions(bounds: list[int]) -> torch.Tensor:
     """One packed row of these documents, positions resetting at every start."""
-    return torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    return torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
 
 
 def _reference_row(bounds: list[int], *, ratio: int) -> DeepSeekV41Metadata:
@@ -684,7 +684,7 @@ def test_engram_builds_each_rows_own_history(monkeypatch):
     _fake_metadata_ops(monkeypatch)
     install_doc_chunk_cp_shard(monkeypatch)
     row = _positions([0, 8, 24])  # documents of 8 and 16 rows; cp=2 gives two 12-row slabs
-    tokens = torch.arange(row.shape[1]).unsqueeze(0)
+    tokens = torch.arange(row.numel())
     model = _fused_tiny_model(monkeypatch)
     model.engram_history_size = 2
 
@@ -702,12 +702,13 @@ def test_engram_builds_each_rows_own_history(monkeypatch):
     )
 
     # Rank 1 holds chunk 1 of both documents: rows 4..7 of the first, 16..23 of the second.
+    # The history is ``[C, H]``: one entry per local row, one column per distance.
     history = extra["engram_token_history"]
-    assert history.shape == (1, 12, 2)
-    assert history[0, :, 0].tolist() == [3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 21, 22]
+    assert history.shape == (12, 2)
+    assert history[:, 0].tolist() == [3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 21, 22]
     # Two back from the first row of each chunk is in the same document, not across the boundary.
-    assert history[0, 0, 1].item() == 2
-    assert history[0, 4, 1].item() == 14
+    assert history[0, 1].item() == 2
+    assert history[4, 1].item() == 14
 
 
 def _fused_tiny_model(monkeypatch):
