@@ -229,14 +229,12 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
         assert entry.cmp_k.cu_seqlens.tolist() == [0, 4, 6]
         assert entry.swa_k.cu_seqlens.tolist() == [0, 16, 24]
 
-    # Both AI_CPU records are sized for the grid their kernels address: this rank's reach where the
-    # kernel anchors at the frame's end, the gathered row where it reads ``seqused``.
+    # The records the kernels read are sized for the grid they are addressed with: this rank's
+    # reach where the kernel anchors at the frame's end, the gathered row where it reads
+    # ``seqused``.  Only SLIKG's and the attention's are launched here: arch22 builds no selector
+    # *forward* record, and this CPU run is an arch22 one.
     pool_grid = [0, 8, 12] if _IS_A5 else [0, 4, 6]
     token_grid = [0, 32, 48] if _IS_A5 else [0, 16, 24]
-    li_calls = [call for call in dsv4.cann_ops.calls if call[0] == "lightning_indexer_metadata"]
-    assert li_calls
-    assert li_calls[-1][2]["cu_seqlens_k"].tolist() == pool_grid
-    assert li_calls[-1][2]["seqused_k"].tolist() == [4, 2]
     slig_calls = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_lightning_indexer_kl_loss_grad_metadata"]
     assert slig_calls
     assert slig_calls[-1][2]["cu_seqlens_k"].tolist() == pool_grid

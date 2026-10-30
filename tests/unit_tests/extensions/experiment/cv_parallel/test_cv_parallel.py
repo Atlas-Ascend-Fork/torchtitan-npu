@@ -891,7 +891,8 @@ def test_npu_reorder_retains_window_and_effect_boundaries(rms_reorder_window, co
 
 
 @pytest.mark.parametrize("chunk_only_metadata", [False, True], ids=["full_roles", "chunk_only_extra_roles"])
-def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_metadata, monkeypatch):
+def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_metadata, monkeypatch, a5_records):
+    """The re-cut rebuilds the record tier the fused selector reads (arch35's, see there)."""
     from torchtitan.config.override import apply_overrides
 
     from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata import (
@@ -948,7 +949,7 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     assert metadata.batch_chunk_tensors is not None
     # On arch35 the query and the sliding window share one row tensor, so the first role that
     # tagged it wins; arch22 rebuilds the window frame, which is tagged under its own name.
-    expected_pair = ("q.cu_seqlens" if _IS_A5 else "swa_k.cu_seqlens", -1)
+    expected_pair = ("q.cu_seqlens", -1)
     assert metadata.swa_k.cu_seqlens._npu_chunk_cv_metadata_pair == expected_pair
     assert len(li_calls) == 3
     for (_, call), q_bounds, k_bounds in zip(

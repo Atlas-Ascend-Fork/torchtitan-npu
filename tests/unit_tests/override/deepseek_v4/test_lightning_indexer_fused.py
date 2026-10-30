@@ -72,7 +72,7 @@ def _kernel_indices() -> torch.Tensor:
     )
 
 
-def test_the_selection_is_sorted_before_it_is_saved(monkeypatch):
+def test_the_selection_is_sorted_before_it_is_saved(monkeypatch, a5_records):
     """``-1`` lands at the tail and the saved order is the emitted order."""
     md = _metadata()
     captured = {}

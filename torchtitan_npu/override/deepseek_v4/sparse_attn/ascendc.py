@@ -91,16 +91,24 @@ def _selector_records(
     geometry: AicpuGeometry,
     ratio: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """The selector's forward record and its SLIG backward record, for one geometry."""
+    """The selector's forward record and its SLIG backward record, for one geometry.
+
+    arch22's (A3) ``lightning_indexer`` schedules itself and is launched with ``metadata=None``,
+    so its forward record is not built there; SLIKG's backward record is required on both SoCs.
+    """
     if ratio != LI_CMP_RATIO or key_frame is None:
         return None, None
     frames = lightning_indexer_options(ratio=ratio, q=q, cmp_k=key_frame)
-    li_record = lightning_indexer_metadata(
-        geometry.index_num_heads,
-        1,
-        geometry.index_head_dim,
-        geometry.index_topk,
-        **frames,
+    li_record = (
+        lightning_indexer_metadata(
+            geometry.index_num_heads,
+            1,
+            geometry.index_head_dim,
+            geometry.index_topk,
+            **frames,
+        )
+        if _IS_A5
+        else None
     )
     slig_metadata = sparse_lightning_indexer_kl_loss_grad_metadata(
         geometry.index_num_heads,

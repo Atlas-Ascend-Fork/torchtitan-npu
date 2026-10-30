@@ -77,9 +77,8 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused selector needs AscV4Metadata")
+        # Absent on arch22, whose selector schedules itself: the kernel takes ``metadata=None``.
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        if li_metadata is None:
-            raise ValueError("the fused selector needs the entry's forward record")
         proof = attention_metadata.compact_selector_frame_proof
         if proof is None:
             raise ValueError(

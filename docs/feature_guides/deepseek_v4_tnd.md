@@ -73,7 +73,7 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 - `position_k`：key 流自己的文档内位置（纯算术，零通信）。degree=1 时就是输入的 `positions`，CP 下是本 rank slab 的——消费者的 RoPE 读它，不自己推、也不需要知道流被搬过。
 - `cp`（`CPMetadata`）：只有 CP 下存在，带 `restore`（`RestorePlan`：只有 `exchange`），即 KV 侧恢复回 slab 的移动；恢复后流自己的位置由 entry 的 `position_k` 承载。
 - `batch_size`：查询 container 的真实 batch 维（构建 entry 时按 `positions.size(0)` 记一次，各 degree 不变；frame 只描述文档，carry 不了行数）。融合注意力在 CP=1 时支持 `local_batch_size > 1`，输入布局按批展平、输出保留 `[B, S]`；CP>1 暂不支持多 batch。参考选择器仍仅支持 MBS1。
-- `aicpu_metadata`（`AscV4Metadata`）：只有融合 entry 才有，按 kernel 分组保存 `sparse_attn.fwd/bwd` 与 `lightning_indexer.fwd/bwd`；模型目录的 `DeepSeekV4Metadata` 不携带这些张量。
+- `aicpu_metadata`（`AscV4Metadata`）：只有融合 entry 才有，按 kernel 分组保存 `sparse_attn.fwd/bwd` 与 `lightning_indexer.fwd/bwd`（arch22 上 `lightning_indexer.fwd` 为 `None`：该 SoC 的 selector 自己算调度、按 `metadata=None` 调用；其余三条照建）；模型目录的 `DeepSeekV4Metadata` 不携带这些张量。
 - `a3_workaround`（`AscV4Metadata`，`override/a3_workaround.py`）：arch22 的融合内核按 key frame 的**末端**对齐 mask 且不读 key 侧 `seqused`，所以 reach 只是文档前缀的 rank 要把两路 key 换成 reach 自己写成的帧并压行；两个流各带一个可微 `index_select`。arch35 不建这个字段。
 
 压缩器没有自己的 metadata 字段：输入为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍。公共入口把整批展平成一条 `[1, B * L, D]` 打包流，完成压缩和 RoPE 后还原为 `[B, L // ratio, D]`。每行 positions 从 0 开始，`create_varlen_metadata_for_document` 据此把行首加入整批 `cu_seq_q`，使 ratio-4 的重叠不会跨行借 token。

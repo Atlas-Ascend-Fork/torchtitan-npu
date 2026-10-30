@@ -82,8 +82,12 @@ def build_indexer_metadata(
         max_seqlen_q=None,
         max_seqlen_k=None,
     )
+    # arch22's ``lightning_indexer`` schedules itself and takes ``metadata=None``, so only arch35
+    # builds the forward record; SLIKG's backward one is required on both SoCs.
     return AscLightningIndexerMetadata(
-        fwd=torch.ops.cann_ops_transformer.lightning_indexer_metadata(**geometry_kwargs, **options),
+        fwd=(
+            torch.ops.cann_ops_transformer.lightning_indexer_metadata(**geometry_kwargs, **options) if _IS_A5 else None
+        ),
         bwd=torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
             **geometry_kwargs,
             **options,

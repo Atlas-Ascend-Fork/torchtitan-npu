@@ -97,6 +97,8 @@ torchtitan_npu/override/<scope>/<target>/
   `sparse_lightning_indexer_kl_loss_grad_metadata` 得到的四条 metadata（每 microbatch 一次），
   在 `aicpu_metadata` 下按消费它的 kernel 分组、按方向取值：`sparse_attn.fwd` /
   `sparse_attn.bwd` 与 `lightning_indexer.fwd` / `lightning_indexer.bwd`。就这些——一方向一份。
+  arch22（A3）上少建其中一条：该 SoC 的 `lightning_indexer` 自己算调度、前向按 `metadata=None`
+  调用，所以 `lightning_indexer.fwd` 为 `None`；其余三条（含 SLIKG 反向记录）两个 SoC 都要建。
   `sparse_attn.asc` 逐层按 `(端口类, compress_ratio)` 取自己的 entry，直接读
   `aicpu_metadata.sparse_attn.fwd` 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
   几何（heads/head dim/indexer 三数）是该 config 自己的必填字段、无默认值，由 override 的五个参数

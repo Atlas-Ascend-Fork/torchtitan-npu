@@ -51,6 +51,12 @@ from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import c
 _TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
 _POSITIONS = torch.arange(128).unsqueeze(0)
 
+
+@pytest.fixture(autouse=True)
+def _arch35(a5_records):
+    """These cases pin the selector's forward record, which arch35 alone builds."""
+
+
 # The geometry the fused recipes state, at the widths the tiny debug flavor runs.  Stated by
 # the override's arguments, not by the model: the port is the only thing that sizes metadata.
 _TINY_GEOMETRY = dict(window_size=128, num_heads=2, head_dim=8, index_topk=32, index_num_heads=2, index_head_dim=4)

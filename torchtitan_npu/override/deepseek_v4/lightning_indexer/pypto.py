@@ -76,9 +76,8 @@ class _PyPTOIndexerTND(torch.autograd.Function):
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused selector needs AscV4Metadata")
+        # Absent on arch22, whose selector schedules itself: the kernel takes ``metadata=None``.
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        if li_metadata is None:
-            raise ValueError("the fused selector needs the entry's forward record")
         # The selector's frame is the entry's: on arch22 the pool this rank's reach covers, which
         # is what the keys below are compacted onto, and what its records were built from.
         assert attention_metadata.cmp_k is not None, "the selector needs the entry's pool"

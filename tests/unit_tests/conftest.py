@@ -203,3 +203,25 @@ def dsv4():
     ns.CPVarlenMetadata = varlen_cp.CPVarlenMetadata
     ns.cann_ops = importlib.import_module("cann_ops_transformer")
     return ns
+
+
+# The builder whose selector record is arch35's alone (arch22's ``lightning_indexer`` schedules
+# itself).  A CPU run answers "not A5", so it exercises the arch22 side by default.
+_A5_RECORD_MODULES = (
+    "torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc",
+    "torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc",
+    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc",
+)
+
+
+@pytest.fixture
+def a5_records(monkeypatch):
+    """Run this test as an A5 host, where the selector's forward record is built and handed over.
+
+    Only modules the test already imported are switched: importing one here would shadow the
+    package attribute of the same name that the override registry tests read (``pypto``).
+    """
+    for module_name in _A5_RECORD_MODULES:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module, "_IS_A5", True)

@@ -182,8 +182,12 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_the_fused_entry_carries_its_geometry_and_records(dsv4):
-    """The fused core's config builds the packed contract and its kernel records."""
+def test_the_fused_entry_carries_its_geometry_and_records(dsv4, a5_records):
+    """The fused core's config builds the packed contract and its kernel records.
+
+    arch35 states all four records; arch22 leaves the selector's forward one out, which is why
+    this case runs as an A5 host.
+    """
     dsv4.cann_ops.calls.clear()
     model = _model_config((1, 4, 128), ascendc=True).build()
 
