@@ -40,7 +40,8 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.common.packing import compression_alignment
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
@@ -326,10 +327,11 @@ def _make_trainer_config(
             interval=100,
         ),
     )
-    # V4 shards contiguous slabs; the upstream default (headtail) is refused at the CP
-    # entry, so every V4 config starts from a runnable value and an explicit headtail
-    # still surfaces as the guard's error.
-    config.parallelism.context_parallel_load_balancer = None
+    # V4's rank-local attention frames describe the doc-chunk layout only, so every V4 config
+    # states it: an unstated layout would inherit the upstream default (headtail), which the CP
+    # entry refuses, and naming it here keeps one source for the model, its MTP depths and the
+    # shard.
+    config.parallelism.context_parallel_load_balancer = DOC_CHUNK_LAYOUT
     if getattr(model_spec.model, "lora", None) is not None:
         from .peft import DeepSeekV4PEFTCheckpointManager
 

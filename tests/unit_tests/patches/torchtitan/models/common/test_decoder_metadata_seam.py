@@ -273,7 +273,7 @@ def test_the_step_counts_the_local_labels_the_seam_hands_back(monkeypatch):
 
 
 def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
-    """A model-level hook owns the whole step; otherwise the CP step is the model's ``_cp_shard``."""
+    """The CP step is the model's ``_cp_shard``: the seam builds the map and hands it over."""
     seen: list = []
     record = object()
     model = _model([_layer(record, geometry=_Geometry(4))])
@@ -282,15 +282,10 @@ def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
         seen.append((kwargs, extra_kwargs.get("attention_metadata")))
         return inputs, labels, extra_kwargs
 
-    model.build_attention_masks = delegate
-    _preprocess(model, parallel_dims=_CP)
-    assert seen == [({"cp_mesh": _CP_MESH, "load_balancer_type": _LB}, None)]  # the hook owns the metadata step
-
-    del model.build_attention_masks
     model._cp_shard = delegate
     _, _, extra = _preprocess(model, parallel_dims=_CP)
     cp_context = {"cp_mesh": _CP_MESH, "device": _TOKENS.device, "load_balancer_type": _LB, "ptrr_mask_key": _PTRR}
-    assert seen[1] == (cp_context, {_Geometry(4): record})  # the seam's own map is what the CP step receives
+    assert seen == [(cp_context, {_Geometry(4): record})]  # the seam's own map is what the CP step receives
     assert extra["attention_metadata"] == {_Geometry(4): record}  # ... and what comes back out
 
 
@@ -325,8 +320,8 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     assert plain_events == ["shard"] and "attention_metadata" not in plain_out
 
 
-def test_an_unnamed_layout_is_the_one_the_metadata_declares(monkeypatch):
-    """A stack declares the layout its frames describe; an unnamed run is sharded by it, and by the row."""
+def test_an_unnamed_layout_stays_unnamed(monkeypatch):
+    """No stack declares a layout for the run: the flag is passed through as the user set it."""
     seen: dict = {}
 
     def shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, *args, positions=None, **kwargs):
@@ -334,16 +329,13 @@ def test_an_unnamed_layout_is_the_one_the_metadata_declares(monkeypatch):
         seen["layout"], seen["positions"] = load_balancer_type, positions
         return inputs, attention_masks
 
-    class _DeclaredMetadata:
-        cp_layout = "doc_chunk"
-
     positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
-    _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type=None, shard=shard)
-    assert seen == {"layout": "doc_chunk", "positions": positions}
+    _shard(monkeypatch, [], {_CPBackend: _CPMetadata()}, positions, load_balancer_type=None, shard=shard)
+    assert seen == {"layout": None, "positions": positions}
 
-    # An explicit balancer wins over the declaration; a stack that declares nothing keeps the pin's default.
-    _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type="headtail", shard=shard)
-    assert seen["layout"] == "headtail"
+    # A named layout reaches the shard unchanged; the seam never substitutes one of its own.
+    _shard(monkeypatch, [], {_CPBackend: _CPMetadata()}, positions, load_balancer_type="doc_chunk", shard=shard)
+    assert seen == {"layout": "doc_chunk", "positions": positions}
 
 
 def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):

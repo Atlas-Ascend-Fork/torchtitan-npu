@@ -133,7 +133,7 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.tensor-parallel-degree=1",
                     "--parallelism.context-parallel-degree=1",
                     "--parallelism.pipeline-parallel-degree=1",
-                    "--parallelism.context-parallel-load-balancer=None",
+                    "--parallelism.context-parallel-load-balancer=doc_chunk",
                     "--debug.no-moe-force-load-balance",
                     "--hf-assets-path=tests/assets/deepseek_v3",
                     # The LR recipe (warmup 25 / total 40) is part of the frozen
@@ -187,7 +187,7 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
         "--parallelism.tensor-parallel-degree=1",
         "--parallelism.context-parallel-degree=1",
         "--parallelism.pipeline-parallel-degree=1",
-        "--parallelism.context-parallel-load-balancer=None",
+        "--parallelism.context-parallel-load-balancer=doc_chunk",
         "--checkpoint.no-enable",
     )
     args += ("--optimizer.name=Muon",)

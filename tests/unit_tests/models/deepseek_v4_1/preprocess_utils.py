@@ -21,11 +21,11 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.common.restore import (
+from torchtitan_npu.models.deepseek_v4.cp_layout import (
     DOC_CHUNK_LAYOUT,
     doc_chunk_permutation,
-    document_starts,
 )
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import document_starts
 
 # ``preprocess_inputs`` takes the parallelism context; these models run a single process
 # with no CP and the default SPMD backend.

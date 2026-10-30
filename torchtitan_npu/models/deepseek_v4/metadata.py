@@ -17,7 +17,7 @@ path supports ``B > 1`` at CP=1; CP>1 currently requires a single batch row.  Th
 **document**-granular, so the container's row count has no carrier among them and is stated once
 as :attr:`DeepSeekV4Metadata.batch_size`.
 
-The row is described by one :class:`~torchtitan_npu.models.common.metadata.KernelFrame` per
+The row is described by one :class:`~torchtitan_npu.models.deepseek_v4.metadata.KernelFrame` per
 addressed tensor -- the queries, the sliding-window keys and, for a geometry that pools, the
 compressed keys.  :func:`build_v4_metadata` derives them from the row's boundaries, so the
 reference core and a fused port grid the same frames; a vendor backend attaches only the AI_CPU
@@ -26,7 +26,7 @@ kernels ignore ``seqused`` and anchor their mask at the frame's end -- restates 
 site (``override/a3_workaround.py``) rather than here: nothing about the row changes.
 
 Under context parallelism the queries are **chunk ``r`` of every document** while the KV side
-stays the **whole row**.  The input layout (``models/common/restore.py``) moves the batch's
+stays the **whole row**.  The input layout (``models/deepseek_v4/cp_attention.py``) moves the batch's
 tokens, positions and labels onto the chunk frame once per batch, so ``q.cu_seqlens`` is the
 rank-local chunk grid and the KV frames address the row; a layer that projects keys restores its
 hidden states onto the slab with the entry's :attr:`DeepSeekV4Metadata.cp`, which is what removes
@@ -35,7 +35,7 @@ the per-layer query movement and the output un-permutation.  There are no ``cu_s
 ``swa_k.cu_seqlens``, query grid = ``q.cu_seqlens``, compressed grid = ``cmp_k.cu_seqlens``).
 
 Nothing here describes the compressor's *internal* stream: under the ratio-4 overlap the carry
-block a rank prepends lives in ``models/common/carry_exchange.CarryExchange``, which builds the
+block a rank prepends lives in ``models/deepseek_v4/cp_compressor.CarryExchange``, which builds the
 augmented boundaries at the call site and hands them to the compressor as an argument.  A
 compressor is therefore CP-agnostic: it sees one local stream, one set of positions and, for the
 overlap, one set of ``cu_seqlens``.
@@ -44,20 +44,20 @@ overlap, one set of ``cu_seqlens``.
 from dataclasses import dataclass, replace
 
 import torch
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
 
-from torchtitan_npu.models.common.document_intervals import document_intervals
-from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.packing import require_document_alignment
-from torchtitan_npu.models.common.restore import (
-    DOC_CHUNK_LAYOUT,
+from torchtitan_npu.models.deepseek_v4.cp_attention import (
     RestorePlan,
     chunk_plan,
     slab_positions,
 )
+from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
+from torchtitan_npu.models.deepseek_v4.packing import require_document_alignment
+
+from .cp_attention import CPMetadata
 
 __all__ = [
-    "CPDeepSeekMetadata",
     "DeepSeekV4Metadata",
     "KernelFrame",
     "build_v4_metadata",
@@ -67,20 +67,23 @@ __all__ = [
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class CPDeepSeekMetadata:
-    """One geometry's doc-chunk layout: what the key side restores, and nothing else.
+class KernelFrame:
+    """One tensor's coordinate frame: the boundaries needed to address it.
 
-    The plan is a function of the row's boundaries, the degree and the rank -- no operand, no
-    layer -- so it is derived once per microbatch with the entry and read by every layer of the
-    geometry.  At one degree the whole object is ``None``: the slab *is* the frame.
+    ``cu_seqlens`` are the ragged document boundaries (``int32``, ``n_documents + 1``), the form
+    the kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix this frame's
+    consumer addresses -- how an operator is told to read a prefix of its operand -- and
+    ``residual`` the trailing partial group of a compressed axis (``None`` where the axis is not
+    compressed; a backend whose kernels need a value substitutes zeros for it).
     """
 
-    restore: RestorePlan
-    """doc-chunk -> slab: the movement the key projections read.
+    cu_seqlens: torch.Tensor
+    seqused: torch.Tensor
+    residual: torch.Tensor | None = None
 
-    The positions of the stream it produces are the entry's ``position_k``, so the movement and
-    the geometry stay separate fields even though both are derived from the same boundaries.
-    """
+
+if KernelFrame not in SUPPORTED_NODES:
+    register_dataclass(KernelFrame, serialized_type_name=f"{KernelFrame.__module__}.{KernelFrame.__name__}")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -120,13 +123,6 @@ class DeepSeekV4Metadata:
     them and never learns that the stream moved.
     """
 
-    cp_layout = DOC_CHUNK_LAYOUT
-    """The layout these frames describe (``--parallelism.context-parallel-load-balancer``).
-
-    A rank-local entry of this stack exists for the doc-chunk arrangement only, so the CP seam can
-    resolve an unnamed layout to it instead of guessing.
-    """
-
     batch_size: int = 1
     """The query container's leading dimension.
 
@@ -144,23 +140,14 @@ class DeepSeekV4Metadata:
     the reference forward reads it instead of deriving it per layer.  A ratio-4 geometry's
     selection is the selector's, and a fused entry never reads this field."""
 
-    cp: CPDeepSeekMetadata | None = None
+    cp: CPMetadata | None = None
     """The doc-chunk layout under context parallelism, ``None`` at one degree.
 
     It carries the movement, not the frames and not the positions: those are the same fields at
     every degree (``position_k`` already describes the stream this rank's keys read), and the
-    entry's grids already describe the degree it was built for."""
-
-    def key_stream(self, x: torch.Tensor, *, group) -> torch.Tensor:
-        """The stream this entry's key projections read: the input's, or this rank's window.
-
-        At one degree the layout left the row in place, so the input *is* the stream; under
-        context parallelism it is the window this rank's chunks are restored onto.  A consumer
-        hands over the stream as the layout produced it and never branches on the degree.
-        """
-        if self.cp is None:
-            return x
-        return self.cp.restore.apply(x, group=group)
+    entry's grids already describe the degree it was built for.  A consumer reads the stream
+    through :func:`~torchtitan_npu.models.deepseek_v4.metadata.restore_key_stream`; this class states
+    no movement of its own."""
 
     @staticmethod
     def prepare_cp_metadata(
@@ -353,5 +340,5 @@ def doc_chunk_entry(
         cmp_k=cmp_k,
         position_k=slab_positions(row, cp_size, cp_rank, slab_len),
         slots=None,
-        cp=CPDeepSeekMetadata(restore=restore),
+        cp=CPMetadata(restore=restore),
     )

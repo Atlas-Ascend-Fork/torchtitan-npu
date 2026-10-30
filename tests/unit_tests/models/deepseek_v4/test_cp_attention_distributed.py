@@ -5,7 +5,7 @@
 
 """The static doc-chunk movement on real collectives: two gloo ranks, one packed row.
 
-``tests/unit_tests/models/common/test_restore.py`` pins the plan by simulating the movement
+``tests/unit_tests/models/deepseek_v4/test_cp_attention.py`` pins the plan by simulating the movement
 rank-by-rank; this file runs the movement itself through ``all_to_all_single`` on two CPU
 processes, which is the only place the collective's split semantics (dim-0 splitting, per-peer
 order, an empty split still entering the call) are exercised end to end: the layout, its exact
@@ -66,7 +66,7 @@ def _worker(rank: int, port: int) -> None:
         world_size=_CP,
     )
     try:
-        from torchtitan_npu.models.common.restore import slab_positions, to_slab
+        from torchtitan_npu.models.deepseek_v4.cp_attention import slab_positions, to_slab
         from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
 
         group = dist.group.WORLD

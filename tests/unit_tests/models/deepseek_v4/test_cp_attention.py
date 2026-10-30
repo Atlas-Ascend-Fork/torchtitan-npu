@@ -14,7 +14,7 @@ The simulation is the contract -- a real ``all_to_all_single`` is that same oper
 import pytest
 import torch
 
-from torchtitan_npu.models.common.restore import (
+from torchtitan_npu.models.deepseek_v4.cp_attention import (
     chunk_plan,
     slab_positions,
     to_slab,
@@ -155,7 +155,7 @@ def test_one_degree_is_the_identity():
 
 def test_the_movement_keeps_the_container_grid(monkeypatch):
     """A ``[1, L, ...]`` tensor comes back ``[1, L, ...]``: the exchange addresses dim 1."""
-    from torchtitan_npu.models.common import restore as restore_module
+    from torchtitan_npu.models.deepseek_v4 import cp_attention as restore_module
 
     _, slab, plans = _plans(_ROW, 2)
     seen = []

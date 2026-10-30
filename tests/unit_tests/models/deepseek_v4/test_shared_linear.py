@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.models.deepseek_v4.linear import SharedLinear
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "aot_eager"])

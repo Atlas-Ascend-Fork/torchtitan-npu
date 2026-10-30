@@ -277,7 +277,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=None",
+                "--parallelism.context-parallel-load-balancer=doc_chunk",
                 "--parallelism.spmd-backend=spmd_types",
                 "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
@@ -303,7 +303,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=None",
+                "--parallelism.context-parallel-load-balancer=doc_chunk",
                 "--parallelism.spmd-backend=spmd_types",
                 "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",

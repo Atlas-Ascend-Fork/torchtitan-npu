@@ -25,11 +25,11 @@ Supersedes: `./2026-10-21-temporary-head-tail-removal.md`（已删除）
 
 CP 的布局定义为整行的**一个置换**：rank `r` 的窗口是每篇文档的 chunk `r`（rank-major、文档内顺序）。
 
-- 布局以 load balancer 的形式进 `cp_shard`：`DocChunkLoadBalancer`
+- 布局以 load balancer 的形式进 `cp_shard`：`DocChunkCPLoadBalancer`
   （`--parallelism.context-parallel-load-balancer doc_chunk`）由**切分前**的整行 positions 构造，
-  `_generate_indices` 自己算置换。切分即重排，零通信；调用方只交整行，不预算置换。
-- 留空（`None`）解析成该栈 metadata 声明的 `cp_layout`（两栈都是 `doc_chunk`），且这个解析对**所有**
-  `cp_shard` 调用点一致（含 MTP 深度那一次）。pinned 布局（headtail / ptrr / 真 `None`）行为不变，只有边界驱动
+  `generate_permutation` 自己算置换。切分即重排，零通信；调用方只交整行，不预算置换。
+- 布局由 config **显式**命名（两栈的 registry 都写 `doc_chunk`），`_cp_shard` 与 MTP 深度读同一个值；
+  没有"留空则从 metadata 反查"的默认。pinned 布局（headtail / ptrr / `None`）行为不变，只有边界驱动的
   布局要求调用方交 positions。
 - 查询从输入到输出都不移动；只有 key 投影读的那份 hidden 由 `RestorePlan` 从 chunk 行恢复到本 rank 的 slab。
   KV 与压缩 KV 始终是整行，由内核边界的声明式 `S(1) -> R` gather 取得。

@@ -18,7 +18,7 @@ numerically inert -- the carry block is always trimmed out of the pooled stream,
 reads the *projected* a-series before RoPE -- so the exchange carries no second collective for
 them.
 
-Like :meth:`~torchtitan_npu.models.common.restore.RestorePlan.apply`, the process group is
+Like :meth:`~torchtitan_npu.models.deepseek_v4.cp_attention.RestorePlan.apply`, the process group is
 the module's only state (wired by the framework's ``Module.parallelize`` recursion) and the
 collectives are functional, so the backward of the prepended block is the reverse exchange.
 At one degree the module is a no-op: it hands its inputs back, and the caller runs the very
@@ -40,7 +40,7 @@ import torch
 from torch.distributed._functional_collectives import all_to_all_single
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.restore import doc_relative_positions
+from torchtitan_npu.models.deepseek_v4.cp_attention import doc_relative_positions
 
 __all__ = ["CarryExchange", "CarryStream"]
 

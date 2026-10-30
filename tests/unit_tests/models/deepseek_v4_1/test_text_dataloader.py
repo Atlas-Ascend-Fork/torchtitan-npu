@@ -14,7 +14,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess, tiny_v41_model
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.common.packing import compression_alignment
+from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import (
     AlignedHuggingfaceDataloader,
     AlignedTextDataset,

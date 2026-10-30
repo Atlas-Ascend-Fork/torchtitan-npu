@@ -41,26 +41,15 @@ from dataclasses import dataclass
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
 
-from torchtitan_npu.models.common.packing import require_document_alignment
-
-DOC_CHUNK_LAYOUT = "doc_chunk"
-"""The layout's name on ``--parallelism.context-parallel-load-balancer``.
-
-Every rank's queries are chunk ``r`` of every document.  The CP shard builds its load balancer
-from the row's boundaries alone (see ``DocChunkLoadBalancer`` in
-``patches/torchtitan/distributed/context_parallel.py``), and the rank-local metadata is derived
-from the same boundaries -- no exchange, no collective.
-"""
+from .cp_layout import chunk_index
 
 __all__ = [
-    "DOC_CHUNK_LAYOUT",
+    "CPMetadata",
     "ExchangeMetadata",
     "RestorePlan",
-    "chunk_index",
     "chunk_plan",
-    "doc_chunk_permutation",
     "doc_relative_positions",
-    "document_starts",
+    "restore_key_stream",
     "slab_positions",
     "to_slab",
 ]
@@ -100,26 +89,6 @@ class RestorePlan:
         return to_slab(x, self.exchange, group=group)
 
 
-def document_starts(positions: torch.Tensor) -> torch.Tensor:
-    """The row's document boundaries (``n_documents + 1``), read off its own positions.
-
-    The stack's positions restart at every document, so a row's document start is its own index
-    minus its position; the distinct starts are the boundaries, and the row's end closes the last
-    one.  Device arithmetic throughout -- no ``nonzero``, no ``tolist`` -- because the CP shard
-    runs this on every microbatch and a round-trip there would drain the pipeline.
-
-    This is the one place the layout learns where the documents are when only the positions are
-    at hand (the shard runs before any metadata consumer); it must agree with the metadata's
-    ``cu_seqlens`` -- the packing grid the positions were built from -- which ``tests`` pins.
-    """
-    flat = positions.reshape(-1)
-    rows = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
-    # Non-decreasing, one distinct value per document, so ``unique_consecutive`` is the boundary
-    # set (a full ``unique`` would sort the row again for nothing).
-    doc_start = rows - flat.to(torch.int64)
-    return torch.cat((torch.unique_consecutive(doc_start), rows.new_tensor([rows.numel()])))
-
-
 def doc_relative_positions(cu_seqlens: torch.Tensor, absolute: torch.Tensor) -> torch.Tensor:
     """The document-relative position of each ``absolute`` row, from the row's boundaries.
 
@@ -130,42 +99,6 @@ def doc_relative_positions(cu_seqlens: torch.Tensor, absolute: torch.Tensor) -> 
     """
     doc = torch.bucketize(absolute, cu_seqlens, right=True) - 1
     return absolute - cu_seqlens[doc.clamp_min(0)]
-
-
-def chunk_index(
-    cu_seqlens: torch.Tensor,
-    cp_size: int,
-    rank: int | None,
-    slab_len: int,
-) -> torch.Tensor:
-    """Which document chunk each row belongs to.
-
-    ``slab_len`` is the slab width ``C``; with ``rank`` the rows are that rank's slab, without it
-    the whole row.  Every document length must be a positive multiple of ``cp_size`` so that a
-    chunk is a whole number of rows; the shared packing check enforces it here -- the one check
-    in the layout that runs per microbatch, so its callers do not repeat it.
-    """
-    require_document_alignment(cu_seqlens, cp_size=cp_size)
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunk = lengths // cp_size
-    if rank is None:
-        pos = torch.arange(slab_len * cp_size, device=cu_seqlens.device)
-    else:
-        pos = torch.arange(rank * slab_len, (rank + 1) * slab_len, device=cu_seqlens.device)
-    doc = (torch.bucketize(pos, cu_seqlens, right=True) - 1).clamp_min(0)
-    return (pos - cu_seqlens[doc]) // chunk[doc]
-
-
-def doc_chunk_permutation(cu_seqlens: torch.Tensor, cp_size: int, slab_len: int) -> torch.Tensor:
-    """The row's global token order under the doc-chunk layout (``[1, N]``, ``int64``).
-
-    The layout is one permutation of the row: rank ``r``'s window of it, ``[r·C, (r+1)·C)``, is
-    chunk ``r`` of every document in document order.  Stably sorting the rows by the chunk they
-    belong to produces exactly that -- within a chunk the rows keep their global order, so the
-    documents stay in order -- which is why the CP shard can apply it *before* slicing and move
-    nothing, and why it agrees row for row with the movement :func:`to_slab` undoes.
-    """
-    return torch.argsort(chunk_index(cu_seqlens, cp_size, None, slab_len), stable=True).unsqueeze(0)
 
 
 def chunk_plan(cu_seqlens: torch.Tensor, cp_size: int, rank: int, slab_len: int) -> ExchangeMetadata:
@@ -238,3 +171,33 @@ def slab_positions(cu_seqlens: torch.Tensor, cp_size: int, rank: int, slab_len: 
     """
     pos = torch.arange(rank * slab_len, (rank + 1) * slab_len, device=cu_seqlens.device)
     return doc_relative_positions(cu_seqlens, pos).reshape(1, -1)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class CPMetadata:
+    """The movement a rank-local entry carries: what the key side restores, and nothing else.
+
+    The plan is a function of the row's boundaries, the degree and the rank -- no operand, no
+    layer -- so it is derived once per microbatch with the entry and read by every layer of the
+    geometry.  At one degree the whole object is ``None``: the slab *is* the frame.
+
+    It lives on the entry's ``cp`` field rather than on the entry itself because the frames are
+    the entry's at every degree, and only the movement is a property of context parallelism.  A
+    consumer asks :func:`restore_key_stream` for the stream, never the plan.
+    """
+
+    restore: RestorePlan
+    """doc-chunk -> slab: the movement the key projections read."""
+
+
+def restore_key_stream(cp: CPMetadata | None, x: torch.Tensor, *, group) -> torch.Tensor:
+    """The stream this entry's key projections read: the input's, or this rank's window.
+
+    At one degree the layout left the row in place, so the input *is* the stream; under context
+    parallelism it is the window this rank's chunks are restored onto.  A consumer hands over the
+    stream as the layout produced it and never branches on the degree -- the identity here is the
+    ``None`` plan, not a caller-side test.
+    """
+    if cp is None:
+        return x
+    return cp.restore.apply(x, group=group)

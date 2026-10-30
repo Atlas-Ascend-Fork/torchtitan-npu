@@ -29,7 +29,7 @@ from dataclasses import dataclass
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
 from torchtitan_npu.patches.torch_npu.device import is_a5
 
 __all__ = ["A3KeyWorkaround", "a3_key_frame", "a3_key_gather"]

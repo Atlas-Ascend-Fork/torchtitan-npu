@@ -23,9 +23,10 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
+from . import cp_layout  # noqa: F401  registers the doc-chunk layout with the CP shard
 from .attention import Attention, CompressedSparseInnerAttention, UnitScaleRMSNorm
 from .compressor import Compressor, Indexer, LightningIndexer
 from .mhc import HcHead, HcPost, HcPre

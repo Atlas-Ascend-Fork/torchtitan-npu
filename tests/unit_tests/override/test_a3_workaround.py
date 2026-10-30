@@ -19,7 +19,7 @@ import pytest
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
-from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround, a3_key_frame, a3_key_gather
 
 

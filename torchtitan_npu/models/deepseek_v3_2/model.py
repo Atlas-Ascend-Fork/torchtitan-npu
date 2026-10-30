@@ -32,10 +32,11 @@ from torchtitan.models.deepseek_v3.model import (
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
+
+from .document_intervals import document_intervals
 
 # The two forms of the packed offsets the reference core reads: the row's own documents, and
 # the rank-local segments the context-parallel transform derives from them.  They are not

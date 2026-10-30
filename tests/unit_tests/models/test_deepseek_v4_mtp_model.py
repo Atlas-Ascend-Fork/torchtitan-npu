@@ -19,7 +19,7 @@ from tests.unit_tests.models.mtp_test_utils import (
     build_cpu_model,
     preprocess,
 )
-from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.models.deepseek_v4.linear import SharedLinear
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
@@ -412,10 +412,10 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     # The row reaches both calls, so the layout cannot be derived from anything else.
     for _, handed_positions, _ in shard_calls:
         assert torch.equal(handed_positions, positions)
-    # The MTP cut is handed the layout the run resolves to, not the raw (unset) flag: an
-    # unset flag means "this stack's layout", and passing it through would cut the depths
-    # contiguously while the inputs are permuted.
-    assert shard_calls[1][2] == "doc_chunk", shard_calls[1][2]
+    # Both cuts are handed the run's configured layout, unchanged: the model does not resolve a
+    # default (the V4 registry names ``doc_chunk`` when the CLI leaves the flag alone), so the two
+    # calls cannot disagree about the order they cut.
+    assert shard_calls[0][2] == shard_calls[1][2] == parallelism.context_parallel_load_balancer
 
     # What the forward reads is the shard's answer, not the global row.
     slab = slice(rank * shard_len, (rank + 1) * shard_len)

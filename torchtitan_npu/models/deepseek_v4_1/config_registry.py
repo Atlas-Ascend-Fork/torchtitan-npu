@@ -19,6 +19,7 @@ from torchtitan.distributed.flex_shard import (
     BlockShard,
     BucketConfig,
     ComputeLayout,
+    Owned,
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.config_utils import decoder_vocab_size
@@ -28,8 +29,8 @@ from torchtitan_npu.config import MuonOptimizerProfile, OptimizerConfig, Trainin
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingTrainer
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.common.muon import make_owned_layout
-from torchtitan_npu.models.common.packing import compression_alignment
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 
 from . import model_registry
 from .indexer import Selector
@@ -142,7 +143,7 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}",
         MeshAxisName.FSDP.value,
     )
-    owned = make_owned_layout(dense_dp_axes)
+    owned = ComputeLayout(shardings_by_mesh_axis={axis: Owned() for axis in dense_dp_axes})
     owned_attention_projections = {"wq_a": owned, "wkv": owned, "wo_b": owned}
     attention_projections = (*owned_attention_projections, "wq_b", "wo_a")
     expert_projections = ("w1", "w2", "w3")
@@ -296,7 +297,7 @@ def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
         raise ValueError("registered V4.1 model does not describe every configured layer")
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
 
-    return DeepSeekV41Trainer.Config(
+    config = DeepSeekV41Trainer.Config(
         # One packed row per rank, which is what the model asserts and the loaders
         # produce: documents are packed into a single row and the row is cut at
         # ``seq_len``.  Upstream's default is 8, so the recipe states it rather than
@@ -314,6 +315,11 @@ def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
         optimizer=_v41_optimizer_config(model_spec),
         activation_checkpoint=FullAC.Config(),
     )
+    # V4.1's rank-local attention frames describe the doc-chunk layout only, so every V4.1
+    # config states it rather than inheriting the upstream default (headtail), which the CP
+    # entry refuses.
+    config.parallelism.context_parallel_load_balancer = DOC_CHUNK_LAYOUT
+    return config
 
 
 def deepseek_v4_1_flash() -> TrainerEx.Config:

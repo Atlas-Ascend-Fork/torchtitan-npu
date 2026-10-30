@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from torchtitan_npu.models.common.compile_policy import (
+from torchtitan_npu.models.deepseek_v4.compile_policy import (
     compiles_under_cp,
     skip_compile_under_cp,
 )

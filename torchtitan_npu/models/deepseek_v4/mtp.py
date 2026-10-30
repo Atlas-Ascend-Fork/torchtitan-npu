@@ -40,7 +40,7 @@ from torchtitan.models.deepseek_v3.mtp import (
 )
 from torchtitan.protocols.module import ModuleList
 
-from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.models.deepseek_v4.linear import SharedLinear
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (  # noqa: TC001
     AttentionMetadataMap,
 )

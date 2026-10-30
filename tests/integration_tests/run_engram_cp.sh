@@ -37,7 +37,7 @@
       --parallelism.data-parallel-shard-degree 2 \
       --parallelism.expert-parallel-degree 2 \
       --parallelism.context-parallel-degree "$cp" \
-      --parallelism.context-parallel-load-balancer None \
+      --parallelism.context-parallel-load-balancer doc_chunk \
       --dataloader.per-doc-alignment 4 \
       --training.global-batch-size 2 --training.seq-len 512 --training.steps 3 \
       --training.no-enable-cpu-offload --training.disable-cuda-graphs --optimizer.name AdamW \

@@ -35,7 +35,7 @@ hierarchy: it builds its own entry, of its own classes, in its own package.
     table.
 
 ``KernelFrame``
-    the model-dir primitive (``models/common/metadata.py``) describing one tensor's coordinate
+    the model-dir primitive (``models/deepseek_v4/metadata.py``) describing one tensor's coordinate
     frame: its ragged document boundaries, the per-document prefix this consumer addresses, and
     the trailing partial group of a compressed axis.  An entry is three of them (queries,
     sliding-window keys, compressed keys) plus the row; the class is shared with the V4 stack, so

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 
 from ..utils import checkpoint as checkpoint_utils
 from . import config as dsv4_config

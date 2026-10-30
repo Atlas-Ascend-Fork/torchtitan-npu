@@ -24,7 +24,7 @@ from torchtitan.experiments.graph_trainer.compile import (
 )
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
-from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
+from torchtitan_npu.models.deepseek_v4.compile_policy import skip_compile_under_cp
 from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
 
 from .lora import is_lora_parameter

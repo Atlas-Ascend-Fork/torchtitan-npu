@@ -12,7 +12,7 @@ from torchtitan.models.common import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.module import Module, ModuleList
 
-from torchtitan_npu.models.common.rope import HalfRotation
+from torchtitan_npu.models.deepseek_v4.rope import HalfRotation
 
 
 class ImageMarkerEmbeddings(Module):

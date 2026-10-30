@@ -11,7 +11,7 @@ import pytest
 from torchtitan.config.manager import ConfigManager
 from torchtitan.config.override import OverrideConfig, apply_overrides
 
-from torchtitan_npu.models.common.rope import HalfRotation
+from torchtitan_npu.models.deepseek_v4.rope import HalfRotation
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.mhc import HcPre
 from torchtitan_npu.override.common.rope import (

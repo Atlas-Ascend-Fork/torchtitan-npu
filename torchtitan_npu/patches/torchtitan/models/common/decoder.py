@@ -1,5 +1,6 @@
 # Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4897
 # Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4116
+# Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4617
 # Remove this module (and its activation import in
 # ``torchtitan_npu/patches/torchtitan/__init__.py``) once the pinned
 # ``torchtitan`` dependency carries both PRs natively.
@@ -39,9 +40,8 @@ Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
 ``labels`` is passed separately (0.3.0 keeps it out of ``input_dict``), and
 ``parallel_dims``/``device``/``parallelism`` stand in for #4116's
 ``parallelism_context`` (0.3.0 has no ``ParallelismContext``).  The
-``build_attention_masks`` branch is transitional: it is the pre-#4116 shape of
-the same seam, and disappears with the DeepSeek models' migration onto
-``build_attention_metadata``.
+The model-level ``build_attention_masks`` hook this file used to honour is gone: every stack of
+this repository builds its metadata through ``build_attention_metadata`` now, so one seam is left.
 """
 
 from typing import Any
@@ -53,12 +53,10 @@ from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import BaseAttention, FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
 
-from torchtitan_npu.patches.torchtitan.distributed.context_parallel import layout_needs_positions
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
     cp_shard_context_set,
     prepare_cp_metadata_map,
-    resolve_cp_layout,
 )
 
 __all__ = ["apply"]
@@ -176,25 +174,23 @@ def _cp_shard(
     ``ParallelismContext`` nor ``shard_tensors``, so the pinned ``cp_shard``
     remains the entry point.
 
-    ``load_balancer_type`` names the layout the inputs are sharded by; ``None``
-    asks the stack, whose metadata declares the layout it can describe
-    (``cp_layout``).  A repository layout -- ``doc_chunk`` -- is built *inside*
-    ``cp_shard`` from the row's boundaries, so nothing here precomputes a
-    permutation; the transform is handed none, because a rank-local entry of
-    these layouts is a function of the row's boundaries alone.  A pinned layout
-    (``headtail``) still hands its permutation over, as upstream does.
+    ``load_balancer_type`` names the layout the inputs are sharded by; it is the run's
+    own choice, with no fallback: a stack that can only consume one layout states it in
+    its config and refuses any other.  A repository layout (``models/common/cp_layout.py``)
+    is built *inside* ``cp_shard`` from the row's boundaries, so nothing here precomputes a
+    permutation; the transform is handed none, because a rank-local entry of these layouts
+    is a function of the row's boundaries alone.  A pinned layout (``headtail``) still
+    hands its permutation over, as upstream does.
     """
     attention_metadata = extra_kwargs.get("attention_metadata")
     # The shard below replaces ``positions`` with this rank's slice; the
     # transform describes the row the shard started from, so keep the global
     # one before that happens.
     row_positions = extra_kwargs.get("positions")
-    # Only a boundary-driven layout reads the positions: it is a function of where the documents
-    # start.  The pinned ones are functions of the length alone, so a model that carries none
-    # keeps sharding exactly as it did before this repository's layouts existed.
-    layout = resolve_cp_layout(load_balancer_type, attention_metadata)
-    if layout_needs_positions(layout) and row_positions is None:
-        raise ValueError(f"the {layout!r} layout needs the row's positions: they are what it is derived from.")
+    # A registered layout is built from the row it is about to shard and raises if the row
+    # carries no positions; the pinned ones are functions of the length alone, so a model that
+    # carries none keeps sharding exactly as it did before these layouts existed.
+    layout = load_balancer_type
     permutation = None
     if attention_metadata and layout == "headtail" and row_positions is not None:
         permutation = _HeadTailLoadBalancer(
@@ -248,7 +244,7 @@ def preprocess_inputs(
     The metadata map is preferred when the stack's attention backends provide
     builders; the 0.3.0 single-mask path stays for the stacks whose inner
     attention is a plain Flex/Varlen config, and a model-level
-    ``build_attention_masks`` override (transitional) still owns the whole
+    model's own ``build_attention_masks`` (removed) used to own the whole
     metadata + CP step.  The CP step itself is delegated to ``_cp_shard``,
     upstream's method for it, which is also where the map becomes rank-local.
     """
@@ -261,51 +257,38 @@ def preprocess_inputs(
     inputs = input_dict["input"]
     extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k != "input"}
 
-    build_attention_masks = getattr(self, "build_attention_masks", None)
-    if build_attention_masks is not None:
-        # Transitional model-level seam (pre-#4116 shape): the model owns the
-        # metadata construction *and* its CP sharding.
-        cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
-        inputs, labels, extra_kwargs = build_attention_masks(
+    positions = extra_kwargs.get("positions")
+    if positions is not None:
+        attention_metadata = self._get_attention_metadata(
+            positions,
+            padding_mask=extra_kwargs.get("padding_mask"),
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
+        )
+        if attention_metadata:
+            extra_kwargs["attention_metadata"] = attention_metadata
+        else:
+            # positions and attention_masks are optional (Decoder.forward
+            # defaults both to None). Build masks only for the masked
+            # backends (Flex/Varlen), which is where get_attention_masks is
+            # defined. A maskless backend (e.g. the SDPA config used by the
+            # graph_trainer tests) still receives positions for RoPE but no
+            # masks — it relies on is_causal instead.
+            inner_attention = getattr(self.config.first_attention, "inner_attention", None)
+            if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
+                extra_kwargs["attention_masks"] = self.get_attention_masks(positions=positions)
+
+    if parallel_dims.cp_enabled:
+        cp_mesh = parallel_dims.get_mesh("cp")
+        inputs, labels, extra_kwargs = self._cp_shard(
             inputs,
             labels,
             extra_kwargs,
             cp_mesh=cp_mesh,
+            device=device,
             load_balancer_type=parallelism.context_parallel_load_balancer,
+            ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
         )
-    else:
-        positions = extra_kwargs.get("positions", None)
-        if positions is not None:
-            attention_metadata = self._get_attention_metadata(
-                positions,
-                padding_mask=extra_kwargs.get("padding_mask", None),
-                max_num_documents=max_num_documents,
-                max_context_length=max_context_length,
-            )
-            if attention_metadata:
-                extra_kwargs["attention_metadata"] = attention_metadata
-            else:
-                # positions and attention_masks are optional (Decoder.forward
-                # defaults both to None). Build masks only for the masked
-                # backends (Flex/Varlen), which is where get_attention_masks is
-                # defined. A maskless backend (e.g. the SDPA config used by the
-                # graph_trainer tests) still receives positions for RoPE but no
-                # masks — it relies on is_causal instead.
-                inner_attention = getattr(self.config.first_attention, "inner_attention", None)
-                if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
-                    extra_kwargs["attention_masks"] = self.get_attention_masks(positions=positions)
-
-        if parallel_dims.cp_enabled:
-            cp_mesh = parallel_dims.get_mesh("cp")
-            inputs, labels, extra_kwargs = self._cp_shard(
-                inputs,
-                labels,
-                extra_kwargs,
-                cp_mesh=cp_mesh,
-                device=device,
-                load_balancer_type=parallelism.context_parallel_load_balancer,
-                ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
-            )
 
     if parallelism.spmd_backend == "spmd_types":
         inputs, labels, extra_kwargs = annotate_input_spmd_types(parallel_dims, inputs, labels, extra_kwargs)

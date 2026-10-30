@@ -46,6 +46,7 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
@@ -328,7 +329,7 @@ class Attention(BaseAttention):
         # rows' own positions -- per token, so it commutes with the movement -- and the restore
         # then hands the core this rank's window for its own gather.
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = attention_metadata.key_stream(swa_k, group=self.cp_group)
+        swa_k = restore_key_stream(attention_metadata.cp, swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
         o = self.inner_attention(

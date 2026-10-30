@@ -27,7 +27,7 @@ from torchtitan.distributed.activation_checkpoint import ActivationCheckpointing
 from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh, validate_config
 
 from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
+from torchtitan_npu.models.deepseek_v4.compile_policy import skip_compile_under_cp
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel

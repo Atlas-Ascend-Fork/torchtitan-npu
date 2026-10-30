@@ -13,6 +13,7 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
@@ -294,7 +295,7 @@ class Attention(BaseAttention):
         # sharding gathers the rows to the whole row at the core's own boundary.
         swa_k = self.kv_norm(self.wkv(x))
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = metadata.key_stream(swa_k, group=self.cp_group)
+        swa_k = restore_key_stream(metadata.cp, swa_k, group=self.cp_group)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None

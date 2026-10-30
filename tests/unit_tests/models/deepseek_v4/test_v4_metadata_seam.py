@@ -16,7 +16,7 @@ entries and the rank-local rebuild -- and drops the per-field detail.
 import pytest
 import torch
 
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata

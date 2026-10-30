@@ -46,7 +46,7 @@ def _require_packing_alignment(self) -> None:
     compress_ratios = getattr(model, "compress_ratios", None)
     if compress_ratios is None:
         return
-    from torchtitan_npu.models.common.packing import require_per_doc_alignment
+    from torchtitan_npu.models.deepseek_v4.packing import require_per_doc_alignment
 
     require_per_doc_alignment(
         getattr(self.config.dataloader, "per_doc_alignment", 1),

@@ -33,6 +33,8 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+
 
 class Compressor(Module):
     """Pool ``compress_ratio`` tokens into one main-KV entry.
@@ -112,7 +114,7 @@ class Compressor(Module):
         if attention_metadata is not None:
             # The pooling is the row's, so a source layer restores the stream onto this rank's
             # window first (the identity at one degree); the caller hands over the chunks it holds.
-            x_BLD = attention_metadata.key_stream(x_BLD, group=self.group)
+            x_BLD = restore_key_stream(attention_metadata.cp, x_BLD, group=self.group)
 
         ratio = self.compress_ratio
         seqlen = x_BLD.size(1)

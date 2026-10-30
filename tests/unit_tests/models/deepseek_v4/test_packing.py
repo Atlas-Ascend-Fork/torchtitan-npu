@@ -8,7 +8,7 @@
 import pytest
 import torch
 
-from torchtitan_npu.models.common.packing import (
+from torchtitan_npu.models.deepseek_v4.packing import (
     compression_alignment,
     require_document_alignment,
     require_per_doc_alignment,

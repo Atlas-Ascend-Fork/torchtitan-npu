@@ -20,11 +20,13 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.common.restore import (
+from torchtitan_npu.models.deepseek_v4.cp_attention import (
     ExchangeMetadata,
     chunk_plan,
-    doc_chunk_permutation,
     to_slab,
+)
+from torchtitan_npu.models.deepseek_v4.cp_layout import (
+    doc_chunk_permutation,
 )
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import (
@@ -340,7 +342,7 @@ def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_ro
         chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
         for rank in range(cp_size):
             masks = _masks(_positions(*[e - s for s, e in pairwise(cu)]), cp_size, rank)
-            assert masks.restore is not None
+            assert masks.cp is not None
             assert masks.q.cu_seqlens.tolist() == (torch.tensor(cu) // cp_size).tolist()
             assert masks.q.seqused.tolist() == chunk.tolist()
             reach = (rank + 1) * chunk
@@ -369,7 +371,7 @@ def test_the_unsharded_forward_is_unchanged():
     the metadata it builds is the one geometry both the torch-native and the fused paths read.
     """
     masks = _masks(_positions(8, 16))
-    assert masks.restore is None
+    assert masks.cp is None
     torch.testing.assert_close(masks.position_k, _positions(8, 16))
     assert masks.q.cu_seqlens.tolist() == [0, 8, 24]
     assert masks.q.seqused.tolist() == [8, 16]
@@ -394,7 +396,7 @@ def test_the_cp_transform_carries_the_plan_and_recuts_the_frames():
         for cp_rank in range(cp_size):
             slab = row.numel() // cp_size
             masks = _masks(row, cp_size, cp_rank)
-            plan = masks.restore.exchange
+            plan = masks.cp.restore.exchange
             assert plan is not None
             assert list(plan.send_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
             assert sum(plan.recv_split) == slab

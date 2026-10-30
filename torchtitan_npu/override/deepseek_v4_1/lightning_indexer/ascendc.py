@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan_npu.models.common.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround

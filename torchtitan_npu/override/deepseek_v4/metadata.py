@@ -33,7 +33,7 @@ it -- one group per pair of kernels, one field per direction::
     for this rank.
 
 The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
-(``models/common/carry_exchange.CarryExchange``), which builds the augmented
+(``models/deepseek_v4/cp_compressor.CarryExchange``), which builds the augmented
 boundaries and the kernel's state table at the call site and passes them as arguments.  The
 quantized selector is another backend: it owns an entry of its own (a subclass of this one) and
 rebuilds the selector group with its own contract.  Nothing here knows about quantization.
@@ -44,10 +44,10 @@ from dataclasses import dataclass
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
-from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, doc_chunk_entry
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, KernelFrame, doc_chunk_entry
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import check_layout_supported
 
 __all__ = [
     "AicpuGeometry",
@@ -205,7 +205,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
         """This rank's frames *and* its AscendC records (upstream #4617).
 
         The rank-local entry comes from the pre-shard row with the static doc-chunk plan
-        (``models/common/restore.chunk_plan``); the records do not carry over, because a record
+        (``models/deepseek_v4/cp_attention.chunk_plan``); the records do not carry over, because a record
         describes the frames it was computed for, so they are rebuilt for the rank-local frames
         by the same builder that built the global ones.
         """
@@ -219,12 +219,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
         context = cp_shard_context()
         if context.cp_mesh is None or context.positions is None:
             raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
-            raise ValueError(
-                "the DeepSeek-V4 fused stack's rank-local frames describe the doc-chunk layout, but the "
-                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
-                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
-            )
+        check_layout_supported("the DeepSeek-V4 fused stack", context.load_balancer_type, supported=(DOC_CHUNK_LAYOUT,))
         row_len = context.positions.shape[-1]
         local = doc_chunk_entry(
             attention_metadata,

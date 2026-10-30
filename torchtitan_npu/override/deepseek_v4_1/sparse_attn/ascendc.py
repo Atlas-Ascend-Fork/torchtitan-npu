@@ -9,14 +9,17 @@ from dataclasses import dataclass
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.packing import require_document_alignment
-from torchtitan_npu.models.common.restore import (
-    DOC_CHUNK_LAYOUT,
+from torchtitan_npu.models.deepseek_v4.cp_attention import (
+    CPMetadata,
     RestorePlan,
     chunk_plan,
     slab_positions,
 )
+from torchtitan_npu.models.deepseek_v4.cp_layout import (
+    DOC_CHUNK_LAYOUT,
+)
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.packing import require_document_alignment
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
@@ -30,6 +33,7 @@ from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AscLightningIndexerMetadata,
     AscSparseAttentionMetadata,
 )
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import check_layout_supported
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
 
@@ -160,12 +164,7 @@ class AscV41Metadata(DeepSeekV41Metadata):
         context = cp_shard_context()
         if context.cp_mesh is None or context.positions is None:
             raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
-            raise ValueError(
-                "the V4.1 fused stack's rank-local frames describe the doc-chunk layout, but the "
-                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
-                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
-            )
+        check_layout_supported("the V4.1 fused stack", context.load_balancer_type, supported=(DOC_CHUNK_LAYOUT,))
         batch_size, row_len = context.positions.shape[0], context.positions.shape[-1]
         return shard_asc_v41_metadata(
             attention_metadata,
@@ -219,7 +218,7 @@ def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: Aicp
         cu_seq_q=cu_seqlens,
         cu_seq_k=row.cu_seq_k,
         position_k=row.position_k,
-        restore=row.restore,
+        cp=row.cp,
         ratio=ratio,
         q=q,
         swa_k=swa_k,
@@ -296,7 +295,7 @@ def shard_asc_v41_metadata(
         cu_seq_q=cu_seqlens,
         cu_seq_k=attention_metadata.cu_seq_k,
         position_k=slab_positions(cu_seqlens, cp_size, cp_rank, slab_len),
-        restore=restore,
+        cp=CPMetadata(restore=restore),
         ratio=ratio,
         q=q,
         swa_k=swa_k,

@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torchtitan.config import OverrideConfig, apply_overrides
 
-from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.models.deepseek_v4 import _debugmodel, _make_v4_config
 from torchtitan_npu.models.deepseek_v4.compressor import (
     Compressor,
@@ -338,7 +338,7 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
     own.  The fake kernel is the same per-document pool the unsharded tests use, so any
     difference is the CP framing itself.
     """
-    from torchtitan_npu.models.common import carry_exchange as carry_module
+    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
 
     cp_size = 4
     total = 16 * ratio

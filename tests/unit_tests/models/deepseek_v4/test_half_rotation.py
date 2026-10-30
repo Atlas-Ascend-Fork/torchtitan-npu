@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from torchtitan_npu.models.common.rope import HalfRotation
+from torchtitan_npu.models.deepseek_v4.rope import HalfRotation
 from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE
 
 

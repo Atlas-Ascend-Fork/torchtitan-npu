@@ -14,8 +14,6 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import resolve_cp_layout
-
 from .metadata import DeepSeekV4Metadata
 from .mhc import HcPost, HcPre
 from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
@@ -219,17 +217,14 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         if mtp_batch is not None:
             # Narrowing for the type checker: the branch above only builds the batch with a mesh.
             assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
-            # The layout the batch was sharded by, resolved exactly as the decoder resolves it:
-            # an unset flag means "the layout this stack declares", and reading the raw config
-            # value here would cut the depths contiguously while the inputs are permuted.
+            # The batch rides the same shard the inputs did, by the same configured layout: reading
+            # a different value here would cut the depths contiguously while the inputs are
+            # permuted.
             tensors, _ = cp_shard(
                 cp_mesh,
                 tuple(mtp_batch),
                 None,
-                resolve_cp_layout(
-                    parallelism.context_parallel_load_balancer,
-                    extra_kwargs.get("attention_metadata"),
-                ),
+                parallelism.context_parallel_load_balancer,
                 1,
                 positions=positions,  # pyrefly: ignore [unexpected-keyword]
             )

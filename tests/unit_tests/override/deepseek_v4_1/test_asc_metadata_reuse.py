@@ -32,8 +32,8 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
     tiny_v41_model,
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
@@ -488,7 +488,7 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     local = _prepare_for_rank(entry, mesh, row)
 
     assert isinstance(local, AscV41Metadata)
-    assert local.restore is not None
+    assert local.cp is not None
     # Chunk queries over the whole-row KV grids: this rank's chunk of every document
     # (``q``), and how far those queries reach into each document (``swa_k``).
     assert local.q.cu_seqlens.tolist() == [0, 4, 10]
@@ -606,7 +606,7 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     for (port, ratio), entry in metadata.items():
         assert port is AscV41SparseAttention.Config
         assert entry.ratio == ratio
-        assert entry.restore is not None
+        assert entry.cp is not None
         assert entry.q.cu_seqlens.tolist() == [0, 4, 12]
         assert entry.swa_k.seqused.tolist() == [8, 16]
     # One geometry has no compressed axis at all, the other two carry their own.

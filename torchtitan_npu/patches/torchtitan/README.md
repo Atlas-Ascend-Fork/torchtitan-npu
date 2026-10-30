@@ -40,6 +40,9 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | PR | 说明 |
 | --- | --- |
 | [#3430](https://github.com/pytorch/torchtitan/pull/3430) | 为变长注意力补充 CP 和 Full DTensor 支持 |
+| [#4116](https://github.com/pytorch/torchtitan/pull/4116) | 把 post-dataloading 的预处理（含 CP shard）收敛到模型的 `preprocess_inputs`，对应 `models/common/decoder.py` |
+| [#4617](https://github.com/pytorch/torchtitan/pull/4617) | CP 的输入切分与 metadata 切分解耦：可配置的 load balancer 在 `Decoder._cp_shard` 里由 batch 构造，rank-local metadata 由后端自己准备；0.3.0 上以 `positions` 入参承载它的 balancer 输入 |
+| [#4897](https://github.com/pytorch/torchtitan/pull/4897) | 把 attention metadata 的所有权交给 attention 后端（`build_attention_metadata` / `attention_metadata_key`），对应 `models/common/attention_metadata.py` |
 | [#3634](https://github.com/pytorch/torchtitan/pull/3634) | 补充 DeepSeek-V4 所需的公共组件及训练接入 |
 | [#3864](https://github.com/pytorch/torchtitan/pull/3864) | 为 torchtitan 补充 AuxLoss 辅助损失框架 |
 | [#4474](https://github.com/pytorch/torchtitan/pull/4474) | 补齐部分初始化的 optimizer state，支持完整 checkpoint 恢复 |

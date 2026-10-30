@@ -224,7 +224,7 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                 cu_seq_q=row.cu_seq_q,
                 cu_seq_k=row.cu_seq_k,
                 position_k=row.position_k,
-                restore=row.restore,
+                cp=row.cp,
                 ratio=self.compress_ratio,
                 q=q,
                 swa_k=swa_k,

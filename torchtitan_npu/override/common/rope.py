@@ -25,7 +25,7 @@ from torchtitan.models.common.rope import (
     _reshape_for_broadcast,
 )
 
-from torchtitan_npu.models.common.rope import HalfRotation
+from torchtitan_npu.models.deepseek_v4.rope import HalfRotation
 from torchtitan_npu.patches.torchtitan.models.common.rope import (
     SplitComplexRoPEConfig,
     SplitCosSinRoPEConfig,

@@ -25,7 +25,7 @@ import pytest
 import torch
 from torch import nn
 
-from torchtitan_npu.models.common.carry_exchange import CarryExchange
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
@@ -355,7 +355,7 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     its own, the ones starting inside a document merge it into that document's first segment.
     Both cases must reproduce the global pool, which is what pins the merge rule.
     """
-    from torchtitan_npu.models.common import carry_exchange as carry_module
+    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
 
     ratio = _RATIO
     total = 16 * ratio
@@ -407,7 +407,7 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
 
 def test_the_rank_that_starts_the_row_carries_nothing(monkeypatch):
     """Rank 0 still enters the collective, but prepends nothing."""
-    from torchtitan_npu.models.common import carry_exchange as carry_module
+    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
 
     calls = []
 
@@ -441,7 +441,7 @@ def test_every_rank_keeps_the_carry_in_the_autograd_graph(monkeypatch):
     and prune *only that rank's* backward exchange -- a hang the next collective would report as
     a timeout.  The empty concat keeps the graph symmetric.
     """
-    from torchtitan_npu.models.common import carry_exchange as carry_module
+    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
 
     module = _compressor()
     slab = 16

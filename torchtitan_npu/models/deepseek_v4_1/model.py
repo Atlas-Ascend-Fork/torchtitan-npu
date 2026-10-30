@@ -46,8 +46,9 @@ import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
-from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT, doc_chunk_permutation, document_starts
+from torchtitan_npu.models.deepseek_v4.cp_layout import doc_chunk_permutation
+from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import document_starts
 
 from .engram import Engram  # noqa: TC001
 from .indexer import IndexerMode
@@ -56,7 +57,7 @@ from .mhc import HcPost, HcPre
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE
 
-    from torchtitan_npu.models.common.restore import RestorePlan
+    from torchtitan_npu.models.deepseek_v4.cp_attention import CPMetadata
     from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import AttentionMetadataMap
 
     from .attention import Attention
@@ -81,13 +82,6 @@ class DeepSeekV41Metadata:
     rather than any kernel's operator outputs.  A kernel that cannot read a frame as stated --
     arch22's TND kernels ignore ``seqused`` and anchor their mask at the frame's end -- restates it
     at its own call site (``override/a3_workaround.py``) rather than here.
-    """
-
-    cp_layout = DOC_CHUNK_LAYOUT
-    """The layout these frames describe (``--parallelism.context-parallel-load-balancer``).
-
-    A rank-local entry of this stack exists for the doc-chunk arrangement only, so the CP seam can
-    resolve an unnamed layout to it instead of guessing.
     """
 
     cu_seq_q: torch.Tensor
@@ -121,20 +115,13 @@ class DeepSeekV41Metadata:
     cmp_k: KernelFrame | None
     """The compressed pool's frame (``None`` for a geometry that does not pool)."""
 
-    restore: RestorePlan | None = None
+    cp: CPMetadata | None = None
     """Under context parallelism the key side's movement: the input already holds this rank's
-    chunks, and the key projections read the slab this restores them onto."""
+    chunks, and the key projections read the slab this restores them onto.
 
-    def key_stream(self, x: torch.Tensor, *, group) -> torch.Tensor:
-        """The stream this entry's key projections read: the input's, or this rank's window.
-
-        At one degree the layout left the row in place, so the input *is* the stream; under
-        context parallelism it is the window this rank's chunks are restored onto.  A consumer
-        hands over the stream as the layout produced it and never branches on the degree.
-        """
-        if self.restore is None:
-            return x
-        return self.restore.apply(x, group=group)
+    The frames above are the entry's at every degree; only the movement is a property of context
+    parallelism, so it is one field and a consumer reads it through
+    :func:`~torchtitan_npu.models.deepseek_v4.metadata.restore_key_stream`."""
 
     @staticmethod
     def prepare_cp_metadata(

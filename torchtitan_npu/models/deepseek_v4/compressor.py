@@ -17,8 +17,9 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.carry_exchange import CarryExchange
-from torchtitan_npu.models.common.document_intervals import document_intervals
+from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 
 
 @cache
@@ -62,9 +63,9 @@ class Compressor(Module):
 
     Under context parallelism the stream it is handed is this rank's chunks while the pooling it
     must reproduce is the row's: the module therefore owns both movements -- the restoration onto
-    this rank's window (``attention_metadata.key_stream``, the identity at one degree) and the
+    this rank's window (``restore_key_stream``, the identity at one degree) and the
     ratio-4 carry
-    (:class:`~torchtitan_npu.models.common.carry_exchange.CarryExchange`) -- and returns the row's
+    (:class:`~torchtitan_npu.models.deepseek_v4.cp_compressor.CarryExchange`) -- and returns the row's
     blocks with the carry's own block trimmed off.  A caller hands over the stream exactly as the
     layout produced it and never learns that either step happened.
     """
@@ -180,7 +181,7 @@ class Compressor(Module):
         if attention_metadata is not None:
             # The window this rank's pooling must reproduce: identity at one degree, the restored
             # slab under CP.  The carry then completes the document the window starts inside.
-            x = attention_metadata.key_stream(x, group=self.group)
+            x = restore_key_stream(attention_metadata.cp, x, group=self.group)
             if self.overlap:
                 carry = self.carry_exchange(x, positions, cu_seqlens)
                 x, positions, cu_seqlens = carry.x, carry.positions, carry.cu_seqlens

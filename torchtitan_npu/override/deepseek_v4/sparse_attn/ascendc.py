@@ -47,9 +47,8 @@ from cann_ops_transformer import (
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
 
-from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, KernelFrame
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.metadata import (
