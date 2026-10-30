@@ -203,14 +203,14 @@
 <p>DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）共用同一套上下文并行语义：<strong>查询按文档内部分成
 <code>cp</code> 份，KV 与压缩 KV 保持整行</strong>。融合内核在边界处把本地 slab 声明式 all-gather 成整行，再用
 frame 的 <code>seqused = reach</code> 把可见范围限制在本 rank 的 chunk 之前。两栈共用
-<code>torchtitan_npu/models/common/metadata.py</code> 的 <code>KernelFrame</code>，也共用同一份输入布局：
-<code>torchtitan_npu/models/common/restore.py</code> 的静态 doc-chunk 布局由 <strong>CP 切分本身</strong>施加——<code>cp_shard</code>
+<code>torchtitan_npu/models/deepseek_v4/metadata.py</code> 的 <code>KernelFrame</code>，也共用同一份输入布局：
+<code>torchtitan_npu/models/deepseek_v4/cp_attention.py</code> 的静态 doc-chunk 布局由 <strong>CP 切分本身</strong>施加——<code>cp_shard</code>
 在切之前按 <code>doc_chunk_permutation</code> 重排整行，所以每个 rank 拿到的输入就是本 rank 的 chunk，不需要
 任何集合通信；每层只在需要"本 rank 窗口"的消费方内部做恢复（压缩器池化前、核心取 swa 键前，
-同一个 <code>key_stream</code>），layer 里不再有 <code>x_k</code>。要说明次数：不池化层是一次（swa 键）；池化层是两次
+同一个 <code>restore_key_stream</code>），layer 里不再有 <code>x_k</code>。要说明次数：不池化层是一次（swa 键）；池化层是两次
 （swa 键 + 主压缩器的 <code>x</code>）；池化且带 indexer 的几何是三次，因为 indexer 自己的压缩器对同一份 <code>x</code>
 再恢复一次——这是「key 侧自己管移动」的代价，各压缩器不必知道别的模块已经恢复过它。ratio-4
-重叠的 carry 由 <code>torchtitan_npu/models/common/carry_exchange.py</code> 的 <code>CarryExchange</code> 在调用点处理，
+重叠的 carry 由 <code>torchtitan_npu/models/deepseek_v4/cp_compressor.py</code> 的 <code>CarryExchange</code> 在调用点处理，
 两栈的压缩器本身都不感知 CP。</p>
 <p>本文是 V4 与 V4.1 的合并指南（原 V4 CP 指南的内容已并入）。</p>
 <h2 id="1">1. 共同契约</h2>
@@ -240,11 +240,12 @@ position_k：               key 侧 slab 自己的文档内位置（entry 顶层
 <li><code>doc_chunk_permutation(cu_seqlens, cp_size, seq_len)</code>（<code>seq_len</code> 是 slab 宽度 <code>C</code>）给出整行的
   全局 token 序：稳定地按「这一行属于哪篇文档的第几个 chunk」排序，于是置换后 rank <code>r</code> 落在
   <code>[r·C, (r+1)·C)</code> 的窗口正是「每篇文档的第 <code>r</code> 个 chunk，文档顺序」。</li>
-<li>布局按框架自己的方式接进切分：<code>cp_shard</code> 认识 <code>doc_chunk</code> 这个名字，用 <code>DocChunkLoadBalancer</code>
-  （<code>patches/torchtitan/distributed/context_parallel.py</code>）构造它，由 balancer 的
-  <code>_generate_indices</code> 自己算置换并交给 <code>_context_parallel_shard</code>：先重排<strong>复制在每 rank 的整行</strong>，
+<li>布局按框架自己的方式接进切分：<code>DocChunkCPLoadBalancer</code>（<code>models/deepseek_v4/cp_layout.py</code>）是上游
+  <code>ContextParallelLoadBalancer</code> 的子类，模型包 import 时把它注册到 <code>doc_chunk</code> 这个名字下；<code>cp_shard</code>
+  按名字解析、用 <code>Config().build(seq_len=…, cu_seqlens=…, cp_size=…)</code> 构造它，<code>generate_permutation</code>
+  自己算置换，再由 <code>shard_tensors</code> 交给 <code>_context_parallel_shard</code>：先重排<strong>复制在每 rank 的整行</strong>，
   再均分切片，所以这一步零通信，反向是 <code>argsort</code> 的逆置换（autograd 自己处理）。调用方只把
-  <strong>整行的 positions</strong> 交进去，不在外面预先算好任何下标——与 <code>_HeadTailLoadBalancer</code> 只差一个
+  <strong>整行的 positions</strong> 交进去，不在外面预先算好任何下标——与 <code>HeadTailCPLoadBalancer</code> 只差一个
   构造参数（它要长度，这里要文档边界）。</li>
 <li><code>document_starts(positions)</code> 从位置的重启读出整行的文档边界（行号减位置，<code>unique_consecutive</code>，
   <strong>全 device</strong>）：切分先于任何 metadata 消费者发生，这是在那里拿到边界的唯一途径；它与 metadata
@@ -290,7 +291,7 @@ entry 的 <code>prepare_cp_metadata</code> 用 rank-local chunk 重建这三个 
 <tbody>
 <tr>
 <td>V4</td>
-<td><code>DeepSeekV4Metadata</code> 自带 <code>q</code>/<code>swa_k</code>/<code>cmp_k</code>、<code>slots</code> 与 <code>cp: CPDeepSeekMetadata(restore)</code>（<code>build_v4_metadata</code> 用整行边界构造）</td>
+<td><code>DeepSeekV4Metadata</code> 自带 <code>q</code>/<code>swa_k</code>/<code>cmp_k</code>、<code>slots</code> 与 <code>cp: CPMetadata(restore)</code>（<code>build_v4_metadata</code> 用整行边界构造）</td>
 <td><code>AscV4Metadata.prepare_cp_metadata</code> → <code>doc_chunk_entry</code> → <code>build_aicpu_metadata</code></td>
 </tr>
 <tr>
@@ -322,9 +323,8 @@ NGPU=2 \
   重建之后，<code>preprocess_inputs</code> 统一施加输入 SPMD 标注，这一步只在 <code>spmd_types</code> 后端执行。</li>
 <li>布局必须是 doc-chunk：<code>--parallelism.context-parallel-load-balancer doc_chunk</code>（上游默认 <code>headtail</code>
   会被融合 entry 的 <code>prepare_cp_metadata</code> 拒绝）。输入在切之前按该置换重排，零通信；示例脚本已按
-  该值传入。两栈的 metadata 类都声明了 <code>cp_layout = DOC_CHUNK_LAYOUT</code>，所以留空（<code>None</code>，即"不做
-  load balance"）时也解析成 doc-chunk——一个 rank-local entry 只对一种行排列成立，让 metadata 说出
-  它是哪一种，比让用户猜更安全。</li>
+  该值传入。布局由 config <strong>显式</strong>命名（两栈的 registry 都写 <code>doc_chunk</code>），没有"留空则从 metadata
+  反查"的默认——一个 rank-local entry 只对一种行排列成立，错配在 metadata 边界直接报错。</li>
 <li>每篇文档按 <code>lcm(compress_ratios) × cp</code> 填充：V4 为 <code>128 × cp</code>（CP=2 即 256），V4.1 为其
   <code>compress_ratios</code> 的 lcm × cp（当前 lcm 为 2，1M 配方用 256 = 2 × 128）。这条约束是<strong>刻意严格</strong>
   的：CP 把每篇文档切成 <code>cp</code> 个等长 chunk，除了 <code>doc % (cp × ratio) == 0</code>，<strong>每个 chunk 自身</strong>也
@@ -381,7 +381,7 @@ NGPU=2 \
 </tr>
 <tr>
 <td>frame 归属</td>
-<td>模型 metadata（<code>DeepSeekV4Metadata</code>，含 <code>cp: CPDeepSeekMetadata(restore)</code>）</td>
+<td>模型 metadata（<code>DeepSeekV4Metadata</code>，含 <code>cp: CPMetadata(restore)</code>）</td>
 <td>融合 entry（<code>AscV41Metadata</code>）</td>
 </tr>
 <tr>
@@ -413,7 +413,7 @@ Attention.forward（每层）
   x（doc-chunk 行）
     ├─ wq_a / q_norm / wq_b / q_head_norm / rope(positions)   [查询不移动]
     ├─ swa：wkv / kv_norm / rope(positions)（chunk 行）      [CP=S(1)]
-    │    └─ key_stream（RestorePlan.apply）-&gt; 本 rank slab，供核心边界 gather
+    │    └─ restore_key_stream（RestorePlan.apply）-&gt; 本 rank slab，供核心边界 gather
     ├─ compressor(x)（见 4.3：内部 restore + ratio-4 carry）  [CP=S(1)]
     └─ indexer：idx_q / idx_w 在 chunk 行上投影；idx_k 由它自己的压缩器产出
   wo_a / wo_b 输出留在 doc-chunk 行（不 unpermute）
@@ -429,7 +429,7 @@ positions 一次到位；<code>DeepSeekV4Model.preprocess_inputs</code> 只把 M
 没有 CP（或 <code>cp_size == 1</code>）时整段跳过，batch 原样进入前向。</p>
 <p><code>Attention.forward</code> 收到的是 doc-chunk 行，查询侧直接投影、在随行搬来的 <code>positions</code> 上做 RoPE。key
 侧同样在这批行上投影、旋转、池化——每一步都是逐 token 的，因此与移动可交换——需要"本 rank 窗口"的
-消费方各自恢复：压缩器在池化前恢复（<code>attention_metadata.key_stream</code>，degree=1 即恒等），核心在取
+消费方各自恢复：压缩器在池化前恢复（<code>restore_key_stream(attention_metadata.cp, …)</code>，degree=1 即恒等），核心在取
 swa 键前恢复（同一函数，窄张量）。layers 里没有 <code>x_k</code>：移动只发生在拥有它的模块内部。输出仍留在
 doc-chunk 行：<code>wo_b</code> 是逐 token 投影，残差、MoE 与 loss 都按同一布局计算，loss 的 labels 也是同一份
 plan 搬过的。</p>
@@ -463,7 +463,7 @@ expression</code> 处失败（CP=1 时没有压实，同一份代码正常编译
 block 用 <code>fullgraph=True</code> 编译，而全量 activation checkpoint 会把 block 放进 <code>checkpoint</code> 这个
 higher-order operator 里 trace，HOP 内部不允许图断点（<code>Skip calling torch.compiler.disable()d
 function</code>）。</p>
-<p>因此<strong>栈自己在 <code>parallelize</code> 里做这个判断</strong>（<code>models/common/compile_policy.py</code>：<code>_IS_A5 or cp &lt;= 1</code>
+<p>因此<strong>栈自己在 <code>parallelize</code> 里做这个判断</strong>（<code>models/deepseek_v4/compile_policy.py</code>：<code>_IS_A5 or cp &lt;= 1</code>
 才编译），判为不可编译时打一条告警并把 <code>compile_config.enable</code> 关掉，让训练照常跑 eager：
 <code>--compile.enable</code> 因此可以留在同一份配方里——A5 上生效，arch22 + CP 上退化为 eager 而不是报错。
 判断放在模型的 parallelize 而不是 patch 里，是因为它只取决于「哪个 arch × 多少度」，与上游
@@ -476,10 +476,10 @@ function</code>）。</p>
 <code>positions</code>（entry 的 <code>position_k</code>）以及<strong>整行</strong>的 <code>cu_seqlens</code>。池化本身仍是扁平的 <code>ratio</code> 折叠，
 重叠的左半块在每个 segment 起点被 mask（score <code>-inf</code>、kv <code>0</code>）；CP 的两件额外工作在模块内部完成：</p>
 <ul>
-<li><strong>restore</strong>：<code>attention_metadata.key_stream(x)</code>（degree=1 即恒等），把 chunk 行换回本 rank 的
+<li><strong>restore</strong>：<code>restore_key_stream(attention_metadata.cp, x, group=…)</code>（degree=1 即恒等），把 chunk 行换回本 rank 的
   slab，使池化的块网格与整行一致；</li>
 <li><strong>carry</strong>：ratio-4 的前驱块由 <code>CarryExchange</code>
-  （<code>torchtitan_npu/models/common/carry_exchange.py</code>）交换、prepend、池化后由压缩器自己裁掉。</li>
+  （<code>torchtitan_npu/models/deepseek_v4/cp_compressor.py</code>）交换、prepend、池化后由压缩器自己裁掉。</li>
 </ul>
 <p>调用方只交 <code>x</code> 与 <code>position_k</code>，看不到这两步。CP 的 KV all-gather 仍由 <code>sharding.py</code> 在融合内核
 边界声明式完成。</p>
@@ -522,7 +522,7 @@ CP=1/CP=2 之间做。</p>
   x (本 rank 的 chunk 行，输入布局已放好，查询不移动)
     ├─ q 投影 / q_norm / rope(positions)
     ├─ swa_k 投影 + rope(positions)（chunk 行）             [CP=S(1)]
-    │    └─ key_stream（RestorePlan.apply）-&gt; 本 rank slab，供核心边界 gather
+    │    └─ restore_key_stream（RestorePlan.apply）-&gt; 本 rank slab，供核心边界 gather
     ├─ compressor(x, position_k)：内部 restore，source 层池化，无 carry   [CP=S(1)]
     └─ indexer：idx_q / weights 在 chunk 行上投影，idx_k 由压缩器的 slab latent 投影
   输出留在 chunk 行：rope(positions, inverse) -&gt; wo_a -&gt; wo_b
@@ -602,23 +602,27 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 </thead>
 <tbody>
 <tr>
-<td><code>torchtitan_npu/models/common/restore.py</code></td>
-<td><code>ExchangeMetadata</code> / <code>RestorePlan</code> / <code>chunk_index</code> / <code>chunk_plan</code> / <code>doc_chunk_permutation</code> / <code>document_starts</code> / <code>to_slab</code> / <code>slab_positions</code>：两栈共用的静态 doc-chunk 布局</td>
+<td><code>torchtitan_npu/models/deepseek_v4/cp_attention.py</code></td>
+<td><code>CPMetadata</code>（<code>restore: RestorePlan</code>）/ <code>ExchangeMetadata</code> / <code>RestorePlan</code> / <code>chunk_plan</code> / <code>to_slab</code> / <code>slab_positions</code> / <code>restore_key_stream</code>：恢复与 key 侧的流</td>
+</tr>
+<tr>
+<td><code>torchtitan_npu/models/deepseek_v4/cp_layout.py</code></td>
+<td><code>DocChunkCPLoadBalancer</code>（<code>generate_permutation</code>）/ <code>chunk_index</code> / <code>doc_chunk_permutation</code>：静态 doc-chunk 置换；模型 import 时注册为 <code>doc_chunk</code></td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/patches/torchtitan/distributed/context_parallel.py</code></td>
-<td><code>DocChunkLoadBalancer</code>：<code>cp_shard</code> 内部按整行边界构造它，<code>_generate_indices</code> 自己算置换（切之前重排，零通信）</td>
+<td><code>ContextParallelLoadBalancer</code>（上游 #4617 的抽象）、布局名注册表、<code>document_starts</code>、<code>shard_tensors</code>：按名字解析布局并在切分前施加置换</td>
 </tr>
 <tr>
-<td><code>torchtitan_npu/models/common/compile_policy.py</code></td>
+<td><code>torchtitan_npu/models/deepseek_v4/compile_policy.py</code></td>
 <td><code>skip_compile_under_cp</code>：arch22 + CP 时把编译关掉并告警（见 §4.2）</td>
 </tr>
 <tr>
-<td><code>torchtitan_npu/models/common/metadata.py</code></td>
+<td><code>torchtitan_npu/models/deepseek_v4/metadata.py</code></td>
 <td><code>KernelFrame</code>（两栈共用的 frame 原语）</td>
 </tr>
 <tr>
-<td><code>torchtitan_npu/models/common/packing.py</code></td>
+<td><code>torchtitan_npu/models/deepseek_v4/packing.py</code></td>
 <td><code>require_document_alignment</code> / <code>require_per_doc_alignment</code>：文档长度与 <code>per_doc_alignment</code> 的严格对齐检查</td>
 </tr>
 <tr>
@@ -627,19 +631,19 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/metadata.py</code></td>
-<td><code>DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, slots, cp)</code> / <code>CPDeepSeekMetadata</code> / <code>build_v4_metadata</code> / <code>doc_chunk_entry</code></td>
+<td><code>DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, slots, cp)</code> / <code>KernelFrame</code> / <code>build_v4_metadata</code> / <code>doc_chunk_entry</code></td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/attention.py</code></td>
-<td>查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 <code>key_stream</code> 恢复、压缩器内部恢复+carry、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 <code>q</code> / <code>cmp_k</code> frame 与预计算的 HCA 选择</td>
+<td>查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 <code>restore_key_stream</code> 恢复、压缩器内部恢复+carry、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 <code>q</code> / <code>cmp_k</code> frame 与预计算的 HCA 选择</td>
 </tr>
 <tr>
-<td><code>torchtitan_npu/models/common/carry_exchange.py</code></td>
+<td><code>torchtitan_npu/models/deepseek_v4/cp_compressor.py</code></td>
 <td><code>CarryExchange</code> / <code>CarryStream</code>：ratio-4 carry 的 ring（只换 tokens；位置由 <code>slab_positions</code> 算出）、增强 <code>cu_seqlens</code> 与 <code>trim</code>；cp=1 为 no-op</td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/compressor.py</code></td>
-<td>压缩器（CP/非 CP 同一实例）：<code>forward</code> 用 <code>attention_metadata.key_stream</code> 恢复窗口、ratio-4 时内部 carry 并裁掉自己那块；<code>Indexer</code> 复用它，<code>idx_q</code> 在 chunk 行、<code>idx_k</code> 是行内的池化块</td>
+<td>压缩器（CP/非 CP 同一实例）：<code>forward</code> 用 <code>restore_key_stream(attention_metadata.cp, …)</code> 恢复窗口、ratio-4 时内部 carry 并裁掉自己那块；<code>Indexer</code> 复用它，<code>idx_q</code> 在 chunk 行、<code>idx_k</code> 是行内的池化块</td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/sharding.py</code></td>
@@ -704,7 +708,7 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
    未对齐文档被拒绝、<code>cp=1</code> 恒等）、<code>document_starts</code> 与 metadata 的 <code>cu_seqlens</code> 一致、frame 坐标
    与 <code>seqused</code> 锚点、rank-local 前缀池、metadata 重建与拒绝路径。这一层不看数值，只看"谁被放到了
    哪"。</li>
-<li><strong>多 rank 集合通信</strong>（<code>tests/unit_tests/models/common/test_restore_distributed.py</code>）：两个 gloo
+<li><strong>多 rank 集合通信</strong>（<code>tests/unit_tests/models/deepseek_v4/test_cp_attention_distributed.py</code>）：两个 gloo
    rank 上真实跑 <code>all_to_all_single</code>，验移动、逆向、<code>position_k</code> 以及 <code>to_slab</code> 的梯度等于反向
    交换。</li>
 <li><strong>单机数值</strong>（A5 单卡 + <code>--comm.mode local_tensor</code> 模拟两个 rank）：CP=1 与 CP=2 两个运行比
