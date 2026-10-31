@@ -10,7 +10,8 @@ Each op quantizes its high precision operands into the tensors of
 and multiplies those.
 
 Quantization scheme (non-grouped ``to_block_mx_then_mm`` / ``to_block_mx_then_bmm``):
-- A (activation):           a ``DualAxisMXTensor``
+- A (activation):           a ``DualAxisMXTensor``, or a pre-quantized ``MXTensor``
+                            quantized along its last dim
 - B ((transposed) weight):  a ``BlockMXTensor``
 - dY:                       a ``DualAxisMXTensor``
 
@@ -51,8 +52,9 @@ def _maybe_quantize_weight_operand(
     - a pre-quantized ``MXTensor`` is converted with ``B.to_block_mx(config_B)``, after its
       ``quant_config`` and ``act_quant_config`` are validated against
       ``config_B.mxfp4_fake_quantize_config`` and ``config_A``;
-    - a pre-quantized ``BlockMXTensor`` is reused as-is after its ``quant_config`` and
-      ``act_quant_config`` are validated to be the caller's ``config_B`` and ``config_A``;
+    - a pre-quantized ``BlockMXTensor`` is reused as-is after its ``quant_config`` is
+      validated to be the caller's ``config_B`` and its ``act_quant_config`` to be
+      either ``None`` or ``config_A``;
     - a high-precision ``B`` is quantized with ``config_B`` -- an MXFP4 QAT config still
       applies its FP4 fake-quantization pre-pass -- recording ``config_A`` as its
       ``act_quant_config``.
@@ -114,26 +116,41 @@ def _maybe_quantize_operands_then_save_for_backward(
     """Quantize the operands unless already quantized, return the forward forms
     and save the backward forms.
 
-    A pre-quantized ``DualAxisMXTensor`` ``A`` is validated against ``config_A`` and
-    reused as-is; ``B`` goes through :func:`_maybe_quantize_weight_operand`. Saves
-    ``A``'s ``dim=-2`` and ``B``'s ``dim=-1`` form for backward, both as
+    A pre-quantized ``DualAxisMXTensor`` or ``MXTensor`` ``A`` is validated against
+    ``config_A`` and reused. The ``MXTensor`` must be quantized along its last dim
+    (the forward form); its ``dim=-2`` backward form is rebuilt by
+    :func:`_retrieve_backward_operands_and_maybe_requantize`. A ``DualAxisMXTensor``
+    saves its ``dim=-2`` form directly. ``B`` goes through
+    :func:`_maybe_quantize_weight_operand`. Saves ``A``'s backward form and ``B``'s
+    ``dim=-1`` form, both as
     :class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`.
 
     Returns:
         ``A``'s ``dim=-1`` and ``B``'s ``dim=-2`` form.
+
+    Raises:
+        AssertionError: If a pre-quantized ``A`` carries a different ``quant_config``,
+            or an ``MXTensor`` ``A`` is not quantized along its last dim.
     """
-    if isinstance(A, DualAxisMXTensor):
+    if isinstance(A, (MXTensor, DualAxisMXTensor)):
         assert A.quant_config == config_A, (
             "The quantization configuration of the pre-quantized ``A`` is not consistent with ``config_A``, "
             f"``A.quant_config`` is {A.quant_config}, "
             f"``config_A`` is {config_A}."
         )
-        dual_axis_mx_A = A
-    else:
-        dual_axis_mx_A = DualAxisMXTensor.from_hp(A, config_A)
 
-    forward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-1)
-    backward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-2)
+    if isinstance(A, MXTensor):
+        assert A.quant_axis == A.ndim - 1, (
+            "The pre-quantized ``MXTensor`` ``A`` must be quantized along its last dim, "
+            f"got quant_axis={A.quant_axis} for a {A.ndim}D tensor."
+        )
+        forward_A = A
+        backward_A = A
+
+    else:
+        dual_axis_mx_A = A if isinstance(A, DualAxisMXTensor) else DualAxisMXTensor.from_hp(A, config_A)
+        forward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-1)
+        backward_A = dual_axis_mx_A.to_mx_tensor(quant_axis=-2)
 
     forward_B, backward_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis)
 
@@ -142,11 +159,37 @@ def _maybe_quantize_operands_then_save_for_backward(
     return forward_A, forward_B
 
 
-class _BlockMXQuantMM(torch.autograd.Function):
-    """Block MX matrix multiply: ``A[M,K] @ B[K,N] = Y[M,N]``.
+def _retrieve_backward_operands_and_maybe_requantize(ctx) -> tuple[MXTensor, MXTensor]:
+    """Return the saved ``A``/``B`` in the forms the backward GEMMs need.
 
-    - A can be either a high precision tensor or a DualAxisMXTensor
-    - B can be either a high precision tensor or a BlockMXTensor
+    A saved ``dim=-2`` form (the ``DualAxisMXTensor`` path) is reused as is. A saved
+    ``dim=-1`` form means ``A`` arrived pre-quantized as an ``MXTensor``: its
+    ``dim=-2`` form does not exist, so it is rebuilt by dequantizing along the last
+    dim and requantizing along ``dim=-2``.
+    """
+    backward_A, mx_B = ctx.saved_tensors
+
+    assert isinstance(backward_A, MXTensor), (
+        f"Expected the saved ``A`` to be an ``MXTensor``, got {type(backward_A).__name__}."
+    )
+    assert isinstance(mx_B, MXTensor), f"Expected the saved ``B`` to be an ``MXTensor``, got {type(mx_B).__name__}."
+
+    if backward_A.quant_axis == backward_A.ndim - 1:
+        dequant_A = backward_A.dequantize()
+        mx_A = MXTensor.from_hp(dequant_A, quant_config=backward_A.quant_config, axis=-2)
+    else:
+        mx_A = backward_A
+
+    return mx_A, mx_B
+
+
+class _BlockMXQuantMM(torch.autograd.Function):
+    """Block MX matrix multiply: ``A[..., M, K] @ B[K, N] = Y[..., M, N]``.
+
+    - A can be a high precision tensor, a DualAxisMXTensor, or an MXTensor quantized
+      along its last dim
+    - B can be a high precision tensor, a BlockMXTensor, or a pre-quantized MXTensor
+      (converted to block MX)
 
     If either A or B is in high precision, it will be quantized first then multiplied.
 
@@ -188,9 +231,7 @@ class _BlockMXQuantMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        mx_A: MXTensor
-        mx_B: MXTensor
-        mx_A, mx_B = ctx.saved_tensors
+        mx_A, mx_B = _retrieve_backward_operands_and_maybe_requantize(ctx)
 
         # dY is quantized along both axes with the same config as A's, providing
         # both GEMMs' dY operands below.
@@ -221,21 +262,25 @@ def to_block_mx_then_mm(
 ) -> torch.Tensor:
     """Block MX matrix multiply: ``A @ B`` with mixed-format quantization.
 
-    Neither operand has to be high precision: ``A`` may already be a
-    ``DualAxisMXTensor`` quantized with ``config_A``, ``B`` a ``BlockMXTensor``
-    quantized with ``config_B``, both validated against the configs here.
-    High-precision operands are quantized before multiplied.
+    - ``A`` may be n-dimensional (n >= 2): leading dimensions are flattened before
+      quantization and restored in the output. It may already be a
+      ``DualAxisMXTensor`` or an ``MXTensor`` quantized along its last dim, validated
+      against ``config_A``.
+    - ``B`` must be 2D. It may already be a ``BlockMXTensor`` or an ``MXTensor``
+      converted to block MX, validated against ``config_B``.
+
+    High-precision operands are quantized before the matmul.
 
     See ``_BlockMXQuantMM`` for details of the three GEMMs.
 
     Args:
-        A: Shape ``(M, K)``.
+        A: Shape ``(..., M, K)`` (n >= 2).
         B: Shape ``(K, N)``.
         config_A: Config for A's quantization.
         config_B: Config for B's quantization.
 
     Returns:
-        Output tensor, shape ``(M, N)``, dtype matching ``A``.
+        Output tensor, shape ``(..., M, N)``, dtype matching ``A``.
     """
     return _BlockMXQuantMM.apply(A, B, config_A, config_B)
 
@@ -251,36 +296,82 @@ def _maybe_quantize_gmm_operands_then_save_for_backward(
     """Quantize the grouped matmul's operands, return the forward forms and save the
     backward forms.
 
-    ``A`` must be high precision; it is quantized along both axes here: along ``dim=-1``
+    ``A`` is either high precision or a pre-quantized ``MXTensor`` quantized along its
+    last dim. A high-precision ``A`` is quantized along both axes here: along ``dim=-1``
     (the contracting dim) for the forward, and along ``dim=-2`` with a group-aware quant
-    op for the wgrad.
+    op for the wgrad. An ``MXTensor`` ``A`` is used as its ``dim=-1`` form; its
+    group-aware ``dim=-2`` form is rebuilt in
+    :func:`_retrieve_gmm_backward_operands_and_maybe_requantize`.
 
     ``B`` goes through :func:`_maybe_quantize_weight_operand`.
 
     Saves ``A``'s ``dim=-2`` form -- a group-aware
-    :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor` -- and
-    ``B``'s ``dim=-1`` form, plus the group offsets, for the backward.
+    :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor` for a
+    high-precision ``A``, or the ``MXTensor`` itself -- and ``B``'s ``dim=-1`` form,
+    plus the group offsets, for the backward.
 
     Returns:
         ``A``'s ``dim=-1`` and ``B``'s ``dim=-2`` form, for the forward grouped matmul.
 
     Raises:
-        AssertionError: If ``A`` is a quantized tensor.
+        AssertionError: If a pre-quantized ``A`` carries a different ``quant_config``,
+            or an ``MXTensor`` ``A`` is not quantized along its last dim.
+        TypeError: If ``A`` is pre-quantized but not a :class:`~torchao_npu.quantized_tensors.mx_tensor.MXTensor`.
     """
-    assert not isinstance(A, BaseQuantizedTensor), f"A must be a plain high precision tensor, got {type(A).__name__}."
+    if isinstance(A, MXTensor):
+        assert A.quant_config == config_A, (
+            "The quantization configuration of the pre-quantized ``A`` is not consistent with ``config_A``, "
+            f"``A.quant_config`` is {A.quant_config}, "
+            f"``config_A`` is {config_A}."
+        )
+        assert A.quant_axis == A.ndim - 1, (
+            "The pre-quantized ``MXTensor`` ``A`` must be quantized along its last dim, "
+            f"got quant_axis={A.quant_axis} for a {A.ndim}D tensor."
+        )
 
-    # A's contracting-dim form, for the forward grouped matmul.
-    forward_A = MXTensor.from_hp(A, config_A, -1)
+        forward_A = A
+        backward_A = A
 
-    # A's M-dim form, for the wgrad: a grouped quant with zero-boundary padding.
-    # A [M, K] → A_s2 (M-dim scale) [M//64 + E, K, 2]
-    backward_A = GroupedMXTensor.from_hp(A, offs, config_A)
+    elif not isinstance(A, BaseQuantizedTensor):
+        # A's contracting-dim form, for the forward grouped matmul.
+        forward_A = MXTensor.from_hp(A, config_A, -1)
+
+        # A's M-dim form, for the wgrad: a grouped quant with zero-boundary padding.
+        # A [M, K] → A_s2 (M-dim scale) [M//64 + E, K, 2]
+        backward_A = GroupedMXTensor.from_hp(A, offs, config_A)
+
+    else:
+        raise TypeError(f"A must be a high precision tensor or an MXTensor, got {type(A).__name__}.")
 
     forward_B, backward_B = _maybe_quantize_weight_operand(B, config_A, config_B, axis=-2)
 
     ctx.save_for_backward(backward_A, backward_B, offs)
 
     return forward_A, forward_B
+
+
+def _retrieve_gmm_backward_operands_and_maybe_requantize(ctx) -> tuple[GroupedMXTensor, MXTensor, torch.Tensor]:
+    """Return the saved ``A``/``B``/offsets in the forms the grouped backward needs.
+
+    A saved ``GroupedMXTensor`` (the high-precision path) is reused as is. A saved
+    ``MXTensor`` means ``A`` arrived pre-quantized along its last dim: its group-aware
+    ``dim=-2`` form is rebuilt from its dequantized values.
+    """
+    backward_A, mx_B, offs = ctx.saved_tensors
+
+    if isinstance(backward_A, MXTensor):
+        dequant_A = backward_A.dequantize()
+        mx_A = GroupedMXTensor.from_hp(dequant_A, offs, quant_config=backward_A.quant_config)
+
+    elif isinstance(backward_A, GroupedMXTensor):
+        mx_A = backward_A
+
+    else:
+        raise TypeError(
+            f"Expected the saved ``A`` to be an ``MXTensor`` or a ``GroupedMXTensor``, got {type(backward_A).__name__}."
+        )
+
+    return mx_A, mx_B, offs
 
 
 class _BlockMXQuantGroupedMM(torch.autograd.Function):
@@ -290,23 +381,29 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
     (cumsum offsets, length ``E``).  Each slice ``A[group_list[i-1]:group_list[i]]``
     is multiplied by ``B[i]``.
 
-    - A must be a high precision tensor
-    - B can be either a high precision tensor or a BlockMXTensor
+    - A must be a high precision tensor or an MXTensor quantized along its last dim
+    - B can be a high precision tensor, a BlockMXTensor, or a pre-quantized MXTensor
+      (converted to block MX)
 
     If B is in high precision, it will be quantized first then multiplied.
 
     Quantization:
-    - A's K-dim (contraction):  ``npu_dynamic_mx_quant(axis=-1)`` (params from ``config_A``)
+    - A's K-dim (contraction):  ``npu_dynamic_mx_quant(axis=-1)`` (params from
+                                ``config_A``); skipped when ``A`` is already an
+                                ``MXTensor``
     - A's M-dim (for wgrad):    ``npu_grouped_dynamic_mx_quant`` (zero-boundary padded;
                                 params from ``config_A``)
     - B:                        ``npu_dynamic_block_mx_quant``, 32×32 blocks
-                                (params from ``config_B``)
+                                (params from ``config_B``); a pre-quantized
+                                ``MXTensor`` is converted with ``MXTensor.to_block_mx``
 
     Forward:
         - Low-precision grouped matmul contracting over K.
-        - Quantized version of A and B are saved in ctx for backward.
-        - A's M-dim form is quantized by a group-aware op, so it is a
-          :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor`.
+        - Quantized version of A and B are saved in ctx for backward. The saved A is
+          the group-aware
+          :class:`~torchao_npu.quantized_tensors.grouped_mx_tensor.GroupedMXTensor`
+          for a high-precision ``A``, or the ``MXTensor`` itself for a pre-quantized
+          ``A``; its group-aware form is rebuilt in the backward.
 
 
     Backward (``dY = grad_output``):
@@ -338,9 +435,7 @@ class _BlockMXQuantGroupedMM(torch.autograd.Function):
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
         assert dY.ndim == 2, f"dY must be 2D, got {dY.ndim}D"
 
-        grouped_mx_A: GroupedMXTensor
-        mx_B: MXTensor
-        grouped_mx_A, mx_B, offs = ctx.saved_tensors
+        grouped_mx_A, mx_B, offs = _retrieve_gmm_backward_operands_and_maybe_requantize(ctx)
 
         # dY is quantized along both axes with the same config as A's, providing both
         # GEMMs' dY operands below: the N-dim form for the dgrad, the group-aware M-dim
@@ -381,9 +476,11 @@ def to_block_mx_then_grouped_mm(
     ``A @ B`` where each group's assigned rows are multiplied by its
     corresponding slice of ``B``.
 
-    ``A`` must be a high precision tensor. ``B`` may already be a ``BlockMXTensor``
-    quantized with ``config_B``, validated against the config here; a high-precision
-    ``B`` is quantized before multiplied.
+    - ``A`` is a high precision tensor or a pre-quantized ``MXTensor`` quantized
+      along its last dim, validated against ``config_A``.
+    - ``B`` may already be a ``BlockMXTensor`` or a pre-quantized ``MXTensor``, validated against ``config_B``.
+
+    High-precision operands are quantized before the matmul.
 
     See ``_BlockMXQuantGroupedMM`` for the quantization scheme and details of the
     three GEMMs.
@@ -405,8 +502,10 @@ def to_block_mx_then_grouped_mm(
 class _BlockMXQuantBMM(torch.autograd.Function):
     """Block MX batched matmul: ``A[B,M,K] @ B[B,K,N] = Y[B,M,N]``.
 
-    - A can be either a high precision tensor or a DualAxisMXTensor
-    - B can be either a high precision tensor or a BlockMXTensor
+    - A can be a high precision tensor, a DualAxisMXTensor, or an MXTensor quantized
+      along its last dim
+    - B can be a high precision tensor, a BlockMXTensor, or a pre-quantized MXTensor
+      (converted to block MX)
 
     If either A or B is in high precision, it will be quantized first then multiplied.
 
@@ -442,9 +541,7 @@ class _BlockMXQuantBMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor):  # pyrefly: ignore [bad-override]
-        mx_A: MXTensor
-        mx_B: MXTensor
-        mx_A, mx_B = ctx.saved_tensors
+        mx_A, mx_B = _retrieve_backward_operands_and_maybe_requantize(ctx)
 
         # dY is quantized along both axes with the same config as A's, providing
         # both GEMMs' dY operands below.
@@ -471,10 +568,12 @@ def to_block_mx_then_bmm(
 
     Both operands are 3D and must share the leading batch dimension.
 
-    Neither operand has to be high precision: ``A`` may already be a
-    ``DualAxisMXTensor`` quantized with ``config_A``, ``B`` a ``BlockMXTensor``
-    quantized with ``config_B``, both validated against the configs here.
-    High-precision operands are quantized before multiplied.
+    - ``A`` may already be a ``DualAxisMXTensor`` or an ``MXTensor`` quantized along
+      its last dim, validated against ``config_A``.
+    - ``B`` may already be a ``BlockMXTensor`` or a pre-quantized ``MXTensor``,
+      validated against ``config_B``.
+
+    High-precision operands are quantized before the matmul.
 
     See ``_BlockMXQuantBMM`` for details of the three GEMMs.
 

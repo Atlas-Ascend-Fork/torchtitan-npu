@@ -21,6 +21,7 @@ from torchao_npu.quantization.quant_configs import (
     MXQuantizeConfig,
 )
 from torchao_npu.quantization.quant_primitives.block_mx import block_mx_quantize
+from torchao_npu.quantized_tensors import DualAxisMXTensor, MXTensor
 
 # (shape, config_a, config_b, sqnr_threshold) cases shared by the forward and
 # gradient SQNR tests below.
@@ -993,3 +994,126 @@ def test_mxfp4_grouped_matmul_backward_equivalence(m, k, n, e, group_sizes):
 
     assert torch.equal(da_old, da_new), "da differs between old and new quantization paths"
     assert torch.equal(db_old, db_new), "db differs between old and new quantization paths"
+
+
+# =========================================================================
+# Pre-quantized MXTensor activations
+# =========================================================================
+
+
+def test_mm_accepts_pre_quantized_activation():
+    """An activation quantized along K feeds the forward and dgrad unchanged."""
+    m, k, n = 128, 64, 256
+    a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="npu", dtype=torch.bfloat16)
+    b = weight.T
+    config_a = MXQuantizeConfig()
+    config_b = BlockMXQuantizeConfig()
+
+    a_ref = a.clone().detach().requires_grad_(True)
+    b_ref = b.clone().detach().requires_grad_(True)
+    out_ref = to_block_mx_then_mm(a_ref, b_ref, config_a, config_b)
+    out_ref.sum().backward()
+
+    # The same quantization the high-precision path applies to its A operand.
+    mx_a = DualAxisMXTensor.from_hp(a.detach(), config_a).to_mx_tensor(quant_axis=-1)
+    mx_a.requires_grad_(True)
+    b_mx = b.clone().detach().requires_grad_(True)
+    out = to_block_mx_then_mm(mx_a, b_mx, config_a, config_b)
+    out.sum().backward()
+
+    assert torch.equal(out, out_ref), "the pre-quantized activation changed the forward"
+    assert torch.equal(mx_a.grad, a_ref.grad), "the dgrad does not use A and must be identical"
+    # The wgrad rebuilds A's dim=-2 form from the dequantized activation, adding one
+    # quantization step, so it only has to stay close to the high-precision path.
+    wgrad_sqnr = compute_error(b_mx.grad, b_ref.grad).item()
+    assert wgrad_sqnr > 20.0, f"the wgrad SQNR vs the HP path is too low: {wgrad_sqnr:.2f} db"
+
+
+def test_bmm_accepts_pre_quantized_activation():
+    """A 3-D activation quantized along K feeds the batched path the same way."""
+    batch, m, k, n = 2, 64, 128, 64
+    a = torch.randn(batch, m, k, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(batch, n, k, device="npu", dtype=torch.bfloat16)
+    b = weight.transpose(-1, -2)
+    config_a = MXQuantizeConfig()
+    config_b = BlockMXQuantizeConfig()
+
+    a_ref = a.clone().detach().requires_grad_(True)
+    b_ref = b.clone().detach().requires_grad_(True)
+    out_ref = to_block_mx_then_bmm(a_ref, b_ref, config_a, config_b)
+    out_ref.sum().backward()
+
+    mx_a = DualAxisMXTensor.from_hp(a.detach(), config_a).to_mx_tensor(quant_axis=-1)
+    mx_a.requires_grad_(True)
+    b_mx = b.clone().detach().requires_grad_(True)
+    out = to_block_mx_then_bmm(mx_a, b_mx, config_a, config_b)
+    out.sum().backward()
+
+    assert torch.equal(out, out_ref), "the pre-quantized activation changed the forward"
+    assert torch.equal(mx_a.grad, a_ref.grad), "the dgrad does not use A and must be identical"
+    wgrad_sqnr = compute_error(b_mx.grad, b_ref.grad).item()
+    assert wgrad_sqnr > 20.0, f"the wgrad SQNR vs the HP path is too low: {wgrad_sqnr:.2f} db"
+
+
+def test_grouped_mm_accepts_pre_quantized_activation():
+    """The grouped path uses the pre-quantized activation as its K-dim form."""
+    m, k, n, e = 128, 64, 128, 4
+    a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(e, k, n, device="npu", dtype=torch.bfloat16)
+    offs = _group_list_from_sizes([32, 32, 32, 32])
+    config_a = MXQuantizeConfig()
+    config_b = BlockMXQuantizeConfig()
+
+    a_ref = a.clone().detach().requires_grad_(True)
+    b_ref = b.clone().detach().requires_grad_(True)
+    out_ref = to_block_mx_then_grouped_mm(a_ref, b_ref, offs, config_a, config_b)
+    out_ref.sum().backward()
+
+    # The high-precision path quantizes A into this exact single-axis form.
+    mx_a = MXTensor.from_hp(a.detach(), config_a, axis=-1)
+    mx_a.requires_grad_(True)
+    b_mx = b.clone().detach().requires_grad_(True)
+    out = to_block_mx_then_grouped_mm(mx_a, b_mx, offs, config_a, config_b)
+    out.sum().backward()
+
+    assert torch.equal(out, out_ref), "the pre-quantized activation changed the forward"
+    assert torch.equal(mx_a.grad, a_ref.grad), "the dgrad does not use A and must be identical"
+    wgrad_sqnr = compute_error(b_mx.grad, b_ref.grad).item()
+    assert wgrad_sqnr > 20.0, f"the wgrad SQNR vs the HP path is too low: {wgrad_sqnr:.2f} db"
+
+
+def test_mm_rejects_mx_activation_quantized_along_the_wrong_axis():
+    """The forward form must be the K-dim form, quantized along the last dim.
+
+    The mm forward reshapes ``A`` to ``(-1, K)`` before validating the operands,
+    and ``MXTensor``'s view handler rejects a tensor whose quant axis is not the
+    last dim, so the rejection surfaces there.
+    """
+    a = torch.randn(128, 64, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(256, 64, device="npu", dtype=torch.bfloat16)
+    mx_a = MXTensor.from_hp(a, MXQuantizeConfig(), axis=-2)
+
+    with pytest.raises(ValueError, match="requires the quant axis to be the last dim"):
+        to_block_mx_then_mm(mx_a, weight.T, MXQuantizeConfig(), BlockMXQuantizeConfig())
+
+
+def test_mm_rejects_mx_activation_with_a_different_config():
+    """A pre-quantized activation must have been quantized with ``config_A``."""
+    a = torch.randn(128, 64, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(256, 64, device="npu", dtype=torch.bfloat16)
+    mx_a = MXTensor.from_hp(a, MXQuantizeConfig(block_size=64), axis=-1)
+
+    with pytest.raises(AssertionError, match="not consistent with ``config_A``"):
+        to_block_mx_then_mm(mx_a, weight.T, MXQuantizeConfig(), BlockMXQuantizeConfig())
+
+
+def test_grouped_mm_rejects_pre_quantized_activation_of_another_class():
+    """Only an MXTensor activation is accepted by the grouped path."""
+    a = torch.randn(128, 64, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(4, 64, 128, device="npu", dtype=torch.bfloat16)
+    offs = _group_list_from_sizes([32, 32, 32, 32])
+    dual_axis_a = DualAxisMXTensor.from_hp(a, MXQuantizeConfig())
+
+    with pytest.raises(TypeError, match="A must be a high precision tensor or an MXTensor"):
+        to_block_mx_then_grouped_mm(dual_axis_a, b, offs, MXQuantizeConfig(), BlockMXQuantizeConfig())
