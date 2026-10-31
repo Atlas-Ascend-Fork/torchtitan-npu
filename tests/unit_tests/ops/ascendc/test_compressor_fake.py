@@ -87,9 +87,9 @@ def test_compressor_fake_shapes_and_dtypes(ratio, coff, shape, batch):
             assert saved.dtype == torch.float32
 
 
-@pytest.fixture(scope="module")
-def cann_boundary():
-    @torch.library.custom_op("test_compressor_compat::forward", mutates_args=())
+@pytest.fixture(scope="module", params=["_compressor_forward", "_compressor_forward_graph"], ids=["legacy", "graph"])
+def cann_boundary(request):
+    @torch.library.custom_op(f"test_compressor_compat::{request.param}", mutates_args=())
     def forward(x: torch.Tensor, cu: torch.Tensor, ratio: int) -> torch.Tensor:
         rows = min(x.shape[0], x.shape[0] // ratio + cu.shape[0] - 1)
         return x.sum().expand(rows, x.shape[1]).clone()
@@ -102,11 +102,13 @@ def cann_boundary():
         return torch.ones_like(x) * grad.sum(), None, None
 
     forward.register_autograd(backward, setup_context=setup_context)
-    return forward
+    return request.param, forward
 
 
 @pytest.mark.parametrize("ratio", [4, 128])
 def test_compressor_fake_under_make_fx_with_unbacked_sizes(cann_boundary, ratio):
+    _, cann_boundary = cann_boundary
+
     def adapted(x, cu, ratio):
         weight = x.new_empty((8, 8))
         return _compressor_forward_fake(x, weight, weight, x, x, ratio, None, cu, None, None)[0]
@@ -128,6 +130,7 @@ def test_compressor_fake_under_make_fx_with_unbacked_sizes(cann_boundary, ratio)
 @pytest.mark.parametrize("ratio", [4, 128])
 @pytest.mark.parametrize("checkpointed", [False, True])
 def test_loader_replaces_unbacked_fake_and_preserves_autograd(monkeypatch, cann_boundary, ratio, checkpointed):
+    forward_name, cann_boundary = cann_boundary
     # Match the failing Python min in CANN's fake, not a traced Python kernel.
     def original_fake(x, cu, ratio):
         return x.new_empty((min(x.shape[0], x.shape[0] // ratio + cu.shape[0] - 1), x.shape[1]))
@@ -158,7 +161,7 @@ def test_loader_replaces_unbacked_fake_and_preserves_autograd(monkeypatch, cann_
         return register_fake(cann_boundary._opoverload, adapted)
 
     monkeypatch.setattr(torch.library, "register_fake", register)
-    namespace = types.SimpleNamespace(_compressor_forward=torch.ops.test_compressor_compat.forward)
+    namespace = types.SimpleNamespace(**{forward_name: getattr(torch.ops.test_compressor_compat, forward_name)})
     monkeypatch.setattr(torch.ops, "cann_ops_transformer", namespace)
     module = types.ModuleType("cann_ops_transformer.ops.compressor")
     module.compressor = cann_boundary

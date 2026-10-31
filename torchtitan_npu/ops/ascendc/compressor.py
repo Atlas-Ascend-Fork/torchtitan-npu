@@ -50,9 +50,12 @@ def _compressor_forward_fake(
 def load_compressor():
     """Load only for the selected override; preserve CANN kernels and autograd."""
     module = importlib.import_module("cann_ops_transformer.ops.compressor")
-    forward_op = getattr(torch.ops.cann_ops_transformer, "_compressor_forward", None)
-    if forward_op is not None:
-        # Remove when supported CANN packages use symbolic-safe shape inference.
-        torch.library.register_fake(forward_op.default, _compressor_forward_fake)
+    # Newer CANN public entries use a mutating graph op; older packages only
+    # expose the functional forward. Keep both native autograd paths intact.
+    for name in ("_compressor_forward", "_compressor_forward_graph"):
+        forward_op = getattr(torch.ops.cann_ops_transformer, name, None)
+        if forward_op is not None:
+            # Remove when supported CANN packages use symbolic-safe shape inference.
+            torch.library.register_fake(forward_op.default, _compressor_forward_fake)
     compressor_op = getattr(torch.ops.cann_ops_transformer, "compressor", None)
     return compressor_op.default if compressor_op is not None else module.compressor
