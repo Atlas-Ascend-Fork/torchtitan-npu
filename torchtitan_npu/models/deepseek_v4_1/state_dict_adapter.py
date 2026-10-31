@@ -16,7 +16,7 @@ the markers and the router's vision bias belong to
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -26,9 +26,7 @@ from torchtitan_npu.extensions.mx_storage_reader.engram import EngramHuggingFace
 
 from .engram.checkpoint import checkpoint_shard
 from .indexer import REUSE
-
-if TYPE_CHECKING:
-    from .vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
+from .vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
 
 
 class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
@@ -122,14 +120,14 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
                         )
                 self.from_hf_map.update(indexer_map)
 
-        # Imported here, not at module scope: the vision package pulls in the tower and,
-        # through it, the multimodal dataset stack -- a text-only run must not need them.
         from .model import DeepSeekV41MultimodalModel
 
         if isinstance(model_config, DeepSeekV41MultimodalModel.Config):
-            from .vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
-
             self._vision_adapter = DeepSeekV41VisionStateDictAdapter()
+        else:
+            self._drop_vision_keys_from_export_mapping()
+        # mtp is unsupported, the keys of mtp should be filtered
+        self._drop_mtp_keys_from_export_mapping()
 
     def _owns_vision_hf_key(self, key: str) -> bool:
         return self._vision_adapter is not None and self._vision_adapter.owns_hf_key(key)
@@ -161,6 +159,23 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         if self._vision_adapter is not None:
             result.update(self._vision_adapter.to_hf(vision_local))
         return result
+
+    def _drop_vision_keys_from_export_mapping(self):
+        """Keep vision keys out of a text-only model's HF export"""
+        if not self.fqn_to_index_mapping:
+            return
+        self.fqn_to_index_mapping = {
+            key: index
+            for key, index in self.fqn_to_index_mapping.items()
+            if not DeepSeekV41VisionStateDictAdapter.owns_hf_key(key)
+        }
+
+    def _drop_mtp_keys_from_export_mapping(self):
+        if not self.fqn_to_index_mapping:
+            return
+        self.fqn_to_index_mapping = {
+            key: index for key, index in self.fqn_to_index_mapping.items() if not key.startswith("mtp.")
+        }
 
     # ---- the text-backbone halves (the V4.1-effective DSV4 mapping) ----
 
