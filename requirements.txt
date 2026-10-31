@@ -9,6 +9,7 @@ torchvision==0.29.0
 torch_npu==2.14.0.dev20260918
 torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@dc3985ad4912f67f71d5a125f2fdf40144ec8354
 attn-gym==0.0.16
+grain==0.2.18
 pybind11==3.0.4
 numpy
 PyYAML
