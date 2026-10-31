@@ -241,6 +241,16 @@ def _cached_batches(
             device=pipeline.device,
         )
         cache_entries.append((parameter, cpu_gradient, npu_gradient))
+        # Register the norm group **before** the empty-shard early exit. FSDP2
+        # does not pad a shard, so a parameter whose numel is smaller than the
+        # FSDP world leaves some ranks with a zero-element local shard. Skipping
+        # those ranks' group here makes them issue one all_reduce fewer than
+        # their peers, and HCCL matches collectives by order on a communicator:
+        # the peers park in the extra all_reduce while these ranks move on to
+        # the next op, and the device reports the mismatch much later as a
+        # notify timeout. _bounded_local_norm registers before its numel check;
+        # the cached path (the one CPU offload uses) did not.
+        group = _get_norm_group(groups, gradient, pipeline.device, infinite=infinite)
         if cpu_gradient.numel() == 0:
             continue
 
@@ -249,7 +259,6 @@ def _cached_batches(
             yield batch
             batch = []
             batch_bytes = 0
-        group = _get_norm_group(groups, gradient, pipeline.device, infinite=infinite)
         batch.append(
             _CachedNormItem(
                 npu_gradient,
