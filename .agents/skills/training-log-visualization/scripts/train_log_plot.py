@@ -202,6 +202,10 @@ def compute_errors(
     rel_errors: list[float] = []
 
     for a_val, b_val in zip(values_a, values_b, strict=True):
+        if math.isnan(a_val) or math.isnan(b_val):
+            absolute_errors.append(math.nan)
+            rel_errors.append(math.nan)
+            continue
         if baseline == "a":
             diff = b_val - a_val
             denom = abs(a_val)
@@ -209,7 +213,12 @@ def compute_errors(
             diff = a_val - b_val
             denom = abs(b_val)
         absolute_errors.append(abs(diff))
-        rel_errors.append(diff / denom if denom > 0 else 0.0)
+        if denom > 0:
+            rel_errors.append(diff / denom)
+        elif diff == 0:
+            rel_errors.append(0.0)
+        else:
+            rel_errors.append(math.copysign(math.inf, diff))
 
     return absolute_errors, rel_errors
 

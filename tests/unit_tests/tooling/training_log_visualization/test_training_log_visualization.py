@@ -108,3 +108,43 @@ def test_absolute_error_is_nonnegative_while_relative_error_keeps_direction():
 
     assert absolute_errors == [1.0, 1.0]
     assert relative_errors == [-0.5, 0.5]
+
+
+@pytest.mark.parametrize(
+    ("values_a", "values_b", "baseline", "expected"),
+    [
+        ([0.0], [2.0], "a", math.inf),
+        ([0.0], [-2.0], "a", -math.inf),
+        ([2.0], [0.0], "b", math.inf),
+        ([-2.0], [0.0], "b", -math.inf),
+        ([0.0], [0.0], "a", 0.0),
+    ],
+    ids=(
+        "positive-from-zero-a",
+        "negative-from-zero-a",
+        "positive-from-zero-b",
+        "negative-from-zero-b",
+        "both-zero",
+    ),
+)
+def test_relative_error_reports_zero_baseline_divergence(
+    values_a,
+    values_b,
+    baseline,
+    expected,
+):
+    _, relative_errors = PARSER.compute_errors(values_a, values_b, baseline=baseline)
+
+    assert relative_errors == [expected]
+
+
+@pytest.mark.parametrize("baseline", ["a", "b"])
+def test_relative_error_preserves_nan_inputs(baseline):
+    absolute_errors, relative_errors = PARSER.compute_errors(
+        [math.nan],
+        [2.0],
+        baseline=baseline,
+    )
+
+    assert math.isnan(absolute_errors[0])
+    assert math.isnan(relative_errors[0])
