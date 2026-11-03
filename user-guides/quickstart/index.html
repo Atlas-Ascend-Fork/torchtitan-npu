@@ -270,13 +270,13 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 </tr>
 <tr>
 <td><code>recipe</code></td>
-<td><code>all_mxfp8</code>、<code>mix</code>、<code>all_block_fp8</code>、<code>all_hif8</code></td>
-<td>选择全 MXFP8、混合 MXFP8/Block FP8、全 Block FP8 或全 HiF8。</td>
+<td>DeepSeek: <code>all_mxfp8</code>、<code>mix</code>、<code>all_block_fp8</code>、<code>all_hif8</code>；Qwen3.5: <code>W4A8_MXFP</code>、<code>W8A8_MXFP8</code></td>
+<td>DeepSeek 选择 MXFP8/Block FP8/HiF8 recipe；Qwen3.5 两个 recipe 仅支持 dense 模型，不支持 MoE 模型或 shared experts，也不量化视觉编码器；激活为 MXFP8，<code>W4A8_MXFP</code> 权重带 MXFP4 fake quant，<code>W8A8_MXFP8</code> 权重为 Block FP8。</td>
 </tr>
 <tr>
 <td><code>enable-mxfp4-qat</code></td>
 <td><code>--enable-mxfp4-qat</code> / <code>--no-enable-mxfp4-qat</code></td>
-<td>为 routed expert 启用或关闭 MXFP4 QAT 约束，默认关闭。</td>
+<td>为 DeepSeek routed expert 启用或关闭 MXFP4 QAT 约束，默认关闭；Qwen3.5 <code>W4A8_MXFP</code> 的 dense 权重不依赖该开关。</td>
 </tr>
 <tr>
 <td><code>li-quantization</code></td>

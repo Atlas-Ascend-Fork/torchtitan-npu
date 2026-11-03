@@ -174,7 +174,7 @@
             <div class="section" itemprop="articleBody">
               
                 <h1 id="_1">低精度训练</h1>
-<p>torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4 和 DeepSeek-V4.1 提供 MXFP8、Block FP8 低精度训练，以及 MXFP4 量化感知训练（QAT）。量化配置复用现有预训练和续训练循环，可按需选择线性层、专家权重和 attention Q/KV 的量化方式。</p>
+<p>torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4、DeepSeek-V4.1 和 Qwen3.5 提供低精度训练。DeepSeek-V4/V4.1 支持 MXFP8、Block FP8 及 routed expert MXFP4 量化感知训练（QAT）；Qwen3.5 额外提供仅作用于 dense 线性层的 <code>W4A8_MXFP</code> 和 <code>W8A8_MXFP8</code> recipe。</p>
 <h2 id="_2">环境要求</h2>
 <ul>
 <li>当前低精度训练面向 A5（Ascend 950）硬件，需要配套的 torch_npu、CANN、HCCL 和融合算子环境。</li>
@@ -244,14 +244,24 @@
 </tbody>
 </table>
 <p>recipe 按模型配置中的模块路径匹配 Attention linear、shared expert 和 routed expert，将匹配上的模块转化为对应的量化实现。MXFP8 路径对权重和激活使用 MX 量化；Block FP8 路径对权重使用 Block FP8 量化，激活使用 MX 量化。</p>
+<p><code>W4A8_MXFP</code> 和 <code>W8A8_MXFP8</code> 仅用于 Qwen3.5 dense 模型。两者匹配 full-attention、DeltaNet 和 dense FFN 投影；不支持 Qwen3.5 MoE 模型，也不量化 routed/shared experts、router、视觉编码器、embedding、LM head、norm 或 conv。两者的激活均使用 MXFP8，<code>W8A8_MXFP8</code> 权重直接使用 Block FP8，等价于 <code>all_block_fp8</code> 的 dense 权重量化方式；<code>W4A8_MXFP</code> 权重先经过 MXFP4 fake quant，再反量化到 Block FP8 参与计算。<code>W4A8_MXFP</code> 不需要同时设置 <code>--extension.quantization.enable-mxfp4-qat</code>；<code>--extension.quantization.dst-type-max</code> 仅影响 <code>W4A8_MXFP</code> 的 MXFP4 量化目标域最大值。</p>
+<pre><code class="language-bash">--extension.quantization.enable-quantized-training \
+--extension.quantization.recipe W8A8_MXFP8
+</code></pre>
+<p>可在 Qwen3.5 启动脚本后追加上述参数，例如：</p>
+<pre><code class="language-bash">bash examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe W8A8_MXFP8
+</code></pre>
+<p>DeepSeek-V4/V4.1 不注册 <code>W4A8_MXFP</code> 或 <code>W8A8_MXFP8</code>，选择这些组合会在转换阶段报错。</p>
 <h2 id="mxfp4-qat">MXFP4 QAT</h2>
-<p><code>--extension.quantization.enable-mxfp4-qat</code> 为 routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。它仅对 <code>mix</code> 和 <code>all_block_fp8</code> 中的 routed expert 生效，默认关闭。</p>
+<p><code>--extension.quantization.enable-mxfp4-qat</code> 为 DeepSeek routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。该独立开关仅对 <code>mix</code> 和 <code>all_block_fp8</code> 中的 routed expert 生效，默认关闭。Qwen3.5 <code>W4A8_MXFP</code> 对 dense 权重固有地使用同一 fake quant 机制，不依赖该开关。</p>
 <p>在训练命令中使用以下参数组合：</p>
 <pre><code class="language-bash">--extension.quantization.enable-quantized-training \
 --extension.quantization.recipe all_block_fp8 \
 --extension.quantization.enable-mxfp4-qat
 </code></pre>
-<p>该选项不会将参数持久化为 4-bit，也不会将计算替换为原生 A8W4 GEMM。<code>all_mxfp8</code> 不包含 Block FP8 权重，启用该项 QAT 约束无效。</p>
+<p>该选项不会将参数持久化为 4-bit，也不会将计算替换为原生 <code>W4A8_MXFP</code> GEMM。<code>all_mxfp8</code> 不包含 Block FP8 权重，启用该项 QAT 约束无效。</p>
 <p>QAT 下做 MXFP4 量化时可以使用 <code>--extension.quantization.dst_type_max</code> 传参来指定量化时目标域的最大值。参数默认值为 0.0 对应 <code>Amax(Dtype)</code>；可以传参 7.0，以防止量化数据中的最大值被截断而产生较大精度损失。</p>
 <p>DeepSeek-V4/V4.1 的完整 QAT 启动方式见<a href="../../user-guides/quickstart/#deepseek-v41-torchao-npu-低精度训练">快速上手</a>。V4.1 QAT 脚本同时启用 routed expert MXFP4 fake quant、Lightning Indexer 和稀疏 attention/KV source Compressor 量化，相关自定义算子依赖见下一节。</p>
 <h2 id="attention">Attention 量化</h2>
@@ -386,7 +396,7 @@
 </code></pre>
 <p><code>fsdp_pre_all_gather()</code> 只处理当前 rank 持有的本地分片；量化结果由 FP8 权重 <code>B_q</code> 和两个方向的 scale <code>B_s1</code>、<code>B_s2</code> 组成，FSDP 对三类数据分别执行 all-gather。通信完成后，<code>fsdp_post_all_gather()</code> 首次创建 wrapper，后续更新已分配的 wrapper。wrapper 对 PyTorch、FSDP 和 autograd 暴露 shape 不变的逻辑参数，量化 MatMul 则直接读取内部的 <code>B_q + scale</code>，避免在同一次 unshard 周期的每个 MatMul 前重复量化权重。</p>
 <p>这里的逻辑 dtype 与物理 payload 是两个概念：逻辑参数仍用于梯度路由和 FSDP 状态管理，实际通信和量化计算使用 FP8 权重及 scale。量化 wrapper 的自定义反向将梯度转换回逻辑权重，再交给 FSDP 按 <code>reduce_dtype</code> 做 reduce-scatter；优化器参数和 checkpoint 不会因此永久变成 FP8。</p>
-<p>该选项默认关闭，需要同时启用低精度训练。它只作用于 <code>mix</code> 中的 routed expert 和 <code>all_block_fp8</code> 中匹配的 Block FP8 模块；<code>all_mxfp8</code>/<code>all_hif8</code> 没有任何预量化 scope，与该开关同开属于矛盾配置，转换阶段直接抛出 <code>ValueError</code>（提示改用 <code>all_block_fp8</code>/<code>mix</code> 或关闭开关），不会被静默忽略：</p>
+<p>该选项默认关闭，需要同时启用低精度训练。它作用于 DeepSeek <code>mix</code> 中的 routed expert、DeepSeek <code>all_block_fp8</code> 中匹配的 Block FP8 模块，以及 Qwen3.5 <code>W4A8_MXFP</code>/<code>W8A8_MXFP8</code> 中的 dense 模块；<code>all_mxfp8</code>/<code>all_hif8</code> 没有任何预量化 scope，与该开关同开属于矛盾配置，转换阶段直接抛出 <code>ValueError</code>（提示改用具有 Block FP8 权重 scope 的 recipe 或关闭开关），不会被静默忽略：</p>
 <pre><code class="language-bash">--extension.quantization.enable-quantized-training \
 --extension.quantization.recipe all_block_fp8 \
 --extension.quantization.enable-fsdp-prequantize
@@ -408,7 +418,7 @@
 --extension.quantization.fsdp-prequantize-dtype mxfp4
 </code></pre>
 <p><code>enable-fsdp-prequantize</code> 启用参数通信预量化；<code>fsdp-prequantize-dtype mxfp4</code> 只将 routed experts 的通信格式切换为 MXFP4，
-attention 等 dense 权重仍使用 FP8。专家在 <code>[E, N, K]</code> 布局下沿 K 轴量化；all-gather 返回的 MXFP4 权重直接保留为反分片权重，
+<code>all_block_fp8</code> 与 Qwen3.5 <code>W4A8_MXFP</code>/<code>W8A8_MXFP8</code> 中的 dense 权重仍使用 FP8。Qwen3.5 dense 模型的这两个 recipe 不包含 routed expert 量化，因此设置 <code>fsdp-prequantize-dtype mxfp4</code> 会直接报错，避免静默回退为 FP8 通信。专家在 <code>[E, N, K]</code> 布局下沿 K 轴量化；all-gather 返回的 MXFP4 权重直接保留为反分片权重，
 在前向矩阵乘时再转换为 Block FP8，因此计算仍按 FP8 × FP8 执行。梯度通信仍使用 FSDP 原有配置。</p>
 <p>该模式要求 routed experts 启用 MXFP4 QAT，并使用 <code>Shard(0)</code> 分片（不均分时自动 pad 对齐、通信后 trim 还原）、2D/3D 权重和 block size 32；不支持 <code>Shard(1)</code>。
 未显式设置 <code>fsdp-prequantize-fqns</code> 时使用 recipe 默认白名单；若只指定 <code>.moe.routed_experts.inner_experts</code>，则只启用专家预量化通信，attention 的 FP8 预量化通信也会关闭。白名单不影响原有计算量化。</p>
@@ -433,12 +443,12 @@ attention 等 dense 权重仍使用 FP8。专家在 <code>[E, N, K]</code> 布�
 <tr>
 <td><code>recipe</code></td>
 <td><code>all_block_fp8</code></td>
-<td>选择 <code>all_mxfp8</code>、<code>all_hif8</code>、<code>mix</code> 或 <code>all_block_fp8</code></td>
+<td>DeepSeek-V4/V4.1 选择 <code>all_mxfp8</code>、<code>all_hif8</code>、<code>mix</code> 或 <code>all_block_fp8</code>；Qwen3.5 dense 模型选择 <code>W4A8_MXFP</code> 或 <code>W8A8_MXFP8</code>，不支持 Qwen3.5 MoE 模型</td>
 </tr>
 <tr>
 <td><code>enable-mxfp4-qat</code></td>
 <td><code>False</code></td>
-<td>Routed expert 的 MXFP4 fake quant 约束</td>
+<td>DeepSeek routed expert 的 MXFP4 fake quant 约束；Qwen3.5 <code>W4A8_MXFP</code> 的 dense 权重不依赖该开关</td>
 </tr>
 <tr>
 <td><code>li-quantization</code></td>
@@ -463,7 +473,7 @@ attention 等 dense 权重仍使用 FP8。专家在 <code>[E, N, K]</code> 布�
 <tr>
 <td><code>fsdp-prequantize-dtype</code></td>
 <td><code>fp8</code></td>
-<td>Routed experts 的预量化通信格式；<code>mxfp4</code> 要求专家启用 MXFP4 QAT。<code>all_block_fp8</code> 下 attention 等 dense 权重仍使用 FP8 通信，启用范围由白名单决定</td>
+<td>Routed experts 的预量化通信格式；<code>mxfp4</code> 要求专家启用 MXFP4 QAT。DeepSeek <code>all_block_fp8</code> 与 Qwen3.5 <code>W4A8_MXFP</code>/<code>W8A8_MXFP8</code> 中的 dense 权重仍使用 FP8 通信；Qwen3.5 dense recipe 选择 <code>mxfp4</code> 时直接报错，启用范围由白名单决定</td>
 </tr>
 <tr>
 <td><code>fsdp-prequantize-fqns</code></td>
