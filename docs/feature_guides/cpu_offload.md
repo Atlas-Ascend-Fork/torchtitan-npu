@@ -48,7 +48,7 @@ CPU Offload 是一套"CPU 常驻 + NPU 计算"的显存优化方案：
 ```
 --training.enable-cpu-offload
 ├── parallelize_fn → CPUOffloadPolicy → FSDPParam.offload_to_cpu = True
-│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank: 上游内建 / 单 rank: 本仓预取补丁）
+│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank 亦由本仓批量 copy-in 补丁覆盖，单 rank 走 copy-only 预取补丁）
 │   └── backward: foreach_reduce → 梯度 reduce-scatter → D2H 落 CPU pinned
 │                                    → 第二个 microbatch 起在 NPU 分块累加（本仓补丁）
 │
@@ -72,7 +72,7 @@ CPU Offload 是一套"CPU 常驻 + NPU 计算"的显存优化方案：
 | `extensions/cpu_offload/runtime.py` | `GradientClipChannel`：clip→optimizer 显式交接 + `stage_gradient` |
 | `extensions/cpu_offload/cpu_offload_adamw.py` | `CpuOffloadAdamW`：公开算子实现，状态驻留面可选（CPU 常驻 / NPU 常驻原地更新）+ NPU 计算 |
 | `extensions/cpu_offload/cpu_offload_muon.py` | `CpuOffloadDistributedMuon`：FlexShard 双路径（local + redistribution），momentum 驻留面同上 |
-| `extensions/distributed/grad_accum.py` | 梯度累加 + 单 rank 参数预取（FSDP 集成） |
+| `extensions/distributed/grad_accum.py` | 梯度累加 + 参数批量 copy-in 预取（单 rank 与多 rank）与批量 D2H |
 | `extensions/distributed/grad_clip.py` | clip 补丁：NPU 侧范数计算（cached / bounded 双模式） |
 | `patches/torch_npu/cpu_dtensor_init.py` | `Module._init_param` 包装：CPU DTensor 参数 NPU 初始化 |
 | `override/common/optimizer.py` | `CpuOffload*OptimizersContainer`：唯一 owner，显式安装/关闭；NPU-state 默认与 CPU-state（含 HostSparse）变体按 `swap_optimizer` 选择 |
