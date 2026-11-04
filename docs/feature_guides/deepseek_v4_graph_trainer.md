@@ -49,6 +49,22 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 
 GraphTrainer 的 trace 约束与 eager 有本质差异：`minimal_fx_tracer` 在 FakeTensor 下联合 trace，数据相关控制流与形状推导无法静态化，aot_autograd recompute 会丢弃 forward 中的 in-place 写。DSV4 稀疏注意力路径中依赖 in-place 写或数据相关形状推断的写法，在编译路径均改为函数式等价实现；注意力元数据 dataclass 注册为 pytree node，使 `minimal_fx_tracer` 能够识别其结构。
 
+### Full Inductor 与 chunk loss
+
+[兼容补丁](../../torchtitan_npu/patches/torchtitan/experiments/graph_trainer/inductor_passes.py)
+在导入 `torchtitan_npu` 时自动启用。设置 `--compile.inductor-compilation full` 时，模型主干仍使用 Inductor 编译；带有
+`loss` / `lm_head` 注解的执行区间保留为独立 FX 子图。该区间包含 chunk 间未标注的梯度累加，
+按捕获时的逐 chunk 前向、反向顺序执行，避免整图编译将多个 chunk 的大中间张量同时保留。
+此兼容行为也适用于普通 loss；`regional` 模式及不含 loss 注解的 full 图沿用上游路径。
+
+分区之间通过可消费的参数列表传递张量：父图先打包参数并清除最后使用的局部引用，
+FX loss 入口清空列表，主干编译区域通过 Inductor 原生 `steal_arg` 路径消费列表。
+这样可以避免父图或调用包装器把已消费的激活一直持有到整个反向子图返回。
+
+该兼容路径适用于固定的 torchtitan 0.3.0，不改变 loss 公式和重计算策略。
+CPU 回归检查执行顺序、loss、输入和参数梯度，并在子图尚未返回时检查已消费输入的存储是否释放；
+真实 NPU 的峰值显存与吞吐仍需在相同配置下比较。
+
 ### Inductor runtime estimation patch
 
 `patches/torch_npu/inductor_runtime_estimation.py`（新增，包导入时按需生效）：NPU 上以常量 1200 GB/s 代替 Triton CUDA-driver 探测 DRAM 带宽——该值只进入 graph 调度 roofline 估计，不改变生成算子；同时默认开启 `standalone_compile(donate_graph_module=True)`，避免图模块深拷贝开销。仅在 `torch.npu.is_available()` 时应用。
