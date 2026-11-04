@@ -21,16 +21,14 @@ subsequent runs with the same shape use the cached graph.
 import pytest
 import torch
 import torch_npu  # noqa: F401
-from torchao_npu.ops.block_mx_ops import (
-    to_block_mx_then_mm,
-)
 from torchao_npu.ops.hif8_ops import to_hif8_then_bmm, to_hif8_then_mm
-from torchao_npu.ops.mx_ops import to_mx_then_mm
 from torchao_npu.quantization.quant_configs import (
     BlockMXQuantizeConfig,
     HiF8QuantizeConfig,
     MXQuantizeConfig,
 )
+from torchao_npu.wrapper_tensors.block_mx_wrapper_tensor import BlockMXTrainingWeightWrapperTensor
+from torchao_npu.wrapper_tensors.mx_wrapper_tensor import MXTrainingWeightWrapperTensor
 
 
 def _compile_and_assert_output(model, lhs, rhs, *, expected_shape):
@@ -46,18 +44,8 @@ def _compile_and_assert_output(model, lhs, rhs, *, expected_shape):
 
 
 # ============================================================================
-# MX quantized matmul (to_mx_then_mm)
+# MX weight-wrapper matmul
 # ============================================================================
-
-
-class MXMMModel(torch.nn.Module):
-    def __init__(self, config_a, config_b):
-        super().__init__()
-        self.config_a = config_a
-        self.config_b = config_b
-
-    def forward(self, a, b):
-        return to_mx_then_mm(a, b, self.config_a, self.config_b)
 
 
 @pytest.mark.parametrize(
@@ -68,14 +56,14 @@ class MXMMModel(torch.nn.Module):
     ],
 )
 def test_mx_fp8_matmul_compile(m, k, n):
-    """``to_mx_then_mm`` with FP8 works under torch.compile."""
+    """``torch.mm`` with an FP8 MX weight wrapper works under torch.compile."""
     torch.manual_seed(42)
     a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
-    b = torch.randn(k, n, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="npu", dtype=torch.bfloat16)
     config = MXQuantizeConfig()  # default: float8_e4m3fn
 
-    model = MXMMModel(config, config).npu()
-    _compile_and_assert_output(model, a, b, expected_shape=(m, n))
+    b = MXTrainingWeightWrapperTensor(b, weight_config=config, activation_config=config)
+    _compile_and_assert_output(lambda activation, weight: torch.mm(activation, weight.T), a, b, expected_shape=(m, n))
 
 
 @pytest.mark.parametrize(
@@ -86,33 +74,23 @@ def test_mx_fp8_matmul_compile(m, k, n):
     ],
 )
 def test_mx_fp4_matmul_compile(m, k, n):
-    """``to_mx_then_mm`` with FP4 works under torch.compile.
+    """``torch.mm`` with an FP4 MX weight wrapper works under torch.compile.
 
     FP4 tensors are stored as ``uint8`` (two FP4 values per byte), so
     ``x1_dtype``/``x2_dtype`` must still be passed.
     """
     torch.manual_seed(42)
     a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
-    b = torch.randn(k, n, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="npu", dtype=torch.bfloat16)
     config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
 
-    model = MXMMModel(config, config).npu()
-    _compile_and_assert_output(model, a, b, expected_shape=(m, n))
+    b = MXTrainingWeightWrapperTensor(b, weight_config=config, activation_config=config)
+    _compile_and_assert_output(lambda activation, weight: torch.mm(activation, weight.T), a, b, expected_shape=(m, n))
 
 
 # ============================================================================
-# Block MX quantized matmul (to_block_mx_then_mm)
+# Block MX weight-wrapper matmul
 # ============================================================================
-
-
-class BlockMXMMModel(torch.nn.Module):
-    def __init__(self, config_a, config_b):
-        super().__init__()
-        self.config_a = config_a
-        self.config_b = config_b
-
-    def forward(self, a, b):
-        return to_block_mx_then_mm(a, b, self.config_a, self.config_b)
 
 
 @pytest.mark.parametrize(
@@ -123,15 +101,15 @@ class BlockMXMMModel(torch.nn.Module):
     ],
 )
 def test_block_mx_without_mxfp4_compile(m, k, n):
-    """``to_block_mx_then_mm`` without MXFP4 fake-quant works under compile."""
+    """``torch.mm`` with a Block MX weight wrapper without MXFP4 fake-quant compiles."""
     torch.manual_seed(42)
     a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
-    b = torch.randn(k, n, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="npu", dtype=torch.bfloat16)
     config_a = MXQuantizeConfig()
     config_b = BlockMXQuantizeConfig()  # no mxfp4_fake_quantize_config
 
-    model = BlockMXMMModel(config_a, config_b).npu()
-    _compile_and_assert_output(model, a, b, expected_shape=(m, n))
+    b = BlockMXTrainingWeightWrapperTensor(b, weight_config=config_b, activation_config=config_a)
+    _compile_and_assert_output(lambda activation, weight: torch.mm(activation, weight.T), a, b, expected_shape=(m, n))
 
 
 @pytest.mark.parametrize(
@@ -142,17 +120,17 @@ def test_block_mx_without_mxfp4_compile(m, k, n):
     ],
 )
 def test_block_mx_with_mxfp4_compile(m, k, n):
-    """``to_block_mx_then_mm`` with MXFP4 fake-quant works under compile."""
+    """``torch.mm`` with a Block MX weight wrapper with MXFP4 fake-quant compiles."""
     torch.manual_seed(42)
     a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
-    b = torch.randn(k, n, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="npu", dtype=torch.bfloat16)
     config_a = MXQuantizeConfig()
     config_b = BlockMXQuantizeConfig(
         mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
     )
 
-    model = BlockMXMMModel(config_a, config_b).npu()
-    _compile_and_assert_output(model, a, b, expected_shape=(m, n))
+    b = BlockMXTrainingWeightWrapperTensor(b, weight_config=config_b, activation_config=config_a)
+    _compile_and_assert_output(lambda activation, weight: torch.mm(activation, weight.T), a, b, expected_shape=(m, n))
 
 
 # ============================================================================
