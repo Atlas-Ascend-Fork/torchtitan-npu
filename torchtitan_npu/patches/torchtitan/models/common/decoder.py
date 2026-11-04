@@ -39,7 +39,7 @@ Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
 0.3.0 adaptation, because the pinned version predates #4116/#4617:
 ``labels`` is passed separately (0.3.0 keeps it out of ``input_dict``), and
 ``parallel_dims``/``device``/``parallelism`` stand in for #4116's
-``parallelism_context`` (0.3.0 has no ``ParallelismContext``).  The
+``parallelism_context`` (0.3.0 has no ``ParallelismContext``).
 The model-level ``build_attention_masks`` hook this file used to honour is gone: every stack of
 this repository builds its metadata through ``build_attention_metadata`` now, so one seam is left.
 """
