@@ -37,6 +37,11 @@ class OverrideDefinitions:
     expected_steps: Sequence[Sequence[int]] | None = None
     check_resume: bool = False
     verify_ema_checkpoint: bool = False
+    # CI resource/asset requirements; ordinary integration cases need no site profile.
+    device: str | None = None
+    required_env: Sequence[str] = ()
+    check_grad_norm: bool = False
+    unset_env: Sequence[str] = ()
 
     def __repr__(self):
         return self.test_descr

@@ -1,0 +1,84 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+name: Training CI
+
+on:
+  pull_request:
+    branches: [master]
+  schedule:
+    # 02:00 Asia/Shanghai; GitHub schedules are expressed in UTC.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Training suite (base ⊂ pr ⊂ nightly)
+        type: choice
+        required: true
+        default: base
+        options: [base, pr, nightly]
+
+permissions:
+  contents: read
+  actions: read
+
+# Serialize scheduled and manual Nightly runs without cancelling remote jobs.
+concurrency:
+  group: training-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly')) && 'nightly' || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  prepare:
+    # Only the organization may dispatch real training. PRs target master.
+    if: >-
+      github.repository == 'torchtitan-npu/torchtitan-npu' &&
+      ((github.event_name == 'pull_request' && github.base_ref == 'master') ||
+       (github.event_name == 'schedule' && github.ref == 'refs/heads/master') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci/'))))
+    name: Prepare training matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
+      pipeline: ${{ steps.plan.outputs.pipeline }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand selected suite
+        id: plan
+        env:
+          CI_SUITE: ${{ inputs.suite }}
+        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
+      - name: Upload immutable CI request
+        uses: actions/upload-artifact@v4
+        with:
+          name: lite-ci-request-${{ github.run_attempt }}
+          path: .ci-request/ci-request.json
+          retention-days: 1
+          if-no-files-found: error
+
+  case:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for training result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
+          CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
+          CI_WAIT_TIMEOUT_SECONDS: "16800"
+          CI_PIPELINE: ${{ needs.prepare.outputs.pipeline }}
+        run: python3 .github/scripts/lite_actions/wait_result.py --case "$CI_PIPELINE" --test-id "${{ matrix.test_id }}"

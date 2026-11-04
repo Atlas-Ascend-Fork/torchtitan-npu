@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "suites": {
+    "base": {
+      "extends": [],
+      "cases": [
+        "dsv4_flash_a3_16p_cp2_ep8_eager",
+        "dsv4_flash_a3_16p_cp2_ep8_compile",
+        "dsv4_flash_a3_8p_cp1_ep8_graphtrainer",
+        "dsv41_flash_a3_8p_multimodal_cpt_eager",
+        "dsv41_flash_a3_8p_multimodal_cpt_compile"
+      ]
+    },
+    "pr": {
+      "extends": [
+        "base"
+      ],
+      "cases": []
+    },
+    "nightly": {
+      "extends": [
+        "pr"
+      ],
+      "cases": []
+    }
+  }
+}

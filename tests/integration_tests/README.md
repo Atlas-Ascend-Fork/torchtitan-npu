@@ -4,7 +4,7 @@
 
 根据运行环境与执行规模的不同，仓内集成测试分为两种核心形态：
 1. **流水线典型用例冒烟测试（A3 4die环境）**：面向 PR 门禁与日常开发快速回归，在配备 1~4 卡（4-die）的开发机或流水线容器内运行，通过仓内集成的并行 Runner 执行典型短步数用例，支持 Deterministic 数值 Loss 精确逐值比对与核心算子冒烟；
-2. **集群 Nightly 全量用例测试**：面向真实的 A3 / A5 物理多机集群（单机 8P / 双机 16P / 八机 64P），覆盖生产级完整规格、跨机分布式通信拓扑与真实权重资产，通过内网 Lite Actions 调度系统排队执行。
+2. **集群 Nightly 全量用例测试**：面向真实的 A3 / A5 物理多机集群（单机 8P / 单机 16P / 双机 16P / 八机 128P），覆盖生产级完整规格、跨机分布式通信拓扑与真实权重资产，通过内网 Lite Actions 调度系统排队执行。
 
 ---
 
@@ -188,116 +188,29 @@ python -m tests.integration_tests.run_tests /tmp/v41_muon_adapter_resume \
 
 ---
 
-## 二、集群 Nightly 全量用例测试（A3 / A5 真实集群）
+## 二、分层训练用例（Lite Actions）
 
-### 2.1 测试矩阵与规格定义
+Lite Actions 的用例清单由 [`.github/ci/suites.json`](../../.github/ci/suites.json) 管理，
+具体定义位于 [`training_cases/`](training_cases/)。当前只接入已经验证的 `base` 层；`pr.py` 和 `nightly.py` 保留为空占位，后续验证完成后再补充。
 
-Nightly CI 用例专为真实物理集群设计，由内网 Lite Actions 调度机通过 SSH 远程拉起：
+| Suite | 当前内容 |
+| --- | --- |
+| `base` | 5 个基础用例 |
+| `pr` | 继承 `base`，暂无新增用例 |
+| `nightly` | 继承 `pr`，暂无新增用例 |
 
-| Suite 名称 | Case ID | 硬件规格 | 优化器与训练配置 | 验证指标 |
-| :--- | :--- | :--- | :--- | :--- |
-| **`a3_8p_tests`** | `dsv4_flash_a3_8p_example` | A3 单机 8P | Muon，Eager，5 steps | Exit Code 0、TensorBoard 步数 |
-| **`a3_8p_tests`** | `dsv4_flash_a3_8p_adamw` | A3 单机 8P | AdamW + Virtual Optimizer，4K seq，5 steps | Exit Code 0、TensorBoard 步数 |
-| **`a3_16p_tests`** | `dsv4_flash_a3_16p_example` | A3 双机 16P | AdamW，EP16，Eager，双机各 8P，5 steps | Exit Code 0、跨机通信与步数 |
-| **`a5_64p_tests`** | `dsv4_pro_a5_64p` | A5 八机 64P | DeepSeek-V4 Pro，八机各 8P | 待硬件环境验收后开放 |
+### 2.1 当前用例
 
----
+| 编号 / Case ID | 设备与拓扑 | 组合特性 |
+| --- | --- | --- |
+| base_01 `dsv4_flash_a3_16p_cp2_ep8_eager` | A3，1 × 16P，CP2 / EP8 | DSV4 Flash 裁剪模型、Muon、eager |
+| base_02 `dsv4_flash_a3_16p_cp2_ep8_compile` | A3，1 × 16P，CP2 / EP8 | DSV4 Flash 裁剪模型、Muon、compile |
+| base_03 `dsv4_flash_a3_8p_cp1_ep8_graphtrainer` | A3，1 × 8P，CP1 / EP8 | DSV4 Flash 裁剪模型、GraphTrainer、`aot_fx_trace` |
+| base_04 `dsv41_flash_a3_8p_multimodal_cpt_eager` | A3，1 × 8P，EP8 | DSV4.1 Flash 裁剪多模态、图文 CPT、eager |
+| base_05 `dsv41_flash_a3_8p_multimodal_cpt_compile` | A3，1 × 8P，EP8 | DSV4.1 Flash 裁剪多模态、图文 CPT、compile |
 
-### 2.2 本地极简调试入口（物理机手动直跑）
-
-若直接在配备 NPU 的物理机器上手动自测 Nightly 用例，无需通过 GitHub Actions，使用单行命令即可拉起：
-
-#### 单机 8P（单节点自测）
-单机用例无需指定跨机 IP，内部自动通过 `run_tests` 执行：
-```bash
-python3 -m tests.integration_tests.tools.lite_actions.entrypoint launch \
-  --test-id dsv4_flash_a3_8p_adamw \
-  --output-dir /tmp/test_8p
-```
-
-#### 双机 16P（跨节点分布式自测）
-两台机器分别执行同一行命令，通过前置 `NODE_IPS` 指定两节点的通信 IP 即可：
-```bash
-NODE_IPS="192.168.1.3,192.168.1.4" python3 -m tests.integration_tests.tools.lite_actions.entrypoint launch \
-  --test-id dsv4_flash_a3_16p_example \
-  --output-dir /tmp/test_16p
-```
-> **提示**：脚本会自动根据本机 IP 匹配并确定 Master（Rank 0）与 Worker（Rank 1）角色；环境中的单节点卡数等参数已在用例定义内配好，无需额外 export。
-
----
-
-### 2.3 开发者实操：如何新增一个 Nightly 集成用例
-
-向 Nightly CI 系统添加新用例非常简单，**只需在模型仓修改 Python 代码，无需改动调度机配置**。
-
-#### 步骤一：找到用例定义文件
-Nightly 用例统一存放于：
-`tests/integration_tests/nightly_all_models_test/`
-
-根据用例的卡数规格，编辑对应文件（或新建文件并在 `__init__.py` 中暴露）：
-- 单机 8P 用例：`a3_8p_tests.py`
-- 双机 16P 用例：`a3_16p_tests.py`
-- 八机 64P 用例：`a5_64p_tests.py`
-
-#### 步骤二：编写 `OverrideDefinitions`
-每个用例都是一个 `OverrideDefinitions` 对象。核心字段说明如下：
-
-| 字段名称 | 类型 | 说明 |
-| :--- | :--- | :--- |
-| **`test_name`** | `str` | 用例唯一标识（不可重复，用于 GitHub Matrix 调度命名与结果报告） |
-| **`nnodes`** | `int` | 所需节点数（单机写 `1`，双机写 `2`） |
-| **`ngpu`** | `int` | 单节点卡数（通常为 `8`） |
-| **`override_args`** | `dict` | 传给训练启动脚本的命令行参数（覆盖默认 toml 配置） |
-| **`env_vars`** | `dict` | 运行时环境变量（CANN 脚本路径、模型权重路径、优化器覆盖等） |
-| **`expected_steps`** | `int` | 预期训练步数（用于 TensorBoard 与日志断言） |
-
-#### 步骤三：代码编写模板
-打开 `tests/integration_tests/nightly_all_models_test/a3_8p_tests.py`，在 `build_test_list()` 中添加新的用例定义：
-
-```python
-from torchtitan_npu.testing.framework import OverrideDefinitions
-
-def build_test_list():
-    tests = [
-        # 现有用例...
-
-        # 新增用例示例：
-        OverrideDefinitions(
-            test_name="dsv4_flash_a3_8p_my_feature",
-            nnodes=1,
-            ngpu=8,
-            override_args={
-                "--job.config_file": "torchtitan_npu/models/deepseek_v4/train_configs/dsv4_flash_8p.toml",
-                "--training.steps": "5",
-                "--training.batch_size": "1",
-            },
-            env_vars={
-                # 必填：执行机上的 CANN 环境配置脚本
-                "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/ascend-toolkit/latest/set_env.sh",
-                # 必填：Tokenizer 与模型资产路径
-                "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
-                # 必填：权重 Checkpoint 路径
-                "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
-                # 可选：如果使用 Virtual Optimizer 优化 AdamW 显存占用
-                "OPTIMIZER_OVERRIDES": "torchtitan_npu.override.common.optimizer.virtual",
-                # 可选：设置共享 Hugging Face 缓存，防止 Docker 满盘
-                "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache",
-            },
-            expected_steps=5,
-        ),
-    ]
-    return tests
-```
-
-#### 步骤四：本地静态语法与元数据解析自测（无需 NPU）
-在提交代码前，在普通的 CPU 开发机环境下执行 `inspect` 子命令，验证用例语法与参数是否合法：
-
-```bash
-# 验证 8P suite 能够正确解析并包含你的新增用例
-python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite a3_8p_tests
-```
-
-输出将以 JSON 格式打印出所有用例的 `test_id`、`nnodes`、`ngpu` 及环境变量。确认你的 `test_name` 正确显示且无 Python 报错即可。
+所有当前用例执行 10 步，使用随机初始化；文本用例使用仓内 C4 资产，base_04 和 base_05 需要 CC12M 图文数据及 `DATASET_PATH`。
+Lite Actions 的详细 launch、verify、资产注入和跨机调度说明后续补充。
 
 ---
 
@@ -314,23 +227,23 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
    - 执行机**完全不持有 GitHub Token**，仅内网调度机单点具有回写 Comment 权限。
 
 ### 3.2 手动调度（Maintainer 冒烟与调试）
-维护者亦可通过 GitHub Actions 网页界面或 GitHub CLI 手动发起调度：
+维护者可通过 `Training CI` 的 suite 下拉框或 GitHub CLI 手动发起调度，默认选择 `base`。
+PR 固定选择 `pr`，定时事件固定选择 `nightly`，不受手动输入影响。定时与手动 Nightly 共用并发组，不取消正在执行的任务。
 
 ```bash
-# 执行 A3 8P 全部用例（Muon + AdamW 独立 Matrix Case，资源不重叠即可并发）
-gh workflow run a3_8p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
-  -f 'test_cases=[{"suite":"a3_8p_tests"}]'
+# 基础核心用例；suite 也可选择 pr 或 nightly。
+gh workflow run training.yml -R torchtitan-npu/torchtitan-npu --ref master \
+  -f suite=base
 
-# 仅执行指定 16P 用例
-gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
-  -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
+# 仅检查调度器与 NPU 资源连接，不运行训练。
+gh workflow run dispatcher_smoke.yml -R torchtitan-npu/torchtitan-npu --ref master
 ```
 
 ### 3.3 CI 矩阵并发与动态端口分配
 
 在 GitHub Actions CI 流水线中，每个 Matrix Case 是独立的调度与执行单元：
 * **并发调度**：Lite Actions 调度机会根据物理集群的空闲 NPU 资源池，将互不冲突的 Case 并发拉起执行（如单机 8P 各用例并发执行，或双机 16P 跨节点独立分配）。
-* **动态端口防冲突**：当同机或跨机并发拉起多个任务时，调度机会为每个任务动态分配互不冲突的通信端口（通过注入环境变量 `LITE_CI_MASTER_PORT`、`LITE_CI_HCCL_IF_BASE_PORT`、`LITE_CI_HCCL_HOST_PORT_RANGE` 与 `LITE_CI_HCCL_NPU_PORT_RANGE`）。仓内的 `nightly_all_models_test/runner.py` 会自动读取并映射这些变量，覆盖用例的默认端口。开发者编写用例时无需硬编码特殊端口，使用默认值即可。
+* **动态端口防冲突**：当同机或跨机并发拉起多个任务时，调度机会为每个任务动态分配互不冲突的通信端口（通过注入环境变量 `LITE_CI_MASTER_PORT`、`LITE_CI_HCCL_IF_BASE_PORT`、`LITE_CI_HCCL_HOST_PORT_RANGE` 与 `LITE_CI_HCCL_NPU_PORT_RANGE`）。仓内的 `tools/lite_actions/runner.py` 会自动读取并映射这些变量，覆盖用例的默认端口。开发者编写用例时无需硬编码特殊端口，使用默认值即可。
 
 ### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 Lite Actions 调度系统运维说明或联系集群管理员排查。

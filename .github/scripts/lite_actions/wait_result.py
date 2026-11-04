@@ -27,9 +27,9 @@ RESULT_AUTHOR = os.environ.get("CI_RESULT_AUTHOR") or os.environ.get("GITHUB_ACT
 
 PIPELINES = {
     "dispatcher-smoke": ("Dispatcher-Smoke", "npu-smi"),
-    "a3-8p": ("A3-8p-CI-Example", "a3-8p"),
-    "a3-16p": ("A3-16p-CI-Example", "a3-16p"),
-    "a5-64p": ("A5-64p-CI", "a5-64p"),
+    "base": ("Training CI", "base"),
+    "pr": ("Training CI", "pr"),
+    "nightly": ("Training CI", "nightly"),
 }
 TEST = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 STATUS = {"PASS", "FAIL", "NOT_RUN", "CANCELLED", "TIMED_OUT", "INFRA_ERROR", "RESOURCE_TIMEOUT"}

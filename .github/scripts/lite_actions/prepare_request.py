@@ -17,49 +17,46 @@ import os
 import re
 from pathlib import Path
 
-TEST = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 # Only the upstream organization may publish CI plans or consume results.
 REPO = "torchtitan-npu/torchtitan-npu"
 if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
     raise ValueError("untrusted GitHub CI repository")
-PIPELINES = {"a3-8p", "a3-16p", "a5-64p"}
+PIPELINES = {"base", "pr", "nightly"}
 
 
-def parse_cases(value: str) -> list[dict]:
-    if len(value.encode()) > 65535:
-        raise ValueError("test_cases input too long")
-    cases = json.loads(value)
-    if not isinstance(cases, list) or not cases:
-        raise ValueError("test_cases selector count invalid")
-    for case in cases:
-        if not isinstance(case, dict) or len(case) != 1 or (("test_id" in case) == ("suite" in case)):
-            raise ValueError("each request selects exactly one test_id or suite")
-        name = case.get("test_id", case.get("suite"))
-        if not isinstance(name, str) or not TEST.fullmatch(name):
-            raise ValueError("invalid registered test/suite")
-    return cases
+def select_suite(event: str, requested: str) -> str:
+    """Automatic events fix the suite; manual runs choose a declared layer."""
+    if event == "pull_request":
+        return "pr"
+    if event == "schedule":
+        return "nightly"
+    if event == "workflow_dispatch" and requested in PIPELINES:
+        return requested
+    raise ValueError("Unsupported training event or suite")
 
 
-def expand_cases(selectors: list[dict]) -> list[dict]:
-    """Use model-owned definitions; imports are trusted from validated master."""
+def expand_cases(suite: str) -> list[dict]:
+    """Expand the selected layer using definitions in the current checkout."""
     from tests.integration_tests.tools.lite_actions.entrypoint import catalog, select
 
     catalogue = catalog()
     expanded, seen = [], set()
-    for selector in selectors:
-        for test in select(catalogue, **selector):
-            if test.test_name in seen:
-                raise ValueError("duplicate expanded Test Case")
-            if not isinstance(test.ngpu, int) or not isinstance(test.nnodes, int):
-                raise ValueError("invalid resource requirements")
-            if test.ngpu < 1 or test.nnodes < 1:
-                raise ValueError("invalid resource requirements")
-            label = test.test_descr.strip()
-            if not label or len(label) > 115 or any(ord(x) < 32 for x in label):
-                raise ValueError("invalid Test Case description")
-            expanded.append({"test_id": test.test_name, "nnodes": test.nnodes, "ngpu": test.ngpu, "label": label})
-            seen.add(test.test_name)
+    for test in select(catalogue, suite=suite):
+        if test.test_name in seen:
+            raise ValueError("duplicate expanded Test Case")
+        if not isinstance(test.ngpu, int) or not isinstance(test.nnodes, int):
+            raise ValueError("invalid resource requirements")
+        if test.ngpu < 1 or test.nnodes < 1:
+            raise ValueError("invalid resource requirements")
+        label = test.test_descr.strip()
+        if not label or len(label) > 115 or any(ord(x) < 32 for x in label):
+            raise ValueError("invalid Test Case description")
+        item = {"test_id": test.test_name, "nnodes": test.nnodes, "ngpu": test.ngpu, "label": label}
+        if test.device is not None:
+            item.update(device=test.device, required_env=list(test.required_env), phases=len(test.override_args))
+        expanded.append(item)
+        seen.add(test.test_name)
     return expanded
 
 
@@ -86,10 +83,10 @@ def create_plan(*, cases: list[dict], run_id: int, attempt: int, sha: str, repo:
 
 
 def main() -> None:
-    selectors = parse_cases(os.environ["CI_TEST_CASES"])
+    pipeline = select_suite(os.environ["GITHUB_EVENT_NAME"], os.environ.get("CI_SUITE", "base"))
     request_dir = Path(".ci-request")
     request_dir.mkdir(exist_ok=True)
-    cases = expand_cases(selectors)
+    cases = expand_cases(pipeline)
     # GitHub Actions supports up to 256 Matrix combinations; never truncate.
     if not cases or len(cases) > 256:
         raise ValueError("GitHub Matrix supports 1..256 test cases per workflow run")
@@ -99,7 +96,7 @@ def main() -> None:
         attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
         sha=os.environ.get("CI_SOURCE_SHA") or os.environ["GITHUB_SHA"],
         repo=os.environ["GITHUB_REPOSITORY"],
-        pipeline=os.environ["CI_PIPELINE"],
+        pipeline=pipeline,
     )
     matrix = {"include": [{"test_id": case["test_id"], "label": case["label"]} for case in cases]}
     output = os.environ.get("GITHUB_OUTPUT")
@@ -108,6 +105,7 @@ def main() -> None:
     with open(output, "a", encoding="utf-8") as handle:
         handle.write("matrix=" + json.dumps(matrix, ensure_ascii=False, separators=(",", ":")) + "\n")
         handle.write("plan_digest=" + result["plan_digest"] + "\n")
+        handle.write("pipeline=" + pipeline + "\n")
     print("Prepared CI Matrix:", [case["test_id"] for case in cases])
     (request_dir / "ci-request.json").write_text(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n",

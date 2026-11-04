@@ -43,6 +43,7 @@ from tests.integration_tests.loss_compare import (
     assert_losses_equal,
     compare_checkpoint_metrics,
     extract_losses_from_tensorboard,
+    extract_scalar_from_tensorboard,
     log_print,
     read_losses_from_file,
 )
@@ -442,6 +443,10 @@ def _check_phase_results(
             for step in sorted(test_losses):
                 _emit_line(test_name, f"[GOLDEN_MISMATCH] {step} {test_losses[step]}")
             raise
+    if test_flavor.check_grad_norm:
+        grad_norms = extract_scalar_from_tensorboard(case_dir / "test_run", tb_folder, "grad_norm")
+        if set(grad_norms) != set(test_losses):
+            raise RuntimeError(f"{test_name} phase {idx}: grad_norm steps do not match loss steps")
 
 
 def run_single_test(
@@ -475,6 +480,8 @@ def run_single_test(
     # command line: per-case ``env_vars`` override --module/--config, while
     # NGPU/LOG_RANK always come last.
     env = os.environ.copy()
+    for key in test_flavor.unset_env:
+        env.pop(key, None)
     if gpu_ids is not None:
         env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
     if module is not None:
@@ -485,7 +492,12 @@ def run_single_test(
         env.update(test_flavor.env_vars)
     env["NGPU"] = str(test_flavor.ngpu)
     env["LOG_RANK"] = all_ranks
-    if test_flavor.ngpu >= 4:
+    if "LITE_CI_HCCL_IF_BASE_PORT" in env:
+        raw = env["LITE_CI_HCCL_IF_BASE_PORT"]
+        if not raw.isascii() or not raw.isdecimal() or not 1024 <= int(raw) <= 65535:
+            raise ValueError("invalid dispatcher-issued LITE_CI_HCCL_IF_BASE_PORT")
+        env["HCCL_IF_BASE_PORT"] = raw
+    elif test_flavor.ngpu >= 4:
         # The only 4-NPU model case shares the host with concurrent 2-NPU cases; give it a
         # distinct host side base port so it cannot collide with their default 60000.  Do not
         # inherit a platform-set value: an out-of-range port fails every rank at HCCL init.

@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+name: Dispatcher-Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    if: >-
+      github.repository == 'torchtitan-npu/torchtitan-npu' &&
+      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci/'))
+    name: Wait for dispatcher-only npu-smi probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for dispatcher-only npu-smi probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SOURCE_SHA: ${{ github.sha }}
+          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
+          CI_WAIT_TIMEOUT_SECONDS: "4800"
+        run: python3 .github/scripts/lite_actions/wait_result.py --case dispatcher-smoke
