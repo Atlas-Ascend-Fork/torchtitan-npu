@@ -91,6 +91,8 @@
     </li>
     <li class="toctree-l3"><a class="reference internal" href="#graph-safe">Graph-safe 改造</a>
     </li>
+    <li class="toctree-l3"><a class="reference internal" href="#full-inductor-chunk-loss">Full Inductor 与 chunk loss</a>
+    </li>
     <li class="toctree-l3"><a class="reference internal" href="#inductor-runtime-estimation-patch">Inductor runtime estimation patch</a>
     </li>
         </ul>
@@ -224,6 +226,18 @@
 <p>入口处有两条硬约束：<code>spmd_types</code> backend 不支持（simple_fsdp 构建于 raw DTensor 操作之上，该 backend 会报错）；TP 启用时 <code>seq_len</code> 必须整除 <code>parallel_dims.seq_len_divisor</code>（TP degree × 2 x CP degree，<code>use_local_output=True</code> 使用 plain tensor）。</p>
 <h3 id="graph-safe">Graph-safe 改造</h3>
 <p>GraphTrainer 的 trace 约束与 eager 有本质差异：<code>minimal_fx_tracer</code> 在 FakeTensor 下联合 trace，数据相关控制流与形状推导无法静态化，aot_autograd recompute 会丢弃 forward 中的 in-place 写。DSV4 稀疏注意力路径中依赖 in-place 写或数据相关形状推断的写法，在编译路径均改为函数式等价实现；注意力元数据 dataclass 注册为 pytree node，使 <code>minimal_fx_tracer</code> 能够识别其结构。</p>
+<h3 id="full-inductor-chunk-loss">Full Inductor 与 chunk loss</h3>
+<p><a href="../../torchtitan_npu/patches/torchtitan/experiments/graph_trainer/inductor_passes.py">兼容补丁</a>
+在导入 <code>torchtitan_npu</code> 时自动启用。设置 <code>--compile.inductor-compilation full</code> 时，模型主干仍使用 Inductor 编译；带有
+<code>loss</code> / <code>lm_head</code> 注解的执行区间保留为独立 FX 子图。该区间包含 chunk 间未标注的梯度累加，
+按捕获时的逐 chunk 前向、反向顺序执行，避免整图编译将多个 chunk 的大中间张量同时保留。
+此兼容行为也适用于普通 loss；<code>regional</code> 模式及不含 loss 注解的 full 图沿用上游路径。</p>
+<p>分区之间通过可消费的参数列表传递张量：父图先打包参数并清除最后使用的局部引用，
+FX loss 入口清空列表，主干编译区域通过 Inductor 原生 <code>steal_arg</code> 路径消费列表。
+这样可以避免父图或调用包装器把已消费的激活一直持有到整个反向子图返回。</p>
+<p>该兼容路径适用于固定的 torchtitan 0.3.0，不改变 loss 公式和重计算策略。
+CPU 回归检查执行顺序、loss、输入和参数梯度，并在子图尚未返回时检查已消费输入的存储是否释放；
+真实 NPU 的峰值显存与吞吐仍需在相同配置下比较。</p>
 <h3 id="inductor-runtime-estimation-patch">Inductor runtime estimation patch</h3>
 <p><code>patches/torch_npu/inductor_runtime_estimation.py</code>（新增，包导入时按需生效）：NPU 上以常量 1200 GB/s 代替 Triton CUDA-driver 探测 DRAM 带宽——该值只进入 graph 调度 roofline 估计，不改变生成算子；同时默认开启 <code>standalone_compile(donate_graph_module=True)</code>，避免图模块深拷贝开销。仅在 <code>torch.npu.is_available()</code> 时应用。</p>
 <h2 id="_5">激活方式</h2>
