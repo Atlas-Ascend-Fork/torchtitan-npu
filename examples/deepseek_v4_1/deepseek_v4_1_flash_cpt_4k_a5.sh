@@ -52,9 +52,18 @@ export NODE_IPS NGPU
 export MBS="${MBS:-1}"
 
 # A5 defaults to block-FP8 quantized training.
+# The FP8 pre-quantize guard needs both local-shard dims to be 64-aligned, and
+# this entry runs DP_SHARD=128: wq_a (1280/128=10), wkv (512/128=4), wo_b
+# (5120/128=40), indexer.wq_b (4096/128=32) and shared_experts w1/w3 (2304/128=18)
+# / w2 (5120/128=40) fail dim0 and would abort at startup, so the whitelist keeps
+# only wq_b/wo_a. Routed experts stay out too: EP=DP_SHARD=128 leaves the expert
+# FSDP mesh (efsdp) at size 1, so a whitelisted entry would only quantize in
+# post-all-gather — extra peak memory with no communication to save.
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
     --extension.quantization.recipe all_block_fp8
+    --extension.quantization.enable-fsdp-prequantize
+    --extension.quantization.fsdp-prequantize-fqns .attention.wq_b,.attention.wo_a
 )
 
 # To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.

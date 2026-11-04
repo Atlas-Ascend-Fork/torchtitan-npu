@@ -67,7 +67,9 @@ bash examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a5.sh
 
 A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、Muon、eager/FullAC、数据依赖 MoE 路由，默认开启 SMLA/LI 及 block-FP8 训练。A3 对应 `deepseek_v4_1_flash_cpt_4k_a3.sh`，默认每机 16 卡、其余并行度相同，使用 A3 融合列表且不默认量化。
 
-`NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 必须为 1。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
+两个 A5 CPT 入口（本多机入口与 `debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh`）在上述量化配置之外还默认启用 FSDP 权重预量化（`--extension.quantization.enable-fsdp-prequantize`），白名单由 `--extension.quantization.fsdp-prequantize-fqns` 指定并随 FSDP 切分度收窄：多机入口在 FSDP128 下只保留分片后仍满足 64 对齐的 `wq_b`、`wo_a`；8P debug 入口在 FSDP8 下可多收录 `wkv`、`wo_b`、`indexer.wq_b` 与 `shared_experts.w2`。两个入口都不收录 routed experts——EP 占满全部 FSDP 切分卡（多机 EP128=DP_SHARD128，8P EP8=DP_SHARD8），专家 FSDP mesh（efsdp）尺寸为 1，白名单命中只会在 post-all-gather 提前量化、抬高峰值显存而无通信收益。`wq_a` 与 `shared_experts.w1`/`w3` 在两个切分度下都不满足对齐，因此均不在白名单内。对齐约束与报错行为详见 [低精度训练指南](../../docs/feature_guides/low_precision_training.md)。
+
+`NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 必须为 1。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。覆盖 `DP_SHARD` 或 `CONFIG` 后脚本白名单不会自动调整：权重按 `Shard(0)` 均分，切分度变化会让原本对齐的分片不再满足 64 对齐；换用 `deepseek_v4_1_debugmodel_multimodal` 等窄宽度 `CONFIG` 同样会破坏对齐（DP_SHARD=8 下 `wkv` 本地分片缩为 8 行、`indexer.wq_b` 缩为 32 行），两种情况训练启动即报错（报错信息只含本地分片形状，可对照低精度训练指南的判定式定位权重），此时从末尾追加的 `--extension.quantization.fsdp-prequantize-fqns` 中移除该权重（多个模式写在同一参数内并以英文逗号分隔）、追加 `--extension.quantization.no-enable-fsdp-prequantize` 关闭预量化，或改回默认 `DP_SHARD`/`CONFIG`。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
 
 初始权重不会因设置 `HF_ASSETS_PATH` 自动加载：需要时设置 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint；保存 checkpoint 另加 `--checkpoint.no-load-only`。默认不启用参数/梯度 CPU offload，保留 `swap_optimizer` 对 Engram 的适配。`USE_GOLDEN=1` 切换 reference override；A5 若还要关闭量化，追加 `--extension.quantization.no-enable-quantized-training`。
 

@@ -44,9 +44,22 @@ if [[ "${USE_GOLDEN:-0}" != "1" ]]; then
     fi
 fi
 
+# The FP8 pre-quantize guard needs both local-shard dims to be 64-aligned, and
+# this entry runs DP_SHARD=8: wq_b/wo_a/wkv/wo_b/indexer.wq_b and shared_experts
+# w2 keep 64-aligned dim0 shards, while wq_a (1280/8=160) and w1/w3 (2304/8=288)
+# do not. Routed experts stay out of the whitelist: EP8 occupies all 8 ranks, so
+# the expert FSDP mesh has size 1 and a whitelisted entry would only quantize in
+# post-all-gather — extra peak memory with no communication to save. The
+# whitelist scales with DP_SHARD; the DP_SHARD=128 entry keeps a narrower list
+# (see ../deepseek_v4_1_flash_cpt_4k_a5.sh). It also assumes the flash widths:
+# a debug-width CONFIG (deepseek_v4_1_debugmodel_*) fails the guard at startup —
+# switch CONFIG only with a matching fqns override or
+# --extension.quantization.no-enable-fsdp-prequantize.
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
     --extension.quantization.recipe all_block_fp8
+    --extension.quantization.enable-fsdp-prequantize
+    --extension.quantization.fsdp-prequantize-fqns .attention.wq_b,.attention.wo_a,.attention.wkv,.attention.wo_b,.attention.indexer.wq_b,.moe.shared_experts.w2
 )
 
 # To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.

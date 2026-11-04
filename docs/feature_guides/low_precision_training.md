@@ -171,20 +171,25 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 
 ```text
 本地权重 shard
-    │ fsdp_pre_all_gather()
-    ├─ 满足条件：cast 到 param_dtype → Block MX 量化
-    │              → B_q（FP8）+ B_s1/B_s2（scale）
-    ├─ 结构性 no-op（不在白名单 / 无 FSDP 分片 / 本地存储未分配）：
-    │              回退普通参数通信（高精度 + 运行时量化），不报错
-    └─ 白名单命中但对齐失败（axis=-2 非 64 倍数 / 末维非 32 倍数）：
-                   抛 ValueError 立即终止，不静默回退
     │
-    ├─ FSDP 分别 all-gather B_q、B_s1、B_s2
+    ├─ fsdp_pre_all_gather()
+    │   ├─ 白名单命中且对齐满足：Block MX 量化 → B_q（FP8）+ B_s1/B_s2（scale）
+    │   │     → cast 到 param_dtype，返回 3 个组件（mxfp4 为 data + scale 共 2 个）
+    │   ├─ 结构性 no-op（不在白名单 / 本地存储未分配）：
+    │   │     走父类路径，cast 到 param_dtype 后返回 1 个高精度分片，不报错
+    │   ├─ mesh size 1（无 FSDP 分片，如 EFSDP=1 的 MoE）：返回空 payload，
+    │   │     不发生通信，post-all-gather 从本地整权重重建（白名单命中时在此量化）
+    │   └─ 白名单命中但对齐失败（fp8：倒数两维任一非 block_size×2 倍数；
+    │                         mxfp4：末维非 block_size×2 倍数）：
+    │                         抛 RuntimeError 立即终止，不静默回退
+    │
+    ├─ FSDP all-gather 上一步返回的各组件（组件个数决定通信形态）
     │
     └─ fsdp_post_all_gather()
-       重建 wrapper：逻辑参数接口保持 BF16，内部保存 FP8 权重和 scale
-       → 前向/反向复用预量化 payload
-       → 梯度按 reduce_dtype reduce-scatter
+        按组件个数重建：3 个 → BlockMXTensor；2 个 → MXTensor（matmul 时转 Block MX）；
+        1 个 → 高精度 wrapper（空 payload 时从本地整权重量化）
+        → 逻辑参数接口保持 BF16，前向/反向复用预量化 payload
+        → 梯度按 reduce_dtype reduce-scatter
 ```
 
 `fsdp_pre_all_gather()` 只处理当前 rank 持有的本地分片；量化结果由 FP8 权重 `B_q` 和两个方向的 scale `B_s1`、`B_s2` 组成，FSDP 对三类数据分别执行 all-gather。通信完成后，`fsdp_post_all_gather()` 首次创建 wrapper，后续更新已分配的 wrapper。wrapper 对 PyTorch、FSDP 和 autograd 暴露 shape 不变的逻辑参数，量化 MatMul 则直接读取内部的 `B_q + scale`，避免在同一次 unshard 周期的每个 MatMul 前重复量化权重。
@@ -201,10 +206,14 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 
 哪些权重保留预量化由 `--extension.quantization.fsdp-prequantize-fqns` 白名单控制：未设置时使用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开在配置校验时报 `ValueError`。白名单命中后，退出路径分为两类，行为刻意不同：
 
-- **结构性 no-op（回退，不报错）**：没有 FSDP 分片（mesh size 1，如 EFSDP=1 的 MoE）、本地存储未分配（反向重建阶段）或本地形状即全局形状时，回退为高精度通信加运行时量化。这是并行拓扑决定的正常路径，不是错误。
-- **对齐失败（报错，不回退）**：分片后的量化维（axis=-2）须为 64 的倍数、最后一维须为 32 的倍数，不满足时抛 `ValueError` 立即终止，报错信息给出本地/全局分片形状与 mesh size，并提示从 `fsdp-prequantize-fqns` 移除该权重或调整并行度。按专家轴分片（Shard(0)）的 3D 专家权重本地量化维完整，不受 64 对齐约束。静默回退会让训练行为偏离配置，因此对齐失败是硬错误。
+- **结构性 no-op（回退，不报错）**：本地存储未分配（反向重建阶段）时回退为高精度通信加运行时量化，这是并行拓扑决定的正常路径，不是错误。mesh size 1（如 EP 占满全部卡、EFSDP=1 的 MoE）时走另一条路径：不发生 all-gather，pre-all-gather 返回空 payload，post-all-gather 直接按 `fsdp_prequantize_dtype` 量化本地整权重——白名单命中不会报错，配置仍被真实执行，但没有通信收益，只会以提前量化抬高峰值显存。
+- **对齐失败（报错，不回退）**：`fsdp_prequantize_dtype=fp8` 时，本地分片的**倒数两维**都须为 `block_size×2`（默认 32×2=64）的倍数；`mxfp4` 只检查**末维**是否为其 `block_size×2` 的倍数。不满足时抛 `RuntimeError` 立即终止，报错信息只包含本地分片形状与 `fsdp_prequantize_dtype`，不给出全局形状、mesh size，也不附带修复建议，需自行对照下面的判定式定位 FQN。按专家轴分片（Shard(0)）的 3D 专家权重末两维保持完整，只要这两维本身满足对齐即可通过（dim0 不均分时自动 pad 到最大分片、通信后 trim 还原）。静默回退会让训练行为偏离配置，因此对齐失败是硬错误。
 
-典型示例：默认白名单包含 `.attention.wkv`（dim0=512）。`dp_shard=8` 时每卡分片 64 行，满足对齐、正常预量化；`dp_shard=16` 时每卡 32 行，启动即报错，需把 `.attention.wkv` 从 `fsdp-prequantize-fqns` 中排除（列出默认白名单的其余模式）。更高并行度会成批触发：如 `dp_shard=128` 时要求 dim0 为 8192 的倍数，均分切分的 `wq_a`/`wkv`/`wo_b`/shared experts（dim0 为 512–4096）全部违规，仅按 head/group 块切分的 `wq_b`/`wo_a`/`indexer.wq_b` 与按专家轴切分的 routed experts 仍可预量化。
+判定式：dense 权重按 `Shard(0)` 均分，`dim0` 被切分度整除、`dim1`（`in_features`）不被切，因此 fp8 预量化要求 `dim0 % (64 × dp_shard × cp) == 0` 且 `dim1 % 64 == 0`。启用 CP 时 FSDP 把 `dp_shard` 与 `cp` 折叠为同一根切分轴，每卡行数是 `dim0 / (dp_shard × cp)` 而非 `dim0 / dp_shard`；如 1M 入口为 CP=128、DP_SHARD=1，有效切分度仍是 128。`dim1` 通常天然满足，能否入选实际由 `dim0` 决定。
+
+典型示例：默认白名单包含 `.attention.wkv`（dim0=512）。`dp_shard=8` 时每卡分片 64 行，满足对齐、正常预量化；`dp_shard=16` 时每卡 32 行，启动即报错，需把 `.attention.wkv` 从 `fsdp-prequantize-fqns` 中排除（列出默认白名单的其余模式）。更高并行度会成批触发：`dp_shard=128` 要求 dim0 为 8192 的倍数，均分切分的 `wq_a`/`wkv`/`wo_b`/shared experts（dim0 为 512–5120）全部违规，只有 dim0 足够大的 `wq_b`（32768）、`wo_a`（`BatchedLinear` 把 group 维摊进 dim0，8×1024=8192）与按专家轴切分、末两维保持完整的 routed experts 仍可预量化。但 routed experts 是否真有通信收益取决于 efsdp 尺寸（`efsdp = dp_shard × cp × tp / ep`）：efsdp=1 时不发生 all-gather，命中白名单只是提前量化。
+
+`indexer.wq_b` 不属于按 group 维摊平的豁免：它是普通 `Linear`，dim0 = `index_n_heads × index_head_dim`，同样按 `Shard(0)` 均分，能否入选只看该乘积。V4 flash 为 64×128=8192，`dp_shard=128` 下每卡 64 行、可以预量化；V4.1 flash 为 32×128=4096，每卡只剩 32 行、不满足对齐，同一切分度下必须从白名单排除。按并行度挑选白名单时应逐个代入上面的判定式，不要按投影名称套用结论。
 
 ### MoE 专家低精度通信
 
