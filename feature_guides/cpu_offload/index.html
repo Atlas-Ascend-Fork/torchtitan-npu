@@ -225,7 +225,7 @@
 <h2 id="_4">架构</h2>
 <pre><code>--training.enable-cpu-offload
 ├── parallelize_fn → CPUOffloadPolicy → FSDPParam.offload_to_cpu = True
-│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank: 上游内建 / 单 rank: 本仓预取补丁）
+│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank 亦由本仓批量 copy-in 补丁覆盖，单 rank 走 copy-only 预取补丁）
 │   └── backward: foreach_reduce → 梯度 reduce-scatter → D2H 落 CPU pinned
 │                                    → 第二个 microbatch 起在 NPU 分块累加（本仓补丁）
 │
@@ -267,7 +267,7 @@
 </tr>
 <tr>
 <td><code>extensions/distributed/grad_accum.py</code></td>
-<td>梯度累加 + 单 rank 参数预取（FSDP 集成）</td>
+<td>梯度累加 + 参数批量 copy-in 预取（单 rank 与多 rank）与批量 D2H</td>
 </tr>
 <tr>
 <td><code>extensions/distributed/grad_clip.py</code></td>
