@@ -142,8 +142,9 @@ V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`�
   路径支持 CP；模型目录的参考 metadata hook 显式拒绝 CP，V4.1 的 `update_from_config` 还会要求
   同时请求 `override.deepseek_v4_1.sparse_attn.asc` 与
   `override.deepseek_v4_1.lightning_indexer.asc`。
-- 量化后端（V4 的 `QuantV4Metadata`、V4.1 的 `_V41QuantAttentionMetadata`）目前不重建 rank-local
-  metadata，`prepare_cp_metadata` 直接拒绝：量化路径只能跑 `context-parallel-degree 1`。
+- 量化后端（V4 的 `QuantV4Metadata`、V4.1 的 `_V41QuantAttentionMetadata`）也按本 rank 的 frames
+  重建自己的 AI_CPU metadata：V4 只替换量化 selector 的 forward 记录，V4.1 重建整套，两者都接受
+  `context-parallel-degree > 1`。
 - DeepSeek-V4 的融合注意力在 CP=1 时支持 `local_batch_size > 1`（输入布局按批展平，attention 输出保留
   `[B, S]`）。CP>1 暂不支持 `local_batch_size > 1`，`CarryExchange` 在交换或边界计算前显式报错；DSA 路径
   TP 固定为 1。
@@ -158,9 +159,9 @@ V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`�
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | 同 arch35（V4.1 只跑在 arch35 上） |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `AscV4Metadata.build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 无 |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `xchg: ExchangeMetadata`） | 融合 entry（`AscV41Metadata`） |
-| indexer teacher 归一化 | `_LightningIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]` | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
+| indexer teacher 归一化 | `_LightningIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]`（量化 selector 同） | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
-| 量化 metadata | `QuantV4Metadata` 拒绝 | `_V41QuantAttentionMetadata` 拒绝 |
+| 量化 metadata | `QuantV4Metadata` 重建（只换 selector 的 forward 记录） | `_V41QuantAttentionMetadata` 重建（整套记录） |
 
 ## 4. DeepSeek-V4
 
@@ -374,9 +375,10 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 
 ### 5.5 拒绝 CP 的路径
 
-`DeepSeekV41Metadata.prepare_cp_metadata` 拒绝参考内核；`_V41QuantAttentionMetadata`
-（`torchtitan_npu/extensions/adaptor/torchao/converter.py`）拒绝量化 attention。两者都在任何层
-执行之前报错，不会静默地拿着全局 metadata 跑 rank-local 行。
+`DeepSeekV4Metadata.prepare_cp_metadata` 与 `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝模型目录
+的参考内核：它们只描述整行的 metadata，CP 下没有一份能交给层去读，所以在任何层执行之前报错，不会
+静默地拿着全局 metadata 跑 rank-local 行。融合与量化后端各自覆盖了这个 hook，重建本 rank 的 frames
+与 AI_CPU metadata。
 
 Engram 不在这一列。它的 token history 要的是每行**在本文档内**的前驱，doc-chunk 下这些前驱不是
 全局行的一段连续区间（`[lo - H, lo)` 是别的文档的尾巴），一个窗口也说不出每行各自的前驱。所以

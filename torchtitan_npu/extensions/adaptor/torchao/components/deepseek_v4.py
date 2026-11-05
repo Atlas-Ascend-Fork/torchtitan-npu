@@ -84,8 +84,9 @@ def _prepare_quant_lightning_indexer_inputs(
     if cmp_k is None or cmp_k.residual is None:
         raise ValueError("Quantized LI requires the geometry's compressed frame.")
     key = idx_k.flatten(0, 1)
-    # The quantized selector is the unsharded backend (its CP hook refuses a re-cut), and the
-    # compressor emits exactly the row's compressed blocks -- there is no container to strip.
+    # The compressor emits exactly the row's compressed blocks, and under context parallelism the
+    # entry the selector is handed is this rank's: its record -- and the reach behind it -- are
+    # rebuilt per rank by the quantized backend's own ``prepare_cp_metadata``.
     return DeepSeekV4QuantizedLightningIndexerInputs(
         query=idx_q.flatten(0, 1),
         key=key.unsqueeze(1).contiguous(),
@@ -95,6 +96,9 @@ def _prepare_quant_lightning_indexer_inputs(
         cu_seqlens_q=attention_metadata.q.cu_seqlens,
         cu_seqlens_k=cmp_k.cu_seqlens,
         cmp_residual_k=cmp_k.residual,
+        # The KL term is a mean over the row, not over this rank's chunk: ``swa_k``'s grid is the
+        # whole row at every degree, which is what the fused selector divides by too.
+        num_global_queries=attention_metadata.swa_k.cu_seqlens[-1],
         backward_metadata=asc.lightning_indexer.bwd,
         seqused_q=attention_metadata.q.seqused,
         seqused_k=cmp_k.seqused,

@@ -752,6 +752,7 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
             sparse_attn=AscSparseAttentionMetadata(),
             lightning_indexer=AscLightningIndexerMetadata(fwd=forward_record, bwd=backward_record),
         ),
+        quant_mode=1,
     )
     query = torch.zeros(1, 8, 2, 4, dtype=torch.bfloat16)
     key = torch.zeros(1, 2, 4, dtype=torch.bfloat16)

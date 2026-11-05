@@ -170,7 +170,7 @@ class DeepSeekV4Metadata:
             "--parallelism.context-parallel-degree."
         )
 
-    def doc_chunk_entry(self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int) -> "DeepSeekV4Metadata":
+    def doc_chunk_entry(self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int) -> Self:
         """This rank's entry: the doc-chunk query frame, the row's KV frames and the movement.
 
         The frames and the movement are derived from the row's boundaries alone, so the entry

@@ -49,6 +49,8 @@ def quant_lightning_indexer_metadata(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     cmp_residual_k: torch.Tensor,
+    seqused_q: torch.Tensor,
+    seqused_k: torch.Tensor,
 ):
     """Build metadata paired with ``quant_lightning_indexer``."""
 
@@ -64,6 +66,8 @@ def quant_lightning_indexer_metadata(
         cmp_ratio=cmp_ratio,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
         cmp_residual_k=cmp_residual_k,
     )
 
@@ -85,6 +89,8 @@ def quant_lightning_indexer(
     cu_seqlens_k: torch.Tensor,
     cmp_residual_k: torch.Tensor,
     metadata: torch.Tensor,
+    seqused_q: torch.Tensor,
+    seqused_k: torch.Tensor,
 ):
     """Run QuantLightningIndexerV2 on packed TND quantized Q/K tensors."""
 
@@ -101,6 +107,8 @@ def quant_lightning_indexer(
         quant_mode,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
         cmp_residual_k=cmp_residual_k,
         metadata=metadata,
         layout_q=layout_q,

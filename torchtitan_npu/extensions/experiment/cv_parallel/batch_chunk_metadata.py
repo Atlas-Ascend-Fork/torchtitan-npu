@@ -151,16 +151,15 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
 
     The fused core's own config built the full microbatch's metadata (upstream
     #4897); this re-cuts that contract at the equal batch boundary and rebuilds the
-    local records from the geometry that rides on it.  A quantized selector's entry
-    is refused: its records are its own backend's operator, and this re-cut has no
-    backend to ask (mirroring ``QuantV4Metadata.prepare_cp_metadata``).
+    local records from the geometry that rides on it.  A quantized selector's entry is
+    refused: its records come from an operator this re-cut has no handle on, and it builds
+    them with the fused builder alone rather than asking the entry to rebuild them.
     """
     if type(metadata) is not AscV4Metadata:
         raise TypeError(
             "batch chunk metadata cannot re-cut "
-            f"{type(metadata).__name__}: its records are its own backend's "
-            "(the quantized selector refuses the re-cut); run without cv_parallel "
-            "or with the BF16 fused selector."
+            f"{type(metadata).__name__}: this re-cut rebuilds only the fused entry's "
+            "records; run without cv_parallel or with the BF16 fused selector."
         )
     first, second = _plain_batch_chunk_metadata(metadata)
 

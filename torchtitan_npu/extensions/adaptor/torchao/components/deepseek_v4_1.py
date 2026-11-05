@@ -11,7 +11,7 @@ Registers the V4.1-unique ``lightning_indexer``, ``compressor`` and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any
 
 import tyro
@@ -161,18 +161,43 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
     """
 
     aicpu_metadata: Any
+    quant_numbers: dict[str, int]
 
     @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
         attention_metadata: _V41QuantAttentionMetadata,
         *,
         permutation,
-    ):
-        """The quantized stack does not rebuild its metadata per rank yet (context parallelism)."""
-        del attention_metadata, permutation
-        raise ValueError(
-            "the quantized sparse attention does not rebuild its metadata per rank yet: run it "
-            "with --parallelism.context-parallel-degree 1."
+    ) -> _V41QuantAttentionMetadata:
+        """This rank's frames and the records rebuilt for them.
+
+        The row is the fused stack's; the kernels' records are this backend's operators, sized
+        by the numbers the entry states, so they are rebuilt from the rank-local frames.
+        """
+        from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import (
+            build_attention_metadata as build_quant_metadata,
+        )
+
+        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
+
+        context = cp_shard_context()
+        local = attention_metadata.doc_chunk_entry(
+            permutation=permutation,  # pyrefly: ignore [bad-argument-type]
+            cp_size=context.cp_mesh.size(),
+            cp_rank=context.cp_mesh.get_local_rank(),
+        )
+        return replace(  # pyrefly: ignore [bad-return]
+            local,
+            aicpu_metadata=build_quant_metadata(  # pyrefly: ignore [unexpected-keyword]
+                ratio=local.ratio,
+                q=local.q,
+                swa_k=local.swa_k,
+                cmp_k=local.cmp_k,
+                # The frame's row count is a shape: ``position_k`` is this rank's slice of
+                # the row, so it already holds ``B * S / cp`` tokens.
+                num_rows=local.position_k.numel(),
+                **attention_metadata.quant_numbers,
+            ),
         )
 
 
@@ -220,6 +245,16 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                 max_context_length=max_context_length,
             )
             q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
+            numbers = {
+                "window_size": self.window_size,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "index_topk": self.index_topk,
+                "index_num_heads": self.index_num_heads,
+                "index_head_dim": self.index_head_dim,
+                "topk_blocks": self.candidate_topk_blocks,
+                "block_size": self.candidate_block_size,
+            }
             return _V41QuantAttentionMetadata(
                 position_k=row.position_k,
                 xchg=row.xchg,
@@ -232,16 +267,10 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                     q=q,
                     swa_k=swa_k,
                     cmp_k=cmp_k,
-                    window_size=self.window_size,
-                    num_heads=self.num_heads,
-                    head_dim=self.head_dim,
-                    index_topk=self.index_topk,
-                    index_num_heads=self.index_num_heads,
-                    index_head_dim=self.index_head_dim,
-                    topk_blocks=self.candidate_topk_blocks,
-                    block_size=self.candidate_block_size,
                     num_rows=positions.numel(),
+                    **numbers,
                 ),
+                quant_numbers=numbers,
             )
 
     def __init__(self, config: Config) -> None:

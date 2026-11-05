@@ -216,8 +216,6 @@ class AscV4Metadata(DeepSeekV4Metadata):
         from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
         context = cp_shard_context()
-        if context.cp_mesh is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh")
         local = attention_metadata.doc_chunk_entry(
             permutation=permutation,  # pyrefly: ignore [bad-argument-type]
             cp_size=context.cp_mesh.size(),

@@ -51,20 +51,28 @@ class QuantV4Metadata(AscV4Metadata):
 
     Same interface as the fused one (``aicpu_metadata.sparse_attn`` /
     ``aicpu_metadata.lightning_indexer``), because the forward it feeds is the fused forward.
-    A context-parallel re-cut is refused: this entry's selector record is this backend's own
-    operator, and the re-cut has no backend to ask.
+    ``quant_mode`` is the selector's ABI, kept so a rank-local re-cut can rebuild the record.
     """
 
-    @staticmethod
+    quant_mode: int
+
+    @classmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
+        cls,
         attention_metadata: QuantV4Metadata,
         *,
         permutation: torch.Tensor | None,
     ) -> QuantV4Metadata:
-        del attention_metadata, permutation
-        raise ValueError(
-            "the quantized DeepSeek-V4 selector does not rebuild its record per rank yet: run "
-            "with --parallelism.context-parallel-degree 1."
+        """This rank's frames and its own records.
+
+        The row and every record but the selector's are the fused entry's, so the fused
+        transform builds them; only the selector's forward grid is this backend's operator.
+        """
+        local = AscV4Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)
+        return attach_selector_record(  # pyrefly: ignore [bad-return]
+            local,
+            geometry=local.aicpu_metadata.geometry,
+            quant_mode=attention_metadata.quant_mode,
         )
 
 
@@ -94,6 +102,8 @@ def selector_record(
         cmp_ratio=CMP_RATIO,
         cu_seqlens_q=metadata.q.cu_seqlens,
         cu_seqlens_k=cmp_k.cu_seqlens,
+        seqused_q=metadata.q.seqused,
+        seqused_k=cmp_k.seqused,
         cmp_residual_k=cmp_k.residual,
     )
 
@@ -128,5 +138,8 @@ def attach_selector_record(
         q=metadata.q,
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,
+        xchg=metadata.xchg,
         aicpu_metadata=asc,
+        a3_workaround=metadata.a3_workaround,
+        quant_mode=quant_mode,
     )

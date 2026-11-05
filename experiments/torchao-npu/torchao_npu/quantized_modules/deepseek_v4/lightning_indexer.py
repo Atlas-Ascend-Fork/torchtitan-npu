@@ -29,9 +29,21 @@ class QuantizedLightningIndexerInputs:
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     cmp_residual_k: torch.Tensor
+    num_global_queries: torch.Tensor
+    """The KL term's denominator: the whole row's query-token count at every degree.
+
+    Every rank divides by the row's count, not by its own chunk's: the parameters' gradients are
+    summed across ranks, so a rank-local divisor would scale them by the parallel degree.
+    """
+    seqused_q: torch.Tensor
+    seqused_k: torch.Tensor
+    """The per-document counts each side is masked by: this rank's reach under CP.
+
+    Required, not optional: the kernels mask right-down causal against them, and the
+    zero-filled default a missing value used to fall back to lets a rank select keys
+    outside its own frame.
+    """
     backward_metadata: torch.Tensor | None = None
-    seqused_q: torch.Tensor | None = None
-    seqused_k: torch.Tensor | None = None
 
 
 class _QuantLightningIndexerTND(torch.autograd.Function):
@@ -54,6 +66,8 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
             cmp_ratio=config.cmp_ratio,
             cu_seqlens_q=inputs.cu_seqlens_q,
             cu_seqlens_k=inputs.cu_seqlens_k,
+            seqused_q=inputs.seqused_q,
+            seqused_k=inputs.seqused_k,
             cmp_residual_k=inputs.cmp_residual_k,
             metadata=inputs.metadata,
         )
@@ -75,9 +89,10 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
         inputs, config = ctx.inputs, ctx.config
         if inputs.backward_metadata is None:
             raise RuntimeError("Quantized LI training requires the SLIKG backward record")
-        # SMLAG already masked padding and applied softmax_scale. Match the BF16
-        # selector's normalization by the whole microbatch's query-token count.
-        teacher = teacher / inputs.cu_seqlens_q[-1].to(torch.float32)
+        # SMLAG already masked padding and applied softmax_scale. Match the BF16 selector's
+        # normalization by the row's query-token count: under context parallelism the rank's own
+        # ``cu_seqlens_q[-1]`` is one chunk of it, and the ranks' gradients are summed.
+        teacher = teacher / inputs.num_global_queries.to(torch.float32)
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=query,
             k=key,

@@ -375,9 +375,9 @@ port 在其上补四个算子的记录。map key 是 `(端口类, compress_ratio
 entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI record 属于 selector：BF16 的
 由 port 在同一入口按 `AicpuGeometry` 构建；量化的 selector 是**另一个 backend**
 （`torchao_npu.quantized_modules.deepseek_v4.QuantizedV4SparseAttention`），它替换融合核的
-config、用 `quant_lightning_indexer_metadata` 构建自己的 entry，并拒绝 CP 重切（其记录契约
-不属于本 port）。`override/` 与 `models/` 都不知道量化存在。CP 下由
-`AscV4Metadata.prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`
+config、用 `quant_lightning_indexer_metadata` 构建自己的 entry（其记录契约不属于本 port，CP
+下由它自己的 `prepare_cp_metadata` 按 rank-local frames 重建）。`override/` 与 `models/` 都不知道
+量化存在。CP 下由 `AscV4Metadata.prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`
 按 rank-local 行重建 plan，再在其上重填记录（upstream PR #4617）；参考契约的 hook 直接拒绝 CP。
 compressor 的状态表由**融合 attention 的 metadata 构建器**在 eager 边界写进 plan（表宽随 batch 的
 文档走，不能在建图时构），因此选 `sparse_attn.asc` 就带上了它，不再有独立的 compressor 状态表入口。非融合的 attention backend（参考核）不建表，压缩器在 forward 里按当前 batch 自行构表（eager 下逐
@@ -527,8 +527,8 @@ lightning_indexer
   的 schedule，量化 kernel 读它不是「稍差一点」而是垃圾索引；
 - 没有池（`candidate_topk_blocks <= 0`）时 `fwd` 仍然是量化 QLI 的那份（pool-free 层也要跑 QLI），
   只有 `fwd_sparse` / `sparse_length` 为空；
-- CP：非量化 entry 由 port 的 `prepare_cp_metadata` 按 rank-local frames 重建；量化 entry 目前
-  只支持 CP=1，其余情况显式报错。
+- CP：非量化 entry 由 port 的 `prepare_cp_metadata` 按 rank-local frames 重建；量化 entry 由量化
+  backend 自己的 `prepare_cp_metadata` 重建——V4 只换量化 selector 的 forward 记录，V4.1 重建整套。
 
 #### indexer 只在两个 override 同开时学习
 

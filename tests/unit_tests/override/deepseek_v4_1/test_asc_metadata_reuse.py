@@ -591,17 +591,6 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     assert len(state["li"]) == 4
 
 
-def test_the_cp_half_needs_the_mesh(monkeypatch):
-    """A transform without the geometry it derives this rank's copy from fails loudly."""
-    _fake_metadata_ops(monkeypatch)
-    entry = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
-        _positions([0, 4])
-    )
-    mesh = cp_parallel_dims(2, 0).get_mesh("cp")
-    with pytest.raises(ValueError, match="needs the CP mesh"):
-        _prepare_for_rank(entry, None, _positions([0, 4]))
-
-
 def test_the_override_factory_swaps_the_core_and_its_builder(monkeypatch):
     """``asc`` installs the port: the class, its key, and a builder that precomputes.
 
