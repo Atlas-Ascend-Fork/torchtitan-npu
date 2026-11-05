@@ -22,17 +22,16 @@ import torch
 import torch.nn.functional as F
 from torchtitan.config import OverrideConfig, apply_overrides
 
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.models.deepseek_v4 import _debugmodel, _make_v4_config
 from torchtitan_npu.models.deepseek_v4.compressor import (
     Compressor,
     CompressorImplementation,
 )
-from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
 from torchtitan_npu.override.deepseek_v4.compressor import ascendc
-from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry
-from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
 
 _FUSED_GEOMETRY = AicpuGeometry(
     num_heads=16,
@@ -51,12 +50,12 @@ def _positions(cu: torch.Tensor) -> torch.Tensor:
 
 def _entry(cu: torch.Tensor, ratio: int):
     """One geometry's model entry: the row and this ratio's fold of it."""
-    return build_v4_metadata(_positions(cu), ratio, cu_seq_q=cu)
+    return DeepSeekV4Metadata.from_positions(_positions(cu), ratio)
 
 
 def _fused_entry(cu: torch.Tensor, ratio: int = 4):
     """One geometry's fused entry: the model entry plus its records."""
-    return build_aicpu_metadata(_entry(cu, ratio), geometry=_FUSED_GEOMETRY)
+    return AscV4Metadata.build_aicpu_metadata(_entry(cu, ratio), geometry=_FUSED_GEOMETRY)
 
 
 def _tiny_config():

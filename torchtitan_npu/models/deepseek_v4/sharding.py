@@ -95,14 +95,14 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
         # side stays replicated, the keys get the same ``S(1) -> R`` gather as the KV streams.
         attention_cfg.lightning_indexer.sharding_config = ShardingConfig(
             in_src_shardings={
-                "idx_q": replicated_activation,
-                "idx_k": replicated_activation,
-                "idx_w": replicated_activation,
+                "idx_q_BLHiDi": replicated_activation,
+                "idx_k_BNDi": replicated_activation,
+                "idx_w_BLHi": replicated_activation,
             },
             in_dst_shardings={
-                "idx_q": replicated_activation,
-                "idx_k": row,
-                "idx_w": replicated_activation,
+                "idx_q_BLHiDi": replicated_activation,
+                "idx_k_BNDi": row,
+                "idx_w_BLHi": replicated_activation,
             },
         )
 

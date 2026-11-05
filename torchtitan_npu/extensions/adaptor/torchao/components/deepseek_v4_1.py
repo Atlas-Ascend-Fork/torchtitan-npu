@@ -150,7 +150,7 @@ class DeepSeekV41QuantSparseAttentionComponent(QuantComponent):
         ]
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
+@dataclass(kw_only=True, slots=True)
 class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
     """The row, this geometry's frames, and the quantized kernels' metadata.
 
@@ -221,10 +221,8 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
             )
             q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
             return _V41QuantAttentionMetadata(
-                cu_seq_q=row.cu_seq_q,
-                cu_seq_k=row.cu_seq_k,
                 position_k=row.position_k,
-                cp=row.cp,
+                xchg=row.xchg,
                 ratio=self.compress_ratio,
                 q=q,
                 swa_k=swa_k,

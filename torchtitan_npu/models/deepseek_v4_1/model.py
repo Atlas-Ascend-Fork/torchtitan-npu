@@ -46,9 +46,7 @@ import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
-from torchtitan_npu.models.deepseek_v4.cp_layout import doc_chunk_permutation
-from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
-from torchtitan_npu.patches.torchtitan.distributed.context_parallel import document_starts
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
 from .engram import Engram  # noqa: TC001
 from .indexer import IndexerMode
@@ -57,78 +55,28 @@ from .mhc import HcPost, HcPre
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE
 
-    from torchtitan_npu.models.deepseek_v4.cp_attention import CPMetadata
     from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import AttentionMetadataMap
 
     from .attention import Attention
     from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
-class DeepSeekV41Metadata:
-    """The packed row's frames, built by the attention backends' config.
+@dataclass(kw_only=True, slots=True)
+class DeepSeekV41Metadata(DeepSeekV4Metadata):
+    """The V4.1 stack's row: V4's contract, plus a refusal its reference core states.
 
-    Upstream's pair of cumulative boundaries -- ``cu_seq_q`` for the queries and ``cu_seq_k`` for
-    the keys this entry addresses -- plus one :class:`KernelFrame` per addressed tensor (the
-    queries, the sliding-window keys and, for a geometry that pools, the compressed keys), the key
-    stream's own positions and, under context parallelism, its movement.  ``cu_seq_k`` is the
-    **pool grid**: an entry belongs to one compression ratio (the metadata map key carries it), so
-    the backend that builds the entry pools the row there and no consumer divides by its ratio at
-    call time.  A layer that pools at all but addresses the row itself (ratio 0 or 1) gets
-    ``cu_seq_k == cu_seq_q`` and still declares the two key frames.
-
-    A vendor backend extends this entry with the records its own kernels launch (the AscendC
-    entry adds ``aicpu_metadata``); the frames belong here, because they describe the tensors
-    rather than any kernel's operator outputs.  A kernel that cannot read a frame as stated --
-    arch22's TND kernels ignore ``seqused`` and anchor their mask at the frame's end -- restates it
-    at its own call site (``override/a3_workaround.py``) rather than here.
+    V4.1 pools at 0, 1 and 2, so ``cmp_k`` is present whenever the geometry addresses a compressed
+    axis and absent for a window-only one -- the frame, not a separate boundary pair, is what says
+    which.  The reference core hands one grid to both sides of the attention, so it cannot describe
+    a rank-local row; a context-parallel run stops here before any layer executes.
     """
-
-    cu_seq_q: torch.Tensor
-    """Packed document boundaries of the row (``int32``, ``n_documents + 1``): the offsets
-    Attention Gym's ``gather_attn`` takes as ``cu_seqlens`` and the kernels as ``cu_seqlens_*``."""
-
-    cu_seq_k: torch.Tensor
-    """The key side's boundaries this entry addresses: the row's own for a layer that does not
-    pool, its ``compress_ratio``-folded grid for one that does.  Precomputed by the backend that
-    knows the ratio, so the core reads a boundary set instead of dividing one per layer."""
-
-    position_k: torch.Tensor
-    """The key stream's own document-relative positions (``[B, C]``, ``C`` the row under one degree).
-
-    The queries rotate at the positions carried beside the input, which are the query frame's by
-    construction, so the entry states only the other side: the stream the key projections read.
-    At one degree that is the input's ``positions``; under CP it is the restored window's, so a
-    consumer never derives them and never learns that the stream moved.
-    """
-
-    ratio: int
-    """The compression ratio this entry describes; every consumer grids this ratio."""
-
-    q: KernelFrame
-    """The query frame: the row's boundaries at one degree, this rank's chunks under CP."""
-
-    swa_k: KernelFrame
-    """The sliding-window keys' frame: the whole row at every degree, with ``seqused`` the
-    per-document reach."""
-
-    cmp_k: KernelFrame | None
-    """The compressed pool's frame (``None`` for a geometry that does not pool)."""
-
-    cp: CPMetadata | None = None
-    """Under context parallelism the key side's movement: the input already holds this rank's
-    chunks, and the key projections read the slab this restores them onto.
-
-    The frames above are the entry's at every degree; only the movement is a property of context
-    parallelism, so it is one field and a consumer reads it through
-    :func:`~torchtitan_npu.models.deepseek_v4.metadata.restore_key_stream`."""
 
     @staticmethod
     def prepare_cp_metadata(
-        attention_metadata: DeepSeekV41Metadata,
+        attention_metadata: DeepSeekV4Metadata,
         *,
         permutation: torch.Tensor | None,
-    ) -> DeepSeekV41Metadata:
+    ) -> DeepSeekV4Metadata:
         """Refuse context parallel: only the fused stack has a rank-local form.
 
         The row is the whole packed sequence, and this core hands one grid to both sides of the
@@ -144,28 +92,6 @@ class DeepSeekV41Metadata:
             "override.deepseek_v4_1.lightning_indexer.asc) to run with "
             "--parallelism.context-parallel-degree."
         )
-
-
-def build_v41_frames(
-    cu_seq_q: torch.Tensor,
-    cu_seq_k: torch.Tensor,
-    ratio: int,
-) -> tuple[KernelFrame, KernelFrame, KernelFrame | None]:
-    """The row's frames: boundary differences as the prefixes, the pool folded at this ratio."""
-    seqused = torch.diff(cu_seq_q).to(torch.int32)
-    q = KernelFrame(cu_seqlens=cu_seq_q, seqused=seqused)
-    swa_k = KernelFrame(cu_seqlens=cu_seq_q, seqused=seqused)
-    cmp_k = None
-    if ratio > 0:
-        cmp_k = KernelFrame(
-            cu_seqlens=cu_seq_k,
-            seqused=(seqused // ratio).to(torch.int32),
-            # A ratio of one addresses the row itself: the axis is not folded, so there is no
-            # trailing group and the frame keeps ``residual`` unset.  A3's kernels take zeros
-            # for it; A5's reject a value, so the frame's ``None`` passes through.
-            residual=None if ratio == 1 else (seqused % ratio).to(torch.int32),
-        )
-    return q, swa_k, cmp_k
 
 
 class DeepSeekV41TransformerBlock(TransformerBlock):
@@ -548,21 +474,16 @@ class DeepSeekV41Model(Decoder):
         document*.  Under context parallel those predecessors are not one window of the row: rank
         ``r`` holds chunk ``r`` of every document, so ``[lo - H, lo)`` of the global row is
         another document's tail, and one window cannot state a different set of predecessors per
-        row.  They are built here, before the shard, as ``[B, C, H]`` -- entry ``d - 1`` is the
-        ``d``-th token back for each of *this rank's* rows -- and the entry's own ``positions``
-        do the document mask, so a row whose document starts sooner reads none of them.  At one
-        degree there is nothing to build: the model's row is its local rows.
+        row.  They are built as ``[B, C, H]`` -- entry ``d - 1`` is the ``d``-th token back for
+        each of *this rank's* rows -- from the row the shard started from, and the entry's own
+        ``positions`` do the document mask, so a row whose document starts sooner reads none of
+        them.  At one degree there is nothing to build: the model's row is its local rows.
+
+        The history is gathered after the shard because the rows it describes are the shard's:
+        ``_cp_shard`` leaves the token order it applied on the decoder, so this reads that order
+        instead of deriving a second one from the row.
         """
-        positions = input_dict.get("positions")
-        if self.engram_history_size and parallel_dims.cp_enabled:
-            if positions is None:
-                raise ValueError("Engram's token history needs the row's document-relative positions.")
-            input_dict["engram_token_history"] = self._engram_row_history(
-                input_dict["input"],
-                positions,
-                parallel_dims,
-            )
-        return super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+        inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
             input_dict,
             labels,
             parallel_dims=parallel_dims,
@@ -570,27 +491,29 @@ class DeepSeekV41Model(Decoder):
             parallelism=parallelism,
             **kwargs,
         )
+        if self.engram_history_size and parallel_dims.cp_enabled:
+            permutation = getattr(self, "_cp_permutation", None)
+            if permutation is None:
+                raise ValueError("Engram's token history reads the shard's order: run with a document layout")
+            extra_kwargs["engram_token_history"] = self._engram_row_history(
+                input_dict["input"],
+                permutation,
+                parallel_dims.get_mesh("cp"),
+            )
+        return inputs, labels, extra_kwargs
 
-    def _engram_row_history(
-        self,
-        tokens: torch.Tensor,
-        positions: torch.Tensor,
-        parallel_dims,
-    ) -> torch.Tensor:
+    def _engram_row_history(self, tokens: torch.Tensor, permutation: torch.Tensor, cp_mesh) -> torch.Tensor:
         """Each of this rank's rows' predecessors, one entry per distance (``[B, C, H]``).
 
-        ``doc_chunk_permutation`` states which row of the whole row each local row is, so this
-        gather is the permutation the shard itself applies: a local row's predecessor is the row
-        before it *in its document*, which the permutation has already placed the right number of
-        slots earlier.  Nothing moves, and no rank sees another rank's rows.
+        The permutation states which row of the whole row each local row is, so a local row's
+        predecessor is the row before it in its document, which the permutation has already placed
+        the right number of slots earlier.  Nothing moves, and no rank sees another rank's rows.
         """
-        cp_mesh = parallel_dims.get_mesh("cp")
-        cp_size, cp_rank = cp_mesh.size(), cp_mesh.get_local_rank()
-        slab_len = tokens.shape[1] // cp_size
-        rows = doc_chunk_permutation(document_starts(positions[0]), cp_size, slab_len)[0]
-        local_rows = rows[cp_rank * slab_len : (cp_rank + 1) * slab_len]
+        width = tokens.shape[1] // cp_mesh.size()
+        cp_rank = cp_mesh.get_local_rank()
+        local_rows = permutation.reshape(-1)[cp_rank * width : (cp_rank + 1) * width]
         history = torch.empty(
-            (tokens.shape[0], slab_len, self.engram_history_size),
+            (tokens.shape[0], width, self.engram_history_size),
             dtype=tokens.dtype,
             device=tokens.device,
         )

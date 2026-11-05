@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The DeepSeek-V4 selector's PyPTO port.
+"""The DeepSeek-V4 indexer's PyPTO port.
 
 Same contract as :mod:`.\u0061scendc` -- LI forward, SLIKG backward, the teacher carrier and
 the saved selection -- but the two kernels are the PyPTO module functions, loaded lazily on
@@ -25,10 +25,8 @@ import torch
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    AscV4Metadata,
-    lightning_indexer_options,
-)
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import kernel_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,13 +73,12 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         attention_metadata,
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("the fused selector needs AscV4Metadata")
-        # Absent on arch22, whose selector schedules itself: the kernel takes ``metadata=None``.
+            raise TypeError("the fused indexer needs AscV4Metadata")
+        # Absent on arch22, whose indexer schedules itself: the kernel takes ``metadata=None``.
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        # The selector's frame is the entry's: on arch22 the pool this rank's reach covers, which
-        # is what the keys below are compacted onto, and what its records were built from.
-        assert attention_metadata.cmp_k is not None, "the selector needs the entry's pool"
-        options = lightning_indexer_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
+        # The indexer's frame is the entry's: on arch22 the pool this rank's reach covers, which
+        # is what the keys below are compacted onto, and what its AI_CPU metadata were built from.
+        options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
         topk_indices, _ = _pypto_lightning_indexer(
             idx_q,
             idx_k,
@@ -110,15 +107,15 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         metadata = ctx.attention_metadata
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
-            raise ValueError("the fused selector needs the entry's backward record")
-        # The emitter already applied ``softmax_scale``; divide by the **row's** query-token
-        # count (the CE loss's denominator), never by this rank's slab -- under CP the
+            raise ValueError("the fused indexer needs the entry's backward metadata")
+        # Divide by the **row's** query-token count (the CE loss's denominator), never by
+        # this rank's slab -- under CP the
         # parameter gradients are summed across the CP axis, so a local denominator would
         # scale every indexer gradient by the CP degree.
         query_rows = metadata.swa_k.cu_seqlens[-1].to(torch.float32)
         attn_softmax_l1_norm = attn_softmax_l1_norm / query_rows
-        assert metadata.cmp_k is not None, "the selector needs the entry's pool"
-        options = lightning_indexer_options(ratio=ctx.ratio, q=metadata.q, cmp_k=metadata.cmp_k)
+        assert metadata.cmp_k is not None, "the indexer needs the entry's pool"
+        options = kernel_options(ratio=ctx.ratio, q=metadata.q, cmp_k=metadata.cmp_k)
         dq, dk, dw, _ = _pypto_sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,
@@ -132,7 +129,7 @@ class _PyPTOIndexerTND(torch.autograd.Function):
 
 
 class PyPTOLightningIndexer(LightningIndexer):
-    """The PyPTO selector: the same contract, implemented over the PyPTO kernel pair.
+    """The PyPTO indexer: the same contract, implemented over the PyPTO kernel pair.
 
     It emits the kernel's document-local ``topk_indices`` in ``[B, L, K]`` layout and the
     ``topk_scores`` teacher carrier, exactly as the AscendC port does.  Nothing is inherited
@@ -143,21 +140,23 @@ class PyPTOLightningIndexer(LightningIndexer):
     class Config(LightningIndexer.Config):
         pass
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+    def forward(self, idx_q_BLHiDi, idx_k_BNDi, idx_w_BLHi, *, attention_metadata):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("PyPTOLightningIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOIndexerTND.apply(
-            idx_q.flatten(0, 1),
+            idx_q_BLHiDi.flatten(0, 1),
             # The keys enter the Function already compacted (arch22): the gather is
             # differentiable, so the teacher's gradient scatters back onto the gathered row and
             # the wrapper's ``S(1) -> R`` reduce-scatter then lands it on the compressor.
-            A3KeyWorkaround.indexer_keys(idx_k.flatten(0, 1), attention_metadata, a5=_IS_A5).unsqueeze(1).contiguous(),
-            idx_w.flatten(0, 1).float(),
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi.flatten(0, 1), attention_metadata, a5=_IS_A5)
+            .unsqueeze(1)
+            .contiguous(),
+            idx_w_BLHi.flatten(0, 1).float(),
             self.index_topk,
             attention_metadata.ratio,
             attention_metadata,
         )
-        batch, seqlen = idx_q.shape[:2]
+        batch, seqlen = idx_q_BLHiDi.shape[:2]
         return (
             topk_indices.reshape(batch, seqlen, -1),
             topk_scores.reshape(batch, seqlen, -1),

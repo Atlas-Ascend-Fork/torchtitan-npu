@@ -14,7 +14,6 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess, tiny_v41_model
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import (
     AlignedHuggingfaceDataloader,
     AlignedTextDataset,
@@ -57,16 +56,6 @@ def _stream(loader):
     return tokens_total, pairs
 
 
-def test_compression_alignment_is_the_lcm_of_the_pooling_ratios():
-    assert compression_alignment(()) == 1
-    assert compression_alignment((0, 0)) == 1
-    assert compression_alignment((0, 1, 1)) == 1
-    assert compression_alignment((0, 2, 1)) == 2
-    assert compression_alignment((0, 2, 4)) == 4
-    # V4.1's own ratios: the 16 ratio-2 layers pool, everything else does not.
-    assert compression_alignment((0, 0) + (2,) * 18 + (1,) * 20) == 2
-
-
 def test_pad_segments_to_multiple_appends_only_pads():
     ids = [2002, 11, 12]
     labels = [IGNORE_INDEX, 12, 2003]
@@ -94,7 +83,7 @@ def test_alignment_adds_a_bounded_number_of_untrained_tokens(tokenizer):
 
     The pads themselves are never targets.  What padding does cost is one target per
     odd-length document: labels are shifted within the document, so the EOS token's
-    label pointed at the pad that now follows it and is no longer supervised.
+    label pointed at the pad that follows it and is not a target.
     """
     aligned_tokens, aligned = _stream(_loader(tokenizer, alignment=2))
     unaligned_tokens, unaligned = _stream(_loader(tokenizer, alignment=1))
@@ -170,19 +159,22 @@ def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):
     expected_cu = torch.tensor([0, 4, 10], dtype=torch.int32)
     for (backend, ratio), frames in metadata.items():
         assert backend is CompressedSparseInnerAttention2.Config
-        torch.testing.assert_close(frames.cu_seq_q, expected_cu, rtol=0, atol=0)
+        torch.testing.assert_close(frames.q.cu_seqlens, expected_cu, rtol=0, atol=0)
         # The pool grid is the same backend's ratio applied once, where the ratio is known: a
-        # layer that pools reads this boundary set instead of dividing one it was handed.  A
-        # layer that does not pool addresses the row itself.
-        expected_pool = expected_cu if ratio <= 1 else (expected_cu // ratio).to(torch.int32)
-        torch.testing.assert_close(frames.cu_seq_k, expected_pool, rtol=0, atol=0)
+        # layer that pools reads this frame instead of dividing one it was handed.  A layer that
+        # does not pool has no compressed axis at all.
+        if ratio == 0:
+            assert frames.cmp_k is None
+        else:
+            expected_pool = expected_cu if ratio == 1 else (expected_cu // ratio).to(torch.int32)
+            torch.testing.assert_close(frames.cmp_k.cu_seqlens, expected_pool, rtol=0, atol=0)
 
 
 def test_the_metadata_carries_no_validity_marks(monkeypatch):
     """Row validity is the label mask, so the metadata carries no mark tensor.
 
     The packed loader marks structural padding with ``IGNORE_INDEX``, which the loss consumes
-    directly; the model must not expect a mark field the loader no longer emits.
+    directly; the model must not expect a mark field the loader does not emit.
     """
     positions = torch.arange(6).unsqueeze(0)
     tokens = torch.zeros_like(positions)

@@ -3,35 +3,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The static doc-chunk layout: the movement between a rank's slab and its chunks.
+"""The doc-chunk layout: the movement between one rank's flatten slice and its chunks.
 
-Shape legend: ``R = cp_size``; ``r = rank``; ``N`` the row's tokens, ``C = N // R`` the slab
+Shape legend: ``R = cp_size``; ``r = rank``; ``N`` the row's tokens, ``C = N // R`` the flatten
 width; ``L_d`` document ``d``'s length and ``Q_d = L_d // R`` its chunk.
 
 The dataloader packs one row; the context-parallel shard applies this layout as the **permutation**
-it shards by (:func:`doc_chunk_permutation`), so every rank receives **chunk ``r`` of every
-document** -- the ``r``-th ``Q_d`` rows of each document, documents in order -- before any hidden
-state exists.  That is what makes the per-document reach ``K_d = (r+1)·Q_d`` one problem on every
-rank.
+its balancer states, so every rank receives chunk ``r`` of every document before any hidden state
+exists.  That is what makes the per-document reach ``K_d = (r+1)·Q_d`` one
+problem on every rank.
 
-:func:`chunk_plan` derives the movement between the two frames from the row's boundaries alone:
-pure, on host values, zero communication.  :func:`to_slab` runs it with the functional collective,
-so the backward of a restore is the reverse exchange; the opposite direction is the shard's
-permutation itself (:func:`doc_chunk_permutation`), which is applied before any hidden state exists.
+:meth:`ExchangeMetadata.from_permutation` inverts the order the shard applied, so the movement
+between the two frames is derived from that one statement of the layout: pure, and it moves nothing
+until a layer asks.  The move happens once, in the shard, for the inputs, and once per layer for
+the KV side (``restore_key_stream``); the query side never moves.
 
-The move happens **once, in the shard, for the inputs** (the permutation, applied to the token ids,
-the positions, the labels and the MTP batch) and **once per layer** for the KV side
-(:meth:`RestorePlan.apply`, applied to the hidden states the key projections read).  The query
-side never moves: it is computed from the doc-chunk rows the input layout produced, which is what
-removes the per-layer query exchange and the output un-permutation.
-
-The two directions are exact inverses -- the movement is a permutation -- so a sharded forward
-sees the tokens the unsharded one does, in a different order.
-
-Everything here is stated on **python ints** (the degree and the rank are host values of the run),
-so no layout arithmetic ever meets a symbolic rank: the only host round-trips are the split lists
-:class:`ExchangeMetadata` carries, which the collective requires and which are derived once per
-microbatch.
+Everything here is stated on python ints (the degree and the rank are host values of the run), so
+no layout arithmetic ever meets a symbolic rank; the only host round-trips are the split lists the
+collective requires, derived once per microbatch.
 """
 
 from __future__ import annotations
@@ -41,163 +30,79 @@ from dataclasses import dataclass
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
 
-from .cp_layout import chunk_index
-
 __all__ = [
-    "CPMetadata",
     "ExchangeMetadata",
-    "RestorePlan",
-    "chunk_plan",
-    "doc_relative_positions",
     "restore_key_stream",
-    "slab_positions",
-    "to_slab",
 ]
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ExchangeMetadata:
-    """One batch's routing between the slab frame and the doc-chunk frame."""
+    """One batch's routing between the flatten frame and the doc-chunk frame."""
 
     send_index: torch.Tensor
     """Reorder of this rank's rows (int64, ``[C]``): the rows addressed to peer ``i`` form one
     contiguous slice, peers in order and ascending slot order within a peer."""
 
     send_split: list[int]
-    """``input_split_sizes``: rows this rank addresses to peer ``i``, one entry per peer.  A list,
-    because that is what the collective takes -- the plan builds it as one."""
+    """``input_split_sizes``: rows this rank addresses to peer ``i``, one entry per peer."""
 
     recv_split: list[int]
     """``output_split_sizes``: rows this rank receives from peer ``i``.  The receiver's buffer is
-    already in held-row order -- sources ascend and each source's rows ascend with them -- so
-    there is no scatter index and no second reorder."""
+    already in held-row order, so there is no scatter index and no second reorder."""
 
+    @classmethod
+    def from_permutation(cls, perm: torch.Tensor, *, cp_size: int, cp_rank: int) -> ExchangeMetadata:
+        """Derive one rank's movement from the token order the shard applied.
 
-@dataclass(frozen=True, kw_only=True, slots=True)
-class RestorePlan:
-    """doc-chunk -> slab: what the key side needs, shared by every projection that reads it."""
-
-    exchange: ExchangeMetadata
-    """The movement itself (the chunks' rows back onto this rank's slab)."""
+        That order is what a layout states and all it states, so its inverse is where every rank's
+        rows go: position ``q`` of the row belongs to rank ``q // C``, and the rows this rank holds
+        are its slice of the permutation.  Reading them needs a rank's held rows to ascend inside
+        its slice -- true of every document layout, which keeps documents in order -- and the
+        movement is then index arithmetic, with no document boundaries involved.
+        """
+        # A layout states ``[1, N]``; the arithmetic below wants the row axis alone.
+        perm = perm.reshape(-1)
+        width = perm.numel() // cp_size
+        mine = slice(cp_rank * width, (cp_rank + 1) * width)
+        # ``perm`` is a permutation of the row's positions, so sorting it inverts it: the value at
+        # position ``g`` is the slot row ``g`` landed in, hence the rank that holds it.
+        dst = torch.argsort(perm)[mine] // width
+        send_index = torch.argsort(dst, stable=True)
+        send_split = torch.bincount(dst, minlength=cp_size)
+        src = perm[mine] // width
+        recv_split = torch.bincount(src, minlength=cp_size)
+        return cls(send_index=send_index, send_split=send_split.tolist(), recv_split=recv_split.tolist())
 
     def apply(self, x: torch.Tensor, *, group) -> torch.Tensor:
-        """Restore ``x`` (doc-chunk rows) onto this rank's slab.
+        """The chunks' rows back onto this rank's flatten slice.
 
-        Differentiable: the reverse exchange is the backward, so the key side's gradient goes
+        A permutation, so the adjoint *is* the inverse: the reply is scattered through
+        ``send_index`` and nothing accumulates.  Differentiable, so the key side's gradient goes
         back to the doc-chunk rows that produced it.
         """
-        return to_slab(x, self.exchange, group=group)
+        if group is None:
+            raise RuntimeError("the doc-chunk layout has no process group; it must be wired before a sharded forward")
+        if x.size(0) != 1:
+            raise ValueError(f"the doc-chunk layout addresses one packed row per batch, got {tuple(x.shape)}.")
+        received = all_to_all_single(
+            x.squeeze(0),
+            output_split_sizes=self.send_split,
+            input_split_sizes=self.recv_split,
+            group=group,
+        )
+        out = torch.empty_like(received)
+        out[self.send_index] = received
+        return out.unsqueeze(0)
 
 
-def doc_relative_positions(cu_seqlens: torch.Tensor, absolute: torch.Tensor) -> torch.Tensor:
-    """The document-relative position of each ``absolute`` row, from the row's boundaries.
-
-    The stack's positions restart at every document, so a row's position is its absolute index
-    minus the start of the document it falls in.  One derivation, because three callers ask the
-    same question of different windows: the slab's own rows, the ratio-4 carry block (whose
-    window starts *before* the slab) and a whole row's reconstruction.
-    """
-    doc = torch.bucketize(absolute, cu_seqlens, right=True) - 1
-    return absolute - cu_seqlens[doc.clamp_min(0)]
-
-
-def chunk_plan(cu_seqlens: torch.Tensor, cp_size: int, rank: int, slab_len: int) -> ExchangeMetadata:
-    """Derive one rank's slab -> doc-chunk movement from the row's document boundaries.
-
-    ``slab_len`` is the slab width ``C``.  The split lists are the plan's only host values: the
-    collective takes them as python lists, and the plan is derived once per microbatch (not per
-    layer), so they are the layout's whole host traffic.  The alignment check is
-    :func:`chunk_index`'s -- it is the same predicate on the same tensor, and running it twice
-    costs a second device read per microbatch.
-    """
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunk = lengths // cp_size
-
-    # Send side: where each row of this rank's slab goes.  The chunk is needed for the sort
-    # anyway, and its histogram is the split.
-    dst = chunk_index(cu_seqlens, cp_size, rank, slab_len)
-    send_index = torch.argsort(dst, stable=True)
-    send_split = torch.bincount(dst, minlength=cp_size)
-
-    # Receive side, locally: each document's chunk ``rank`` is one global interval and spans at
-    # most two slabs (``chunk <= slab_len``), so it contributes a first segment to the slab it
-    # starts in and -- when it crosses -- the remainder to the next one.  The clamp is the
-    # crossing test, so no mask and no second pass are needed.
-    start = cu_seqlens[:-1] + rank * chunk
-    edge = (start // slab_len + 1) * slab_len
-    recv_split = torch.bincount(
-        torch.cat((start // slab_len, (start // slab_len + 1).clamp(max=cp_size - 1))),
-        weights=torch.cat((torch.minimum(start + chunk, edge) - start, (start + chunk - edge).clamp(min=0))).float(),
-        minlength=cp_size,
-    ).long()
-
-    return ExchangeMetadata(
-        send_index=send_index,
-        send_split=send_split.tolist(),
-        recv_split=recv_split.tolist(),
-    )
-
-
-def to_slab(tensor: torch.Tensor, plan: ExchangeMetadata | None, *, group) -> torch.Tensor:
-    """The chunks' rows back onto this rank's slab.
-
-    A permutation, so the adjoint *is* the inverse: the reply is scattered through
-    ``send_index`` and nothing accumulates.  Without a plan this is the identity, for the same
-    reason as at one degree: the slab *is* the frame there, so the caller's forward needs no
-    process group and no branch of its own.
-    """
-    if plan is None:
-        return tensor
-    if group is None:
-        raise RuntimeError("the doc-chunk layout has no process group; it must be wired before a sharded forward")
-    if tensor.size(0) != 1:
-        raise ValueError(f"the doc-chunk layout addresses one packed row per batch, got {tuple(tensor.shape)}.")
-    received = all_to_all_single(
-        tensor.squeeze(0),
-        output_split_sizes=plan.send_split,
-        input_split_sizes=plan.recv_split,
-        group=group,
-    )
-    out = torch.empty_like(received)
-    out[plan.send_index] = received
-    return out.unsqueeze(0)
-
-
-def slab_positions(cu_seqlens: torch.Tensor, cp_size: int, rank: int, slab_len: int) -> torch.Tensor:
-    """The document-relative positions of this rank's slab (int64, ``[1, C]``).
-
-    No communication: the row's boundaries and the slab's own interval say where every row sits
-    inside its document.
-    """
-    pos = torch.arange(rank * slab_len, (rank + 1) * slab_len, device=cu_seqlens.device)
-    return doc_relative_positions(cu_seqlens, pos).reshape(1, -1)
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class CPMetadata:
-    """The movement a rank-local entry carries: what the key side restores, and nothing else.
-
-    The plan is a function of the row's boundaries, the degree and the rank -- no operand, no
-    layer -- so it is derived once per microbatch with the entry and read by every layer of the
-    geometry.  At one degree the whole object is ``None``: the slab *is* the frame.
-
-    It lives on the entry's ``cp`` field rather than on the entry itself because the frames are
-    the entry's at every degree, and only the movement is a property of context parallelism.  A
-    consumer asks :func:`restore_key_stream` for the stream, never the plan.
-    """
-
-    restore: RestorePlan
-    """doc-chunk -> slab: the movement the key projections read."""
-
-
-def restore_key_stream(cp: CPMetadata | None, x: torch.Tensor, *, group) -> torch.Tensor:
+def restore_key_stream(xchg: ExchangeMetadata | None, x: torch.Tensor, *, group) -> torch.Tensor:
     """The stream this entry's key projections read: the input's, or this rank's window.
 
     At one degree the layout left the row in place, so the input *is* the stream; under context
     parallelism it is the window this rank's chunks are restored onto.  A consumer hands over the
-    stream as the layout produced it and never branches on the degree -- the identity here is the
-    ``None`` plan, not a caller-side test.
+    stream as the layout produced it and never branches on the degree.
     """
-    if cp is None:
+    if xchg is None:
         return x
-    return cp.restore.apply(x, group=group)
+    return xchg.apply(x, group=group)

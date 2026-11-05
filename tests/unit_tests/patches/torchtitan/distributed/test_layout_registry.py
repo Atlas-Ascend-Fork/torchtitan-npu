@@ -19,7 +19,6 @@ import torch
 from torchtitan_npu.patches.torchtitan.distributed.context_parallel import (
     LAYOUT_BALANCERS,
     ContextParallelLoadBalancer,
-    check_layout_supported,
     register_layout,
 )
 
@@ -43,17 +42,6 @@ def test_the_model_package_registers_its_layout():
     import torchtitan_npu.models.deepseek_v4.cp_layout  # noqa: F401  imported for its registration
 
     assert LAYOUT_BALANCERS["doc_chunk"].__name__ == "DocChunkCPLoadBalancer"
-
-
-def test_a_stack_refuses_a_layout_it_does_not_describe():
-    """The support check is the stack's matrix, not the registry's contents."""
-    import torchtitan_npu.models.deepseek_v4.cp_layout  # noqa: F401  imported for its registration
-
-    check_layout_supported("a stack", "doc_chunk", supported=("doc_chunk",))  # a no-op when it matches
-    with pytest.raises(ValueError, match="shards by one of"):
-        check_layout_supported("a stack", None, supported=("doc_chunk",))
-    with pytest.raises(ValueError, match="shards by one of"):
-        check_layout_supported("a stack", "headtail", supported=("doc_chunk",))
 
 
 def test_a_taken_name_cannot_be_rebound_to_another_class():

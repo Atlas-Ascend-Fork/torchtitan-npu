@@ -14,10 +14,11 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
-from .metadata import DeepSeekV4Metadata, build_v4_metadata
+from .metadata import DeepSeekV4Metadata
 
 
 class UnitScaleRMSNorm(RMSNorm):
@@ -48,7 +49,7 @@ class CompressedSparseInnerAttention(Module):
     The core is Attention Gym's ``gather_attn`` over the packed offsets the metadata already
     carries, so no document-aware block mask is built per layer:
 
-    - ``compress_ratio == 1``: sliding window plus sink, no compressed stream;
+    - ``compress_ratio == 0``: sliding window plus sink, no compressed stream;
     - ``compress_ratio == 4`` (CSA): the selector's picks, already numbered inside each query's
       own document -- the numbering ``gather_attn`` addresses a packed pool by;
     - a higher ratio (the model's HCA layers): every causally reachable compressed slot of the
@@ -112,7 +113,7 @@ class CompressedSparseInnerAttention(Module):
             # into the pool grid its kernels address.  The selector's records are the selector
             # port's business: this builder produces the row's frames only, and a fused selector
             # backend attaches its own records.
-            return build_v4_metadata(positions, self.compress_ratio)
+            return DeepSeekV4Metadata.from_positions(positions, self.compress_ratio)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -122,6 +123,23 @@ class CompressedSparseInnerAttention(Module):
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
         self.return_lse = config.return_lse
+
+    def make_hca_indices(
+        self, q: torch.Tensor, cmp_k: torch.Tensor, cu_seqlens: torch.Tensor, cu_seqlens_k: torch.Tensor
+    ):
+        """A geometry without a selector reaches every causally complete group of its document.
+
+        Document-local numbering with ``-1`` for an unreachable slot -- the coordinate system
+        ``gather_attn`` reads.  Built here rather than carried on the metadata: only this core
+        reads it, and the matrix is ``S x (S / ratio)``.  ``q`` and ``cmp_k`` supply the query rows
+        and the pool width as shapes, so nothing reads a device value on the host.
+        """
+        seqlen, n_cmp = q.size(1), cmp_k.size(1)
+        pool_start, pool_end, local = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=seqlen)
+        ends = torch.minimum(pool_end, pool_start + (local + 1) // self.compress_ratio)
+        slots = torch.arange(n_cmp, device=cu_seqlens.device).unsqueeze(0)
+        visible = (slots >= pool_start) & (slots < ends)
+        return torch.where(visible, slots.expand(seqlen, -1) - pool_start, -1).unsqueeze(0)
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
@@ -162,11 +180,12 @@ class CompressedSparseInnerAttention(Module):
             if cmp_frame is None:
                 raise ValueError("a compressed KV needs the entry's compressed frame")
             cu_seqlens_k = cmp_frame.cu_seqlens
-            # The selection is an input: the selector's picks at ratio four, and the entry's
-            # precomputed reference selection for a geometry without a selector.
-            kv_indices = topk_indices if self.compress_ratio == 4 else attention_metadata.slots
-            if kv_indices is None:
-                raise ValueError("the entry carries no selection for this geometry")
+            # The selection is an input: the selector's picks at ratio four, and, for a geometry
+            # without a selector, every causally complete group of the query's own document.
+            if self.compress_ratio == 4:
+                kv_indices = topk_indices
+            else:
+                kv_indices = self.make_hca_indices(q, cmp_k, cu_seqlens, cu_seqlens_k)
             sparse_kv = cmp_k.reshape(bsz, 1, n_cmp, head_dim)
 
         aux = AuxRequest(lse=True) if self.return_lse else None
@@ -295,7 +314,7 @@ class Attention(BaseAttention):
         # sharding gathers the rows to the whole row at the core's own boundary.
         swa_k = self.kv_norm(self.wkv(x))
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = restore_key_stream(metadata.cp, swa_k, group=self.cp_group)
+        swa_k = restore_key_stream(metadata.xchg, swa_k, group=self.cp_group)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None

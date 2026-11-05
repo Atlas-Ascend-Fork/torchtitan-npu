@@ -6,7 +6,7 @@
 
 """Override: run DeepSeek-V4 DSA with fused AscendC TND kernels.
 
-This module holds the AscendC backend: the record tier the fused path consumes
+This module holds the AscendC backend: the AI_CPU metadata tier the fused path consumes
 (``AscV4Metadata`` + the ``*_metadata`` fills, built by
 ``AscCompressedSparseInnerAttention.Config.build_attention_metadata``, upstream
 #4897's seam) and the fused TND kernel (``AscCompressedSparseInnerAttention``).
@@ -14,12 +14,12 @@ The ``sparse_attn`` package ``__init__`` defines the registration, so the
 override path stays ``override.deepseek_v4.sparse_attn.asc``.
 
 The fused path only bridges the AscendC TND kernels' forward/backward with a
-slim ``torch.autograd.Function``.  The selector is the separate
+slim ``torch.autograd.Function``.  The indexer is the separate
 ``lightning_indexer.asc`` override: this bridge consumes its ``topk_indices``,
-and SMLAG's backward emits the teacher on the selector's ``topk_scores`` edge.
-All AscendC metadata is precomputed at the backend's own metadata boundary and
+and SMLAG's backward emits the teacher on the indexer's ``topk_scores`` edge.
+All AscendC AI_CPU metadata is precomputed at the backend's own metadata boundary and
 carried in the registered ``AscV4Metadata``, so this module never builds or
-caches metadata per layer; because the records describe *frames*, the CP
+caches metadata per layer; because they describe *frames*, the CP
 transform rebuilds them for this rank (``prepare_cp_metadata``).  The CP path's
 ``S(1) -> R`` sharding gathers the KV streams to the whole row at the wrapper
 boundary, and the frames' ``seqused`` limits each rank's view.  Every fused
@@ -27,10 +27,9 @@ kernel of arch22, however, anchors its mask at the *end* of the key frame it is
 given (it reads no ``seqused`` there), so on that SoC the options state the reach
 itself as the frame and the wrapper compacts both gathered rows onto it before the
 kernel call -- the entry's ``a3_workaround``, built once per microbatch beside the
-records (``override/a3_workaround.py``).  The kernels therefore see the reach as
+AI_CPU metadata (``override/a3_workaround.py``).  The kernels therefore see the reach as
 their key frame's end, while the picks and indices keep the model's
-document-local numbering.  There is no container or ``_assemble_tnd`` step
-anymore.
+document-local numbering.  There is no container or ``_assemble_tnd`` step.
 
 The kernel inputs follow the training autocast contract: q/k/v are bf16 and
 the sink is fp32 — an eager-fp32 caller fails loudly at the kernel's dtype
@@ -39,88 +38,20 @@ check.
 
 from dataclasses import dataclass
 
+import cann_ops_transformer  # noqa: F401  (registers the torch.ops below)
 import torch
-from cann_ops_transformer import (
-    lightning_indexer_metadata,
-    sparse_flash_mla_grad_metadata,
-    sparse_flash_mla_metadata,
-    sparse_lightning_indexer_kl_loss_grad_metadata,
-)
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, KernelFrame
 from torchtitan_npu.override import _IS_A5
-from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    LI_CMP_RATIO,
-    AicpuGeometry,
-    AicpuMetadata,
-    AscLightningIndexerMetadata,
-    AscSparseAttentionMetadata,
-    CompactSelectorFrameProof,
-    lightning_indexer_options,
-)
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    AscV4Metadata as AscV4Metadata,
-)
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
 
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
 _CMP_MASK_MODE = 3
 
 
-# ---------------------------------------------------------------------------
-# AscendC metadata layer
-# ---------------------------------------------------------------------------
-#
-# The AscendC backend's metadata is the model-dir row plus its own record
-# tier: after the document-packed row is built, this backend fills
-# the precomputed AscendC ``*_metadata`` kernel outputs (lightning_indexer,
-# sparse_flash_mla, sparse_flash_mla_grad,
-# sparse_lightning_indexer_kl_loss_grad) into an ``AscV4Metadata`` wrapper,
-# keeping the model-dir metadata NPU-free.  Those kernels take only shape
-# information, so their results are layer-invariant and reused by every DSA
-# layer and by the backward pass.  ``AscCompressedSparseInnerAttention.Config``
-# builds the whole thing (upstream #4897); because a record describes the frames
-# it was derived from, ``prepare_cp_metadata`` rebuilds them per rank.
-
-
-def _selector_records(
-    q: KernelFrame,
-    key_frame: KernelFrame | None,
-    geometry: AicpuGeometry,
-    ratio: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """The selector's forward record and its SLIG backward record, for one geometry.
-
-    arch22's (A3) ``lightning_indexer`` schedules itself and is launched with ``metadata=None``,
-    so its forward record is not built there; SLIKG's backward record is required on both SoCs.
-    """
-    if ratio != LI_CMP_RATIO or key_frame is None:
-        return None, None
-    frames = lightning_indexer_options(ratio=ratio, q=q, cmp_k=key_frame)
-    li_record = (
-        lightning_indexer_metadata(
-            geometry.index_num_heads,
-            1,
-            geometry.index_head_dim,
-            geometry.index_topk,
-            **frames,
-        )
-        if _IS_A5
-        else None
-    )
-    slig_metadata = sparse_lightning_indexer_kl_loss_grad_metadata(
-        geometry.index_num_heads,
-        1,
-        geometry.index_head_dim,
-        topk=geometry.index_topk,
-        **frames,
-    )
-    return li_record, slig_metadata
-
-
-def _sparse_attention_options(
+def kernel_options(
     *,
     q: KernelFrame,
     swa_k: KernelFrame,
@@ -152,32 +83,28 @@ def _sparse_attention_options(
     )
 
 
-def _sparse_attention_records(
+def kernel_aicpu_metadata(
+    *,
     q: KernelFrame,
     swa_k: KernelFrame,
     cmp_k: KernelFrame | None,
-    geometry: AicpuGeometry,
     ratio: int,
+    geometry: AicpuGeometry,
+    has_indexer: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The SMLA/SMLAG records for these frames."""
-    options = _sparse_attention_options(
-        q=q,
-        swa_k=swa_k,
-        cmp_k=cmp_k,
-        ratio=ratio,
-        window_size=geometry.window_size,
-    )
+    """The SMLA/SMLAG AI_CPU metadata for these frames."""
+    options = kernel_options(q=q, swa_k=swa_k, cmp_k=cmp_k, ratio=ratio, window_size=geometry.window_size)
     has_cmp_kv = cmp_k is not None
     geometry_kwargs = dict(
         ori_topk=0,
-        # Only the ratio-4 CSA geometry selects compressed entries.  A ratio-128 HCA layer
+        # Only a geometry with an indexer selects compressed entries.  A ratio-128 HCA layer
         # addresses the whole causal prefix, and the kernel rejects a non-zero ``cmp_topk``
         # with a ratio above 4 (the error the A3 integration run surfaced).
-        cmp_topk=geometry.index_topk if ratio == LI_CMP_RATIO else 0,
+        cmp_topk=geometry.index_topk if has_indexer else 0,
         has_ori_kv=True,
         has_cmp_kv=has_cmp_kv,
     )
-    smla_metadata = sparse_flash_mla_metadata(
+    smla_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
         geometry.num_heads,
         1,
         geometry.head_dim,
@@ -186,7 +113,7 @@ def _sparse_attention_records(
         **options,
         **geometry_kwargs,
     )
-    smla_grad_metadata = sparse_flash_mla_grad_metadata(
+    smla_grad_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_grad_metadata(
         geometry.num_heads,
         1,
         geometry.head_dim,
@@ -196,180 +123,13 @@ def _sparse_attention_records(
     return smla_metadata, smla_grad_metadata
 
 
-def _compact_selector_frame_proof(
-    q: KernelFrame,
-    key_frame: KernelFrame,
-    positions_q: torch.Tensor,
-    key_tokens: int,
-) -> CompactSelectorFrameProof | None:
-    """Validate once at the eager metadata boundary, never inside a layer graph.
+class _SparseMLA(torch.autograd.Function):
+    """SMLA forward with SMLAG backward, in the TND layout of one packed row.
 
-    The single scalar read combines compactness, monotonicity and canonical
-    endpoints. Noncompact frames remain available to backends that support
-    seqused; they simply receive no compact-only Pro proof.
-    """
-    q_cu, q_used = q.cu_seqlens, q.seqused
-    k_cu, k_used = key_frame.cu_seqlens, key_frame.seqused
-    if (
-        q_cu.ndim != 1
-        or k_cu.ndim != 1
-        or q_used.ndim != 1
-        or k_used.ndim != 1
-        or q_cu.numel() < 2
-        or q_cu.shape != k_cu.shape
-        or q_used.numel() != q_cu.numel() - 1
-        or k_used.numel() != k_cu.numel() - 1
-    ):
-        return None
-    q_lengths, k_lengths = torch.diff(q_cu), torch.diff(k_cu)
-    valid = (
-        (q_cu[0] == 0)
-        & (k_cu[0] == 0)
-        & (q_cu[-1] == positions_q.numel())
-        & (k_cu[-1] == key_tokens)
-        & (q_lengths >= 0).all()
-        & (k_lengths >= 0).all()
-        & (q_used == q_lengths).all()
-        & (k_used == k_lengths).all()
-    )
-    if not bool(valid):
-        return None
-    tensors = [q_cu, q_used, k_cu, k_used, positions_q]
-    try:
-        versions = tuple(tensor._version for tensor in tensors)
-    except RuntimeError:
-        # Inference tensors do not track versions. Do not change another
-        # backend's usable frames merely because Pro cannot certify them.
-        return None
-    return CompactSelectorFrameProof(
-        q_cu=q_cu,
-        q_seqused=q_used,
-        k_cu=k_cu,
-        k_seqused=k_used,
-        positions_q=positions_q,
-        selector_k_gather=None,
-        key_tokens=key_tokens,
-        versions=versions,
-    )
-
-
-def build_aicpu_metadata(
-    metadata: DeepSeekV4Metadata,
-    *,
-    geometry: AicpuGeometry,
-    positions_q: torch.Tensor | None = None,
-) -> AscV4Metadata:
-    """The AscendC record tier over one geometry's frames (upstream #4897).
-
-    The frames are the entry's own (``q`` / ``swa_k`` / ``cmp_k``); this builder reads them and
-    returns the same entry with this geometry's records attached.  Because a record describes the
-    frames it was computed for, a re-cut entry -- the CP transform's rank-local chunks -- runs
-    this again rather than reusing records of the frame they came from.
-
-    ``positions_q`` is the query axis this build describes -- the row's positions at build time,
-    this rank's after the CP transform re-cuts it.  Only the compact-only selector's proof needs
-    it; without one the entry simply carries no proof and that backend refuses, which is why it is
-    optional rather than read off the entry (the entry no longer stores the row's positions).
-    """
-    ratio = metadata.ratio
-    q = metadata.q
-    swa_k = metadata.swa_k
-    cmp_k = metadata.cmp_k
-    if cmp_k is not None and ratio <= 1:
-        cmp_k = None
-    cmp_tokens = int(cmp_k.cu_seqlens[-1]) if cmp_k is not None and ratio > 1 else 0
-    if cmp_k is not None and ratio > 1 and cmp_tokens == 0:
-        raise ValueError(
-            f"batch has no complete compression block for ratio={ratio}; doc-packed sequences "
-            "must be long enough to produce at least one full block."
-        )
-    # arch22 anchors its mask at the key frame's end and reads no ``seqused``, so its key frames are
-    # the per-document reach this rank may read.  The workaround is built here, once per microbatch
-    # (the walk inside it synchronises once), and the entry keeps what it built.
-    workaround = None
-    if not _IS_A5:
-        workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
-    li_record, slig_metadata = _selector_records(q, cmp_k, geometry, ratio)
-    smla_metadata, smla_grad_metadata = _sparse_attention_records(q, swa_k, cmp_k, geometry, ratio)
-    record = AicpuMetadata(
-        geometry=geometry,
-        sparse_attn=AscSparseAttentionMetadata(fwd=smla_metadata, bwd=smla_grad_metadata),
-        lightning_indexer=AscLightningIndexerMetadata(fwd=li_record, bwd=slig_metadata),
-    )
-    # The compact-only Pro selector certifies the exact tensors it reads, so it needs the query
-    # axis this build describes.  The entry no longer carries the row's positions -- the frames
-    # and the plan say everything else -- so the caller hands them in: the row's at build time,
-    # this rank's when the CP transform rebuilds the entry.
-    compact_proof = None
-    if (
-        positions_q is not None
-        and cmp_k is not None
-        and ratio == LI_CMP_RATIO
-        and geometry.index_num_heads == 64
-        and geometry.index_head_dim == 128
-    ):
-        compact_proof = _compact_selector_frame_proof(q, cmp_k, positions_q, int(cmp_k.cu_seqlens[-1]))
-    result = AscV4Metadata(
-        ratio=ratio,
-        q=q,
-        swa_k=swa_k,
-        cmp_k=cmp_k,
-        position_k=metadata.position_k,
-        batch_size=metadata.batch_size,
-        slots=metadata.slots,
-        cp=metadata.cp,
-        aicpu_metadata=record,
-        a3_workaround=workaround,
-        compact_selector_frame_proof=compact_proof,
-    )
-    _mark_dynamic(result)
-    return result
-
-
-def _mark_dynamic(metadata: AscV4Metadata) -> None:
-    """Mark batch-dependent leading dimensions so Dynamo does not specialize."""
-    tensors: list[torch.Tensor] = [
-        metadata.q.cu_seqlens,
-        metadata.q.seqused,
-        metadata.swa_k.cu_seqlens,
-        metadata.swa_k.seqused,
-    ]
-    if metadata.cmp_k is not None:
-        tensors += [metadata.cmp_k.cu_seqlens, metadata.cmp_k.seqused]
-        if metadata.cmp_k.residual is not None:
-            tensors.append(metadata.cmp_k.residual)
-    if not _IS_A5:
-        workaround = metadata.a3_workaround
-        assert workaround is not None, "an arch22 entry states the key workaround"
-        tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
-    if metadata.cp is not None:
-        # The restore's scatter table moves with the slab width and the batch's document layout;
-        # ``position_k`` is the geometry's own field and is marked here with the rest of the
-        # tensors whose first dimension follows the batch.
-        tensors += [metadata.position_k, metadata.cp.restore.exchange.send_index]
-    if metadata.aicpu_metadata.lightning_indexer.fwd is not None:
-        tensors.append(metadata.aicpu_metadata.lightning_indexer.fwd)
-    for tensor in tensors:
-        torch._dynamo.maybe_mark_dynamic(tensor, 0)
-        # Written via setattr: "_dynamo_unbacked_indices" is the dynamo shape
-        # annotation the GraphTrainer tracer reads (torchtitan
-        # experiments/graph_trainer/dynamic_shapes.py); the underscore name is
-        # deliberate and must stay off the codecheck protected-member list.
-        setattr(tensor, "_dynamo_unbacked_indices", {0})  # noqa: B010
-
-
-class _SparseFlashMLATND(torch.autograd.Function):
-    """Bridge SparseFlashMLA forward with SMLAG backward and its teacher by-product.
-
-    The ``cann_ops_transformer`` kernels carry no native autograd registration, so the manual
-    Function runs SMLA forward and SMLAG backward.  It does **not** train the indexer: SMLAG's
-    backward emits the raw teacher on ``topk_scores``' gradient and the selector's own
-    ``_LightningIndexerTND`` backward consumes that edge with SLIKG.  ``topk_scores`` is an
-    input here only so an incoming gradient on it exists and is routed to the emitter.
-
-    The kernels are addressed by this geometry's frames, not by a plan: the query frame is this
-    rank's chunks and the two KV frames are the row's; on arch22 the options state their reach as
-    the frame instead, and the wrapper has already compacted the rows onto it.
+    ``cmp_k`` is the pooled container (a ratio above one, addressed by ``topk_indices``) or the
+    full-resolution second stream (ratio one).  ``topk_scores`` is an input only so the teacher
+    SMLAG emits on its gradient has a consumer: the indexer's backward reads that edge and it is
+    never read here.
     """
 
     @staticmethod
@@ -386,150 +146,176 @@ class _SparseFlashMLATND(torch.autograd.Function):
         window_size,
         topk_scores,
     ):
-        metadata = attention_metadata
-        if not isinstance(metadata, AscV4Metadata):
+        if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused core needs AscV4Metadata")
-        asc = metadata.aicpu_metadata
-        has_compressed = metadata.cmp_k is not None
-        options = _sparse_attention_options(
-            q=metadata.q,
-            swa_k=metadata.swa_k,
-            cmp_k=metadata.cmp_k,
+        options = kernel_options(
+            q=attention_metadata.q,
+            swa_k=attention_metadata.swa_k,
+            cmp_k=attention_metadata.cmp_k,
             ratio=ratio,
             window_size=window_size,
         )
-        result, softmax_lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
+        output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
             ori_kv=swa_k,
-            cmp_kv=cmp_k if has_compressed else None,
-            cmp_sparse_indices=(topk_indices if has_compressed else None),
+            cmp_kv=cmp_k,
+            cmp_sparse_indices=topk_indices,
             ori_block_table=None,
             cmp_block_table=None,
             sinks=sinks,
-            metadata=asc.sparse_attn.fwd,
+            metadata=attention_metadata.aicpu_metadata.sparse_attn.fwd,
             softmax_scale=softmax_scale,
             return_softmax_lse=True,
             **options,
         )
-        ctx.save_for_backward(
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices,
-            sinks,
-            result,
-            softmax_lse,
-        )
-        ctx.softmax_scale = softmax_scale
-        ctx.ratio = ratio
-        ctx.window_size = window_size
-        # The carrier is an input only while training; its position in the backward's
-        # per-input list must still be answered with ``None`` when it was not threaded.
+        ctx.save_for_backward(q, swa_k, cmp_k, topk_indices, sinks, output, lse)
+        ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
         ctx.has_carrier = topk_scores is not None
-        # A dataclass cannot go through ``save_for_backward``; it is a context attribute
-        # instead, holding the same frames the graph already keeps for the backward.
-        ctx.attention_metadata = metadata
-        # The LSE is a teacher signal, never a loss input.
-        ctx.mark_non_differentiable(softmax_lse)
-        return result, softmax_lse
+        # A dataclass cannot go through ``save_for_backward``; it holds only the frames the graph
+        # already keeps, and is released when this backward has run.
+        ctx.attention_metadata = attention_metadata
+        ctx.mark_non_differentiable(lse)
+        return output, lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):  # pyrefly: ignore [bad-override]
         del grad_lse
-        (
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices,
-            sinks,
-            result,
-            softmax_lse,
-        ) = ctx.saved_tensors
-        metadata = ctx.attention_metadata
-        has_compressed = metadata.cmp_k is not None
-        options = _sparse_attention_options(
-            q=metadata.q,
-            swa_k=metadata.swa_k,
-            cmp_k=metadata.cmp_k,
+        q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
+        options = kernel_options(
+            q=ctx.attention_metadata.q,
+            swa_k=ctx.attention_metadata.swa_k,
+            cmp_k=ctx.attention_metadata.cmp_k,
             ratio=ctx.ratio,
             window_size=ctx.window_size,
         )
-        (
-            dquery,
-            dori_kv,
-            dcmp_kv,
-            dsinks,
-            _,
-            cmp_softmax_l1,
-        ) = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
+        dq, dswa_k, dcmp_k, dsinks, _, teacher = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
-            result,
-            softmax_lse,
+            output,
+            lse,
             ori_kv=swa_k,
-            cmp_kv=cmp_k if has_compressed else None,
+            cmp_kv=cmp_k,
             ori_sparse_indices=None,
-            cmp_sparse_indices=(topk_indices if has_compressed else None),
+            cmp_sparse_indices=topk_indices,
             sinks=sinks,
-            metadata=metadata.aicpu_metadata.sparse_attn.bwd,
+            metadata=ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd,
+            ori_topk_length=None,
+            cmp_topk_length=None,
             softmax_scale=ctx.softmax_scale,
             **options,
         )
-        if not has_compressed:
-            dcmp_kv = None
-
-        # The teacher edge: SMLAG's raw marginal mass, with every ``-1`` slot zeroed (the
-        # kernel may write junk there, and SLIKG sums every slot into ``p_reduce``), scaled by
-        # ``softmax_scale`` exactly once here; the selector's backward only divides by the
-        # microbatch's query-row count.  Only a layer that threads a carrier has an edge to
-        # emit on: an HCA layer's compressed branch has no selector, and an eval forward
-        # passes no carrier.
-        teacher = None
-        if ctx.has_carrier and cmp_softmax_l1 is not None:
-            teacher = cmp_softmax_l1.masked_fill(topk_indices < 0, 0.0) * ctx.softmax_scale
-
-        # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices, sinks,
-        # attention_metadata, softmax_scale, ratio, window_size, topk_scores).
+        # One gradient per forward input, in order.  ``cmp_k`` and the carrier are answered only
+        # where the forward carried them.
         return (
-            dquery,
-            dori_kv,
-            dcmp_kv,
-            None,  # topk_indices
+            dq,
+            dswa_k,
+            dcmp_k if cmp_k is not None else None,
+            None,
             dsinks,
-            None,  # attention_metadata
-            None,  # softmax_scale
-            None,  # ratio
-            None,  # window_size
-            teacher,  # topk_scores
+            None,
+            None,
+            None,
+            None,
+            teacher if ctx.has_carrier else None,
         )
 
 
-class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
-    """Run SMLA/SMLAG in a local TND layout, consuming the selector's selection.
+def _compact_key_rows(swa_k, cmp_k, metadata):
+    """arch22 reads only this rank's reach, so both key streams are compacted onto it.
 
-    The flow mirrors ``AscSparseInnerAttention`` (dsv3.2): the core reads this geometry's
-    frames (queries on this rank's chunks) and calls the AscendC ops directly.  The selector's
-    forward/backward is **not** here: it is the separate ``lightning_indexer.asc`` override,
-    which emits ``topk_indices`` and the teacher carrier.  This core consumes both, and its
-    SMLAG backward writes the raw teacher onto the carrier's gradient.  The container/plan
-    assembly is gone: the compressor produces the whole compressed row through the core's
-    ``S(1) -> R`` gather, and the frames' ``seqused`` limits each rank's view.  On arch22 both KV
-    streams are then compacted onto this rank's reach, because these kernels anchor their mask at
-    the key frame's end -- the same frame the selector picked in -- and the gradients scatter back
-    through the compaction.
+    The gathers are differentiable, so the kernels' gradients scatter back onto the gathered
+    rows; on the rank whose reach is every document in full they are the identity.
+    """
+    if _IS_A5:
+        return swa_k, cmp_k
+    workaround = metadata.a3_workaround
+    assert workaround is not None, "an arch22 entry states the key workaround"
+    if workaround.swa_k_gather is not None:
+        swa_k = swa_k.index_select(0, workaround.swa_k_gather)
+    if cmp_k is not None and workaround.cmp_k_gather is not None:
+        cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
+    return swa_k, cmp_k
+
+
+class AscSparseMLAMixin:
+    """The kernel-facing half both stacks' fused cores share.
+
+    The reference cores differ (V4's single indexer against V4.1's indexer modes and kv
+    sources), so the ports share behaviour here rather than a base class: the row/TND
+    translation, the arch22 compaction and the Function call.
+    """
+
+    training: bool
+    softmax_scale: float
+    compress_ratio: int
+    window_size: int
+
+    def __init__(self, config) -> None:
+        super().__init__(config)  # pyrefly: ignore [bad-argument-count]
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.index_num_heads = config.index_num_heads
+        self.index_head_dim = config.index_head_dim
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        q,
+        swa_k,
+        attn_sink: torch.Tensor,
+        attention_metadata,
+        *,
+        cmp_k=None,
+        topk_indices=None,
+        topk_scores=None,
+    ) -> torch.Tensor:
+        batch_size, seqlen = q.shape[0], q.shape[1]
+        swa_k, cmp_k = _compact_key_rows(
+            swa_k.flatten(0, 1),
+            None if cmp_k is None else cmp_k.flatten(0, 1),
+            attention_metadata,
+        )
+        swa_k = swa_k.unsqueeze(1).contiguous()
+        if cmp_k is not None:
+            cmp_k = cmp_k.unsqueeze(1).contiguous()
+        indices = None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1])
+        # The carrier is a training-only by-product: its gradient is the indexer's only edge.
+        carrier = None
+        if self.training and topk_scores is not None:
+            carrier = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
+        output, _lse = _SparseMLA.apply(
+            q.flatten(0, 1),
+            swa_k,
+            cmp_k,
+            indices,
+            attn_sink.float(),
+            attention_metadata,
+            self.softmax_scale,
+            self.compress_ratio,
+            self.window_size,
+            carrier,
+        )
+        return output.reshape(batch_size, seqlen, *output.shape[1:])
+
+
+class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInnerAttention):
+    """Run SMLA/SMLAG in a local TND layout, consuming the indexer's selection.
+
+    The core reads this geometry's frames and calls the AscendC ops directly; the indexer is the
+    separate ``lightning_indexer.asc`` override, which emits ``topk_indices`` and the teacher
+    carrier that this core's backward writes onto.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(CompressedSparseInnerAttention.Config):
-        """The fused config: the reference core's fields plus the geometry its records need."""
+        """The fused config: the reference core's fields plus the geometry its AI_CPU metadata need."""
 
         num_heads: int  # pyrefly: ignore [bad-override]
         head_dim: int
-        """The main attention geometry the SMLA/SMLAG records are sized with."""
+        """The main attention geometry the SMLA/SMLAG AI_CPU metadata are sized with."""
 
         index_num_heads: int
         index_head_dim: int
-        """The selector geometry its record and SLIKG backward are sized with."""
+        """The indexer geometry its metadata and SLIKG backward are sized with."""
 
         @property
         def geometry(self) -> AicpuGeometry:
@@ -553,94 +339,9 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         ) -> AscV4Metadata:
             """This backend's per-microbatch metadata (upstream #4897).
 
-            The model-dir plain row plus the record tier: this geometry's four ``*_metadata``
+            The model-dir plain row plus the AI_CPU metadata tier: this geometry's four ``*_metadata``
             kernel outputs, computed here once per microbatch for every layer of the geometry.
             """
             del padding_mask, max_num_documents, max_context_length
-            from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
-
-            # The fused core never reads ``slots``: its HCA branch runs full-causal on the
-            # compressed pool, so the reference-only S x (S / ratio) selection is skipped here.
-            metadata = build_v4_metadata(positions, self.compress_ratio, build_slots=False)
-            return build_aicpu_metadata(metadata, geometry=self.geometry, positions_q=positions)
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        self.num_heads = config.num_heads
-        self.head_dim = config.head_dim
-        self.index_num_heads = config.index_num_heads
-        self.index_head_dim = config.index_head_dim
-
-    def forward(  # pyrefly: ignore [bad-override]
-        self,
-        q,
-        swa_k,
-        attn_sink: torch.Tensor,
-        *,
-        cmp_k=None,
-        topk_indices=None,
-        topk_scores=None,
-        attention_metadata: AscV4Metadata,
-    ) -> torch.Tensor:
-        # The single-source contract (see ``docs/feature_guides/fused_ops.md``): the fused
-        # kernels read the records their own builder attached, so an entry built by any other
-        # backend is refused here rather than launched with missing metadata.  There is no
-        # inline fallback.
-        if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError(
-                "asc requires the attention metadata its own config built, got "
-                f"{type(attention_metadata).__name__}: the decoder hands each layer the entry "
-                "its attention_metadata_key names, so this layer's backend did not build one."
-            )
-        if self.compress_ratio == 4 and (cmp_k is None or topk_indices is None):
-            raise ValueError("ratio-4 asc requires cmp_k and topk_indices together.")
-        metadata = attention_metadata
-        batch_size, seqlen, _, _ = q.shape
-
-        q = q.flatten(0, 1)
-        swa_k = swa_k.flatten(0, 1)
-        if cmp_k is not None:
-            cmp_k = cmp_k.flatten(0, 1)
-        if not _IS_A5:
-            # Both KV streams arrive as the gathered whole row, and this rank may read only its
-            # per-document reach: the options state that reach as the kernels' frame, so each row is
-            # compacted onto it here.  Both gathers are differentiable, so the kernels' gradients
-            # scatter back onto the gathered rows; on the rank whose reach is every document in
-            # full there is no gather and no row is copied.
-            workaround = metadata.a3_workaround
-            assert workaround is not None, "an arch22 entry states the key workaround"
-            if workaround.swa_k_gather is not None:
-                swa_k = swa_k.index_select(0, workaround.swa_k_gather)
-            if cmp_k is not None and workaround.cmp_k_gather is not None:
-                cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
-        swa_k = swa_k.unsqueeze(1).contiguous()
-        if cmp_k is not None:
-            cmp_k = cmp_k.unsqueeze(1).contiguous()
-
-        topk_indices_tnd = None
-        if topk_indices is not None:
-            # The model carries the selection as ``[B, L, K]``; a TND kernel wants
-            # ``[T, 1, K]``.  Order is left exactly as the selector emitted it: it already
-            # canonicalised position order, and the teacher's slots follow that order.
-            topk_indices_tnd = topk_indices.reshape(-1, 1, topk_indices.shape[-1])
-
-        # The carrier is a training-only by-product: its gradient is the selector's only edge,
-        # and SMLAG's backward writes the teacher on it.  In eval there is no indexer gradient
-        # to feed, so the carrier is not threaded through.
-        topk_scores_tnd = None
-        if self.training and topk_scores is not None:
-            topk_scores_tnd = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
-
-        output, _lse = _SparseFlashMLATND.apply(
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices_tnd,
-            attn_sink.float(),
-            metadata,
-            self.softmax_scale,
-            self.compress_ratio,
-            self.window_size,
-            topk_scores_tnd,
-        )
-        return output.reshape(batch_size, seqlen, *output.shape[1:])
+            metadata = DeepSeekV4Metadata.from_positions(positions, self.compress_ratio)
+            return AscV4Metadata.build_aicpu_metadata(metadata, geometry=self.geometry)

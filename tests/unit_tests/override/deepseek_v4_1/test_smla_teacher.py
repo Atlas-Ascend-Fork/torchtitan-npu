@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _SparseMLA
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
 
 
@@ -27,8 +28,8 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     The teacher is the only thing that trains the indexer, and it travels on
     ``topk_scores`` because SMLAG's backward runs after the indexer's forward.  So the
     gradient this port produces must be the kernel's ``cmp_softmax_l1_norm`` verbatim --
-    no loss scaling, no ``Z * Y`` term -- because SLIKG applies ``dI = Z * Y - p`` itself
-    and would read anything else as the teacher.
+    no loss scaling, no ``Z * Y`` term, no ``-1`` masking -- because SLIKG applies
+    ``dI = Z * Y - p`` itself and would read anything else as the teacher.
     """
     meta = torch.zeros(1, dtype=torch.int32)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", lambda *a, **k: meta)
@@ -120,18 +121,16 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     grad = scores.grad.reshape(4, 3)
     # The carrier is FP32 and SMLAG's mass is FP32, and the op returns it in the
     # selection's own layout, so the port forwards it with no conversion and no
-    # reshaping at all -- the value that lands here is the kernel's tensor.
+    # reshaping at all -- the value that lands here is the kernel's tensor, verbatim.
     assert scores.dtype == torch.float32
     assert scores.grad.dtype == scores.dtype
-    # Every ``-1`` slot comes back zero however much junk the kernel put there: the port
-    # masks on the selection, because SLIKG's ``ReduceSumVf`` sums every slot and a padded
-    # one carrying mass would enter ``dI = Z * Y - p``.
-    assert grad[0, 0] == 0
-    assert not valid[3].any()
-    assert torch.equal(grad[3], torch.zeros(3))
-    assert (grad[:3][valid[:3]] != 0).all()
+    # Verbatim means the port neither scales nor masks: a ``-1`` slot keeps whatever the
+    # kernel wrote there, and SLIKG -- the only reader -- owns the selection's spelling.
+    expected = torch.zeros(4, 3)
+    expected[:, 1] = torch.where(valid[:, 1], torch.tensor(mass[1]), torch.tensor(junk))
+    expected[:, 2] = torch.where(valid[:, 2], torch.tensor(mass[2]), torch.tensor(junk))
     # Each consumer's backward delivers the mass again, hence the doubling.
-    assert torch.equal(grad[0], torch.tensor([0.0, mass[1] * 2, mass[2] * 2]))
+    assert torch.equal(grad, expected * 2)
 
 
 @pytest.mark.parametrize(
@@ -156,7 +155,7 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
         captured.append(args)
         return args[0].clone(), torch.zeros(1, 4, 1)
 
-    monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
+    monkeypatch.setattr(_SparseMLA, "apply", kernel)
     config = ascendc.AscV41SparseAttention.Config(
         window_size=2,
         softmax_scale=0.5,
@@ -181,12 +180,11 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
         v41_metadata([0, 4], port=config),
         cmp_k=shared,
         topk_indices=indices,
-        topk_scores=torch.ones(1, 4, 1, requires_grad=True),
+        topk_scores=torch.ones(1, 4, 1, requires_grad=True) if with_pool else None,
     )
     torch.testing.assert_close(out, q)
     # The apply args are (q, swa_k, cmp_k, topk_indices, sinks, attention_metadata,
-    # softmax_scale, ratio, window_size, topk_scores, wants_teacher): the teacher travels
-    # as the carrier's gradient, so no carrier means this layer carries none.  The boundary
-    # tensors are no longer arguments -- they are read off the mask at position 5.
+    # softmax_scale, ratio, window_size, topk_scores): the teacher travels as the carrier's
+    # gradient, so no carrier means this layer carries none.  The boundary tensors are no
+    # longer arguments -- they are read off the metadata at position 5.
     assert captured[0][9] is None
-    assert captured[0][10] is False

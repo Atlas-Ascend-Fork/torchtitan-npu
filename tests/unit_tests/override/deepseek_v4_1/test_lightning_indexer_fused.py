@@ -16,7 +16,7 @@ produces the teacher (SMLAG's backward is the only source of it) and
 ``lightning_indexer.asc`` consumes it (SLIKG is the only consumer). With the selector
 override alone the indexer's selection feeds the attention as indices, which carry no
 gradient, so its parameters stay frozen; that is why nothing here checks an "eager
-indexer gradient" -- with the distillation loss removed there is no longer a path to one.
+indexer gradient" -- without a distillation loss there is no path to one.
 """
 
 import dataclasses
@@ -31,11 +31,11 @@ from torchtitan.config import derive
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import layer_metadata, preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     AscSelector,
 )
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
-from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import build_fused_metadata
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Metadata
 
 _TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)]).unsqueeze(0)
 _POSITIONS = torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0)
@@ -65,9 +65,8 @@ def _metadata(bounds: list[int], *, ratio: int = 2, geometry: AicpuGeometry | No
     """
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
     reference = CompressedSparseInnerAttention2.Config(window_size=128, softmax_scale=0.5, compress_ratio=ratio)
-    return build_fused_metadata(
+    return AscV41Metadata.build_aicpu_metadata(
         reference.build_attention_metadata(positions),
-        ratio=ratio,
         geometry=_TINY_LAYER_GEOMETRY if geometry is None else geometry,
     )
 
@@ -387,19 +386,13 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
     assert seen["calls"] == len(sources), (seen["calls"], sources)
     assert len(set(seen["tokens"])) == 1, set(seen["tokens"])
 
-    for teacher, padding in zip(seen["teacher"], seen["padding"], strict=True):
+    for teacher in seen["teacher"]:
         tokens = seen["tokens"][0]
         assert tokens == _TOKENS.shape[1], (tokens, _TOKENS.shape[1])
         assert constant > num_global_queries
-        # The ``-1`` slots are SMLAG's junk zeroed out on the way here; the unpadded ones
-        # are what the division acts on.
-        torch.testing.assert_close(
-            teacher.masked_select(padding),
-            torch.zeros(int(padding.sum())),
-            rtol=0,
-            atol=0,
-        )
-        value = teacher.masked_select(~padding).max().item()
+        # SMLAG's tensor is forwarded verbatim -- its ``-1`` slots included -- and only the
+        # division by the row's query count is the port's.
+        value = teacher.max().item()
         # Shared index sources accumulate one normalized teacher per contributing layer.
         contributors = value * num_global_queries / constant
         assert abs(contributors - round(contributors)) < 1e-6, (
@@ -412,9 +405,7 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
             f"the teacher implies {round(contributors)} contributors but only {seen['emitters']} "
             f"layers emitted one, so the seqlen division ({tokens}) is missing"
         )
-        expected = torch.full_like(teacher, constant * round(contributors) / num_global_queries).masked_fill(
-            padding, 0.0
-        )
+        expected = torch.full_like(teacher, constant * round(contributors) / num_global_queries)
         torch.testing.assert_close(teacher, expected)
 
 
@@ -433,7 +424,7 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
     list).  ``meta`` stands in for "not the default device" here, since the CPU harness
     has no second device to hand.
     """
-    from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as li
+    from torchtitan_npu.override.deepseek_v4.lightning_indexer import ascendc as li
 
     device = torch.device("meta")
     seen = {}
@@ -487,15 +478,15 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
     match ``sparse_indices`` exactly.  Both are silent in the CPU fakes -- they accept any
     shape -- so this pins them here, since a wrong rank only surfaces on device.
     """
-    from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as sa
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _SparseMLA
 
     seen = {}
-    real_apply = sa._SparseMLA.apply
+    real_apply = _SparseMLA.apply
 
-    def spy_apply(q, swa_k, cmp_k, topk_indices, sinks, masks, scale, ratio, window, tscore, wants):
+    def spy_apply(q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore):
         seen["smla_indices"] = tuple(topk_indices.shape)
         seen["smla_carrier"] = None if tscore is None else tuple(tscore.shape)
-        return real_apply(q, swa_k, cmp_k, topk_indices, sinks, masks, scale, ratio, window, tscore, wants)
+        return real_apply(q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore)
 
     def fake_slig(q, k, w, sparse_indices, attn_softmax_l1_norm, **kw):
         seen["slig_indices"] = tuple(sparse_indices.shape)
@@ -507,7 +498,7 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
             torch.zeros_like(attn_softmax_l1_norm),
         )
 
-    monkeypatch.setattr(sa._SparseMLA, "apply", staticmethod(spy_apply))
+    monkeypatch.setattr(_SparseMLA, "apply", staticmethod(spy_apply))
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad", fake_slig)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _fake_li_metadata)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _fake_slig_metadata)
@@ -779,14 +770,3 @@ def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch
     expected = torch.autograd.grad(loss, (qr, kr, wr))
     for actual, reference in zip((q.grad, k.grad, w.grad), expected, strict=True):
         torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
-
-
-def test_indexer_backward_requires_global_query_count(monkeypatch):
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
-    selector.num_global_queries = None
-    q = torch.ones(1, 8, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
-    k = torch.ones(1, 4, selector.index_head_dim, requires_grad=True)
-    w = torch.ones(1, 8, selector.num_index_heads, requires_grad=True)
-    _, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
-    with pytest.raises(RuntimeError, match=r"Set Selector\.num_global_queries"):
-        scores.backward(torch.ones_like(scores))

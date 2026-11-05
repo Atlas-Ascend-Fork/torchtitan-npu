@@ -98,7 +98,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         self.compress_ratios = model_config.compress_ratios
         for layer_id in range(model_config.n_layers):
             cr = self.compress_ratios[layer_id]
-            if cr != 1:
+            if cr > 1:  # 0 and 1 are both window-only: only a pooled layer owns a compressor
                 comp = "compressor"
                 self.from_hf_map.update(
                     {

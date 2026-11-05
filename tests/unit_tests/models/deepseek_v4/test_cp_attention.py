@@ -15,10 +15,11 @@ import pytest
 import torch
 
 from torchtitan_npu.models.deepseek_v4.cp_attention import (
-    chunk_plan,
-    slab_positions,
-    to_slab,
+    ExchangeMetadata,
+    restore_key_stream,
 )
+from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
 # Every document is a multiple of both degrees, so its chunks are whole rows.
 _ROW = (32, 16, 64)
@@ -29,9 +30,25 @@ def _row_cu(lengths=_ROW) -> torch.Tensor:
 
 
 def _plans(lengths=_ROW, cp_size: int = 2):
+    """This layout's movement, derived from the permutation the shard applies."""
     cu = _row_cu(lengths)
     slab = int(cu[-1]) // cp_size
-    return cu, slab, [chunk_plan(cu, cp_size, rank, slab) for rank in range(cp_size)]
+    row = DeepSeekV4Metadata.from_positions(_positions(lengths), 1)
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=int(cu[-1]), cp_size=cp_size, attention_metadata=row)
+        .generate_permutation()
+    )
+    return (
+        cu,
+        slab,
+        [ExchangeMetadata.from_permutation(permutation, cp_size=cp_size, cp_rank=rank) for rank in range(cp_size)],
+    )
+
+
+def _positions(lengths=_ROW) -> torch.Tensor:
+    """The packed row's document-relative positions, from its lengths."""
+    return torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
 
 
 def _chunk_rows(lengths: tuple[int, ...], cp_size: int, rank: int) -> list[int]:
@@ -133,24 +150,19 @@ def _slab_rows(cp_size: int, rank: int, slab: int) -> torch.Tensor:
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_the_restored_positions_are_the_slabs_own(cp_size):
     cu, slab, _ = _plans(_ROW, cp_size)
+    row_positions = _positions(_ROW)
     for rank in range(cp_size):
-        positions = slab_positions(cu, cp_size, rank, slab)
+        positions = row_positions[:, rank * slab : (rank + 1) * slab]
         assert positions.shape == (1, slab)
         for row, position in zip(_slab_rows(cp_size, rank, slab), positions.reshape(-1).tolist(), strict=True):
             document = int(torch.searchsorted(cu[1:], row, right=True))
             assert position == row - int(cu[document])
 
 
-def test_the_plan_refuses_a_document_that_cannot_be_chunked():
-    cu = _row_cu((10, 22))
-    with pytest.raises(ValueError, match="per_doc_alignment"):
-        chunk_plan(cu, 4, 0, 8)
-
-
 def test_one_degree_is_the_identity():
     """At one degree the entry carries no plan and nothing moves -- not even a collective."""
     tensor = torch.arange(8).reshape(1, -1)
-    assert to_slab(tensor, None, group=None) is tensor
+    assert restore_key_stream(None, tensor, group=None) is tensor
 
 
 def test_the_movement_keeps_the_container_grid(monkeypatch):
@@ -167,7 +179,7 @@ def test_the_movement_keeps_the_container_grid(monkeypatch):
 
     monkeypatch.setattr(restore_module, "all_to_all_single", fake_all_to_all)
     tensor = torch.randn(1, slab, 3)
-    out = to_slab(tensor, plans[0], group=object())
+    out = plans[0].apply(tensor, group=object())
     assert out.shape == tensor.shape
     # The collective splits the row axis, never the batch axis; the restore swaps the splits.
     plan = plans[0]

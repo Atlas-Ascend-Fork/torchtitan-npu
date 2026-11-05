@@ -494,7 +494,7 @@ def _build_mtp_layers(
         layer_id = n_main_layers + depth
 
         attention = cast("Attention.Config", copy.deepcopy(inner_cfg.attention))
-        attention.compress_ratio = 1
+        attention.compress_ratio = 0
         attention.compressor = None
         attention.indexer = None
         # MTP attention is dense; disable the prebuilt selector branch too.
@@ -503,7 +503,7 @@ def _build_mtp_layers(
         # variant) while keeping the per-site split pin: rope receives the
         # full-width head_dim tensor and rotates only its trailing channels.
         attention.rope = copy.deepcopy(dataclasses.replace(rope, split=attention.head_dim - attention.rope_head_dim))
-        cast("CompressedSparseInnerAttention.Config", attention.inner_attention).compress_ratio = 1
+        cast("CompressedSparseInnerAttention.Config", attention.inner_attention).compress_ratio = 0
 
         moe = copy.deepcopy(inner_cfg.moe)
         moe.router.gate.param_init = _depth_init(layer_id)
@@ -696,7 +696,7 @@ def _debugmodel(
         q_lora_rank=128,
         o_lora_rank=128,
         n_groups=2,
-        compress_ratios=(1, 1, 4, 128),
+        compress_ratios=(0, 0, 4, 128),
         window_size=128,
         norm_eps=1e-6,
         index_n_heads=8,
@@ -741,7 +741,7 @@ def _deepseek_v4_flash(
         q_lora_rank=1024,
         o_lora_rank=1024,
         n_groups=8,
-        compress_ratios=(1, 1) + (4, 128) * 20 + (4,),
+        compress_ratios=(0, 0) + (4, 128) * 20 + (4,),
         window_size=128,
         norm_eps=1e-6,
         index_n_heads=64,

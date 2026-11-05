@@ -33,7 +33,7 @@ def _window_metadata(bounds: list[int]):
     metadata = config.build_attention_metadata(positions)
     # The window-only geometry has no pool, so its key grid is the row's own -- the property
     # that makes passing both offsets to ``gather_attn`` a no-op here.
-    torch.testing.assert_close(metadata.cu_seq_k, metadata.cu_seq_q, rtol=0, atol=0)
+    assert metadata.cmp_k is None, "a window-only geometry has no compressed axis"
     return metadata
 
 

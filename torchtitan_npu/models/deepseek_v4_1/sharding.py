@@ -177,12 +177,10 @@ def set_indexer_sharding(indexer_cfg):
         in_src_shardings={
             "idx_q_BLHiDi": replicated_activation,
             "idx_k_BNDi": replicated_activation,
-            "weights_BLHi": replicated_activation,
         },
         in_dst_shardings={
             "idx_q_BLHiDi": replicated_activation,
             "idx_k_BNDi": dense_activation_placement(tp=spmd.R, cp=spmd.R),
-            "weights_BLHi": replicated_activation,
         },
     )
     indexer_cfg.rope.sharding_config = ShardingConfig(

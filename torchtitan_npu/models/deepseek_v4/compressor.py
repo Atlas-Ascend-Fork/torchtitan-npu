@@ -181,7 +181,7 @@ class Compressor(Module):
         if attention_metadata is not None:
             # The window this rank's pooling must reproduce: identity at one degree, the restored
             # slab under CP.  The carry then completes the document the window starts inside.
-            x = restore_key_stream(attention_metadata.cp, x, group=self.group)
+            x = restore_key_stream(attention_metadata.xchg, x, group=self.group)
             if self.overlap:
                 carry = self.carry_exchange(x, positions, cu_seqlens)
                 x, positions, cu_seqlens = carry.x, carry.positions, carry.cu_seqlens
@@ -388,7 +388,7 @@ class LightningIndexer(Module):
         super().__init__()
         self.index_topk = config.index_topk
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+    def forward(self, idx_q_BLHiDi, idx_k_BNDi, idx_w_BLHi, *, attention_metadata):
         """Select the compressed slots and score them differentiably.
 
         Returns ``(topk_indices, topk_scores)``:
@@ -400,7 +400,7 @@ class LightningIndexer(Module):
           descending order inside its Function, because there the saved indices must pair
           slot-for-slot with the teacher;
         - ``topk_scores`` ``[B, L, K]``: the student logits at those picks, differentiable in
-          ``idx_q``/``idx_k``/``idx_w`` and ``-inf`` on every ``-1`` slot.  This is the value
+          ``idx_q_BLHiDi``/``idx_k_BNDi``/``idx_w_BLHi`` and ``-inf`` on every ``-1`` slot.  This is the value
           contract the reference path exposes; the fused override returns an unread carrier
           on the same edge because its teacher arrives on the gradient.
         """
@@ -418,17 +418,17 @@ class LightningIndexer(Module):
         # (see the module docstring), so the two paths agree on the *set* and on ``-1``.
         with torch.no_grad():
             topk_indices = select_compressed_slots(
-                idx_q,
-                idx_k,
-                idx_w,
+                idx_q_BLHiDi,
+                idx_k_BNDi,
+                idx_w_BLHi,
                 cu_seqlens,
                 cu_seqlens_k,
                 self.index_topk,
             )
         topk_scores = student_logits_at_picks(
-            idx_q,
-            idx_k,
-            idx_w,
+            idx_q_BLHiDi,
+            idx_k_BNDi,
+            idx_w_BLHi,
             topk_indices,
             cu_seqlens,
             cu_seqlens_k,

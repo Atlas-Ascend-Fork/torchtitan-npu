@@ -19,15 +19,16 @@ from itertools import pairwise
 import pytest
 import torch
 
+from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as selector_ascendc
 from torchtitan_npu.override import _IS_A5
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
-from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as core_ascendc
-from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
-    build_fused_metadata,
-    shard_asc_v41_metadata,
-)
+from torchtitan_npu.override.deepseek_v4 import asc_metadata as shared_asc_metadata
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4.lightning_indexer import ascendc as shared_selector_ascendc
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import kernel_options as selector_options
+from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc as shared_core
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import kernel_options
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Metadata
 
 # Only the frames are under test, so any window does.
 _WINDOW = 128
@@ -57,34 +58,29 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
     so the tests below read them through the same option builder the kernels are called with.
     """
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
-    entry = build_fused_metadata(
-        _row(positions, ratio),
-        ratio=ratio,
-        geometry=AicpuGeometry(window_size=_WINDOW, **_GEOMETRY),
-    )
-    if cp_size == 1:
-        return entry
-    return shard_asc_v41_metadata(
-        entry,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        batch_size=1,
-        slab_len=positions.shape[-1] // cp_size,
-    )
+    row = _row(positions, ratio)
+    if cp_size > 1:
+        permutation = (
+            DocChunkCPLoadBalancer.Config()
+            .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
+            .generate_permutation()
+        )
+        row = row.doc_chunk_entry(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+    return AscV41Metadata.build_aicpu_metadata(row, geometry=AicpuGeometry(window_size=_WINDOW, **_GEOMETRY))
 
 
 def _core_options(metadata, ratio: int = _RATIO):
     """The options the SMLA kernels are called with, read off the entry's own frames.
 
-    ``entry_options`` is what the forward and the backward pass to the kernels, so this reads
+    ``kernel_options`` is what the forward and the backward pass to the kernels, so this reads
     exactly what they are handed -- the entry's ``a3_workaround`` frames on arch22.
     """
-    return core_ascendc.entry_options(metadata, ratio=ratio, window_size=_WINDOW)
+    return kernel_options(q=metadata.q, swa_k=metadata.swa_k, cmp_k=metadata.cmp_k, ratio=ratio, window_size=_WINDOW)
 
 
 def _selector_options(metadata, ratio: int = _RATIO):
     """The same, for the selector's two operators: its queries and the pool it addresses."""
-    return selector_ascendc.entry_options(ratio, metadata)
+    return selector_options(ratio=ratio, q=metadata.q, cmp_k=metadata.cmp_k)
 
 
 def _prefix(lengths: torch.Tensor) -> torch.Tensor:
@@ -123,8 +119,10 @@ def test_a_ratio_one_frame_keeps_the_targets_residual_spelling(monkeypatch, is_a
     (EZ0037), so the frame's ``None`` passes through.  A ratio-2 frame carries its own
     tensor on both targets.
     """
-    monkeypatch.setattr(core_ascendc, "_IS_A5", is_a5)
-    monkeypatch.setattr(selector_ascendc, "_IS_A5", is_a5)
+    # The frames, the workaround and the option builders sit in different modules, so the target
+    # switch is patched in each of them.
+    for module in (shared_core, shared_selector_ascendc, shared_asc_metadata):
+        monkeypatch.setattr(module, "_IS_A5", is_a5)
     metadata = _masks([0, 8, 24], ratio=1)
 
     for options, name in (
@@ -196,9 +194,8 @@ def test_the_selector_gets_the_same_chunk_and_reach(cp_size, cp_rank):
     metadata = _masks(bounds, cp_size, cp_rank)
     options = _selector_options(metadata)
 
-    # The row's pool grid stays the entry's ``cu_seq_k``; ``cmp_k`` is the frame the selector reads:
-    # the row itself where the kernel honours ``seqused``, this rank's reach where it does not.
-    assert torch.equal(metadata.cu_seq_k, (row // 2).to(torch.int32))
+    # ``cmp_k`` is the frame the selector reads: the row's pool grid where the kernel honours
+    # ``seqused``, this rank's reach where it does not.
     expected = (row // 2).to(torch.int32) if _IS_A5 else _prefix(reach // 2)
     assert torch.equal(metadata.cmp_k.cu_seqlens, expected)
     assert torch.equal(metadata.cmp_k.seqused, reach // 2)

@@ -43,8 +43,10 @@ def quantization_calls(monkeypatch, converter_module):
     # Patch where the call sites live (generated modules in recipes + the DeepSeek
     # quantized-expert class in configs.deepseek_v4), not the facade, so the patched
     # quantize_ is what NpuQuantized*Module.__init__ resolves.
-    for mod in ("torchtitan_npu.extensions.adaptor.torchao.recipes",
-                "torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4"):
+    for mod in (
+        "torchtitan_npu.extensions.adaptor.torchao.recipes",
+        "torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4",
+    ):
         monkeypatch.setattr(importlib.import_module(mod), "quantize_", quantize)
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     with torch.random.fork_rng(devices=[]):
@@ -389,9 +391,10 @@ def test_family_configs_are_split_and_registered(converter_module):
     )
 
     # The lightning_indexer suffix differs per family; sparse_attention is V4.1-only.
-    assert converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"] is not converter_module._DSV41_CONFIG_FILTERS[
-        "lightning_indexer"
-    ]
+    assert (
+        converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"]
+        is not converter_module._DSV41_CONFIG_FILTERS["lightning_indexer"]
+    )
     assert "sparse_attention" not in converter_module._DSV4_CONFIG_FILTERS
     assert "sparse_attention" in converter_module._DSV41_CONFIG_FILTERS
 
@@ -400,15 +403,11 @@ def test_family_configs_are_split_and_registered(converter_module):
 
     # Per-model components resolve under their feature name for each family.
     assert (
-        type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "sparse_attention")
-        ).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "sparse_attention")).__name__
         == "DeepSeekV41QuantSparseAttentionComponent"
     )
     assert (
-        type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "compressor")
-        ).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "compressor")).__name__
         == "DeepSeekV41QuantCompressorComponent"
     )
     assert (
@@ -727,8 +726,8 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
 def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(converter_module):
     from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import QuantV4Metadata
 
-    from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
-    from torchtitan_npu.override.deepseek_v4.metadata import (
+    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+    from torchtitan_npu.override.deepseek_v4.asc_metadata import (
         AicpuGeometry,
         AicpuMetadata,
         AscLightningIndexerMetadata,
@@ -736,17 +735,16 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     )
 
     positions = torch.arange(8).unsqueeze(0)
-    row = build_v4_metadata(positions, ratio=4, build_slots=False)
+    row = DeepSeekV4Metadata.from_positions(positions, 4)
     forward_record = torch.tensor([7], dtype=torch.int32)
     backward_record = torch.tensor([9], dtype=torch.int32)
     metadata = QuantV4Metadata(
-        cu_seq_q=row.cu_seq_q,
-        cu_seq_k=row.cu_seq_k,
         ratio=row.ratio,
         position_k=row.position_k,
         q=row.q,
         swa_k=row.swa_k,
         cmp_k=row.cmp_k,
+        xchg=row.xchg,
         aicpu_metadata=AicpuMetadata(
             geometry=AicpuGeometry(
                 num_heads=2, head_dim=8, window_size=8, index_topk=4, index_num_heads=2, index_head_dim=4
@@ -769,6 +767,6 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     assert inputs.metadata is forward_record and inputs.backward_metadata is backward_record
     assert inputs.seqused_q is metadata.q.seqused
     assert inputs.seqused_k is metadata.cmp_k.seqused
-    assert inputs.cu_seqlens_q is row.cu_seq_q
+    assert inputs.cu_seqlens_q is row.q.cu_seqlens
     assert inputs.cu_seqlens_k is row.cmp_k.cu_seqlens
     assert inputs.cmp_residual_k is row.cmp_k.residual

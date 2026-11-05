@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import cast
 
@@ -30,7 +31,6 @@ from torchtitan_npu.extensions.components.gradient_clipping import GradientClipp
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
-from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 
 from . import model_registry
 from .indexer import Selector
@@ -44,7 +44,8 @@ def _per_doc_alignment(model_spec: ModelSpec) -> int:
     cannot disagree: a document whose length is not a multiple of every ratio would
     get a group straddling its edge.
     """
-    return compression_alignment(model_spec.model.compress_ratios)  # pyrefly: ignore [missing-attribute]
+    ratios = model_spec.model.compress_ratios  # pyrefly: ignore [missing-attribute]
+    return math.lcm(*(ratio for ratio in ratios if ratio > 0))
 
 
 @dataclass(kw_only=True)

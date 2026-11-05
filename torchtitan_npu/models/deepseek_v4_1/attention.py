@@ -40,7 +40,7 @@ from dataclasses import dataclass
 import torch
 from attn_gym.sparse import gather_attn
 from torch import nn
-from torchtitan.models.common.attention import BaseAttention, create_varlen_metadata_for_document
+from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -51,7 +51,7 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
 from .indexer import HierarchicalIndexer
-from .model import DeepSeekV41Metadata, build_v41_frames
+from .model import DeepSeekV41Metadata
 
 
 class CompressedSparseInnerAttention2(Module):
@@ -84,7 +84,7 @@ class CompressedSparseInnerAttention2(Module):
         def attention_metadata_key(self):
             """This geometry's entry: the backend's class plus its compression ratio.
 
-            One entry per ratio, because ``cu_seq_k`` is ratio-dependent: the builder folds the
+            One entry per ratio, because the pool grid is ratio-dependent: the builder folds the
             row's boundaries there once, instead of every layer dividing them at call time.  A
             stack that pools at two ratios therefore costs two entries, not a ratio table on
             every layer's config.
@@ -101,26 +101,13 @@ class CompressedSparseInnerAttention2(Module):
         ) -> DeepSeekV41Metadata:
             """The packed row and this geometry's pool grid, built once per microbatch (#4897).
 
-            Upstream's ``create_varlen_metadata_for_document`` supplies the row's boundaries --
-            the "a document starts where ``positions`` resets to 0" convention, with the
-            padding-aware and fixed-shape modes this stack does not use yet -- and this backend
-            adds the key grid its own ratio implies, so the core never divides a boundary set it
-            was handed.  A fused port starts from the same two grids and adds the frames and the
-            records only it reads.
+            The row's boundaries come from the positions themselves -- "a document starts where
+            ``positions`` resets to 0" -- and this backend adds the frames its own ratio implies,
+            so the core never folds a boundary set it was handed.  A fused port starts from the
+            same row and adds the records only it reads.
             """
             del padding_mask, max_num_documents, max_context_length
-            bounds = create_varlen_metadata_for_document(positions).cu_seq_q
-            pooled = bounds if self.compress_ratio <= 1 else (bounds // self.compress_ratio).to(torch.int32)
-            q, swa_k, cmp_k = build_v41_frames(bounds, pooled, self.compress_ratio)
-            return DeepSeekV41Metadata(
-                cu_seq_q=bounds,
-                cu_seq_k=pooled,
-                position_k=positions,
-                ratio=self.compress_ratio,
-                q=q,
-                swa_k=swa_k,
-                cmp_k=cmp_k,
-            )
+            return DeepSeekV41Metadata.from_positions(positions, self.compress_ratio)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -166,7 +153,7 @@ class CompressedSparseInnerAttention2(Module):
 
         batch, num_tokens, _, head_dim = q.size()
         local_kv_B1LD = swa_k.reshape(batch, 1, num_tokens, head_dim)
-        cu_seqlens = attention_metadata.cu_seq_q
+        cu_seqlens = attention_metadata.q.cu_seqlens
         if cmp_k is not None:
             # ``forward`` pairs the two inputs, so ``topk_indices`` is present here.
             assert topk_indices is not None
@@ -184,7 +171,8 @@ class CompressedSparseInnerAttention2(Module):
             kv_indices_BLK = torch.empty(batch, num_tokens, 0, dtype=torch.long, device=q.device)
         # The key grid is the metadata's, not this layer's arithmetic: the backend that built the
         # entry folded its ratio there, so the core and the fused port read one set of boundaries.
-        cu_seqlens_k = attention_metadata.cu_seq_k
+        # A window-only geometry has no compressed axis, so its key grid is the row's own.
+        cu_seqlens_k = cu_seqlens if attention_metadata.cmp_k is None else attention_metadata.cmp_k.cu_seqlens
 
         result = gather_attn(
             q.transpose(1, 2),
@@ -329,7 +317,7 @@ class Attention(BaseAttention):
         # rows' own positions -- per token, so it commutes with the movement -- and the restore
         # then hands the core this rank's window for its own gather.
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = restore_key_stream(attention_metadata.cp, swa_k, group=self.cp_group)
+        swa_k = restore_key_stream(attention_metadata.xchg, swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
         o = self.inner_attention(

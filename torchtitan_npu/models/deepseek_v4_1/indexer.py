@@ -44,9 +44,10 @@ complete.  The selection is emitted inside that interval -- the document-local n
 
 The interval arithmetic is exact only when every document segment is a multiple of
 ``compress_ratio`` tokens; otherwise a pooling group straddles a document edge and its
-entry mixes the two documents.  The loaders pad every document up to
-:func:`~torchtitan_npu.models.deepseek_v4_1.model.compression_alignment`, so the
-straddling group does not arise in the packed layout they produce.
+entry mixes the two documents.  The loaders pad every document up to the least common
+multiple of the ratios the stack pools with (``--dataloader.per_doc_alignment``, defaulted by
+this stack's config registry), so the straddling group does not arise in the packed layout they
+produce.
 
 Every layer owns a :class:`HierarchicalIndexer`, statically assigned one of CSA2's three
 modes: Full Mode carries the parameters and produces both the index keys and the top-k,
@@ -132,9 +133,9 @@ def _selection_mask(
 
 
 def _student_logits(
-    idx_q_BLHiDi: torch.Tensor,
-    idx_k_BNDi: torch.Tensor,
-    weights_BLHi: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    weights: torch.Tensor,
     local_BLK: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -148,11 +149,11 @@ def _student_logits(
     ``-inf``.  The row is the batch, so the key axis is squeezed.  Returns ``[B, L, K]``,
     head-summed.
     """
-    pool_start_L1, _, _ = _document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q_BLHiDi.size(1))
+    pool_start_L1, _, _ = _document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
     # A ``-1`` slot may name a real entry once shifted; the value is discarded below.
-    selected_BLKDi = idx_k_BNDi.squeeze(0)[(local_BLK + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
-    logits_BLHiK = torch.einsum("blhd,blkd->blhk", idx_q_BLHiDi, selected_BLKDi)
-    logits_BLHiK = logits_BLHiK.relu() * weights_BLHi.unsqueeze(-1)
+    selected_BLKDi = idx_k.squeeze(0)[(local_BLK + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
+    logits_BLHiK = torch.einsum("blhd,blkd->blhk", idx_q, selected_BLKDi)
+    logits_BLHiK = logits_BLHiK.relu() * weights.unsqueeze(-1)
     return logits_BLHiK.sum(dim=2).masked_fill(local_BLK < 0, -torch.inf)
 
 
@@ -286,8 +287,8 @@ class Selector(Module):
         # Both grids come with the metadata: the backend that owns this layer's ratio folded the
         # pool's at build time, so the selector reads a boundary set instead of dividing the row's
         # own -- and it is the same grid the fused port's kernels are handed.
-        cu_seqlens = attention_metadata.cu_seq_q
-        cu_seqlens_k = attention_metadata.cu_seq_k
+        cu_seqlens = attention_metadata.q.cu_seqlens
+        cu_seqlens_k = attention_metadata.cmp_k.cu_seqlens  # pyrefly: ignore [missing-attribute]
         visible_LN, newest_L1, newest_valid_L1, pool_start_L1 = _selection_mask(
             cu_seqlens,
             cu_seqlens_k,
@@ -329,7 +330,7 @@ class Selector(Module):
             topk_indices_BLK = local_BLK.sort(dim=-1, descending=True).values
 
         # This gradient trains the indexer: into ``wq_b``, ``weights_proj`` and, through
-        # ``idx_k``, the shared keys' owner.  Built on every path; who consumes it is the
+        # ``idx_k_BNDi``, the shared keys' owner.  Built on every path; who consumes it is the
         # teacher edge's decision.
         topk_scores_BLK = _student_logits(
             idx_q_BLHiDi,
@@ -375,7 +376,7 @@ class HierarchicalIndexer(Module):
 
     The indexer is trained by distillation alone, so its graph starts at its own
     parameters: the caller detaches the trunk inputs (``Attention.forward``).  The shared
-    index keys are the one exception -- a Reindex Mode layer receives ``idx_k`` live, so
+    index keys are the one exception -- a Reindex Mode layer receives ``idx_k_BNDi`` live, so
     that the consumers of a key keep training its owner.
     """
 
@@ -478,11 +479,14 @@ class HierarchicalIndexer(Module):
         # rescores the keys a preceding Full Mode layer produced.
         if self.mode is FULL:
             assert latent is not None, "A Full Mode indexer projects its keys from the compressor latent."
-            idx_k = self.k_norm(self.wk(latent))
+            projected = self.k_norm(self.wk(latent))
             # One rank-2 head; RoPE rotates rank-3 [B, N, 1, H], at the key stream's own pooled
             # positions -- the entry's, one per compression block.
             idx_k = self.rope(
-                idx_k.unsqueeze(2), positions=attention_metadata.position_k[..., :: self.compress_ratio]
+                projected.unsqueeze(2),
+                positions=attention_metadata.position_k[
+                    ..., :: self.compress_ratio
+                ],  # pyrefly: ignore [missing-attribute]
             ).squeeze(2)
         else:
             assert idx_k is not None, (

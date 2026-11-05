@@ -40,7 +40,6 @@ _NO_CP = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
 # ``preprocess_inputs`` only forwards the CP mesh, so a sentinel stands in for it.
 _CP_MESH = object()
 _CP = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: _CP_MESH)
-_LB, _PTRR = _NO_SPMD.context_parallel_load_balancer, _NO_SPMD.context_parallel_ptrr_mask_key
 # One kernel geometry of one backend class (what a DSV4 stack varies on).
 _Geometry = namedtuple("_Geometry", "ratio")
 _SEQ_LEN, _SHARD_LEN = 8, 4
@@ -172,28 +171,58 @@ def _preprocess(model, parallel_dims=_NO_CP, parallelism=_NO_SPMD):
     )
 
 
-def _shard(monkeypatch, events: list, entries=None, positions=None, load_balancer_type="headtail", shard=None):
+def _shard(
+    monkeypatch,
+    events: list,
+    entries=None,
+    positions=None,
+    load_balancer_type="headtail",
+    shard=None,
+    *,
+    parallelism=_NO_SPMD,
+):
     """Run the patched ``_cp_shard`` on a bare receiver, with the CP shard stubbed out."""
     extra_kwargs = {"positions": torch.zeros(1, _SEQ_LEN, dtype=torch.int64) if positions is None else positions}
     if entries is not None:
         extra_kwargs["attention_metadata"] = entries
 
-    def fake_shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, input_seq_dim=1, ptrr_mask_key=None, **kwargs):
-        del cp_mesh, load_balancer_type, input_seq_dim, ptrr_mask_key, kwargs
+    def fake_shard(
+        cp_mesh,
+        inputs,
+        attention_masks,
+        load_balancer_type=None,
+        input_seq_dim=1,
+        ptrr_mask_key=None,
+        *,
+        permutation=None,
+        **kwargs,
+    ):
+        del cp_mesh, load_balancer_type, input_seq_dim, ptrr_mask_key, kwargs, permutation
         events.append("shard")
         tokens, labels, positions = inputs
         return (tokens[:, :_SHARD_LEN], labels, positions[:, :_SHARD_LEN]), attention_masks
 
     monkeypatch.setattr(decoder_patch, "cp_shard", fake_shard if shard is None else shard)
     tokens = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
+    parallelism = SimpleNamespace(
+        spmd_backend=parallelism.spmd_backend,
+        context_parallel_load_balancer=load_balancer_type,
+        context_parallel_ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
+    )
+    # ``_cp_shard`` reads the layer a layout addresses off ``self.config.first_attention``;
+    # a bare receiver only needs that slot's metadata key.
+    first_attention = (
+        SimpleNamespace(inner_attention=SimpleNamespace(attention_metadata_key=next(iter(entries))))
+        if entries
+        else None
+    )
     return Decoder._cp_shard(
-        SimpleNamespace(),
+        SimpleNamespace(config=SimpleNamespace(first_attention=first_attention)),
         tokens,
         tokens,
         extra_kwargs,
         cp_mesh=_MESH,
-        device=torch.device("cpu"),
-        load_balancer_type=load_balancer_type,
+        parallelism=parallelism,
     )
 
 
@@ -284,7 +313,7 @@ def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
 
     model._cp_shard = delegate
     _, _, extra = _preprocess(model, parallel_dims=_CP)
-    cp_context = {"cp_mesh": _CP_MESH, "device": _TOKENS.device, "load_balancer_type": _LB, "ptrr_mask_key": _PTRR}
+    cp_context = {"cp_mesh": _CP_MESH, "parallelism": _NO_SPMD}
     assert seen == [(cp_context, {_Geometry(4): record})]  # the seam's own map is what the CP step receives
     assert extra["attention_metadata"] == {_Geometry(4): record}  # ... and what comes back out
 
@@ -307,13 +336,12 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     assert handed is record
     assert permutation.tolist() == _HEADTAIL_PERMUTATION
     # The pinned stand-in for upstream's ambient parallelism context carries what the
-    # permutation alone cannot: the mesh, the balancer and the *pre-shard* row.
-    assert context.cp_mesh is _MESH and context.load_balancer_type == "headtail"
-    assert context.positions is positions
-    # Only the headtail balancer shards by a permutation the seam can re-derive.
+    # permutation alone cannot: the mesh the shard spliced with.
+    assert context.cp_mesh is _MESH
+    # No layout means no permutation: the pinned shard derives its own order.
     _CPBackend.calls, _CPBackend.events = [], events
     _shard(monkeypatch, events, {_CPBackend: record}, positions, load_balancer_type=None)
-    assert _CPBackend.calls[0][1] is None and _CPBackend.calls[0][2].load_balancer_type is None
+    assert _CPBackend.calls[0][1] is None and _CPBackend.calls[0][2].cp_mesh is _MESH
 
     plain_events: list = []
     _, _, plain_out = _shard(monkeypatch, plain_events)  # no map: the pinned shard runs alone
@@ -324,18 +352,26 @@ def test_an_unnamed_layout_stays_unnamed(monkeypatch):
     """No stack declares a layout for the run: the flag is passed through as the user set it."""
     seen: dict = {}
 
-    def shard(cp_mesh, inputs, attention_masks, load_balancer_type=None, *args, positions=None, **kwargs):
+    def shard(
+        cp_mesh,
+        inputs,
+        attention_masks,
+        load_balancer_type=None,
+        *args,
+        permutation=None,
+        **kwargs,
+    ):
         del cp_mesh, args, kwargs
-        seen["layout"], seen["positions"] = load_balancer_type, positions
+        seen["layout"], seen["permutation"] = load_balancer_type, permutation
         return inputs, attention_masks
 
     positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
     _shard(monkeypatch, [], {_CPBackend: _CPMetadata()}, positions, load_balancer_type=None, shard=shard)
-    assert seen == {"layout": None, "positions": positions}
+    assert seen == {"layout": None, "permutation": None}
 
     # A named layout reaches the shard unchanged; the seam never substitutes one of its own.
-    _shard(monkeypatch, [], {_CPBackend: _CPMetadata()}, positions, load_balancer_type="doc_chunk", shard=shard)
-    assert seen == {"layout": "doc_chunk", "positions": positions}
+    _shard(monkeypatch, [], {_CPBackend: _CPMetadata()}, positions, load_balancer_type="headtail", shard=shard)
+    assert seen["layout"] == "headtail" and seen["permutation"].tolist() == _HEADTAIL_PERMUTATION
 
 
 def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):

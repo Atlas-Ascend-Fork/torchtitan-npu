@@ -66,8 +66,8 @@ def _worker(rank: int, port: int) -> None:
         world_size=_CP,
     )
     try:
-        from torchtitan_npu.models.deepseek_v4.cp_attention import slab_positions, to_slab
-        from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
+        from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+        from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
         group = dist.group.WORLD
         tokens = torch.arange(_ROW).reshape(1, -1) + 100
@@ -75,9 +75,14 @@ def _worker(rank: int, port: int) -> None:
         labels = tokens + 1
         slab = slice(rank * _SLAB, (rank + 1) * _SLAB)
 
-        row = build_v4_metadata(positions, _RATIO)
-        entry = doc_chunk_entry(row, cp_size=_CP, cp_rank=rank, slab_len=_SLAB)
-        plan = entry.cp.restore.exchange
+        row = DeepSeekV4Metadata.from_positions(positions, _RATIO)
+        permutation = (
+            DocChunkCPLoadBalancer.Config()
+            .build(seq_len=_ROW, cp_size=_CP, attention_metadata=row)
+            .generate_permutation()
+        )
+        entry = row.doc_chunk_entry(permutation=permutation, cp_size=_CP, cp_rank=rank)
+        plan = entry.xchg
 
         # The frames the entry describes: chunk r of every document over the whole-row KV frame.
         chunk = torch.tensor([length // _CP for length in _LENGTHS], dtype=torch.int32)
@@ -95,11 +100,13 @@ def _worker(rank: int, port: int) -> None:
 
         # The restore is the exact inverse, its positions come from the entry, and its backward is
         # the reverse exchange.
-        assert torch.equal(to_slab(moved, plan, group=group), tokens[:, slab])
-        assert torch.equal(entry.position_k, slab_positions(row.swa_k.cu_seqlens, _CP, rank, _SLAB))
+        assert torch.equal(plan.apply(moved, group=group), tokens[:, slab])
+        # The key stream is the row's contiguous slice, so its positions are that slice of the
+        # row's own positions -- the loader built them document-relative already.
+        assert torch.equal(entry.position_k, positions[:, slab])
 
         x = (torch.randn(1, _SLAB, 3, dtype=torch.float64) + 10.0 * rank).requires_grad_()
-        slabbed = to_slab(x, plan, group=group)
+        slabbed = plan.apply(x, group=group)
         weight = torch.arange(slabbed.numel(), dtype=torch.float64).reshape(slabbed.shape)
         (slabbed * weight).sum().backward()
         assert x.grad is not None

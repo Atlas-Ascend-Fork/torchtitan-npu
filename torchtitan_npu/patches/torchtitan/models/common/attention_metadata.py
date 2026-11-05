@@ -138,16 +138,13 @@ class CPShardContext:
     """What a backend's CP transform reads here (upstream: ``ParallelismContext``).
 
     Upstream's ``prepare_cp_metadata`` takes the permutation alone because the
-    mesh and the load balancer are ambient in the ``ParallelismContext`` its
-    model is called with.  0.3.0 has neither, so ``Decoder._cp_shard`` publishes
-    the three things its pinned CP entry cannot recover -- the mesh it sharded
-    with, the load-balancer type it sharded by, and the *pre-shard* positions
-    the rank-local copy is derived from -- for the duration of the transform.
+    mesh is ambient in the ``ParallelismContext`` its model is called with.
+    0.3.0 has no such context, so ``Decoder._cp_shard`` publishes the one thing
+    its pinned CP entry cannot recover -- the mesh it sharded with -- for the
+    duration of the transform.
     """
 
     cp_mesh: Any
-    load_balancer_type: str | None
-    positions: torch.Tensor | None
 
 
 _CP_SHARD_CONTEXT: ContextVar[CPShardContext | None] = ContextVar(
@@ -165,14 +162,9 @@ def cp_shard_context() -> CPShardContext:
 
 
 @contextmanager
-def cp_shard_context_set(
-    *,
-    cp_mesh: Any,
-    load_balancer_type: str | None,
-    positions: torch.Tensor | None,
-):
+def cp_shard_context_set(*, cp_mesh: Any):
     """Publish the pinned shard context around one metadata transform."""
-    token = _CP_SHARD_CONTEXT.set(CPShardContext(cp_mesh, load_balancer_type, positions))
+    token = _CP_SHARD_CONTEXT.set(CPShardContext(cp_mesh))
     try:
         yield
     finally:
@@ -197,9 +189,8 @@ def prepare_cp_metadata_map(
     anything hashable may address an entry, and no key has to look like a class.
 
     The transform is handed the permutation alone, as upstream does; the pinned
-    version has no ambient parallelism context, so the mesh, the load-balancer
-    type and the pre-shard positions come from :func:`cp_shard_context`, which
-    ``Decoder._cp_shard`` publishes around this call.
+    version has no ambient parallelism context, so the mesh comes from
+    :func:`cp_shard_context`, which ``Decoder._cp_shard`` publishes around this call.
     """
     prepared: dict[Hashable, Any] = {}
     for key, metadata in attention_metadata.items():

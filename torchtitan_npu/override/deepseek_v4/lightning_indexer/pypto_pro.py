@@ -7,7 +7,7 @@
 
 Select ``lightning_indexer.pypto_pro`` together with ``sparse_attn.asc``. The latter
 builds the packed metadata and emits the teacher on ``topk_scores``' gradient;
-this selector owns the LI/LIG autograd bridge. The optional PyPTO-Pro runtime
+this indexer owns the LI/LIG autograd bridge. The optional PyPTO-Pro runtime
 is loaded only inside the real NPU callbacks in ``ops.pypto_pro.li_lig_wrapper``.
 
 The kernels require BF16 query/key, FP32 weights, 64 indexer heads of width
@@ -28,37 +28,17 @@ from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
     sparse_lightning_indexer_kl_loss_grad,
 )
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    AscV4Metadata,
-    CompactSelectorFrameProof,
-    lightning_indexer_options,
-)
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import kernel_options
 
 
 def _pro_options(metadata: AscV4Metadata, ratio: int) -> dict:
     key_frame = metadata.cmp_k
-    assert key_frame is not None, "the selector needs the entry's compressed frame"
-    proof = metadata.compact_selector_frame_proof
-    if not isinstance(proof, CompactSelectorFrameProof):
-        raise ValueError(
-            "PyPTO-Pro requires compact frames validated by the eager metadata builder with tracked tensor versions; "
-            "manual, noncompact or inference-mode metadata must be rebuilt outside inference_mode"
-        )
-    if (
-        proof.q_cu is not metadata.q.cu_seqlens
-        or proof.q_seqused is not metadata.q.seqused
-        or proof.k_cu is not key_frame.cu_seqlens
-        or proof.k_seqused is not key_frame.seqused
-    ):
-        raise ValueError("PyPTO-Pro compact-frame proof is stale; rebuild metadata after replacing frame tensors")
-    options = lightning_indexer_options(ratio=ratio, q=metadata.q, cmp_k=key_frame)
-    # This Pro kernel pair reads compact boundaries, not seqused. The eager
-    # builder verified that contract for these tensors. Real opaque callbacks
-    # also reject in-place changes using host version counters, without a
-    # device-value read in this graph.
+    assert key_frame is not None, "the indexer needs the entry's compressed frame"
+    options = kernel_options(ratio=ratio, q=metadata.q, cmp_k=key_frame)
+    # This Pro kernel pair reads compact boundaries, not seqused; the frames are compact by
+    # construction because the indexer refuses context parallel.
     del options["seqused_q"], options["seqused_k"]
-    options["guard_tensors"] = proof.tensors()
-    options["guard_versions"] = list(proof.versions)
     return options
 
 
@@ -76,18 +56,14 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         attention_metadata,
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("the fused selector needs AscV4Metadata")
-        # Absent on arch22, whose selector schedules itself: the kernel takes ``metadata=None``.
+            raise TypeError("the fused indexer needs AscV4Metadata")
+        # Absent on arch22, whose indexer schedules itself: the kernel takes ``metadata=None``.
+        if attention_metadata.xchg is not None:
+            raise ValueError("PyPTO-Pro does not support context parallel: its kernels read compact frames")
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        proof = attention_metadata.compact_selector_frame_proof
-        if proof is None:
-            raise ValueError(
-                "PyPTO-Pro requires compact frames validated by the eager metadata builder "
-                "with tracked tensor versions; "
-                "manual, noncompact or inference-mode metadata must be rebuilt outside inference_mode"
-            )
-        torch._check(idx_q.shape[0] == proof.positions_q.numel())
-        torch._check(idx_k.shape[0] == proof.key_tokens)
+        cmp_frame = attention_metadata.cmp_k  # pyrefly: ignore [missing-attribute]
+        if idx_k.shape[0] != int(cmp_frame.cu_seqlens[-1]):  # pyrefly: ignore [missing-attribute]
+            raise ValueError("PyPTO-Pro needs the whole row's compressed keys")
         topk_indices = lightning_indexer_indices(
             idx_q,
             idx_k,
@@ -113,11 +89,9 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         metadata = ctx.attention_metadata
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
-            raise ValueError("the fused selector needs the entry's backward record")
-        # SMLAG already applies softmax_scale. Normalize by the whole row, not
-        # the CP slab. Pro's Z * student - teacher formula is linear in teacher,
-        # so neither teacher renormalization nor another gradient scale belongs here.
-        query_rows = metadata.cu_seq_q[-1].to(torch.float32)
+            raise ValueError("the fused indexer needs the entry's backward metadata")
+        # Normalize by the whole row, not the CP slab.
+        query_rows = metadata.swa_k.cu_seqlens[-1].to(torch.float32)
         teacher = attn_softmax_l1_norm / query_rows
         dq, dk, dw, _ = sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
@@ -132,26 +106,26 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
 
 
 class PyPTOProLightningIndexer(LightningIndexer):
-    """Standalone selector over compile-safe, lazily loaded PyPTO-Pro kernels."""
+    """Standalone indexer over compile-safe, lazily loaded PyPTO-Pro kernels."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(LightningIndexer.Config):
         pass
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
+    def forward(self, idx_q_BLHiDi, idx_k_BNDi, idx_w_BLHi, *, attention_metadata):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("PyPTOProLightningIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOProIndexerTND.apply(
-            idx_q.flatten(0, 1),
+            idx_q_BLHiDi.flatten(0, 1),
             # index_select stays outside the Function so dk scatters back to
             # the gathered whole-row keys before the CP wrapper reduce-scatters.
-            A3KeyWorkaround.indexer_keys(idx_k, attention_metadata).unsqueeze(1).contiguous(),
-            idx_w.flatten(0, 1).float(),
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi, attention_metadata).unsqueeze(1).contiguous(),
+            idx_w_BLHi.flatten(0, 1).float(),
             self.index_topk,
             attention_metadata.ratio,
             attention_metadata,
         )
-        batch, seqlen = idx_q.shape[:2]
+        batch, seqlen = idx_q_BLHiDi.shape[:2]
         return (
             topk_indices.reshape(batch, seqlen, -1),
             topk_scores.reshape(batch, seqlen, -1),

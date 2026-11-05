@@ -27,8 +27,6 @@ from torchtitan_npu.patches.torchtitan.distributed.context_parallel import (
     register_layout,
 )
 
-from .packing import require_document_alignment
-
 DOC_CHUNK_LAYOUT = "doc_chunk"
 """The layout's name on ``--parallelism.context-parallel-load-balancer``.
 
@@ -39,86 +37,81 @@ the same boundaries, so the layout needs no exchange and no collective.
 __all__ = [
     "DOC_CHUNK_LAYOUT",
     "DocChunkCPLoadBalancer",
-    "chunk_index",
-    "doc_chunk_permutation",
+    "PerDocCPLoadBalancer",
 ]
 
 
-class DocChunkCPLoadBalancer(ContextParallelLoadBalancer):
-    """Rank ``r``'s window is chunk ``r`` of every document, in document order.
+class PerDocCPLoadBalancer(ContextParallelLoadBalancer):
+    """The shared construction of the document layouts.
 
-    The layout *is* the permutation, so the balancer states it and the shard applies it before
-    slicing -- zero communication.  It is a function of the row's document boundaries, the degree
-    and the row's length alone: device arithmetic, nothing to agree on across ranks.
+    A layout states a token order that gives every rank whole pieces of every document, so the
+    shard it drives never cuts a document: the row's boundaries come from the batch's attention
+    metadata, the degree from the run.  One construction for all of them -- only the piece count
+    and the assignment differ -- which is why the subclasses state just their permutation.
 
-    It does not balance work: every rank still holds ``seq_len / cp_size`` tokens, and the causal
-    imbalance of a contiguous shard is unchanged.  The name is the seam's -- a static token order
-    is what a balancer produces here -- not a claim about the schedule.
-
-    The constructor takes the batch the shard is about to slice: ``seq_len``, the row's boundaries
-    (upstream hands the balancer the batch's attention metadata; this pin hands it the positions it
-    would have read them from) and the degree the shard runs at.
+    The constructor takes the batch the shard is about to slice -- the row's length, the degree and
+    the batch's attention metadata, where the row's boundaries are -- as upstream's balancers do;
+    the degree is a parameter because this pin has no ambient CP mesh to read it from.  Nothing is
+    checked here: what the split needs of the row is stated where the row is built.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(ContextParallelLoadBalancer.Config):
-        """The doc-chunk layout takes no options: the row's boundaries are its whole input."""
+        """The document layouts take no options: boundaries and degree are their whole input."""
 
     def __init__(
         self,
         config: Config,
         *,
         seq_len: int,
-        cu_seqlens: torch.Tensor,
         cp_size: int,
+        attention_metadata,
     ) -> None:
         del config
-        if seq_len % cp_size:
-            raise ValueError(f"the row ({seq_len} tokens) does not split into {cp_size} slabs.")
-        self.cu_seqlens = cu_seqlens
+        self.cu_seqlens = attention_metadata.q.cu_seqlens
         self.cp_size = cp_size
         self.seq_len = seq_len
 
+    def _document_chunks(self, chunks: int) -> list[torch.Tensor]:
+        """Each document as a ``(chunks, L_d // chunks)`` block of global token indices.
+
+        The split is not validated here: every document length must be a positive multiple of
+        ``chunks``, and the shard's own checks state that contract before a layout is built.
+        """
+        return [
+            torch.arange(start, end, device=self.cu_seqlens.device, dtype=torch.int64).view(chunks, -1)
+            for start, end in zip(self.cu_seqlens[:-1].tolist(), self.cu_seqlens[1:].tolist(), strict=True)
+        ]
+
+    def generate_permutation(self) -> torch.Tensor:
+        """The row's global token order under this layout (``[1, seq_len]``, ``int64``)."""
+        raise NotImplementedError
+
+
+class DocChunkCPLoadBalancer(PerDocCPLoadBalancer):
+    """Rank ``r``'s window is chunk ``r`` of every document, in document order.
+
+    The layout *is* the permutation, so the balancer states it and the shard applies it before
+    slicing -- zero communication.  Stacking the chunk-``r`` block of every document along the
+    document axis and flattening rank-major is that order: chunk ``r`` of document 0, then of
+    document 1, and so on.
+
+    It does not balance work: every rank still holds ``seq_len / cp_size`` tokens, and the causal
+    imbalance of a contiguous shard is unchanged.  The name is the seam's -- a static token order
+    is what a balancer produces here -- not a claim about the schedule.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(PerDocCPLoadBalancer.Config):
+        """The doc-chunk policy takes no options."""
+
     def generate_permutation(self) -> torch.Tensor:
         """The row's global token order under the doc-chunk layout (``[1, seq_len]``, ``int64``)."""
-        return doc_chunk_permutation(self.cu_seqlens, self.cp_size, self.seq_len // self.cp_size)
+        return torch.cat(self._document_chunks(self.cp_size), dim=1).reshape(-1).unsqueeze(0)
 
 
-def chunk_index(
-    cu_seqlens: torch.Tensor,
-    cp_size: int,
-    rank: int | None,
-    slab_len: int,
-) -> torch.Tensor:
-    """Which document chunk each row belongs to.
-
-    ``slab_len`` is the slab width ``C``; with ``rank`` the rows are that rank's slab, without it
-    the whole row.  Every document length must be a positive multiple of ``cp_size`` so that a
-    chunk is a whole number of rows; the shared packing check enforces it here -- the one check
-    in the layout that runs per microbatch, so its callers do not repeat it.
-    """
-    require_document_alignment(cu_seqlens, cp_size=cp_size)
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    chunk = lengths // cp_size
-    if rank is None:
-        pos = torch.arange(slab_len * cp_size, device=cu_seqlens.device)
-    else:
-        pos = torch.arange(rank * slab_len, (rank + 1) * slab_len, device=cu_seqlens.device)
-    doc = (torch.bucketize(pos, cu_seqlens, right=True) - 1).clamp_min(0)
-    return (pos - cu_seqlens[doc]) // chunk[doc]
-
-
-def doc_chunk_permutation(cu_seqlens: torch.Tensor, cp_size: int, slab_len: int) -> torch.Tensor:
-    """The row's global token order under the doc-chunk layout (``[1, N]``, ``int64``).
-
-    Stably sorting the rows by the chunk they belong to produces exactly that -- within a chunk the
-    rows keep their global order, so the documents stay in order -- which is why the CP shard can
-    apply it *before* slicing and move nothing, and why it agrees row for row with the movement
-    :func:`to_slab` undoes.
-    """
-    return torch.argsort(chunk_index(cu_seqlens, cp_size, None, slab_len), stable=True).unsqueeze(0)
-
-
-# The shard finds a layout by the name its CLI flag carries, so the model package that owns the
-# permutation registers it -- at import time, exactly like ``@override``.
+# The shard finds a layout by the name the CLI flag carries, so the package that owns the
+# permutation registers it here, at import time -- exactly like ``@override``.  Without this call
+# ``build_load_balancer`` returns ``None`` and the shard silently falls back to the pinned
+# contiguous split, which is only observable as a numerics change at CP>1.
 register_layout(DOC_CHUNK_LAYOUT, DocChunkCPLoadBalancer)

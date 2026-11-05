@@ -34,16 +34,12 @@ import cann_ops_transformer  # noqa: F401  # register torch.ops.cann_ops_transfo
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    LI_CMP_RATIO as CMP_RATIO,
-)
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    LI_LAYOUT as LAYOUT,
-)
-from torchtitan_npu.override.deepseek_v4.metadata import (
-    LI_MASK_MODE as MASK_MODE,
-)
-from torchtitan_npu.override.deepseek_v4.metadata import (
+CMP_RATIO = 4
+"""The ratio V4's indexer runs at."""
+LAYOUT = "TND"
+MASK_MODE = 3
+
+from torchtitan_npu.override.deepseek_v4.asc_metadata import (
     AicpuGeometry,
     AscV4Metadata,
 )

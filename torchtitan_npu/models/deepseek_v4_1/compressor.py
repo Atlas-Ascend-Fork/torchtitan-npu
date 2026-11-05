@@ -114,7 +114,7 @@ class Compressor(Module):
         if attention_metadata is not None:
             # The pooling is the row's, so a source layer restores the stream onto this rank's
             # window first (the identity at one degree); the caller hands over the chunks it holds.
-            x_BLD = restore_key_stream(attention_metadata.cp, x_BLD, group=self.group)
+            x_BLD = restore_key_stream(attention_metadata.xchg, x_BLD, group=self.group)
 
         ratio = self.compress_ratio
         seqlen = x_BLD.size(1)

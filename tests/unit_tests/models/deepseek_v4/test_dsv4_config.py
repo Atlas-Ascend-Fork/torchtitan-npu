@@ -11,7 +11,8 @@ def test_debugmodel_uses_the_documented_per_layer_compression_ratios():
 
     model_spec = model_registry("debugmodel")
 
-    assert model_spec.model.compress_ratios == (1, 1, 4, 128)
+    # Window-only layers state ratio 0: they own no compressed axis at all.
+    assert model_spec.model.compress_ratios == (0, 0, 4, 128)
     assert len(model_spec.model.layers) == len(model_spec.model.compress_ratios)
 
 
@@ -110,6 +111,7 @@ def test_aligned_dataloader_only_inserts_pads():
     import torch
     from torchtitan.components.loss import IGNORE_INDEX
     from torchtitan.components.tokenizer import HuggingFaceTokenizer
+
     from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedTextDataset
 
     tokenizer = HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3")

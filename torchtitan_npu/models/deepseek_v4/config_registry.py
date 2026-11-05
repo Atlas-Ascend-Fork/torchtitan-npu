@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 import re
 from collections.abc import Callable
 from dataclasses import fields
@@ -41,7 +42,6 @@ from torchtitan_npu.config import (
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
-from torchtitan_npu.models.deepseek_v4.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
@@ -264,8 +264,13 @@ def _dsv4_optimizer_config(
 
 
 def _per_doc_alignment(model_spec: ModelSpec) -> int:
-    """The pooling granularity the loader pads every packed document to (V4: 128)."""
-    return compression_alignment(model_spec.model.compress_ratios)  # pyrefly: ignore [missing-attribute]
+    """The pooling granularity the loader pads every packed document to (V4: 128).
+
+    The least common multiple of the ratios this stack pools with: a document whose length is not a
+    multiple of each of them would get a group straddling its edge.
+    """
+    ratios = model_spec.model.compress_ratios  # pyrefly: ignore [missing-attribute]
+    return math.lcm(*(ratio for ratio in ratios if ratio > 0))
 
 
 def _make_trainer_config(

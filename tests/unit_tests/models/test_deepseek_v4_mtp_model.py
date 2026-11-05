@@ -19,9 +19,9 @@ from tests.unit_tests.models.mtp_test_utils import (
     build_cpu_model,
     preprocess,
 )
-from torchtitan_npu.models.deepseek_v4.linear import SharedLinear
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+from torchtitan_npu.models.deepseek_v4.linear import SharedLinear
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
@@ -87,10 +87,10 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
 
     _, _, extra_kwargs = preprocess(model, tokens, labels, positions)
 
-    # One entry per geometry: the stack's ratios -- the MTP depths' uncompressed one included --
-    # are one map key each, and each entry carries only its own ratio's plan.
+    # One entry per geometry: the stack's ratios -- the MTP depths' uncompressed one (zero)
+    # included -- are one map key each, and each entry carries only its own ratio's plan.
     entries = extra_kwargs["attention_metadata"]
-    assert {ratio for _, ratio in entries} == {1, 4, 128}
+    assert {ratio for _, ratio in entries} == {0, 4, 128}
     assert all(entry.ratio == ratio for (_, ratio), entry in entries.items())
     output = model(tokens, **extra_kwargs)
     assert isinstance(output, list) and len(output) == 2
@@ -255,7 +255,7 @@ def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_thre
             assert (parameter.grad is None) == (expected_grad is None), name
             if expected_grad is not None:
                 torch.testing.assert_close(
-                    parameter.grad, expected_grad, rtol=0, atol=0, msg=lambda message: f"{name}: {message}"
+                    parameter.grad, expected_grad, rtol=0, atol=0, msg=lambda message, name=name: f"{name}: {message}"
                 )
 
 
@@ -324,12 +324,15 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
 
     A shift across a shard boundary is not a shift, so the batch must be built
     from the whole row and the same ``cp_shard`` cut applied afterwards.  The
-    shard here really slices rank 1's half of a two-rank run, so the test pins
-    the alignment, not only the call order.
+    shard here really slices rank 1's half of a two-rank run, by the permutation
+    the seam built for the batch, so the test pins the alignment and the shared
+    layout, not only the call order.
     """
     from types import SimpleNamespace
 
     from torchtitan_npu.models.deepseek_v4 import model as model_mod
+    from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
     model = build_cpu_model(_build_model_config())
     tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
@@ -344,13 +347,23 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
         built.append((inputs, prepared_labels, prepared_positions, batch))
         return batch
 
-    shard_calls = []
     rank, cp_size = 1, 2
     shard_len = SEQ_LEN // cp_size
+    row_entry = DeepSeekV4Metadata.from_positions(positions, 1)
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=SEQ_LEN, cp_size=cp_size, attention_metadata=row_entry)
+        .generate_permutation()
+    )
+    local_entry = row_entry.doc_chunk_entry(permutation=permutation, cp_size=cp_size, cp_rank=rank)
+    held = permutation[0, rank * shard_len : (rank + 1) * shard_len]
 
-    def fake_cp_shard(mesh, tensors, masks=None, load_balancer_type=None, input_seq_dim=1, *, positions=None):
-        shard_calls.append((tuple(tensors), positions, load_balancer_type))
-        cut = tuple(tensor.narrow(input_seq_dim, rank * shard_len, shard_len) for tensor in tensors)
+    shard_calls = []
+
+    def fake_cp_shard(mesh, tensors, masks=None, load_balancer_type=None, input_seq_dim=1, *, permutation=None):
+        shard_calls.append((tuple(tensors), permutation, load_balancer_type))
+        rows = held if permutation is not None else torch.arange(rank * shard_len, (rank + 1) * shard_len)
+        cut = tuple(tensor.index_select(input_seq_dim, rows) for tensor in tensors)
         return cut, masks
 
     monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
@@ -358,24 +371,23 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
 
     # The base seam is exercised in its own tests; here the model's own
     # responsibility is the MTP batch: built on the global row, then cut by the
-    # same shard, handed the same row so the balancer derives the same layout.
+    # same permutation the base shard applied, read off the model.
     from torchtitan.models.common.decoder import Decoder
 
-    from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
-
     base_calls = []
-    row_entry = build_v4_metadata(positions, 1)
-    local_entry = doc_chunk_entry(row_entry, cp_size=cp_size, cp_rank=rank, slab_len=shard_len)
 
     def fake_base(self, input_dict, labels, **kwargs):
         base_calls.append((input_dict["input"].shape, labels.shape))
+        # ``Decoder._cp_shard`` publishes the layout's permutation on the model; the MTP
+        # depths read it instead of deriving a second order.
+        self._cp_permutation = permutation
         cut, _ = model_mod.cp_shard(
             mesh,
             (input_dict["input"], labels, input_dict["positions"]),
             None,
             None,
             1,
-            positions=input_dict["positions"],
+            permutation=permutation,  # pyrefly: ignore [unexpected-keyword]
         )
         return cut[0], cut[1], {"positions": cut[2], "attention_metadata": {("debug", 1): local_entry}}
 
@@ -402,28 +414,27 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     assert torch.equal(global_labels, labels)
     assert torch.equal(global_positions, positions)
 
-    # Two cuts, both fed the full row: the base inputs, then the MTP batch.
+    # Two cuts, both fed the full row.
     assert base_calls == [(tokens.shape, labels.shape)]
     assert len(shard_calls) == 2
     for got, expected in zip(shard_calls[0][0], (tokens, labels, positions), strict=True):
         assert torch.equal(got, expected)
     for got, expected in zip(shard_calls[1][0], batch, strict=True):
         assert torch.equal(got, expected)
-    # The row reaches both calls, so the layout cannot be derived from anything else.
-    for _, handed_positions, _ in shard_calls:
-        assert torch.equal(handed_positions, positions)
+    # Both cuts are handed the one permutation the base seam built: the model does not derive a
+    # second order, so the two cannot land on different rows.
+    assert shard_calls[0][1] is permutation and shard_calls[1][1] is permutation
     # Both cuts are handed the run's configured layout, unchanged: the model does not resolve a
     # default (the V4 registry names ``doc_chunk`` when the CLI leaves the flag alone), so the two
     # calls cannot disagree about the order they cut.
     assert shard_calls[0][2] == shard_calls[1][2] == parallelism.context_parallel_load_balancer
 
     # What the forward reads is the shard's answer, not the global row.
-    slab = slice(rank * shard_len, (rank + 1) * shard_len)
-    assert torch.equal(inputs, tokens[:, slab]) and torch.equal(out_labels, labels[:, slab])
-    assert torch.equal(extra_kwargs["positions"], positions[:, slab])
+    assert torch.equal(inputs, tokens[:, held]) and torch.equal(out_labels, labels[:, held])
+    assert torch.equal(extra_kwargs["positions"], positions[:, held])
     # The mask is the global row's own (a shift across a shard boundary is not a shift): the
-    # local copy is exactly its slab, so the row's last token still has no successor.
+    # local copy is the rows this rank holds of it.
     local_batch = extra_kwargs["mtp_batch"]
-    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[:, slab])
+    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[:, held])
     assert not bool(local_batch.input_valid_mask[:, -1].all())
     assert extra_kwargs["attention_metadata"][("debug", 1)] is local_entry

@@ -57,8 +57,8 @@ def _masks():
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(BOUNDS)]).unsqueeze(0)
     config = CompressedSparseInnerAttention2.Config(window_size=8, softmax_scale=0.5, compress_ratio=2)
     metadata = config.build_attention_metadata(positions)
-    torch.testing.assert_close(metadata.cu_seq_k, metadata.cu_seq_q // 2, rtol=0, atol=0)
-    assert metadata.cu_seq_k.tolist() == POOL
+    torch.testing.assert_close(metadata.cmp_k.cu_seqlens, metadata.q.cu_seqlens // 2, rtol=0, atol=0)
+    assert metadata.cmp_k.cu_seqlens.tolist() == POOL
     return metadata
 
 

@@ -21,11 +21,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.deepseek_v4.cp_layout import (
-    DOC_CHUNK_LAYOUT,
-    doc_chunk_permutation,
-)
-from torchtitan_npu.patches.torchtitan.distributed.context_parallel import document_starts
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 
 # ``preprocess_inputs`` takes the parallelism context; these models run a single process
 # with no CP and the default SPMD backend.
@@ -78,7 +74,7 @@ def tiny_v41_model(monkeypatch, *, configure=None):
 def preprocess(model, tokens, labels, positions, *, parallel_dims=None, parallelism=None, **batch):
     """Run the model's own input preprocessing and return its forward arguments.
 
-    The metadata is the seam's product: the model no longer builds one object for every
+    The metadata is the seam's product: the model builds one object per
     layer, so what a migrated stack must reach its forward through is the **map**
     (``attention_metadata``), not the pinned single ``attention_masks``.
 
@@ -128,11 +124,12 @@ def cp_parallel_dims(cp_size: int, cp_rank: int) -> SimpleNamespace:
 def install_doc_chunk_cp_shard(monkeypatch) -> None:
     """Stand in for the framework's CP input shard, on CPU.
 
-    With the doc-chunk layout the framework permutes the replicated row and slices it evenly,
-    so rank ``r`` holds chunk ``r`` of every document; this reproduces that without a device
-    mesh or a collective.  Only the shard is stubbed: the map's own CP transform is
-    ``Decoder._cp_shard``'s, and it runs after this returns, on the pre-shard positions, which
-    is the geometry the transform derives this rank's copy from.
+    With the doc-chunk layout the framework permutes the replicated row by the order its balancer
+    states and slices it evenly, so rank ``r`` holds chunk ``r`` of every document; this reproduces
+    that without a device mesh or a collective, reading the permutation the shard is handed.
+    Only the shard is stubbed: the map's own CP transform is ``Decoder._cp_shard``'s, and it
+    runs after this returns, on the pre-shard positions, which is the geometry the transform
+    derives this rank's copy from.
     """
     import torchtitan_npu.patches.torchtitan.models.common.decoder as decoder_patch
 
@@ -144,13 +141,12 @@ def install_doc_chunk_cp_shard(monkeypatch) -> None:
         input_seq_dim=1,
         ptrr_mask_key=None,
         *,
-        positions=None,
+        permutation=None,
     ):
         del attention_masks, ptrr_mask_key
-        if load_balancer_type != DOC_CHUNK_LAYOUT or positions is None:
+        if load_balancer_type != DOC_CHUNK_LAYOUT or permutation is None:
             raise AssertionError("the CPU stand-in only reproduces the doc-chunk layout")
         slab = inputs[0].size(input_seq_dim) // cp_mesh.size()
-        permutation = doc_chunk_permutation(document_starts(positions), cp_mesh.size(), slab)
         lo = cp_mesh.get_local_rank() * slab
         held = permutation[0][lo : lo + slab]
         moved = tuple(torch.index_select(tensor, input_seq_dim, held) for tensor in inputs)

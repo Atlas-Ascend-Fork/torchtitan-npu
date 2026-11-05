@@ -12,10 +12,9 @@ import torch
 
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
     AscV41Metadata,
-    build_fused_metadata,
 )
 
 
@@ -28,7 +27,7 @@ def reference_row(positions: torch.Tensor, *, ratio: int) -> DeepSeekV41Metadata
     """The row a fused entry starts from, built the way the reference backend builds it.
 
     ``cu_seq_k`` is the backend's own ratio applied to the row's boundaries, so the row handed
-    to :func:`build_fused_metadata` has to be built at the ratio of the entry it feeds.  A
+    to :meth:`AscV41Metadata.build_aicpu_metadata` has to be built at the ratio of the entry it feeds.  A
     reference config carries no kernel geometry at all -- that is ``test_fused_geometry``'s pin --
     which is why the window stated here is incidental to the row.
     """
@@ -65,6 +64,6 @@ def v41_metadata():
         positions = packed_positions(bounds)
         if port is not None:
             return port.build_attention_metadata(positions)
-        return build_fused_metadata(reference_row(positions, ratio=ratio), ratio=ratio, geometry=geometry)
+        return AscV41Metadata.build_aicpu_metadata(reference_row(positions, ratio=ratio), geometry=geometry)
 
     return _build

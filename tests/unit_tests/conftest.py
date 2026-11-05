@@ -194,23 +194,16 @@ def dsv4():
     ns.metadata = importlib.import_module("torchtitan_npu.models.deepseek_v4.metadata")
     ns.attention = importlib.import_module("torchtitan_npu.models.deepseek_v4.attention")
     ns.compressor = importlib.import_module("torchtitan_npu.models.deepseek_v4.compressor")
-    spec = importlib.util.spec_from_file_location(
-        "varlen_cp_backport",
-        _REPO / "torchtitan_npu" / "patches" / "torchtitan" / "distributed" / "varlen_cp.py",
-    )
-    varlen_cp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(varlen_cp)
-    ns.CPVarlenMetadata = varlen_cp.CPVarlenMetadata
     ns.cann_ops = importlib.import_module("cann_ops_transformer")
     return ns
 
 
-# The builder whose selector record is arch35's alone (arch22's ``lightning_indexer`` schedules
-# itself).  A CPU run answers "not A5", so it exercises the arch22 side by default.
+# The builders whose selector record is arch35's alone (arch22's ``lightning_indexer`` schedules
+# itself).  A CPU run answers "not A5", so it exercises the arch22 side by default.  The V4.1
+# selector reuses the shared port, so only the shared modules own the switch to patch.
 _A5_RECORD_MODULES = (
     "torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc",
     "torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc",
-    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc",
 )
 
 

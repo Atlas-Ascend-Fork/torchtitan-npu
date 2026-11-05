@@ -17,8 +17,8 @@ import torch
 
 from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import (
     AscLightningIndexer,
+    kernel_options,
 )
-from torchtitan_npu.override.deepseek_v4.metadata import lightning_indexer_options
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
     AscCompressedSparseInnerAttention,
 )
@@ -117,7 +117,7 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch, a5_records):
     # The forward metadata is the entry's own record; the options are the frame contract.
     assert captured["metadata"] is md.aicpu_metadata.lightning_indexer.fwd
     # The options are the entry's own frame -- the one its keys were compacted onto.
-    assert captured["options"] == lightning_indexer_options(ratio=md.ratio, q=md.q, cmp_k=md.cmp_k)
+    assert captured["options"] == kernel_options(ratio=md.ratio, q=md.q, cmp_k=md.cmp_k)
 
     # The value of the carrier is never read: overwrite it with NaN and still drive the edge.
     teacher = torch.zeros_like(scores)

@@ -40,8 +40,8 @@ Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
 ``labels`` is passed separately (0.3.0 keeps it out of ``input_dict``), and
 ``parallel_dims``/``device``/``parallelism`` stand in for #4116's
 ``parallelism_context`` (0.3.0 has no ``ParallelismContext``).
-The model-level ``build_attention_masks`` hook this file used to honour is gone: every stack of
-this repository builds its metadata through ``build_attention_metadata`` now, so one seam is left.
+Every stack of this repository builds its metadata through ``build_attention_metadata``; the
+model-level ``build_attention_masks`` hook is not part of the seam.
 """
 
 from typing import Any
@@ -53,6 +53,7 @@ from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.models.common.attention import BaseAttention, FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
 
+from torchtitan_npu.patches.torchtitan.distributed.context_parallel import build_load_balancer
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
     cp_shard_context_set,
@@ -155,47 +156,52 @@ def _cp_shard(
     extra_kwargs: dict[str, Any],
     *,
     cp_mesh: Any,
-    device: torch.device,
-    load_balancer_type: str | None = None,
-    ptrr_mask_key: str | None = None,
+    parallelism: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Shard for CP, then prepare this rank's attention metadata (upstream #4617).
 
     Upstream #4116/#4617 put the CP half of the metadata seam on the model, and
-    ``_cp_shard`` is its name.  The map carries this rank's frames and the
-    kernel records built from them, so it is rank-dependent exactly as
-    ``attention_masks`` is: its transform runs *after* the shard, on this rank's
-    rows, with the row's positions the map was built from.  Upstream calls the
-    backend's ``prepare_cp_metadata`` per entry because the mesh is ambient
-    there; 0.3.0 hands the mesh, the load-balancer type and those positions
-    along as well.
+    ``_cp_shard`` is its name: the balancer is built here from the batch's own
+    attention metadata, states the token order, and the shard applies it.  The
+    map carries this rank's frames and the kernel records built from them, so it
+    is rank-dependent exactly as ``attention_masks`` is: its transform runs
+    *after* the shard, on this rank's rows.
 
-    The shard itself stays 0.3.0's: the pinned version has neither
-    ``ParallelismContext`` nor ``shard_tensors``, so the pinned ``cp_shard``
-    remains the entry point.
-
-    ``load_balancer_type`` names the layout the inputs are sharded by; it is the run's
-    own choice, with no fallback: a stack that can only consume one layout states it in
-    its config and refuses any other.  A repository layout (``models/common/cp_layout.py``)
-    is built *inside* ``cp_shard`` from the row's boundaries, so nothing here precomputes a
-    permutation; the transform is handed none, because a rank-local entry of these layouts
-    is a function of the row's boundaries alone.  A pinned layout (``headtail``) still
-    hands its permutation over, as upstream does.
+    What the pinned version cannot supply is passed instead of read: the mesh is
+    an argument (upstream's is ambient in ``ParallelismContext``) and so is the
+    degree a layout is built with.
     """
     attention_metadata = extra_kwargs.get("attention_metadata")
-    # The shard below replaces ``positions`` with this rank's slice; the
-    # transform describes the row the shard started from, so keep the global
-    # one before that happens.
+    layout = parallelism.context_parallel_load_balancer
+    # The shard below replaces ``positions`` with this rank's slice, so keep the row's own to add
+    # it to the buffers that travel together.
     row_positions = extra_kwargs.get("positions")
-    # A registered layout is built from the row it is about to shard and raises if the row
-    # carries no positions; the pinned ones are functions of the length alone, so a model that
-    # carries none keeps sharding exactly as it did before these layouts existed.
-    layout = load_balancer_type
+    seq_len = inputs.size(1)
     permutation = None
-    if attention_metadata and layout == "headtail" and row_positions is not None:
-        permutation = _HeadTailLoadBalancer(
-            row_positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
-        )._generate_indices()
+    # The layer a layout addresses, as upstream picks it: the first attention's own entry.  A
+    # stack that builds no entry for it has no boundaries to read, so the shard keeps the pinned
+    # path and a registered layout says so there.
+    attention = self.config.first_attention
+    inner = None if attention is None else getattr(attention, "inner_attention", None)
+    row_metadata = None if inner is None else (attention_metadata or {}).get(inner.attention_metadata_key)
+    if layout is not None and row_metadata is not None:
+        # A repository layout is built from the batch's boundaries; a pinned one owns its own
+        # balancer, but the metadata transform must apply the same order the shard does, so its
+        # permutation is derived here and handed to both.
+        balancer = build_load_balancer(
+            layout,
+            seq_len=seq_len,
+            cp_size=cp_mesh.size(),
+            attention_metadata=row_metadata,
+        )
+        permutation = (
+            balancer.generate_permutation()
+            if balancer is not None
+            else _HeadTailLoadBalancer(seq_len, cp_mesh.size(), cp_mesh.device_type)._generate_indices()
+        )
+    # A model that shards a second batch the same way (V4's MTP depths) reads this instead of
+    # rebuilding a balancer, which needs the row metadata that second batch does not carry.
+    self._cp_permutation = permutation
 
     attention_masks = extra_kwargs.get("attention_masks")
     buffers: tuple[torch.Tensor, ...] = (inputs, labels) if row_positions is None else (inputs, labels, row_positions)
@@ -204,8 +210,8 @@ def _cp_shard(
         buffers,
         attention_masks,
         layout,
-        ptrr_mask_key=ptrr_mask_key,
-        positions=row_positions,  # pyrefly: ignore [unexpected-keyword]
+        ptrr_mask_key=getattr(parallelism, "context_parallel_ptrr_mask_key", None),
+        permutation=permutation,  # pyrefly: ignore [unexpected-keyword]
     )
     inputs, labels = sharded[0], sharded[1]
     if len(sharded) > 2:
@@ -214,13 +220,9 @@ def _cp_shard(
         extra_kwargs["attention_masks"] = attention_masks
 
     if attention_metadata:
-        # Upstream's loop, with the pinned stand-in for its ambient parallelism
-        # context published around it (see ``attention_metadata``).
-        with cp_shard_context_set(
-            cp_mesh=cp_mesh,
-            load_balancer_type=layout,
-            positions=row_positions,
-        ):
+        # Upstream's loop, with the pinned stand-in for its ambient parallelism context published
+        # around it (see ``attention_metadata``).
+        with cp_shard_context_set(cp_mesh=cp_mesh):
             extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(
                 attention_metadata,
                 permutation=permutation,
@@ -243,10 +245,9 @@ def preprocess_inputs(
 
     The metadata map is preferred when the stack's attention backends provide
     builders; the 0.3.0 single-mask path stays for the stacks whose inner
-    attention is a plain Flex/Varlen config, and a model-level
-    model's own ``build_attention_masks`` (removed) used to own the whole
-    metadata + CP step.  The CP step itself is delegated to ``_cp_shard``,
-    upstream's method for it, which is also where the map becomes rank-local.
+    attention is a plain Flex/Varlen config.  The metadata + CP step is
+    ``_cp_shard``'s, upstream's method for it, which is also where the map
+    becomes rank-local.
     """
     if parallelism.spmd_backend == "full_dtensor":
         # Fail before any mask build, shard or wrapping: the config is stale.
@@ -285,9 +286,7 @@ def preprocess_inputs(
             labels,
             extra_kwargs,
             cp_mesh=cp_mesh,
-            device=device,
-            load_balancer_type=parallelism.context_parallel_load_balancer,
-            ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
+            parallelism=parallelism,
         )
 
     if parallelism.spmd_backend == "spmd_types":

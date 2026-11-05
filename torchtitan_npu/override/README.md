@@ -369,7 +369,7 @@ recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它
 
 metadata 不再是独立入口：每个 microbatch、每个几何一份 entry，由被替换的
 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 直接构建
-（upstream PR #4897 的 backend-owned 接缝）：模型目录的 `build_v4_metadata` 给出整行的
+（upstream PR #4897 的 backend-owned 接缝）：模型目录的 `DeepSeekV4Metadata.from_positions` 给出整行的
 document 边界、按 ratio 折好的池网格与三个 kernel frame（`q`/`swa_k`/`cmp_k`），
 port 在其上补四个算子的记录。map key 是 `(端口类, compress_ratio)`，每层只读自己 ratio 的
 entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI record 属于 selector：BF16 的
@@ -467,7 +467,7 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 SMLA 与 indexer 的 metadata 都是 AI_CPU 算子，只依赖本次 forward 的 frames 与静态几何，
 所以它们在 `build_attention_metadata`（每 microbatch 一次的 eager 边界）里预计算，随 map entry
 下发、全层共享。这份几何**不在参考 config 上**：参考核只读整行的 document 边界，以及后端在
-同一处按自己的 `compress_ratio` 折好的 `cu_seq_k`（池化轴），因此 kernel 几何属于端口，由
+同一处按自己的 `compress_ratio` 折好的 `cmp_k` frame（池化轴），因此 kernel 几何属于端口，由
 override 参数声明：
 
 ```text
@@ -517,8 +517,8 @@ frame 建出四份 metadata（SMLA 前后向、量化 selector 的两条 schedul
 ```text
 lightning_indexer
 + fwd            -> 打分层的 QLI schedule（建池与 pool-free 共用；与池宽度无关，宽度是 launch 参数）
-+ fwd_sparse     -> 搜候选池的 QSLI schedule（按几何建；非量化路径暂空，等带 candidate 的非量化算子）
-+ sparse_length  -> QSLI 的 per-row 候选数（同上，按几何建）
++ fwd_sparse     -> 搜候选池的 QSLI schedule（V4.1 独有；非量化路径暂空，等带 candidate 的非量化算子）
++ sparse_length  -> QSLI 的 per-row 候选数（V4.1 独有，同上）
 + bwd            -> sparse_lightning_indexer_kl_loss_grad（教师边，两条精度路径共用）
 ```
 

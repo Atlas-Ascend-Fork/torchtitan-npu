@@ -5,10 +5,10 @@
 
 """V4 SMLAG carries the raw teacher to the selector's SLIKG backward.
 
-The sparse core no longer trains the indexer itself.  SMLAG's by-product -- the marginal
-mass ``p`` over the selected slots -- is written on ``topk_scores``' gradient, with every
-``-1`` slot zeroed and ``softmax_scale`` applied exactly once.  These cases pin that edge,
-including the layers that must not emit one.
+The sparse core does not train the indexer itself.  SMLAG's by-product -- the marginal
+mass ``p`` over the selected slots -- is written on ``topk_scores``' gradient verbatim: no
+``-1`` masking and no ``softmax_scale`` applied here.  These cases pin that edge, including
+the layers that must not emit one.
 """
 
 import pytest
@@ -94,13 +94,15 @@ def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
     out.sum().backward()
 
     assert scores.grad is not None
+    # The teacher is forwarded verbatim: SMLAG's mass on every slot, including the junk it
+    # writes for the ``-1`` padding, and with no ``softmax_scale`` applied here.
     expected = torch.zeros(1, 4, 3)
-    expected[0, 0] = torch.tensor([0.1, 0.3, 0.0])
-    expected[0, 1] = torch.tensor([0.1, 0.0, 0.0])
+    expected[0, 0] = torch.tensor([0.1, 0.3, 7.0])
+    expected[0, 1] = torch.tensor([0.1, 7.0, 7.0])
+    expected[0, 2] = torch.tensor([7.0, 7.0, 7.0])
     expected[0, 3] = torch.tensor([0.1, 0.3, 0.4])
-    # ``softmax_scale`` is the emitter's one scaling.
-    torch.testing.assert_close(scores.grad, expected * 0.5, rtol=0, atol=0)
-    assert (scores.grad[indices < 0] == 0).all()
+    torch.testing.assert_close(scores.grad, expected, rtol=0, atol=0)
+    assert (scores.grad[indices < 0] == 7.0).all()
 
 
 @pytest.mark.parametrize("mode", ["eval", "hca"])

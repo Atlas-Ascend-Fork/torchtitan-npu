@@ -17,7 +17,6 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_npu
-from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.models.common.attention import (
     VarlenAttention,
     VarlenMetadata,
@@ -26,10 +25,6 @@ from torchtitan.models.common.attention import (
 from torchtitan_npu.models.deepseek_v3_2.model import (
     SparseIndexerLoss,
     build_reference_varlen_metadata,
-)
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
-    cp_shard_context,
 )
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
@@ -278,12 +273,6 @@ class AscSparseInnerAttention(VarlenAttention):
         idx_w_TN = idx_w_BLN.reshape(T_q, N2)
 
         varlen_meta = attention_masks.varlen_meta
-        if isinstance(varlen_meta, CPVarlenMetadata):
-            gather = varlen_meta.k_global_gather_indices
-            k_nope_T1H = k_nope_T1H.index_select(0, gather)
-            k_rope_T1H = k_rope_T1H.index_select(0, gather)
-            idx_k_T1H = idx_k_T1H.index_select(0, gather)
-
         cu_seq_q_1 = varlen_meta.cu_seq_q[1:]
         cu_seq_k_1 = varlen_meta.cu_seq_k[1:]
 
@@ -353,46 +342,12 @@ class AscVarlenMetadata:
     they came from, so a rank's copy is re-read in one transfer.
     """
 
-    varlen_meta: VarlenMetadata | CPVarlenMetadata
+    varlen_meta: VarlenMetadata
     actual_seq_qlen: list[int]
     actual_seq_klen: list[int]
 
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """This rank's copy of the packed layout (upstream #4617's CP half).
-
-        The global documents are re-cut for the load-balancer permutation, so the host
-        length lists are re-read from the rank-local offsets: the TND kernels receive
-        exactly the segments this rank runs.  The hook lives here, on the layout it
-        rebuilds, rather than on the backend that produced it.
-
-        The balancer is rebuilt here rather than received, because 0.3.0's CP entry takes
-        its *type* and builds the object internally; anything but ``headtail`` means that
-        entry sharded with no permutation, so this derivation passes no balancer either and
-        stays in step with the shard.  An unusable type never reaches here: the pinned entry
-        rejects it first (``ptrr`` included, since the map path hands it no masks).
-        """
-        del permutation
-        context = cp_shard_context()
-        if context.cp_mesh is None or context.positions is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        batch_size, seq_len = context.positions.shape
-        return AscVarlenMetadata.from_varlen(
-            CPVarlenMetadata.from_global(
-                attention_metadata.varlen_meta,
-                context.cp_mesh,
-                batch_size,
-                seq_len,
-                load_balancer=(
-                    _HeadTailLoadBalancer(seq_len, context.cp_mesh.size(0), context.cp_mesh.device_type)
-                    if context.load_balancer_type == "headtail"
-                    else None
-                ),
-            )
-        )
-
     @classmethod
-    def from_varlen(cls, varlen_meta: VarlenMetadata | CPVarlenMetadata) -> AscVarlenMetadata:
+    def from_varlen(cls, varlen_meta: VarlenMetadata) -> AscVarlenMetadata:
         """Read both host offset lists of a packed layout in one transfer."""
         cu_q, cu_k = varlen_meta.cu_seq_q, varlen_meta.cu_seq_k
         actual_seq_qlen, actual_seq_klen = torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()

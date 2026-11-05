@@ -8,17 +8,19 @@
 #
 # #4617 made the load balancer a configurable object built from the batch it is about to
 # shard, and moved `prepare_cp_metadata` onto the backend.  0.3.0's `cp_shard` takes a
-# balancer *name* and builds it internally from the sequence length alone, so a
-# boundary-driven layout has nothing to read: the ``positions`` keyword below is #4617's
-# balancer input in this pin's shape.  It disappears with the pin, not with this repository.
+# balancer *name* and builds it internally, so the pieces below -- the balancer object, the
+# registry that resolves the name to one, and the permutation-driven ``shard_tensors`` --
+# exist to give this pin #4617's split.  The whole module sunsets with the pin bump, which
+# brings the flat ``context_parallel`` module that has no ``cp_shard`` to rebind: nothing
+# here is expected to survive it, so nothing here defends against it.
 
 """The CP shard, with upstream's balancer abstraction and a registry for this repository's layouts.
 
 The pinned ``cp_shard`` shards by sharding alone, or by a load-balancer permutation the framework
 owns (``headtail``, ``ptrr``).  This module adds the pieces #4617 gave the shard -- an abstract
 :class:`ContextParallelLoadBalancer` that states a permutation, a registry that resolves a layout
-name to one, :func:`shard_tensors`, and the boundary derivation a packed row needs -- and leaves the
-pinned path below unchanged for everything that is not registered.
+name to one, and :func:`shard_tensors` -- and leaves the pinned path below unchanged for everything
+that is not registered.
 
 The split is deliberate.  A layout is a property of a model's attention contract, so the model
 package defines and registers it; the mechanism is generic, so it lives here, with no model name and
@@ -30,24 +32,17 @@ import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _HeadTailLoadBalancer,
-)
+from torch.distributed.tensor.experimental._attention import _context_parallel_shard
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
     _LoadBalancer,
 )
 from torchtitan.config import Configurable
 from torchtitan.distributed.context_parallel.api import cp_shard as original_cp_shard
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
-
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
-    CPVarlenMetadata,
-)
+from torchtitan.models.common.attention import AttentionMasksType
 
 logger = logging.getLogger(__name__)
 
@@ -96,48 +91,6 @@ def register_layout(name: str, balancer: type[ContextParallelLoadBalancer]) -> N
     LAYOUT_BALANCERS[name] = balancer
 
 
-def check_layout_supported(
-    stack: str,
-    load_balancer_type: str | None,
-    *,
-    supported: tuple[str, ...] | None = None,
-) -> None:
-    """Refuse a layout this stack's rank-local metadata does not describe.
-
-    Upstream #4617's support matrix, transposed: there it maps a balancer class to the inner
-    attentions it can drive, because every inner attention is a class there; here a stack states
-    the layouts it can consume.  The check runs at the metadata boundary, before a layer runs, and
-    catches a run sharded by a layout whose frames this stack cannot build.
-    """
-    allowed = supported if supported is not None else tuple(sorted(LAYOUT_BALANCERS))
-    if load_balancer_type not in allowed:
-        raise ValueError(
-            f"{stack} shards by one of {sorted(allowed)}, but "
-            f"--parallelism.context-parallel-load-balancer is {load_balancer_type!r}: run with one "
-            "of them."
-        )
-
-
-def document_starts(positions: torch.Tensor) -> torch.Tensor:
-    """The row's document boundaries (``n_documents + 1``), read off its own positions.
-
-    The stack's positions restart at every document, so a row's document start is its own index
-    minus its position; the distinct starts are the boundaries, and the row's end closes the last
-    one.  Device arithmetic throughout -- no ``nonzero``, no ``tolist`` -- because the CP shard
-    runs this on every microbatch and a round-trip there would drain the pipeline.
-
-    This is the one place the layout learns where the documents are when only the positions are
-    at hand (the shard runs before any metadata consumer); it must agree with the metadata's
-    ``cu_seqlens`` -- the packing grid the positions were built from -- which ``tests`` pins.
-    """
-    flat = positions.reshape(-1)
-    rows = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
-    # Non-decreasing, one distinct value per document, so ``unique_consecutive`` is the boundary
-    # set (a full ``unique`` would sort the row again for nothing).
-    doc_start = rows - flat.to(torch.int64)
-    return torch.cat((torch.unique_consecutive(doc_start), rows.new_tensor([rows.numel()])))
-
-
 class _FixedPermutation(_LoadBalancer):
     """Replay a permutation a balancer already generated.
 
@@ -179,63 +132,25 @@ def shard_tensors(
     return cast("tuple[torch.Tensor, ...]", tuple(sharded))
 
 
-def shard_for_layout(
-    cp_mesh: DeviceMesh,
-    inputs: tuple[torch.Tensor, ...],
-    attention_masks,
-    load_balancer_type: str | None,
+def build_load_balancer(
+    name: str | None,
     *,
-    input_seq_dim: int = 1,
-    positions: torch.Tensor | None = None,
-):
-    """Shard by one of this repository's layouts, or return ``None`` when it is not one.
+    seq_len: int,
+    cp_size: int,
+    attention_metadata: Any,
+) -> ContextParallelLoadBalancer | None:
+    """This repository's layout named ``name``, built from the batch it is about to shard.
 
-    The balancer is built from the batch (:class:`ContextParallelLoadBalancer`), states the
-    permutation, and the shard applies it -- #4617's two steps.  ``positions`` is what a
-    boundary-driven balancer is built from on this pin; upstream hands the balancer the batch's
-    attention metadata instead.
-
-    The rank-local metadata of these layouts is the model's own transform -- it reads the row's
-    boundaries, not the sharded rows -- so nothing is returned in place of the masks, and the
-    caller keeps them as they are.
+    ``None`` means the name is not one of this repository's layouts -- a pinned balancer
+    (``headtail``, ``ptrr``) or no balancer at all -- and the caller leaves the shard to the
+    pinned path.  ``attention_metadata`` is one entry of the batch's metadata map -- the layer the
+    layout addresses -- where the row's boundaries are, as upstream's balancers read them; the
+    degree is a parameter because this pin has no ambient CP mesh.
     """
-    balancer_cls = LAYOUT_BALANCERS.get(load_balancer_type) if load_balancer_type else None
+    balancer_cls = LAYOUT_BALANCERS.get(name) if name else None
     if balancer_cls is None:
         return None
-    if attention_masks is not None:
-        raise NotImplementedError(
-            "a boundary-driven CP layout shards tensors only: the attention masks of this "
-            "repository's stacks are varlen metadata built by the model from the row's "
-            "boundaries, not BlockMask objects the shard could slice."
-        )
-    if positions is None:
-        raise ValueError(
-            f"the {load_balancer_type!r} layout is a function of the row's document boundaries: "
-            "pass the row's positions to cp_shard."
-        )
-    balancer = balancer_cls.Config().build(
-        seq_len=inputs[0].size(input_seq_dim),
-        cu_seqlens=document_starts(positions),
-        cp_size=cp_mesh.size(),
-    )
-    sharded = shard_tensors(
-        cp_mesh,
-        tuple(inputs),
-        permutation=balancer.generate_permutation(),
-        input_seq_dim=input_seq_dim,
-    )
-    return sharded, attention_masks
-
-
-def _varlen_from_masks(masks):
-    """Return the shared VarlenMetadata behind a bare mask or an all-varlen dict."""
-    if isinstance(masks, VarlenMetadata):
-        return masks
-    if isinstance(masks, dict):
-        values = [value for value in masks.values() if value is not None]
-        if values and all(isinstance(value, VarlenMetadata) for value in values):
-            return values[0]
-    return None
+    return balancer_cls.Config().build(seq_len=seq_len, cp_size=cp_size, attention_metadata=attention_metadata)
 
 
 @functools.wraps(original_cp_shard)
@@ -247,81 +162,38 @@ def patched_cp_shard(
     input_seq_dim: int = 1,
     ptrr_mask_key: str | None = None,
     *,
-    positions: torch.Tensor | None = None,
-) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | CPVarlenMetadata | None]:
-    """Shard inputs for CP: a registered layout first, the pinned path otherwise.
+    permutation: torch.Tensor | None = None,
+) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
+    """Shard inputs for CP by a permutation the caller built, or by the pinned path.
 
-    ``positions`` is the row's own positions, consumed only by a registered layout (see
-    :func:`shard_for_layout`); the pinned layouts are functions of the length alone, so a stack
-    that carries no positions shards as it did before these layouts existed.
+    Upstream #4617 builds the balancer in ``Decoder._cp_shard`` and hands the shard its
+    permutation; this entry keeps that split.  ``permutation=None`` means the caller has no
+    balancer of its own, so the pinned shard -- which builds ``headtail``/``ptrr`` from the
+    length and the masks -- runs exactly as upstream's shard does.
     """
-    sharded = shard_for_layout(
-        cp_mesh,
-        inputs,
-        attention_masks,
-        load_balancer_type,
-        input_seq_dim=input_seq_dim,
-        positions=positions,
-    )
-    if sharded is not None:
-        return sharded
-    if load_balancer_type not in (None, "headtail", "ptrr"):
-        raise ValueError(
-            f"no CP layout is registered under {load_balancer_type!r}: the model package that "
-            "defines it must be imported (it calls register_layout), and the pinned shard only "
-            "knows None, 'headtail' and 'ptrr'."
+    if permutation is None:
+        if load_balancer_type in LAYOUT_BALANCERS:
+            raise ValueError(
+                f"the {load_balancer_type!r} layout is built from the batch's document boundaries, "
+                "but the batch carries no attention metadata to read them from."
+            )
+        return original_cp_shard(
+            cp_mesh, inputs, attention_masks, load_balancer_type, input_seq_dim, ptrr_mask_key=ptrr_mask_key
         )
-
-    varlen_metadata = _varlen_from_masks(attention_masks)
-    is_varlen = varlen_metadata is not None
-    batch_size = inputs[0].size(0)
-    seq_len = inputs[0].size(input_seq_dim)
-
-    inputs, output_masks = original_cp_shard(
-        cp_mesh,
-        inputs,
-        None if is_varlen else attention_masks,
-        load_balancer_type,
-        input_seq_dim,
-        ptrr_mask_key=ptrr_mask_key,
-    )
-
-    if varlen_metadata is not None:
-        assert load_balancer_type in (
-            None,
-            "headtail",
-        ), f"varlen only support headtail as load balancer, got ({load_balancer_type})"
-
-        cp_metadata = CPVarlenMetadata.from_global(
-            varlen_metadata,
-            cp_mesh,
-            batch_size,
-            seq_len,
-            load_balancer=(
-                _HeadTailLoadBalancer(seq_len, cp_mesh.size(0), cp_mesh.device_type)
-                if load_balancer_type == "headtail"
-                else None
-            ),
+    if attention_masks is not None:
+        raise NotImplementedError(
+            "a permuted CP shard moves the inputs only: the attention masks of this repository's "
+            "stacks are varlen metadata built by the model from the row's boundaries, not "
+            "BlockMask objects the shard could slice."
         )
-        if isinstance(attention_masks, dict):
-            # Hybrid attention stacks carry one shared varlen metadata under
-            # multiple mask keys; keep the dict shape so each block can still
-            # select its mask by key after CP sharding.
-            output_masks = {
-                key: cp_metadata if isinstance(value, VarlenMetadata) else value
-                for key, value in attention_masks.items()
-            }
-        else:
-            output_masks = cp_metadata
-
-    return inputs, output_masks  # pyrefly: ignore [bad-return]
+    return shard_tensors(cp_mesh, inputs, permutation=permutation, input_seq_dim=input_seq_dim), attention_masks
 
 
 def apply() -> None:
-    try:
-        import torchtitan.distributed.context_parallel.api as context_parallel_api
-    except ImportError:
-        import torchtitan.distributed.context_parallel as context_parallel_api
+    # Every caller of the pinned shard -- the models here, and Flux upstream -- imports it from the
+    # package path, so the package's re-exported name is the one to rebind.  The defining ``api``
+    # module is reached only by this module's own ``original_cp_shard``, which must stay original.
+    import torchtitan.distributed.context_parallel as context_parallel
 
     # Qwen3.5 vision masks are created after NPU initialization.  Torch's
     # compiled helper starts a worker process, which cannot reinitialize NPU;
@@ -339,15 +211,8 @@ def apply() -> None:
     except (ImportError, AttributeError):
         logger.debug("CP eager block-mask workaround is unavailable", exc_info=True)
 
-    logger.info("[PATCH] torchtitan.distributed.context_parallel.api.cp_shard -> patched_cp_shard")
-    context_parallel_api.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
-
-    try:
-        import torchtitan.distributed.context_parallel as context_parallel_root
-
-        context_parallel_root.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
-    except ImportError:
-        pass
+    logger.info("[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard")
+    context_parallel.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
 
 
 apply()

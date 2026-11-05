@@ -217,16 +217,15 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         if mtp_batch is not None:
             # Narrowing for the type checker: the branch above only builds the batch with a mesh.
             assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
-            # The batch rides the same shard the inputs did, by the same configured layout: reading
-            # a different value here would cut the depths contiguously while the inputs are
-            # permuted.
+            # The batch rides the same shard the inputs did: the permutation ``_cp_shard`` built for
+            # this batch is the layout, and re-deriving it here would risk a second, different one.
             tensors, _ = cp_shard(
                 cp_mesh,
                 tuple(mtp_batch),
                 None,
                 parallelism.context_parallel_load_balancer,
                 1,
-                positions=positions,  # pyrefly: ignore [unexpected-keyword]
+                permutation=getattr(self, "_cp_permutation", None),  # pyrefly: ignore [unexpected-keyword]
             )
             extra_kwargs["mtp_batch"] = MTPBatch(*tensors)
         return inputs, labels, extra_kwargs

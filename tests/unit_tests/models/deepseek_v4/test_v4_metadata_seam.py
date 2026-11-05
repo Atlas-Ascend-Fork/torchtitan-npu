@@ -16,13 +16,13 @@ entries and the rank-local rebuild -- and drops the per-field detail.
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
 from torchtitan_npu.override import _IS_A5
-from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry, AscV4Metadata
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
 from torchtitan_npu.override.deepseek_v4.sparse_attn import asc
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscCompressedSparseInnerAttention
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
@@ -102,21 +102,22 @@ def _entry(model, ratio: int = 4, positions=None):
 
 def test_entries_are_built_per_geometry():
     """One entry per (backend class, ratio), and every layer dispatches by its own key."""
-    model = _model_config((1, 1, 4, 128), ascendc=False).build()
+    model = _model_config((0, 0, 4, 128), ascendc=False).build()
 
     metadata = model._get_attention_metadata(_positions_for((128, 128)))
 
-    assert {ratio for _, ratio in metadata} == {1, 4, 128}
+    assert {ratio for _, ratio in metadata} == {0, 4, 128}
     entry = metadata[(CompressedSparseInnerAttention.Config, 4)]
     assert type(entry) is DeepSeekV4Metadata and entry.ratio == 4
     # The row grid lives on the sliding-window frame; the pool grid is this entry's own fold of it,
     # and an unpooled geometry has no pool at all.  At one degree nothing is moved or restored.
     assert entry.swa_k.cu_seqlens.tolist() == [0, 128, 256]
     assert entry.cmp_k is not None and entry.cmp_k.cu_seqlens.tolist() == [0, 32, 64]
-    assert metadata[(CompressedSparseInnerAttention.Config, 1)].cmp_k is None
-    assert entry.cp is None
+    # A dense geometry (zero) addresses no pool: only a positive ratio builds a compressed frame.
+    assert metadata[(CompressedSparseInnerAttention.Config, 0)].cmp_k is None
+    assert entry.xchg is None
     keys = {layer.attention.attention_metadata_key for layer in model.layers.values()}
-    assert {key[1] for key in keys} == {1, 4, 128}
+    assert {key[1] for key in keys} == {0, 4, 128}
     assert all(metadata[key].ratio == key[1] for key in keys)
 
 
@@ -135,7 +136,7 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
         # explicitly rejects B > 1. Isolate only that kernel with dense causal math;
         # RoPE and all input/output projections remain production code.
         del kwargs
-        assert attention_metadata.cp is None
+        assert attention_metadata.xchg is None
         scores = torch.einsum("bshd,btd->bhst", q, swa_k) * attention.inner_attention.softmax_scale
         causal = torch.ones(seq_len, seq_len, dtype=torch.bool).tril()
         scores = scores.masked_fill(~causal, float("-inf"))
@@ -148,7 +149,7 @@ def test_attention_without_cp_matches_independent_samples(batch_size, monkeypatc
     x = values.clone().requires_grad_()
     positions = torch.arange(seq_len).expand(batch_size, -1)
     entry = model._get_attention_metadata(positions)[attention.attention_metadata_key]
-    assert entry.batch_size == batch_size
+    assert entry.position_k.size(0) == batch_size
     # At one degree the query frame is the row's own grid and every row is a document here;
     # the KV frame addresses that same row.
     assert entry.q.cu_seqlens.tolist() == [row * seq_len for row in range(batch_size + 1)]
@@ -189,7 +190,7 @@ def test_the_fused_entry_carries_its_geometry_and_records(dsv4, a5_records):
     this case runs as an A5 host.
     """
     dsv4.cann_ops.calls.clear()
-    model = _model_config((1, 4, 128), ascendc=True).build()
+    model = _model_config((0, 4, 128), ascendc=True).build()
 
     metadata = model._get_attention_metadata(_positions_for((128, 128, 128, 128)))
 
@@ -208,10 +209,13 @@ def test_the_fused_entry_carries_its_geometry_and_records(dsv4, a5_records):
         assert entry.aicpu_metadata.sparse_attn.fwd is not None
         assert entry.aicpu_metadata.sparse_attn.bwd is not None
         assert entry.q is not None and entry.swa_k is not None
-        assert entry.cmp_k is None if ratio == 1 else entry.cmp_k is not None
+        # Only a pooled geometry owns a compressed frame; ratio zero is V4's dense geometry.
+        if ratio == 0:
+            assert entry.cmp_k is None
+        else:
+            assert entry.cmp_k is not None
         # The fused core never reads ``slots``: its builder skips the reference-only
         # S x (S / ratio) HCA matrix even for the ratio-128 geometry.
-        assert entry.slots is None
         if ratio == 4:
             assert entry.aicpu_metadata.lightning_indexer.fwd is not None
         else:
@@ -219,23 +223,6 @@ def test_the_fused_entry_carries_its_geometry_and_records(dsv4, a5_records):
     smla = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_flash_mla_metadata"]
     assert len(smla) == 3
     assert {call[2]["cmp_ratio"] for call in smla} == {1, 4, 128}
-
-
-def test_only_the_reference_builds_the_hca_selection():
-    """``slots`` is the reference core's precomputed selection, not the fused core's.
-
-    The reference forward reads it (``kv_indices`` for a geometry without a selector); the
-    fused core's HCA branch runs full-causal on the compressed pool and never touches it, so
-    its builder passes ``build_slots=False`` and the ``S x (S / ratio)`` int64 matrix -- 64 GiB
-    at S=1M, ratio=128 -- is never materialised on the fused path.
-    """
-    positions = _positions_for((128, 128))
-    reference = _entry(_model_config((128,), ascendc=False).build(), 128, positions)
-    assert reference.slots is not None
-    assert reference.slots.shape == (1, 256, 2)
-
-    fused = _entry(_model_config((128,), ascendc=True).build(), 128, positions)
-    assert fused.slots is None
 
 
 class _FakeCPMesh:
@@ -256,12 +243,14 @@ class _FakeCPMesh:
 
 
 def _prepare_for_rank(attention_metadata, positions, *, rank: int, cp_size: int = 2):
-    with cp_shard_context_set(
-        cp_mesh=_FakeCPMesh(rank, cp_size),
-        load_balancer_type=DOC_CHUNK_LAYOUT,
-        positions=positions,
-    ):
-        return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=None)
+    """Run the metadata's CP transform with the permutation the shard would hand it."""
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=attention_metadata)
+        .generate_permutation()
+    )
+    with cp_shard_context_set(cp_mesh=_FakeCPMesh(rank, cp_size)):
+        return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=permutation)
 
 
 def _prefix(lengths: torch.Tensor) -> torch.Tensor:
@@ -271,15 +260,13 @@ def _prefix(lengths: torch.Tensor) -> torch.Tensor:
 
 def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
     """The CP half rebuilds this rank's frames and records from the global row."""
-    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
-
     built: list[torch.Tensor] = []
 
     def recording_smla_metadata(*args, **kwargs):
         built.append(kwargs["cu_seqlens_q"])
         return torch.tensor([kwargs["cu_seqlens_q"][-1].item()], dtype=torch.int32)
 
-    monkeypatch.setattr(ascendc, "sparse_flash_mla_metadata", recording_smla_metadata)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", recording_smla_metadata)
     positions = _positions_for((_WINDOW, _WINDOW // 2))
     model = _model_config((1, 4), ascendc=True).build()
 
@@ -305,7 +292,7 @@ def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
         assert metadata.ratio == 4
         assert metadata.aicpu_metadata.sparse_attn.fwd is not global_metadata.aicpu_metadata.sparse_attn.fwd
         assert metadata.aicpu_metadata.geometry == global_metadata.aicpu_metadata.geometry
-        assert metadata.cp is not None and metadata.cp.restore.exchange is not None
+        assert metadata.xchg is not None and metadata.xchg.send_index is not None
     # The restore is rank-dependent even though the row is.
     assert rank_metadata[0].position_k.tolist() != rank_metadata[1].position_k.tolist()
 
@@ -321,7 +308,7 @@ def test_the_inner_attention_and_selector_own_the_cp_boundary():
     core_sharding = attention.inner_attention.sharding_config
     assert core_sharding is not None
     names = set(core_sharding.in_src_shardings)
-    assert not names & {"idx_q", "idx_k", "idx_w"}
+    assert not names & {"idx_q_BLHiDi", "idx_k_BNDi", "idx_w_BLHi"}
     assert {"q", "swa_k", "cmp_k", "topk_indices", "topk_scores", "attn_sink"} <= names
     # Positional forward args are (q, swa_k, attn_sink): the KV streams are gathered on the
     # way in, so their destination placement is the whole row.
@@ -331,5 +318,8 @@ def test_the_inner_attention_and_selector_own_the_cp_boundary():
 
     selector_sharding = attention.lightning_indexer.sharding_config
     assert selector_sharding is not None
-    assert set(selector_sharding.in_src_shardings) == {"idx_q", "idx_k", "idx_w"}
-    assert selector_sharding.in_dst_shardings["idx_k"] != selector_sharding.in_src_shardings["idx_k"]
+    assert set(selector_sharding.in_src_shardings) == {"idx_q_BLHiDi", "idx_k_BNDi", "idx_w_BLHi"}
+    assert (
+        selector_sharding.in_dst_shardings["idx_k_BNDi"]
+        != selector_sharding.in_src_shardings["idx_k_BNDi"]
+    )

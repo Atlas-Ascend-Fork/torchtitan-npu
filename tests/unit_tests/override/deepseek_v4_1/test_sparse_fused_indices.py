@@ -10,7 +10,8 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _SparseMLA
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
 
 
@@ -35,7 +36,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
             window_size=2, num_heads=2, head_dim=4, index_topk=5, index_num_heads=2, index_head_dim=4
         ),
     )
-    assert torch.equal(metadata.cu_seq_q, torch.tensor(bounds, dtype=torch.int32))
+    assert torch.equal(metadata.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
     cu_cmp = metadata.cmp_k.cu_seqlens
 
     # Document-local indices, -1 for unused slots, interleaved: another document's first
@@ -53,7 +54,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
         calls.append(selection)
         return torch.zeros_like(q), torch.zeros((1, q.shape[0], q.shape[1]))
 
-    monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
+    monkeypatch.setattr(_SparseMLA, "apply", kernel)
     attention = ascendc.AscV41SparseAttention.Config(
         window_size=2,
         softmax_scale=0.5,
@@ -140,8 +141,8 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", forward)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
-    # The boundary triples are no longer arguments: they come out of the metadata.
-    out, returned_lse = ascendc._SparseMLA.apply(
+    # The boundary triples come out of the metadata.
+    out, returned_lse = _SparseMLA.apply(
         q,
         original,
         shared,
@@ -165,7 +166,6 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
         2 if with_shared else 0,
         2,
         None,  # topk_scores: no teacher carrier in this test
-        False,  # wants_teacher
     )
     # The LSE passes through as a detached teacher signal.
     assert returned_lse is lse

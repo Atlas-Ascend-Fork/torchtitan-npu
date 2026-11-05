@@ -18,19 +18,19 @@ import torch
 pytestmark = pytest.mark.usefixtures("dsv4")
 
 HD = 16
-# The metadata is built with the model's full ratio stack (1, 4, 128), so every
+# The metadata is built with the model's full ratio stack (0, 4, 128), so every
 # document is a whole number of 128-token blocks (the loader's alignment): four
 # one-block documents, and two long three-block documents.
 _SHORT = torch.tensor([0, 128, 256, 384, 512], dtype=torch.int32)
 _LONG = torch.tensor([0, 384, 768], dtype=torch.int32)
-_RATIOS = (1, 4, 128)
+_RATIOS = (0, 4, 128)
 _WINDOW, _SCALE, _TOPK = 8, 0.25, 8
 
 
 def _metadata(dsv4, cu):
     """One entry per geometry, the way each layer's own config builds it."""
     positions = torch.cat([torch.arange(end - start) for start, end in pairwise(cu.tolist())]).unsqueeze(0)
-    return {ratio: dsv4.metadata.build_v4_metadata(positions, ratio, cu_seq_q=cu) for ratio in _RATIOS}
+    return {ratio: dsv4.metadata.DeepSeekV4Metadata.from_positions(positions, ratio) for ratio in _RATIOS}
 
 
 def _core(dsv4, ratio, *, return_lse=False):
@@ -49,7 +49,7 @@ def _inputs(ratio, cu, seed=0):
     """Query, window keys, compressed pool, and the sink."""
     torch.manual_seed(seed)
     seqlen, heads = int(cu[-1]), 3
-    n_cmp = 0 if ratio == 1 else seqlen // ratio
+    n_cmp = 0 if ratio == 0 else seqlen // ratio
     q = torch.randn(1, seqlen, heads, HD)
     swa_k = torch.randn(1, seqlen, HD)
     cmp_k = None if n_cmp == 0 else torch.randn(1, n_cmp, HD)
@@ -97,8 +97,8 @@ def test_the_core_reads_only_the_packed_offsets(dsv4):
 def test_hca_slots_stay_inside_the_query_document(dsv4):
     """Ratio 128 reaches its whole visible prefix, numbered inside its own document.
 
-    The selection is built with the metadata entry (there is no selector to ask), so this
-    pins the entry's field against the rule spelled out independently below.
+    The selection is built in the core's forward (there is no selector to ask), so this pins
+    that method against the rule spelled out independently below.
     """
     cu = _LONG
     metadata = _metadata(dsv4, cu)
@@ -106,10 +106,12 @@ def test_hca_slots_stay_inside_the_query_document(dsv4):
     n_cmp = seqlen // ratio
 
     entry = metadata[ratio]
-    assert entry.slots is not None
-    assert torch.equal(entry.slots, _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp))
-    # A geometry with a selector reads the selection from it instead.
-    assert metadata[4].slots is None
+    core = _core(dsv4, ratio)
+    q = torch.zeros(1, seqlen, 1, HD)
+    cmp_k = torch.zeros(1, n_cmp, HD)
+    selection = core.make_hca_indices(q, cmp_k, entry.q.cu_seqlens, entry.cmp_k.cu_seqlens)
+    assert selection.shape == (1, seqlen, n_cmp)
+    assert torch.equal(selection, _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp))
 
 
 def test_the_teacher_exit_is_reserved_and_inert(dsv4):

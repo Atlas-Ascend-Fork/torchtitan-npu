@@ -10,8 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-from torchtitan_npu.override import _IS_A5
 import torch_npu
 from torch import fx
 from torchtitan.experiments.graph_trainer import passes as graph_passes
@@ -38,7 +36,8 @@ from torchtitan_npu.extensions.experiment.cv_parallel.whole_graph_runtime_profil
     assign_stable_node_tags,
     node_id,
 )
-from torchtitan_npu.override.deepseek_v4.metadata import AscV4Metadata
+from torchtitan_npu.override import _IS_A5
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
@@ -901,7 +900,6 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     from torchtitan_npu.models.deepseek_v4.config_registry import (
         graph_trainer_deepseek_v4_debugmodel,
     )
-    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 
     li_calls = []
 
@@ -911,14 +909,14 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
         mode = args[4] if len(args) == 5 else 0
         return torch.tensor([mode, kwargs["cu_seqlens_q"][-1].item()], dtype=torch.int32)
 
-    monkeypatch.setattr(ascendc, "lightning_indexer_metadata", record_li_metadata)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", record_li_metadata)
     if chunk_only_metadata:
         # The vendor may omit a field for the full layout but return it for
         # each local layout. Only full-layout roles belong in the FX inputs.
         def optional_smla_metadata(*args, cu_seqlens_q, **kwargs):
             return None if cu_seqlens_q.numel() == 3 else torch.tensor([7], dtype=torch.int32)
 
-        monkeypatch.setattr(ascendc, "sparse_flash_mla_metadata", optional_smla_metadata)
+        monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", optional_smla_metadata)
 
     # The fused stack: the core's own config builds the records.
     config = graph_trainer_deepseek_v4_debugmodel()
@@ -949,7 +947,7 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     assert metadata.batch_chunk_tensors is not None
     # On arch35 the query and the sliding window share one row tensor, so the first role that
     # tagged it wins; arch22 rebuilds the window frame, which is tagged under its own name.
-    expected_pair = ("q.cu_seqlens", -1)
+    expected_pair = ("q.cu_seqlens", -1) if _IS_A5 else ("swa_k.cu_seqlens", -1)
     assert metadata.swa_k.cu_seqlens._npu_chunk_cv_metadata_pair == expected_pair
     assert len(li_calls) == 3
     for (_, call), q_bounds, k_bounds in zip(

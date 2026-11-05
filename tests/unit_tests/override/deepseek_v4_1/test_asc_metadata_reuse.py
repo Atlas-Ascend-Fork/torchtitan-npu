@@ -32,19 +32,18 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
     tiny_v41_model,
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT, DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
-from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
-from torchtitan_npu.override.deepseek_v4_1.metadata import (
+from torchtitan_npu.override.deepseek_v4.asc_metadata import (
     AicpuGeometry,
     AicpuMetadata,
 )
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
     AscV41Metadata,
     AscV41SparseAttention,
-    shard_asc_v41_metadata,
 )
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
@@ -152,18 +151,14 @@ def test_a_geometry_builds_its_own_ratios_frames_and_metadata(monkeypatch, ratio
     assert built.ratio == ratio
     assert config.attention_metadata_key == (AscV41SparseAttention.Config, ratio)
     # The row's own boundaries, and this ratio's pool grid folded by the backend that built them.
-    assert built.cu_seq_q.tolist() == [0, 4, 8]
-    assert built.cu_seq_k.tolist() == [bound // max(ratio, 1) for bound in (0, 4, 8)]
     assert built.q.cu_seqlens.tolist() == [0, 4, 8]
     # The row's own grids stay the entry's boundaries; on this SoC the key frames are the
     # per-document reach itself, because these kernels anchor their mask at the frame's end.
-    assert built.cu_seq_q.tolist() == [0, 4, 8]
     assert built.swa_k.cu_seqlens.tolist() == [0, 4, 8]
     if ratio == 0:
         assert built.cmp_k is None, "a window-only layer has no compressed axis to grid"
     else:
         assert built.cmp_k is not None
-        assert built.cu_seq_k.tolist() == [bound // ratio for bound in (0, 4, 8)]
         assert built.cmp_k.cu_seqlens.tolist() == [bound // ratio for bound in (0, 4, 8)]
         assert built.cmp_k.seqused.tolist() == [4 // ratio, 4 // ratio]
         if ratio == 1:
@@ -218,8 +213,6 @@ def test_the_reference_row_carries_frames_and_the_port_adds_only_records(monkeyp
     # ``test_fused_geometry``'s pin -- so one row entry serves the whole stack.
     row = reference.build_attention_metadata(_positions([0, 4]))
     assert type(row) is DeepSeekV41Metadata
-    assert row.cu_seq_q.tolist() == [0, 4]
-    assert row.cu_seq_k.tolist() == [0, 2]
     assert row.ratio == 2
     assert row.q.cu_seqlens.tolist() == [0, 4] and row.q.seqused.tolist() == [4]
     assert row.swa_k.cu_seqlens.tolist() == [0, 4] and row.swa_k.seqused.tolist() == [4]
@@ -356,7 +349,7 @@ def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
     row = _reference_row([0, 4], ratio=2)
     q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16)
 
-    with pytest.raises(AttributeError, match="a3_workaround|aicpu_metadata"):
+    with pytest.raises(TypeError, match="fused core needs AscV4Metadata"):
         attention(
             q,
             q.squeeze(2),
@@ -494,19 +487,16 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     local = _prepare_for_rank(entry, mesh, row)
 
     assert isinstance(local, AscV41Metadata)
-    assert local.cp is not None
+    assert local.xchg is not None
     # Chunk queries over the whole-row KV grids: this rank's chunk of every document
     # (``q``), and how far those queries reach into each document (``swa_k``).
     assert local.q.cu_seqlens.tolist() == [0, 4, 10]
     assert local.q.seqused.tolist() == [4, 6]
-    # The row's own grid stays the entry's boundary; the key frames are the ones the kernels read.
-    assert local.cu_seq_q.tolist() == [0, 16, 40]
     assert local.swa_k.cu_seqlens.tolist() == ([0, 16, 40] if _IS_A5 else [0, 12, 30])
     assert local.swa_k.seqused.tolist() == [12, 18]
     # The compressed axis is that reach at this geometry's own ratio -- not the row's frame,
     # and not a grid this rank divided for itself.
     assert local.cmp_k is not None
-    assert local.cu_seq_k is entry.cu_seq_k
     assert local.cmp_k.cu_seqlens.tolist() == ([0, 8, 20] if _IS_A5 else [0, 6, 15])
     assert local.cmp_k.seqused.tolist() == [6, 9]
     # The key stream is this rank's window, so its positions are the window's -- one per row of
@@ -537,33 +527,10 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     assert local.ratio == entry.ratio == 2
 
 
-def test_the_cp_alignment_is_this_geometries_own_factor(monkeypatch):
-    """Each geometry checks its own ``cp_size * ratio``; the stack's lcm is the loader's.
-
-    A document must be a whole number of chunks and of pooling groups, so a length that is not
-    a multiple of ``cp_size * ratio`` cannot be cut: the first factor makes every prefix a
-    whole number of chunks, the second keeps every compressed prefix a whole number of groups.
-    The stack-wide lcm is the dataloader's alignment, so what one entry enforces is its own
-    factor and the entries together are the same constraint.
-    """
-    _fake_metadata_ops(monkeypatch)
-    aligned = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
-        _positions([0, 8, 16])
-    )
-    sliced = shard_asc_v41_metadata(aligned, cp_size=4, cp_rank=0, batch_size=1, slab_len=4)
-    assert sliced.q.cu_seqlens.tolist() == [0, 2, 4]
-
-    ragged = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
-        _positions([0, 6, 12])
-    )
-    with pytest.raises(ValueError, match=r"positive multiples of 8"):
-        shard_asc_v41_metadata(ragged, cp_size=4, cp_rank=0, batch_size=1, slab_len=3)
-
-
 def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     """End to end: the framework slices the inputs and every geometry's entry follows them.
 
-    The model no longer shards its own inputs -- ``prepare_context_parallel_input`` does, one
+    The model does not shard its own inputs: ``prepare_context_parallel_input`` does, one
     even slab per rank when no load balancer is configured -- and the metadata a rank reads is
     prepared *after* that shard, from the pre-shard positions, **per geometry**: each entry is
     rebuilt from its own ratio's frames rather than one stack-wide object being re-cut once.
@@ -612,7 +579,7 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     for (port, ratio), entry in metadata.items():
         assert port is AscV41SparseAttention.Config
         assert entry.ratio == ratio
-        assert entry.cp is not None
+        assert entry.xchg is not None
         assert entry.q.cu_seqlens.tolist() == [0, 4, 12]
         assert entry.swa_k.seqused.tolist() == [8, 16]
     # One geometry has no compressed axis at all, the other two carry their own.
@@ -624,15 +591,13 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     assert len(state["li"]) == 4
 
 
-def test_the_cp_half_needs_the_mesh_and_the_positions(monkeypatch):
+def test_the_cp_half_needs_the_mesh(monkeypatch):
     """A transform without the geometry it derives this rank's copy from fails loudly."""
     _fake_metadata_ops(monkeypatch)
     entry = _core_config(compress_ratio=2, index_num_heads=0, index_head_dim=0).build_attention_metadata(
         _positions([0, 4])
     )
     mesh = cp_parallel_dims(2, 0).get_mesh("cp")
-    with pytest.raises(ValueError, match="needs the CP mesh"):
-        _prepare_for_rank(entry, mesh, None)
     with pytest.raises(ValueError, match="needs the CP mesh"):
         _prepare_for_rank(entry, None, _positions([0, 4]))
 
@@ -721,12 +686,19 @@ def _fused_tiny_model(monkeypatch):
     return tiny_v41_model(monkeypatch, configure=_fuse_every_layer)[0]
 
 
-def _prepare_for_rank(attention_metadata, mesh, positions):
+def _prepare_for_rank(attention_metadata, mesh, positions, *, cp_size: int = 2, cp_rank: int = 0):
     """Run one entry's CP transform the way ``Decoder._cp_shard`` does.
 
-    The transform takes the permutation alone (upstream #4617); the mesh and the *pre-shard*
-    row come from the context the patched shard publishes around it.  It is the metadata's own
-    hook, which is what lets a map key be a geometry rather than a backend class.
+    The transform takes the permutation the shard applied (upstream #4617) and reads the mesh
+    from the context ``Decoder._cp_shard`` publishes around it.  It is the metadata's own hook,
+    which is what lets a map key be a geometry rather than a backend class.
     """
-    with cp_shard_context_set(cp_mesh=mesh, load_balancer_type=DOC_CHUNK_LAYOUT, positions=positions):
-        return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=None)
+    if mesh is not None:
+        cp_size, cp_rank = mesh.size(), mesh.get_local_rank()
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=attention_metadata)
+        .generate_permutation()
+    )
+    with cp_shard_context_set(cp_mesh=mesh):
+        return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)

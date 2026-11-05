@@ -18,15 +18,15 @@ Models with a compressed KV pool each group of ``R`` consecutive tokens into one
 main-KV entry, and the indexer addresses that entry axis as the row's boundaries over
 ``R``.  A document whose token count is not a multiple of ``R`` therefore gets a partial
 trailing group that the *next* document's tokens complete: the pooled value mixes two
-documents, and the boundaries no longer say which document the group belongs to.
+documents, and the boundaries cannot say which document the group belongs to.
 
 Padding every packed document segment up to a multiple of the model's alignment keeps
 each group inside one document.  The pad stays inside its segment -- positions keep
 running through it, so the next document still starts at position 0 -- and its labels
 are ``IGNORE_INDEX``, so it never becomes a target.
 
-The alignment value itself is the model's business (``V41Model``'s
-``compression_alignment``); this module only applies it.
+The alignment value itself is the model's business (its config registry derives
+``--dataloader.per_doc_alignment`` from the ratios it pools with); this module only applies it.
 
 What the backport does not carry from upstream
 ----------------------------------------------

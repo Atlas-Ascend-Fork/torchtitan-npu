@@ -214,10 +214,10 @@ def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -
     """The varlen metadata is the row's boundaries, derived from the positions, and its pool grid.
 
     One entry per ``(backend, compress_ratio)`` -- the entry *is* one geometry -- and the row is
-    all a *reference* backend reads: ``cu_seq_k`` is that backend's own ratio applied to those
-    boundaries once, where the ratio is known, so a layer that pools reads a boundary set instead
-    of dividing one it was handed.  The fused port's frames and the kernel records on top of that
-    row are the override tests' subject.
+    all a *reference* backend reads: the compressed frame is that backend's own ratio applied to
+    those boundaries once, where the ratio is known, so a layer that pools reads a frame instead
+    of dividing one it was handed.  The fused port's records on top of that row are the override
+    tests' subject.
     """
     model, _ = _tiny_debug_model(monkeypatch)
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]], dtype=torch.long)
@@ -232,9 +232,12 @@ def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -
     expected_cu = torch.tensor([0, 4, 8, 10], dtype=torch.int32)
     for (backend, ratio), row in metadata.items():
         assert backend is CompressedSparseInnerAttention2.Config
-        torch.testing.assert_close(row.cu_seq_q, expected_cu, rtol=0, atol=0)
-        expected_pool = expected_cu if ratio <= 1 else (expected_cu // ratio).to(torch.int32)
-        torch.testing.assert_close(row.cu_seq_k, expected_pool, rtol=0, atol=0)
+        torch.testing.assert_close(row.q.cu_seqlens, expected_cu, rtol=0, atol=0)
+        if ratio == 0:
+            assert row.cmp_k is None, "a window-only layer has no compressed axis"
+        else:
+            expected_pool = expected_cu if ratio == 1 else (expected_cu // ratio).to(torch.int32)
+            torch.testing.assert_close(row.cmp_k.cu_seqlens, expected_pool, rtol=0, atol=0)
         # The key stream's positions are the entry's own, and at one degree they are the row's.
         torch.testing.assert_close(row.position_k, positions)
 

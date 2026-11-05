@@ -11,14 +11,8 @@ from typing import Any, cast
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.deepseek_v4.metadata import (
-    DeepSeekV4Metadata,
-    build_v4_metadata,
-)
-from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-    AscV4Metadata,
-    build_aicpu_metadata,
-)
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
 
 from . import _BATCH_CHUNK_PAIR_ATTR
 
@@ -52,7 +46,7 @@ def _plain_batch_chunk_metadata(
     metadata: DeepSeekV4Metadata,
 ) -> tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]:
     """Build two local plain-stream contracts at an aligned document boundary."""
-    if metadata.cp is not None:
+    if metadata.xchg is not None:
         raise ValueError("batch chunk metadata does not support context parallelism")
     cu = metadata.swa_k.cu_seqlens
     cu_host = tuple(int(value) for value in cu.cpu().tolist())
@@ -71,13 +65,11 @@ def _plain_batch_chunk_metadata(
     ratio = metadata.ratio
     positions = _row_positions(cu)
     chunks = []
-    for start_index, end_index, token_offset in (
-        (0, split_index, 0),
-        (split_index, len(cu_host) - 1, split_token),
-    ):
-        local_cu = (cu[start_index : end_index + 1] - token_offset).contiguous()
+    for end_index, token_offset in ((split_index, 0), (len(cu_host) - 1, split_token)):
+        # The chunk's boundaries are its positions' own: the split is a document boundary, and
+        # each of its documents restarts at zero, which is where the builder reads them from.
         local_positions = positions[..., token_offset : cu_host[end_index]]
-        chunks.append(build_v4_metadata(local_positions, ratio, cu_seq_q=local_cu))
+        chunks.append(DeepSeekV4Metadata.from_positions(local_positions, ratio))
     return cast(
         "tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]",
         tuple(chunks),
@@ -179,7 +171,7 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
 
     def doc_chunk_records(chunk: DeepSeekV4Metadata) -> AscV4Metadata:
         """This tier's records: the selector's and the attention's."""
-        return build_aicpu_metadata(chunk, geometry=geometry)
+        return AscV4Metadata.build_aicpu_metadata(chunk, geometry=geometry)
 
     chunks = (doc_chunk_records(first), doc_chunk_records(second))
     return BatchChunkAscV4Metadata(
@@ -188,8 +180,7 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,
         position_k=metadata.position_k,
-        slots=metadata.slots,
-        cp=metadata.cp,
+        xchg=metadata.xchg,
         a3_workaround=metadata.a3_workaround,
         aicpu_metadata=metadata.aicpu_metadata,
         batch_chunk_tensors=_tag_batch_chunk_metadata(metadata, chunks),

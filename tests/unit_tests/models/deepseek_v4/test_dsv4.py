@@ -133,12 +133,12 @@ _CU = torch.tensor([0, 128, 256, 384, 512], dtype=torch.int32)
 def _metadata_for(dsv4, cu, ratios):
     """One entry per geometry, the way each layer's own config builds it."""
     positions = _positions_from(cu)
-    return {ratio: dsv4.metadata.build_v4_metadata(positions, ratio, cu_seq_q=cu) for ratio in ratios}
+    return {ratio: dsv4.metadata.DeepSeekV4Metadata.from_positions(positions, ratio) for ratio in ratios}
 
 
 def _build_metadata(dsv4):
-    """The 512-token four-document layout (ratios 1/4/128) as the model builds it."""
-    return _metadata_for(dsv4, _CU, (1, 4, 128))
+    """The 512-token four-document layout (ratios 0/4/128) as the model builds it."""
+    return _metadata_for(dsv4, _CU, (0, 4, 128))
 
 
 def build_compressor(dsv4, ratio):
@@ -188,7 +188,7 @@ def manual_compress(x, md, comp, ratio):
             score = torch.cat([score_prev, score[:, :, HD:]], dim=1)
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
         out.append(comp.norm(kv.to(x.dtype)))
-    return torch.cat(out).view(md.batch_size, -1, HD)
+    return torch.cat(out).view(md.position_k.size(0), -1, HD)
 
 
 def _pool_blocks_where(comp, block_tokens, block_positions, overlap_valid, dtype, ratio):
@@ -427,10 +427,3 @@ def _consumer_grads(consumer, sparse, md, base):
     upstream = torch.linspace(-1, 1, out.numel()).reshape_as(out)
     (out * upstream).sum().backward()
     return out, (q.grad, swa_k.grad, cmp_k.grad, attn_sink.grad)
-
-
-def test_unaligned_documents_are_refused(dsv4):
-    """A stream off the compression grid is an input bug, not a partial-block plan."""
-    cu = torch.tensor([0, 10, 27], dtype=torch.int32)
-    with pytest.raises(ValueError, match="per_doc_alignment"):
-        dsv4.metadata.build_v4_metadata(_positions_from(cu), 4, cu_seq_q=cu)

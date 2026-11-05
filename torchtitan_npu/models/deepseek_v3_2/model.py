@@ -32,55 +32,21 @@ from torchtitan.models.deepseek_v3.model import (
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .document_intervals import document_intervals
 
-# The two forms of the packed offsets the reference core reads: the row's own documents, and
-# the rank-local segments the context-parallel transform derives from them.  They are not
-# related by inheritance, but they carry the same two offset tensors.
-AttentionMetadata = VarlenMetadata | CPVarlenMetadata
-
-_REFERENCE_CP_UNSUPPORTED = (
-    "the DeepSeek-V3.2 reference core is not context-parallel: attn-gym's indexer "
-    "selects a query's prefix of its own document, while a CP rank holds a "
-    "document's middle and needs the kernels' end-aligned causal range. Use the "
-    "AscendC override (override.deepseek_v3_2.sparse_attn.asc) under context "
-    "parallel."
-)
+AttentionMetadata = VarlenMetadata
 
 
-class ReferenceVarlenMetadata(VarlenMetadata):
-    """The reference core's global packed layout, which context parallel cannot shard.
-
-    The refusal lives here, beside the layout it refuses (upstream #4617's hook, hosted
-    by the metadata rather than by the backend): a stack that cannot be sharded must say
-    so while the rank-local metadata is being prepared, or the layer would silently
-    attend to a global layout it does not hold.
-    """
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """Refuse context parallel while the rank-local metadata is prepared.
-
-        attn-gym's indexer selects a query's prefix of its own document, while a CP rank
-        holds a document's middle; the kernels need their end-aligned causal range, which
-        this core cannot express.
-        """
-        del attention_metadata, permutation
-        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
-
-
-def build_reference_varlen_metadata(positions: torch.Tensor) -> ReferenceVarlenMetadata:
+def build_reference_varlen_metadata(positions: torch.Tensor) -> VarlenMetadata:
     """The packed document layout both DeepSeek-V3.2 attention cores read.
 
-    Together with :class:`ReferenceVarlenMetadata` this is the whole metadata
-    contract of the reference core; the AscendC core reads the same documents
-    and wraps the result, so the two backends' builders share this one call.
+    The AscendC core reads the same documents and wraps the result, so the two
+    backends' builders share this one call.
     """
-    return ReferenceVarlenMetadata(*create_varlen_metadata_for_document(positions))
+    return VarlenMetadata(*create_varlen_metadata_for_document(positions))
 
 
 @functools.cache
@@ -356,7 +322,7 @@ class SparseInnerAttention(VarlenAttention):
             padding_mask: torch.Tensor | None = None,
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
-        ) -> ReferenceVarlenMetadata:
+        ) -> VarlenMetadata:
             """The packed document layout the reference core reads.
 
             Upstream #4897 makes the attention backend own this construction, so
@@ -384,8 +350,6 @@ class SparseInnerAttention(VarlenAttention):
         attention_masks: AttentionMetadata,
         scale: float,
     ) -> torch.Tensor:
-        if isinstance(attention_masks, CPVarlenMetadata):
-            raise ValueError(_REFERENCE_CP_UNSUPPORTED)
         q_BLNH = torch.cat([q_nope_BLNH, q_rope_BLNH], dim=-1)
         k_BL1H = torch.cat([k_nope_BL1H, k_rope_BL1H], dim=-1)
 
@@ -587,6 +551,13 @@ class DeepSeekV32Model(DeepSeekV3Model):
 
             MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+            if parallelism.context_parallel_degree > 1:
+                raise ValueError(
+                    "DeepSeek-V3.2 does not support context parallel: attn-gym's indexer selects a "
+                    "query's prefix of its own document, while a CP rank holds a document's middle "
+                    "and needs the kernels' end-aligned causal range. Run with "
+                    "--parallelism.context-parallel-degree 1."
+                )
 
             from torchtitan_npu.models.deepseek_v3_2.sharding import (
                 set_deepseek_v3_2_sharding_config,

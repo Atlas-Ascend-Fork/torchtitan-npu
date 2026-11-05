@@ -27,7 +27,7 @@ _PICKS = torch.tensor([[0, 1]] * _DOC + [[0, -1]] * _DOC + [[1, -1]] * _DOC, dty
 
 def _metadata(dsv4):
     positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
-    return dsv4.metadata.build_v4_metadata(positions, _RATIO, cu_seq_q=_CU)
+    return dsv4.metadata.DeepSeekV4Metadata.from_positions(positions, _RATIO)
 
 
 def _inputs(seqlen, seed=0):
@@ -156,7 +156,7 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
 
 def test_lightning_indexer_refuses_a_geometry_without_a_compressed_pool(dsv4):
     positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())]).unsqueeze(0)
-    metadata = dsv4.metadata.build_v4_metadata(positions, 1)
+    metadata = dsv4.metadata.DeepSeekV4Metadata.from_positions(positions, 1)
     module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
     idx_q, idx_k, idx_w = _inputs(int(_CU[-1]))
     with pytest.raises(ValueError, match="compressed"):

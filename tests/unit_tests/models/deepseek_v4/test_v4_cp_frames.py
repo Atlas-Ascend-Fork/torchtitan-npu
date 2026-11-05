@@ -25,13 +25,12 @@ import pytest
 import torch
 from torch import nn
 
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
-from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
-from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry
-from torchtitan_npu.models.deepseek_v4.metadata import doc_chunk_entry
-from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
+from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+from torchtitan_npu.override import _IS_A5
+from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
 
 _WINDOW = 8
 _RATIO = 4
@@ -64,7 +63,7 @@ def _row(positions: torch.Tensor, *, ratio: int = _RATIO):
 
 
 def _entry(positions: torch.Tensor, *, ratio: int = _RATIO):
-    return build_aicpu_metadata(_row(positions, ratio=ratio), geometry=_GEOMETRY)
+    return AscV4Metadata.build_aicpu_metadata(_row(positions, ratio=ratio), geometry=_GEOMETRY)
 
 
 def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _RATIO):
@@ -72,13 +71,14 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
     entry = _entry(positions, ratio=ratio)
     if cp_size == 1:
         return entry
-    local = doc_chunk_entry(
-        _row(positions, ratio=ratio),
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        slab_len=positions.shape[-1] // cp_size,
+    row = _row(positions, ratio=ratio)
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
+        .generate_permutation()
     )
-    return build_aicpu_metadata(local, geometry=_GEOMETRY)
+    local = row.doc_chunk_entry(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+    return AscV4Metadata.build_aicpu_metadata(local, geometry=_GEOMETRY)
 
 
 def _lengths(bounds: list[int]) -> torch.Tensor:
@@ -109,22 +109,23 @@ def _kernel_grid(reach: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
     return row if _IS_A5 else _prefix(reach)
 
 
-@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("ratio", [0, 4])
 @pytest.mark.parametrize("bounds", [[0, 16, 48], [0, 16, 32, 48]], ids=["two-docs", "three-docs"])
 def test_one_degree_passes_the_boundary_differences(bounds, ratio):
     entry = _masks(bounds, ratio=ratio)
     lengths = _lengths(bounds)
     row = torch.tensor(bounds, dtype=torch.int32)
-    # The row's grid lives on the frame that addresses it.
+    # The row's grid lives on the frame that addresses it; only a geometry that pools owns a
+    # compressed frame, so a dense one (ratio one) has none.
     assert torch.equal(entry.swa_k.cu_seqlens, row)
-    assert entry.cmp_k is None or torch.equal(entry.cmp_k.cu_seqlens, row // ratio)
     assert torch.equal(entry.q.cu_seqlens, row)
     assert torch.equal(entry.q.seqused, lengths)
     assert torch.equal(entry.swa_k.cu_seqlens, row)
     assert torch.equal(entry.swa_k.seqused, lengths)
-    if ratio == 1:
+    if ratio == 0:
         assert entry.cmp_k is None
     else:
+        assert entry.cmp_k is not None
         assert torch.equal(entry.cmp_k.cu_seqlens, row // ratio)
         assert torch.equal(entry.cmp_k.seqused, lengths // ratio)
         assert entry.cmp_k.residual is not None and not entry.cmp_k.residual.any()
@@ -133,7 +134,7 @@ def test_one_degree_passes_the_boundary_differences(bounds, ratio):
 @pytest.mark.parametrize(
     "cp_size, cp_rank", [(2, 0), (2, 1), (4, 1), (4, 3), (8, 7)], ids=["R2r0", "R2r1", "R4r1", "R4r3", "R8r7"]
 )
-@pytest.mark.parametrize("ratio", [1, 4])
+@pytest.mark.parametrize("ratio", [0, 4])
 def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     bounds = [0, 32, 64]
     row = torch.tensor(bounds, dtype=torch.int32)
@@ -148,30 +149,33 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     assert torch.equal(entry.q.seqused, chunk)
     assert torch.equal(entry.swa_k.seqused, reach)
     assert torch.equal(entry.swa_k.seqused - entry.q.seqused, cp_rank * chunk)
-    if ratio == 1:
+    if ratio == 0:
         assert entry.cmp_k is None
     else:
+        assert entry.cmp_k is not None
         assert torch.equal(entry.cmp_k.cu_seqlens, _kernel_grid(reach // ratio, row // ratio))
         assert torch.equal(entry.cmp_k.seqused, reach // ratio)
         assert entry.cmp_k.residual is not None and not entry.cmp_k.residual.any()
-        if _IS_A5:
-            # arch35 reads ``seqused`` itself: nothing is compacted.
-            assert entry.a3_workaround is None
-        elif cp_rank == cp_size - 1:
-            # This rank's reach is every document in full, so no row moves.
-            assert _gather_of(entry, "swa_k") is None
+    if _IS_A5:
+        # arch35 reads ``seqused`` itself: nothing is compacted.
+        assert entry.a3_workaround is None
+    elif cp_rank == cp_size - 1:
+        # This rank's reach is every document in full, so no row moves.
+        assert _gather_of(entry, "swa_k") is None
+        if ratio > 1:
             assert _gather_of(entry, "cmp_k") is None
-        else:
-            starts = row[:-1].to(torch.int64)
-            assert torch.equal(
-                _gather_of(entry, "swa_k"),
-                torch.cat(
-                    [
-                        torch.arange(int(start), int(start) + int(length))
-                        for start, length in zip(starts, reach, strict=True)
-                    ]
-                ),
-            )
+    else:
+        starts = row[:-1].to(torch.int64)
+        assert torch.equal(
+            _gather_of(entry, "swa_k"),
+            torch.cat(
+                [
+                    torch.arange(int(start), int(start) + int(length))
+                    for start, length in zip(starts, reach, strict=True)
+                ]
+            ),
+        )
+        if ratio > 0:
             pool_starts = (row // ratio)[:-1].to(torch.int64)
             assert torch.equal(
                 _gather_of(entry, "cmp_k"),
@@ -187,7 +191,7 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     held = torch.arange(cp_rank * slab, (cp_rank + 1) * slab)
     docs = torch.searchsorted(row[1:], held, right=True)
     expected = (held - row[docs]).tolist()
-    assert entry.cp is not None
+    assert entry.xchg is not None
     assert entry.position_k.reshape(-1).tolist() == expected
 
 
@@ -248,17 +252,6 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
     assert smla_calls[-1][2]["seqused_cmp_kv"].tolist() == [4, 2]
     assert smla_calls[-1][2]["cu_seqlens_ori_kv"].tolist() == token_grid
     assert smla_calls[-1][2]["seqused_ori_kv"].tolist() == [16, 8]
-
-
-def test_the_sharded_path_checks_the_launcher_contract():
-    with pytest.raises(ValueError, match="per_doc_alignment"):
-        _masks([0, 20, 48], 2, 1)
-
-
-@pytest.mark.parametrize("documents, cp_size", [((20,), 2), ((12,), 4)])
-def test_a_document_shorter_than_cp_times_ratio_is_refused(documents, cp_size):
-    with pytest.raises(ValueError, match="per_doc_alignment"):
-        _masks([0, *documents], cp_size, cp_size - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -330,18 +323,6 @@ class _FakeMesh:
 
     def size(self) -> int:
         return self._size
-
-
-@pytest.mark.parametrize("ratio", [4, 128], ids=["overlap", "non-overlap"])
-def test_cp_rejects_batched_slabs_before_exchange_or_bounds(ratio):
-    exchange = CarryExchange.Config(ratio=ratio).build()
-    exchange.group = _FakeMesh(0, 2)
-    x = torch.zeros(2, 128, _DIM)
-    positions = torch.arange(128).expand(2, -1)
-    cu_seqlens = torch.tensor([0, 256, 512], dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="CP>1 暂不支持 local_batch_size>1"):
-        exchange(x, positions, cu_seqlens)
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])

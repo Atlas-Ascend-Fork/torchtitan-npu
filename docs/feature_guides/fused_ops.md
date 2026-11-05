@@ -111,18 +111,20 @@ torchtitan_npu/override/<scope>/<target>/
   ——字段名与上面同一套（`sparse_attn.fwd`/`.bwd`、`lightning_indexer.fwd`/`.bwd`），但 selector
   那一组换成量化 selector 的 QLI schedule 并多出 `fwd_sparse`（QSLI）与 `sparse_length`（逐行候选数）；
   候选池的容量与块大小从模型 config 读取，只作为 launch 参数与候选数推导的输入。因此 `asc` 在这条路径上
-  不生效，非量化 entry 的 `fwd_sparse`/`sparse_length` 保持为空，等带 candidate 的非量化算子落地后由端口填。
+  不生效。`fwd_sparse` / `sparse_length` 是 V4.1 自己那份 selector record
+  （`AscV41LightningIndexerMetadata`）的字段：非量化路径今天留空，等带 candidate 的非量化算子落地后由端口填；
+  V4 的 `AscLightningIndexerMetadata` 没有这两个字段。
 - DeepSeek-V4 的 `CompressedSparseInnerAttention.Config.build_attention_metadata` 由模型目录的
-  `build_v4_metadata` 建好这个几何的 entry（一条 entry 一个 ratio）：整行 document 边界、按自身
+  `DeepSeekV4Metadata.from_positions` 建好这个几何的 entry（一条 entry 一个 ratio）：整行 document 边界、按自身
   `compress_ratio` 折好的池网格，以及三个 kernel frame（`q`/`swa_k`/`cmp_k`）——frame 属于模型
-  metadata（`models/deepseek_v4/metadata.py`），参考内核和融合端口读同一份，entry 另带 CP 的 `cp` 计划
-  （`CPMetadata(restore)`）。`AscCompressedSparseInnerAttention.Config`
+  metadata（`models/deepseek_v4/metadata.py`），参考内核和融合端口读同一份，entry 另带 CP 的交换表
+  （`xchg: ExchangeMetadata`）。`AscCompressedSparseInnerAttention.Config`
   在其上只补四个算子的记录；`sparse_attn.asc` 桥接 SparseFlashMLA/SMLAG 的正反向，
   `lightning_indexer.asc` 桥接 `lightning_indexer`/`sparse_lightning_indexer_kl_loss_grad` 的正反向，
   几何（heads/head dim）是该 config 自己的必填字段、无默认值，由 override 参数一次写入，默认值即
   V4-Flash 的发布形状。CP 下由 `AscV4Metadata.prepare_cp_metadata` 调 `doc_chunk_entry` 把 entry
   换成本 rank 的 frames 与 `cp` 计划（输入已由模型的 `preprocess_inputs` 搬到 doc-chunk），再用
-  `build_aicpu_metadata` 按这些 frames 重建记录；参考契约的 hook 直接拒绝 CP。
+  `AscV4Metadata.build_aicpu_metadata` 按这些 frames 重建记录；参考契约的 hook 直接拒绝 CP。
 
 - MoE token dispatcher 的 `npu_moe_token_unpermute` 与 `npu_moe_re_routing` 在
   `torchtitan_npu/ops/ascendc/` 中以 `torch.library.custom_op` 做编译兼容封装，并提供 Fake 和
