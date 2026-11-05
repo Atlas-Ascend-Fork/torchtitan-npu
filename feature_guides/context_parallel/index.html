@@ -340,8 +340,9 @@ NGPU=2 \
   路径支持 CP；模型目录的参考 metadata hook 显式拒绝 CP，V4.1 的 <code>update_from_config</code> 还会要求
   同时请求 <code>override.deepseek_v4_1.sparse_attn.asc</code> 与
   <code>override.deepseek_v4_1.lightning_indexer.asc</code>。</li>
-<li>量化后端（V4 的 <code>QuantV4Metadata</code>、V4.1 的 <code>_V41QuantAttentionMetadata</code>）目前不重建 rank-local
-  metadata，<code>prepare_cp_metadata</code> 直接拒绝：量化路径只能跑 <code>context-parallel-degree 1</code>。</li>
+<li>量化后端（V4 的 <code>QuantV4Metadata</code>、V4.1 的 <code>_V41QuantAttentionMetadata</code>）也按本 rank 的 frames
+  重建自己的 AI_CPU metadata：V4 只替换量化 selector 的 forward 记录，V4.1 重建整套，两者都接受
+  <code>context-parallel-degree &gt; 1</code>。</li>
 <li>DeepSeek-V4 的融合注意力在 CP=1 时支持 <code>local_batch_size &gt; 1</code>（输入布局按批展平，attention 输出保留
   <code>[B, S]</code>）。CP&gt;1 暂不支持 <code>local_batch_size &gt; 1</code>，<code>CarryExchange</code> 在交换或边界计算前显式报错；DSA 路径
   TP 固定为 1。</li>
@@ -388,7 +389,7 @@ NGPU=2 \
 </tr>
 <tr>
 <td>indexer teacher 归一化</td>
-<td><code>_LightningIndexerTND.backward</code> 除以整行 token 数 <code>swa_k.cu_seqlens[-1]</code></td>
+<td><code>_LightningIndexerTND.backward</code> 除以整行 token 数 <code>swa_k.cu_seqlens[-1]</code>（量化 selector 同）</td>
 <td><code>num_global_queries</code>（本 step 全部 query 数，按 DP 求和）</td>
 </tr>
 <tr>
@@ -398,8 +399,8 @@ NGPU=2 \
 </tr>
 <tr>
 <td>量化 metadata</td>
-<td><code>QuantV4Metadata</code> 拒绝</td>
-<td><code>_V41QuantAttentionMetadata</code> 拒绝</td>
+<td><code>QuantV4Metadata</code> 重建（只换 selector 的 forward 记录）</td>
+<td><code>_V41QuantAttentionMetadata</code> 重建（整套记录）</td>
 </tr>
 </tbody>
 </table>
@@ -580,9 +581,10 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 <code>metadata.swa_k.cu_seqlens[-1]</code>（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
 来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。</p>
 <h3 id="55-cp">5.5 拒绝 CP 的路径</h3>
-<p><code>DeepSeekV41Metadata.prepare_cp_metadata</code> 拒绝参考内核；<code>_V41QuantAttentionMetadata</code>
-（<code>torchtitan_npu/extensions/adaptor/torchao/converter.py</code>）拒绝量化 attention。两者都在任何层
-执行之前报错，不会静默地拿着全局 metadata 跑 rank-local 行。</p>
+<p><code>DeepSeekV4Metadata.prepare_cp_metadata</code> 与 <code>DeepSeekV41Metadata.prepare_cp_metadata</code> 拒绝模型目录
+的参考内核：它们只描述整行的 metadata，CP 下没有一份能交给层去读，所以在任何层执行之前报错，不会
+静默地拿着全局 metadata 跑 rank-local 行。融合与量化后端各自覆盖了这个 hook，重建本 rank 的 frames
+与 AI_CPU metadata。</p>
 <p>Engram 不在这一列。它的 token history 要的是每行<strong>在本文档内</strong>的前驱，doc-chunk 下这些前驱不是
 全局行的一段连续区间（<code>[lo - H, lo)</code> 是别的文档的尾巴），一个窗口也说不出每行各自的前驱。所以
 <code>DeepSeekV41Model.preprocess_inputs</code> 在切分之前把整行的前驱算成 <code>[B, C, H]</code>（第 <code>d - 1</code> 项是这一行
