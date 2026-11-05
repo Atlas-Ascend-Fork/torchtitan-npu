@@ -161,13 +161,7 @@ _EXPORT_SCRIPT = (
 
 @pytest.fixture(scope="module")
 def export_module():
-    """Execute the export script for its tables, leaving global import state untouched.
-
-    Loading the script runs ``_bootstrap_sys_path``, which appends the repo's
-    ``experiments/torchao-npu`` tree to ``sys.path``; leaked, that flips other
-    tests' ``importorskip("torchao_npu")`` from skip to fail depending on order.
-    ``MonkeyPatch.context`` is the module-scope stand-in for the function fixture.
-    """
+    """Execute the export script for its tables, containing its ``sys.path`` / ``sys.modules`` writes."""
     root = _EXPORT_SCRIPT.parent
     with pytest.MonkeyPatch.context() as mpatch:
         mpatch.setattr(sys, "path", list(sys.path))

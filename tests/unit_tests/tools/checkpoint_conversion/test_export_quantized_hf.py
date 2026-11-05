@@ -4,8 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib.util
+import io
 import json
 import logging
+import os
+import pickle
 import re
 import struct
 import subprocess
@@ -20,6 +23,7 @@ import torch
 
 _REPO = Path(__file__).resolve().parents[4]
 _SCRIPT = _REPO / "torchtitan_npu" / "tools" / "checkpoint_conversion" / "export_quantized_hf.py"
+_DCP_MODULE = _REPO / "torchtitan_npu" / "tools" / "checkpoint_conversion" / "dcp_quant_configs.py"
 
 _K = 64  # weight inner dim; 2 MX blocks of 32 per row
 _N = 4  # per-expert rows for w1 / w3
@@ -32,6 +36,13 @@ class _FakeQuantizeConfig:
     """Value-comparable stand-in for ``MXQuantizeConfig``; the merge compares configs by value."""
 
     elem_dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class _FakeStorageIndex:
+    """Hashable pickled stand-in for the ``.metadata`` storage key; only ``fqn`` is read."""
+
+    fqn: str
 
 
 _CFG = _FakeQuantizeConfig(torch.int32)
@@ -65,10 +76,14 @@ def _load_module(name: str, path: Path):
 
 
 class _FakeSwap:
-    """Stand-in for ``ParamSwapConfig``: identity is all the FqnToConfig builder needs."""
+    """Stand-in for ``ParamSwapConfig``: grouped by object identity, compared by value (real configs
+    are dataclasses, and the dcp mode gives each FQN its own instance of equal value)."""
 
     def __init__(self, name):
         self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, _FakeSwap) and other.name == self.name
 
 
 class _FakeFqnToConfig:
@@ -241,44 +256,64 @@ def test_build_recipe_plan_routes_recipes(export, monkeypatch):
         export.build_recipe_plan("all_hif8", enable_mxfp4_qat=False)
 
 
-def test_quantize_state_dict_threads_plan_index(export, monkeypatch):
-    """Matched tensors become quantized and carry the index of the plan entry that claimed them.
+def test_quantize_state_dict_threads_applied_config(export, monkeypatch):
+    """Matched tensors become quantized and carry the applied ``ParamSwapConfig``.
 
-    This ``fqn -> plan index`` dict is what ``_build_fqn_to_config_record`` groups the
-    ``FqnToConfig`` plan by, so attribution must survive first-match and passthrough.
+    This ``fqn -> config`` dict is what ``_build_fqn_to_config_record`` groups the
+    ``FqnToConfig`` plan by (config object identity) and what
+    ``_to_in_memory_layout`` carries through the rename/merge, so attribution
+    must survive passthrough.
     """
-    monkeypatch.setattr(export, "_quantize_to_mx_tensor", lambda w, swap, device: f"Q<{swap}>")
-    plan = [
-        ("MX", lambda p, fqn: fqn.endswith(".q_a_proj.weight")),
-        ("BR", lambda p, fqn: "experts" in fqn),
-    ]
+    monkeypatch.setattr(export, "_quantize_to_mx_tensor", lambda w, swap, device: f"Q<{swap.name}>")
+    dense, routed = _FakeSwap("dense"), _FakeSwap("routed")
+    plan = {
+        "model.layers.0.self_attn.q_a_proj.weight": dense,
+        "model.layers.0.mlp.experts.gate_up_proj": routed,
+    }
     sd = {
         "model.layers.0.self_attn.q_a_proj.weight": torch.randn(2, 2),
         "model.layers.0.mlp.experts.gate_up_proj": torch.randn(2, 2),
-        "lm_head.weight": torch.randn(2, 2),  # matched by neither filter -> passthrough
+        "lm_head.weight": torch.randn(2, 2),  # absent from the plan -> passthrough
         "router.tid2eid": torch.zeros(3, dtype=torch.int64),  # non-float -> passthrough
     }
 
     out, quantized = export.quantize_state_dict(sd, plan, device="cpu")
 
     assert quantized == {
-        "model.layers.0.self_attn.q_a_proj.weight": 0,
-        "model.layers.0.mlp.experts.gate_up_proj": 1,
+        "model.layers.0.self_attn.q_a_proj.weight": dense,
+        "model.layers.0.mlp.experts.gate_up_proj": routed,
     }
-    assert out["model.layers.0.self_attn.q_a_proj.weight"] == "Q<MX>"
-    assert out["model.layers.0.mlp.experts.gate_up_proj"] == "Q<BR>"
+    assert out["model.layers.0.self_attn.q_a_proj.weight"] == "Q<dense>"
+    assert out["model.layers.0.mlp.experts.gate_up_proj"] == "Q<routed>"
     assert out["lm_head.weight"] is sd["lm_head.weight"]
     assert out["router.tid2eid"] is sd["router.tid2eid"]
 
 
-def test_quantize_state_dict_first_matching_plan_entry_wins(export, monkeypatch):
-    monkeypatch.setattr(export, "_quantize_to_mx_tensor", lambda w, swap, device: f"Q<{swap}>")
-    plan = [("broad", lambda p, fqn: True), ("never", lambda p, fqn: False)]
+def test_plan_from_recipe_first_matching_entry_wins(export, monkeypatch):
+    """Ordered recipe entries act as a priority list; non-floats are never planned."""
+    dense, routed = _FakeSwap("dense"), _FakeSwap("routed")
 
-    out, quantized = export.quantize_state_dict({"x.w": torch.randn(2, 2)}, plan, device="cpu")
+    def fake_plan(recipe, **kw):
+        # mirrors the real dense filter's suffix semantics: quantizable params end in ``.weight``
+        return [
+            (routed, lambda p, fqn: "experts" in fqn),
+            (dense, lambda p, fqn: fqn.endswith(".weight")),
+        ]
 
-    assert quantized == {"x.w": 0}
-    assert out["x.w"] == "Q<broad>"
+    monkeypatch.setattr(export, "build_recipe_plan", fake_plan)
+    sd = {
+        "layers.0.ffn.experts.1.w1.weight": torch.randn(2, 2),
+        "layers.0.attn.wq_a.weight": torch.randn(2, 2),
+        "layers.0.ffn.gate.bias": torch.zeros(4),  # ends in .bias: excluded by the dense filter
+        "layers.0.router.tid2eid": torch.zeros(3, dtype=torch.int64),  # non-float -> skipped outright
+    }
+
+    plan = export.plan_from_recipe(sd, recipe="mix", enable_mxfp4_qat=False, dst_type_max=0.0)
+
+    assert plan == {
+        "layers.0.ffn.experts.1.w1.weight": routed,  # claimed by the earlier matching entry
+        "layers.0.attn.wq_a.weight": dense,
+    }
 
 
 def test_qwen35_quantized_fqn_is_already_in_memory_layout(export):
@@ -513,31 +548,56 @@ def test_generalized_fqn_pattern(export):
     assert not re.fullmatch(regex, "model.layers.0.self_attn.q_b_proj.weight")
 
 
-def test_build_fqn_to_config_record_groups_by_plan(export):
-    """One deduped ``re:`` key per quantized FQN shape, valued with that group's swap config."""
+def test_build_fqn_to_config_record_groups_by_config(export):
+    """One deduped ``re:`` key per quantized FQN shape; siblings sharing the config object collapse.
+
+    Group order follows the alphabetically-first FQN of each config (the dcp
+    mode gives every training FQN its own config object; identity grouping
+    must not depend on that).
+    """
     dense, routed = _FakeSwap("dense"), _FakeSwap("routed")
     quantized = {
-        "model.layers.1.self_attn.q_a_proj.weight": 0,
-        "model.layers.0.self_attn.q_a_proj.weight": 0,  # same shape, deduped
-        "model.layers.0.mlp.experts.gate_up_proj": 1,
+        "model.layers.1.self_attn.q_a_proj.weight": dense,
+        "model.layers.0.self_attn.q_a_proj.weight": dense,  # same shape, deduped
+        "model.layers.0.mlp.experts.gate_up_proj": routed,
     }
 
-    record = export._build_fqn_to_config_record(quantized, [(dense, None), (routed, None)])
+    record = export._build_fqn_to_config_record(quantized)
 
     assert record["_type"] == "FqnToConfig"
     fqn_to_config = record["_data"]["fqn_to_config"]
     assert list(fqn_to_config) == [
-        r"re:model\.layers\.\d+\.self_attn\.q_a_proj\.weight",
         r"re:model\.layers\.\d+\.mlp\.experts\.gate_up_proj",
-    ]  # plan-group order
-    assert [v["_data"]["tag"] for v in fqn_to_config.values()] == ["dense", "routed"]
+        r"re:model\.layers\.\d+\.self_attn\.q_a_proj\.weight",
+    ]
+    assert [v["_data"]["tag"] for v in fqn_to_config.values()] == ["routed", "dense"]
     # the ``__post_init__`` alias duplicates the mapping; the export strips it
     assert "module_fqn_to_config" not in record["_data"]
     json.dumps(record)  # the record must survive config.json serialization
 
 
+def test_build_fqn_to_config_record_rejects_sibling_conflict(export):
+    """Generalization collapses numeric siblings onto one key; conflicting configs cannot be described by it."""
+    quantized = {
+        "model.layers.0.self_attn.q_a_proj.weight": _FakeSwap("a"),
+        "model.layers.1.self_attn.q_a_proj.weight": _FakeSwap("b"),
+    }
+    with pytest.raises(ValueError, match="conflicting configs"):
+        export._build_fqn_to_config_record(quantized)
+
+
+def test_build_fqn_to_config_record_merges_value_equal_configs(export):
+    """Value-equal configs deserialize per FQN; merging must compare by value, not identity."""
+    quantized = {
+        "model.layers.0.self_attn.q_a_proj.weight": _FakeSwap("mxfp8"),
+        "model.layers.1.self_attn.q_a_proj.weight": _FakeSwap("mxfp8"),
+    }
+    record = export._build_fqn_to_config_record(quantized)
+    assert list(record["_data"]["fqn_to_config"]) == [r"re:model\.layers\.\d+\.self_attn\.q_a_proj\.weight"]
+
+
 def test_build_fqn_to_config_record_without_quantized(export):
-    assert export._build_fqn_to_config_record({}, [(_FakeSwap("d"), None)]) is None
+    assert export._build_fqn_to_config_record({}) is None
 
 
 def test_build_fqn_to_config_record_survives_real_torchao_encoder(export, tmp_path):
@@ -556,7 +616,7 @@ def test_build_fqn_to_config_record_survives_real_torchao_encoder(export, tmp_pa
         "spec.loader.exec_module(mod)\n"
         "swap = ps.ParamSwapConfig(weight_config=qc.MXQuantizeConfig())\n"
         "record = mod._build_fqn_to_config_record(\n"
-        "    {'model.layers.0.self_attn.q_a_proj.weight': 0}, [(swap, None)]\n"
+        "    {'model.layers.0.self_attn.q_a_proj.weight': swap}\n"
         ")\n"
         "entry = record['_data']['fqn_to_config']['re:' + r'model\\.layers\\.\\d+\\.self_attn\\.q_a_proj\\.weight']\n"
         "assert entry['_type'] == 'ParamSwapConfig'\n"
@@ -1087,3 +1147,227 @@ def test_validate_detects_tensor_missing_from_shards(export, tmp_path):
     headers.pop(_FQNS[1])
     with pytest.raises(ValueError, match="missing from shards"):
         _validate(export, tmp_path, record, headers, quantized=_FQNS)
+
+
+# =========================================================================
+# DCP input mode: config extraction, train->HF plan mapping, plan routing
+# =========================================================================
+
+
+class _StubAdapter:
+    """``from_hf_map`` in the adapter's real direction (HF name -> training name)."""
+
+    from_hf_map = {
+        "layers.{}.attn.wq_a.weight": "layers.{}.attention.wq_a.weight",
+        "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
+        "layers.{}.norm.weight": "layers.{}.mtp_norm.weight",
+    }
+
+
+class _FakeParamSwap:
+    def __init__(self, weight_config=None, activation_config=None):
+        self.weight_config = weight_config
+        self.activation_config = activation_config
+
+
+def test_train_fqn_to_hf_fqns_expands_templates(export, monkeypatch):
+    """Inverted ``from_hf_map`` resolution: templates format, experts fan out, MTP re-prefixes, unknown raises."""
+    configs = types.ModuleType("torchao_npu.configs")
+    configs.ParamSwapConfig = _FakeParamSwap
+    monkeypatch.setitem(sys.modules, "torchao_npu.configs", configs)
+
+    to_hf = {v: k for k, v in _StubAdapter.from_hf_map.items()}
+    assert export._train_fqn_to_hf_fqns("layers.0.attention.wq_a.weight", to_hf, {"layers.0.attn.wq_a.weight": 0}) == [
+        "layers.0.attn.wq_a.weight"
+    ]
+    routed_hf = {f"layers.0.ffn.experts.{e}.w1.weight": 0 for e in (1, 0)}
+    assert export._train_fqn_to_hf_fqns("layers.0.moe.routed_experts.inner_experts.w1_EFD", to_hf, routed_hf) == [
+        "layers.0.ffn.experts.0.w1.weight",
+        "layers.0.ffn.experts.1.w1.weight",
+    ]
+    assert export._train_fqn_to_hf_fqns("mtp_layers.0.mtp_norm.weight", to_hf, {"mtp.0.norm.weight": 0}) == [
+        "mtp.0.norm.weight"
+    ]
+    with pytest.raises(ValueError, match="no HF name for it"):
+        export._train_fqn_to_hf_fqns("layers.0.mystery.weight", to_hf, {})
+
+    weight, act = object(), object()
+    plan = export.plan_from_dcp_configs(
+        routed_hf | {"layers.0.attn.wq_a.weight": 0},
+        {
+            "layers.0.attention.wq_a.weight": (weight, act),
+            "layers.0.moe.routed_experts.inner_experts.w1_EFD": (weight, act),
+        },
+        _StubAdapter(),
+    )
+    assert set(plan) == routed_hf.keys() | {"layers.0.attn.wq_a.weight"}
+    assert all(p.weight_config is weight and p.activation_config is act for p in plan.values())
+    with pytest.raises(ValueError, match="matches no exported tensor"):
+        export.plan_from_dcp_configs({}, {"layers.77.attention.wq_a.weight": (weight, act)}, _StubAdapter())
+
+
+def test_resolve_plan_routing_and_rejection(export, monkeypatch, caplog):
+    """``--plan_source`` contract: auto replays or falls back, dcp rejects plain, flags never reach replay."""
+    configs = types.ModuleType("torchao_npu.configs")
+    configs.ParamSwapConfig = _FakeParamSwap
+    monkeypatch.setitem(sys.modules, "torchao_npu.configs", configs)
+    swap = _FakeSwap("recipe-entry")
+    monkeypatch.setattr(export, "build_recipe_plan", lambda *a, **k: [(swap, lambda p, fqn: True)])
+
+    base = dict(
+        plan_source="auto",
+        recipe=None,
+        enable_mxfp4_qat=False,
+        dst_type_max=0.0,
+        input_dir=Path("/nonexistent"),
+        model_name="torchtitan_npu.models.deepseek_v4",
+        hf_state_dict={"layers.0.attn.wq_a.weight": torch.randn(2, 2)},
+        sd_adapter=_StubAdapter(),
+    )
+    embedded = {"layers.0.attention.wq_a.weight": (object(), object())}
+
+    plan, desc = export._resolve_plan(**{**base, "extracted": embedded})
+    assert desc.startswith("dcp configs") and set(plan) == set(base["hf_state_dict"])
+
+    with caplog.at_level(logging.WARNING, logger="export_quantized_hf_under_test"):
+        plan, desc = export._resolve_plan(**{**base, "extracted": {}})
+    assert set(plan) == set(base["hf_state_dict"])
+    assert desc == "recipe=mix (auto fallback: plain checkpoint)"
+    assert any("falling back to recipe=mix" in r.getMessage() for r in caplog.records)
+
+    with pytest.raises(ValueError, match="carries no wrapper quantization configs"):
+        export._resolve_plan(**{**base, "plan_source": "dcp", "extracted": {}})
+    for flags in ({"recipe": "mix"}, {"dst_type_max": 6.0}):
+        with pytest.raises(ValueError, match="No combination of recipe flags"):
+            export._resolve_plan(**{**base, "extracted": embedded, **flags})
+    assert (
+        export._resolve_plan(**{**base, "plan_source": "recipe", "recipe": "all_mxfp8", "extracted": embedded})[1]
+        == "recipe=all_mxfp8"
+    )
+
+    # quantized MTP weights have no HF in-memory name: fail at plan time, not after quantizing
+    with pytest.raises(ValueError, match="MTP-layer"):
+        export._resolve_plan(
+            **{
+                **base,
+                "plan_source": "recipe",
+                "extracted": {},
+                "hf_state_dict": {"mtp.0.attn.wq_a.weight": torch.randn(2, 2)},
+            }
+        )
+
+    # the effective recipe (incl. the default mix) must fit the model family
+    with pytest.raises(ValueError, match=r"Qwen3\.5 export recipe"):
+        export._resolve_plan(
+            **{**base, "plan_source": "recipe", "extracted": {}, "model_name": "torchtitan.models.qwen3_5"}
+        )
+
+    parser = export._build_arg_parser()
+    args = parser.parse_args(["in", "out", "--hf_assets_path", "a"])
+    assert args.plan_source == "auto" and args.recipe is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(["in", "out", "--hf_assets_path", "a", "--plan_source", "nope"])
+
+
+def test_quantize_dispatch_rejects_unsupported_formats(export, monkeypatch):
+    """Registry dispatch fails loudly: no handler for a config type, no silent non-MXTensor payload."""
+
+    def stub_transform(handler, unwrap):
+        transform = types.ModuleType("torchao_npu.quantization.transform")
+        transform._PARAM_SWAP_QUANTIZE_CONFIG_HANDLER = handler
+        transform.unwrap_param = unwrap
+        monkeypatch.setitem(sys.modules, "torchao_npu.quantization.transform", transform)
+
+    cfg = _NS(weight_config=object(), activation_config=None)
+    stub_transform({}, None)
+    with pytest.raises(ValueError, match="no parameter-swap handler registered"):
+        export._quantize_to_mx_tensor(torch.randn(2, 2), cfg, device="cpu")
+
+    stub_transform({object: lambda *a: "wrapped"}, lambda *a: _NS(data=torch.randn(2, 2)))
+    with pytest.raises(ValueError, match="not an MXTensor"):
+        export._quantize_to_mx_tensor(torch.randn(2, 2), cfg, device="cpu")
+
+
+def test_extract_wrapper_configs_recovers_embedded_configs(tmp_path):
+    """A real wrapper DCP round-trips through ``extract_wrapper_configs`` (fresh subprocess:
+    the real stack self-registers safe globals); plain streams yield nothing.
+
+    Skips where ``torchao_npu`` is unimportable.
+    """
+    dqc = _load_module("dcp_quant_configs_under_test", _DCP_MODULE)
+    with pytest.raises(ValueError, match="not a DCP checkpoint directory"):
+        dqc.extract_wrapper_configs(tmp_path)
+
+    probe = tmp_path / "extract_probe.py"
+    probe.write_text(
+        "import importlib.util, pathlib, sys\n"
+        f"sys.path[:0] = [{str(_REPO)!r}, {str(_REPO / 'experiments' / 'torchao-npu')!r}]\n"
+        "try:\n"
+        "    import torch\n"
+        "    import torch.distributed.checkpoint as dcp\n"
+        "    from torchao_npu.quantization.quant_configs import MXQuantizeConfig\n"
+        "    from torchao_npu.wrapper_tensors.mx_wrapper_tensor import MXTrainingWeightWrapperTensor\n"
+        "except Exception as exc:\n"
+        "    print('SKIP', exc)\n"
+        "    sys.exit(0)\n"
+        "from torchao_npu.quantization.transform import _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER\n"
+        "assert MXQuantizeConfig in _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER, 'swap registry not populated'\n"
+        f"spec = importlib.util.spec_from_file_location('dqc', {str(_DCP_MODULE)!r})\n"
+        "dqc = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(dqc)\n"
+        "cfg = MXQuantizeConfig(dst_type_max=1.0)\n"
+        "wrapper = MXTrainingWeightWrapperTensor(\n"
+        "    torch.randn(4, 4, dtype=torch.bfloat16), weight_config=cfg, activation_config=cfg\n"
+        ")\n"
+        "ckpt = pathlib.Path(sys.argv[1])\n"
+        "dcp.save(\n"
+        "    {'layers.0.attention.wq_a.weight': wrapper,\n"
+        "     'layers.0.attention_norm.weight': torch.randn(4, dtype=torch.bfloat16)},\n"
+        "    checkpoint_id=str(ckpt),\n"
+        ")\n"
+        "configs = dqc.extract_wrapper_configs(ckpt)\n"
+        "assert set(configs) == {'layers.0.attention.wq_a.weight'}, configs\n"
+        "weight, act = configs['layers.0.attention.wq_a.weight']\n"
+        "assert weight.dst_type_max == 1.0 and act is weight\n"
+        "print('OK')\n"
+    )
+    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    proc = subprocess.run(
+        [sys.executable, str(probe), str(tmp_path / "dcp")],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    # ``torchao_npu`` import pulls in torch_npu, whose JIT build log pollutes
+    # stdout; scan the tail line for the token instead of comparing verbatim.
+    if proc.stdout.startswith("SKIP"):
+        pytest.skip("real torchao stack unavailable")
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines()[-1] == "OK", proc.stdout
+
+
+def test_extract_wrapper_configs_warns_on_configless_wrapper_streams(tmp_path, caplog, monkeypatch):
+    """A fabricated config-less wrapper stream fires both warnings; safe-global registration is stubbed."""
+    dqc = _load_module("dcp_quant_configs_warn_test", _DCP_MODULE)
+    monkeypatch.setattr(dqc, "register_wrapper_safe_globals", lambda: None)
+
+    # Plain dict carrying the marker string trips the byte probe; weights_only loads it fine.
+    stream = io.BytesIO()
+    torch.save({"probe": "torchao_npu.wrapper_tensors"}, stream)
+    blob = stream.getvalue()
+    (tmp_path / "0_0.distcp").write_bytes(blob)
+
+    index = _FakeStorageIndex(fqn="layers.0.self_attn.q_a_proj.weight")
+    storage = types.SimpleNamespace(relative_path=Path("0_0.distcp"), offset=0, length=len(blob))
+    (tmp_path / ".metadata").write_bytes(
+        pickle.dumps(types.SimpleNamespace(storage_data={index: storage}))
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dcp_quant_configs_warn_test"):
+        configs = dqc.extract_wrapper_configs(tmp_path)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert configs == {}
+    assert any("carries no weight_config" in m for m in warnings)
+    assert any("none yielded a quantization config" in m for m in warnings)

@@ -5,15 +5,11 @@
 
 """Export a torchtitan DCP checkpoint as a quantized HuggingFace safetensors checkpoint.
 
-The applied recipe is also recorded in ``config.json`` as an ``FqnToConfig``
-plan (``quantization_config.quant_type``): a machine-readable source of
-quantization info for downstream tooling, never applied at load time (loaders
-rebuild tensors from the per-instance shard-header records) and not
-necessarily executable as-is. Decoding the record (torchao
-``config_from_dict``) needs ``import torchao_npu.configs`` for its
-``ALLOWED_AO_MODULES`` registration; plain JSON reads are unaffected. The
-export fails closed unless the plan matches the shard headers
-(``_validate_plan_against_shards``).
+``--plan_source`` (default ``auto``) replays the quantization configs a
+quantized-training DCP embeds, or rebuilds the plan from ``--recipe`` for
+plain-trained checkpoints (PTQ); recipe flags are rejected in replay mode.
+The applied plan is recorded in ``config.json`` as a descriptive
+``FqnToConfig`` record and must match the shard headers.
 """
 
 import argparse
@@ -58,8 +54,6 @@ def _bootstrap_sys_path() -> None:
             sys.path.insert(0, str(cand))
 
 
-_bootstrap_sys_path()
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -96,6 +90,7 @@ _ROUTED_WEIGHT_PATTERN = r".*\.ffn\.experts\.\d+\.w[123]\.weight"
 # The converter's own recipe list also carries all_hif8, which this tool cannot export.
 _QWEN35_RECIPES = ("W4A8_MXFP", "W8A8_MXFP8")
 _SUPPORTED_RECIPES = ("all_mxfp8", "mix", "all_block_fp8", *_QWEN35_RECIPES)
+_DEFAULT_RECIPE = "mix"
 
 
 def _validate_recipe_model(recipe: str, model_name: str) -> None:
@@ -144,64 +139,130 @@ def build_recipe_plan(recipe: str, *, enable_mxfp4_qat: bool, dst_type_max: floa
     return [(dense_config, dense_filter), (routed_config, routed_filter)]
 
 
+def plan_from_recipe(hf_state_dict, *, recipe: str, enable_mxfp4_qat: bool, dst_type_max: float) -> dict[str, Any]:
+    """PTQ plan for plain-trained checkpoints: recipe filters matched by HF name, first match wins."""
+    plan: dict[str, Any] = {}
+    plan_entries = build_recipe_plan(recipe, enable_mxfp4_qat=enable_mxfp4_qat, dst_type_max=dst_type_max)
+    for fqn, value in hf_state_dict.items():
+        if not value.is_floating_point():
+            continue
+        for swap_config, filter_fn in plan_entries:
+            if filter_fn(nn.Parameter(value), fqn):
+                plan[fqn] = swap_config
+                break
+    return plan
+
+
+def _train_fqn_to_hf_fqns(train_fqn: str, to_hf_map: dict[str, str], hf_state_dict) -> list[str]:
+    """HF export keys covered by one training-namespace FQN (inverse of the ``to_hf`` naming)."""
+    is_mtp = train_fqn.startswith("mtp_layers.")
+    layer_match = re.search(r"\d+", train_fqn)
+    layer_num = layer_match.group(0) if layer_match else None
+    abstract = re.sub(r"(\d+)", "{}", train_fqn, count=1)
+    if is_mtp:
+        abstract = abstract.replace("mtp_layers.{}.", "layers.{}.", 1)
+    # Compressor/indexer entries are per-layer literal keys; the rest are ``layers.{}.`` templates.
+    hf_abstract = to_hf_map.get(train_fqn)
+    if hf_abstract is None:
+        hf_abstract = to_hf_map.get(abstract)
+        if hf_abstract is not None and is_mtp:
+            hf_abstract = hf_abstract.replace("layers.{}.", "mtp.{}.", 1)
+    if hf_abstract is None:
+        raise ValueError(
+            f"the checkpoint embeds a quantization config for {train_fqn!r}, but the state_dict adapter has no "
+            "HF name for it (see from_hf_map); extending the adapter is required to export this checkpoint."
+        )
+    if "{}" not in hf_abstract:
+        return [hf_abstract] if hf_abstract in hf_state_dict else []
+    if layer_num is None:
+        # A template HF name without a digit in the training FQN expands to nothing.
+        return []
+    if hf_abstract.count("{}") == 1:
+        hf_fqn = hf_abstract.format(layer_num)
+        return [hf_fqn] if hf_fqn in hf_state_dict else []
+    # Second placeholder is the per-expert index.
+    pre, _, rest = hf_abstract.partition("{}")
+    mid, _, post = rest.partition("{}")
+    per_expert = re.compile("^" + re.escape(pre + layer_num + mid) + r"\d+" + re.escape(post) + "$")
+    return sorted(fqn for fqn in hf_state_dict if per_expert.match(fqn))
+
+
+def plan_from_dcp_configs(hf_state_dict, extracted, sd_adapter) -> dict[str, Any]:
+    """Map the checkpoint-embedded configs onto HF names; unmapped configs raise."""
+    from torchao_npu.configs import ParamSwapConfig
+
+    to_hf_map = {v: k for k, v in sd_adapter.from_hf_map.items()}
+    plan: dict[str, Any] = {}
+    for train_fqn, (weight_config, activation_config) in extracted.items():
+        hf_fqns = _train_fqn_to_hf_fqns(train_fqn, to_hf_map, hf_state_dict)
+        if not hf_fqns:
+            raise ValueError(
+                f"the checkpoint embeds a quantization config for {train_fqn!r}, but its HF name mapping matches "
+                "no exported tensor; --model_flavor may not match the checkpoint."
+            )
+        swap_config = ParamSwapConfig(weight_config=weight_config, activation_config=activation_config)
+        for hf_fqn in hf_fqns:
+            plan[hf_fqn] = swap_config
+    return plan
+
+
 def _quantize_to_mx_tensor(weight: torch.Tensor, swap_config, device: str):
-    """Quantize one plain ``weight`` per ``swap_config`` on ``device`` and return the ``MXTensor`` on CPU."""
-    from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
+    """Quantize ``weight`` per ``swap_config`` on ``device``, returning the ``MXTensor`` on CPU.
+
+    Dispatches through the torchao-npu swap registry, i.e. training's own CONVERT path;
+    HiF8 (no inference conversion) fails with its ``NotImplementedError``.
+    """
+    from torchao_npu.quantization.transform import _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER, unwrap_param
     from torchao_npu.quantized_tensors import MXTensor
-    from torchao_npu.wrapper_tensors import BlockMXTrainingWeightWrapperTensor, MXTrainingWeightWrapperTensor
 
     on_device = weight.to(device)
     # npu_dynamic_block_mx_quant rejects fp32 inputs.
     if on_device.dtype not in (torch.float16, torch.bfloat16):
         on_device = on_device.to(torch.bfloat16)
     weight_config = swap_config.weight_config
-    if isinstance(weight_config, BlockMXQuantizeConfig):
-        wrapper = BlockMXTrainingWeightWrapperTensor(
-            on_device, weight_config=weight_config, activation_config=swap_config.activation_config
-        )
-    elif type(weight_config) is MXQuantizeConfig:
-        wrapper = MXTrainingWeightWrapperTensor(
-            on_device, weight_config=weight_config, activation_config=swap_config.activation_config
-        )
-    else:
+    handler = _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER.get(type(weight_config))
+    if handler is None:
         raise ValueError(
-            f"weight_config must be `MXQuantizeConfig` or `BlockMXQuantizeConfig`, got {type(weight_config).__name__}."
+            f"no parameter-swap handler registered for weight_config {type(weight_config).__name__}; "
+            "this export cannot produce that format."
         )
-    mx = wrapper.to_inference_weight()
+    # The registry takes (module, fqn, parameter); a detached holder stands in for the owner.
+    holder = nn.Module()
+    wrapped = handler(holder, "weight", nn.Parameter(on_device), (swap_config,))
+    inference = unwrap_param(holder, "weight", wrapped).data
+    if not isinstance(inference, MXTensor):
+        raise ValueError(
+            f"weight_config {type(weight_config).__name__} converts to {type(inference).__name__}, not an "
+            "MXTensor; the safetensors writer only supports MXTensor payloads."
+        )
     # Storage must land on CPU: the NPU->CPU copy is bit-exact, and the
     # flatten-time clone kernel does not support FP4 qdata on the NPU.
     return MXTensor(
-        mx.qdata.cpu(),
-        mx.scale.cpu(),
-        mx.dtype,
-        mx.quant_axis,
-        mx.quant_config,
-        mx.act_quant_config,
-        mx.pack_axis,
+        inference.qdata.cpu(),
+        inference.scale.cpu(),
+        inference.dtype,
+        inference.quant_axis,
+        inference.quant_config,
+        inference.act_quant_config,
+        inference.pack_axis,
     )
 
 
 def quantize_state_dict(hf_state_dict, plan, *, device: str):
-    """Quantize the recipe-matched weights; returns ``(state_dict, fqn -> plan index)``.
-
-    Non-matched tensors pass through unchanged (still on CPU, master dtype).
-    """
+    """Quantize the planned weights; returns ``(state_dict, fqn -> applied ParamSwapConfig)``."""
     out = {}
-    quantized: dict[str, int] = {}
+    quantized: dict[str, Any] = {}
     for fqn, value in hf_state_dict.items():
-        # Non-floating-point tensors (e.g. the int64 ``tid2eid`` hash-router
-        # table) are never recipe-matched and ``nn.Parameter`` rejects them;
-        # pass them through untouched.
+        # Non-float tensors (e.g. int64 ``tid2eid``) are never planned; ``nn.Parameter`` rejects them.
         if not value.is_floating_point():
             out[fqn] = value
             continue
-        for idx, (swap_config, filter_fn) in enumerate(plan):
-            if filter_fn(nn.Parameter(value), fqn):
-                out[fqn] = _quantize_to_mx_tensor(value, swap_config, device)
-                quantized[fqn] = idx
-                break
-        else:
+        swap_config = plan.get(fqn)
+        if swap_config is None:
             out[fqn] = value
+            continue
+        out[fqn] = _quantize_to_mx_tensor(value, swap_config, device)
+        quantized[fqn] = swap_config
     return out, quantized
 
 
@@ -268,21 +329,21 @@ def _stack_expert_axes(per_expert, partner=None):
 def _merge_routed_experts(hf_state_dict, quantized):
     """Merge the per-expert MXTensors into the 3D routed-expert tensors.
 
-    Returns ``(merged_tensors, merged_plan_index)``; the merged tensor inherits
-    the plan index of the per-expert tensors it was stacked from.
+    Returns ``(merged_tensors, merged_plan)``; a merged tensor inherits the
+    ``ParamSwapConfig`` of the per-expert tensors it was stacked from.
     """
     from torchao_npu.quantized_tensors import MXTensor
 
     experts: dict[tuple[str, str], dict[int, MXTensor]] = {}
-    group_idx: dict[tuple[str, str], int] = {}
+    group_config: dict[tuple[str, str], Any] = {}
     for fqn in sorted(quantized):
         m = _EXPERT_FQN_RE.match(fqn)
         if m:
             experts.setdefault((m.group(1), m.group(3)), {})[int(m.group(2))] = hf_state_dict[fqn]
-            group_idx[(m.group(1), m.group(3))] = quantized[fqn]
+            group_config[(m.group(1), m.group(3))] = quantized[fqn]
 
     merged: dict[str, MXTensor] = {}
-    merged_plan: dict[str, int] = {}
+    merged_plan: dict[str, Any] = {}
     for (layer, w), per_expert in sorted(experts.items()):
         if w == "3":
             continue  # folded into gate_up_proj with w1
@@ -317,7 +378,7 @@ def _merge_routed_experts(hf_state_dict, quantized):
             first.act_quant_config,
             merged_pack_axis,
         )
-        merged_plan[key] = group_idx[(layer, w)]
+        merged_plan[key] = group_config[(layer, w)]
     return merged, merged_plan
 
 
@@ -330,24 +391,24 @@ def _to_in_memory_layout(hf_state_dict, quantized_fqns):
     Dense weights are renamed to their in-memory FQNs (the quantized loader
     rebuilds each param from the metadata under the checkpoint's original key,
     so these must be the final names).
-    Returns ``(state_dict, final fqn -> plan index)``.
+    Returns ``(state_dict, final fqn -> applied ParamSwapConfig)``.
     """
     out = {k: v for k, v in hf_state_dict.items() if k not in quantized_fqns}
-    new_quantized: dict[str, int] = {}
+    new_quantized: dict[str, Any] = {}
 
-    for fqn, idx in sorted(quantized_fqns.items()):
+    for fqn, swap_config in sorted(quantized_fqns.items()):
         if _EXPERT_FQN_RE.match(fqn):
             continue  # merged below
         for pattern, replacement in _LOGICAL_TO_HF:
             new_key = re.sub(pattern, replacement, fqn, count=1)
             if new_key != fqn:
                 out[new_key] = hf_state_dict[fqn]
-                new_quantized[new_key] = idx
+                new_quantized[new_key] = swap_config
                 break
         else:
             if fqn.startswith(_QWEN35_HF_PREFIXES) and fqn.endswith(_QWEN35_DENSE_WEIGHT_SUFFIXES):
                 out[fqn] = hf_state_dict[fqn]
-                new_quantized[fqn] = idx
+                new_quantized[fqn] = swap_config
             else:
                 raise ValueError(f"quantized tensor {fqn!r} has no in-memory name mapping")
 
@@ -623,14 +684,11 @@ def _drop_callable_fields(config):
     return clone
 
 
-def _build_fqn_to_config_record(quantized: dict[str, int], plan) -> dict | None:
-    """Serialize the recipe plan as the AO-official ``FqnToConfig`` ``quant_type`` record.
+def _build_fqn_to_config_record(quantized: dict[str, Any]) -> dict | None:
+    """Serialize the applied plan as the AO-official ``FqnToConfig`` ``quant_type`` record.
 
     One ``re:`` key per generalized parameter FQN, valued with the applied
-    ``ParamSwapConfig``. Keys name parameters (``...q_a_proj.weight``), not the
-    module FQNs torchao's own matcher walks: merged 3D expert tensors put
-    several quantized parameters on one module, so the parameter level is the
-    precise namespace.
+    ``ParamSwapConfig``; weights sharing one config object form one group.
 
     The record is descriptive source material -- no load path applies it, and
     downstream consumers may need a conversion step -- but it carries one hard
@@ -646,15 +704,24 @@ def _build_fqn_to_config_record(quantized: dict[str, int], plan) -> dict | None:
     from torchao.core.config import config_to_dict
     from torchao.quantization import FqnToConfig
 
-    groups: dict[int, list[str]] = {}
-    for fqn, idx in quantized.items():
-        groups.setdefault(idx, []).append(fqn)
+    groups: OrderedDict[int, list[str]] = OrderedDict()
+    for fqn in sorted(quantized):
+        groups.setdefault(id(quantized[fqn]), []).append(fqn)
 
-    fqn_to_config: OrderedDict[str, object] = OrderedDict()
-    for idx, (swap_config, _) in enumerate(plan):
-        config = _drop_callable_fields(swap_config)
-        for fqn in sorted(groups.get(idx, ())):
-            fqn_to_config.setdefault(_generalized_fqn_pattern(fqn), config)
+    # Values are ``ParamSwapConfig``; loosely annotated (see ``FqnToConfig`` variance).
+    fqn_to_config: OrderedDict[str, Any] = OrderedDict()
+    for group_fqns in groups.values():
+        config = _drop_callable_fields(quantized[group_fqns[0]])
+        for fqn in group_fqns:
+            pattern = _generalized_fqn_pattern(fqn)
+            previous = fqn_to_config.get(pattern)
+            if previous is not None and previous != config:
+                # Generalization collapses numeric siblings; conflicting configs would be lost.
+                raise ValueError(
+                    f"pattern {pattern!r} would describe conflicting configs; "
+                    "the FqnToConfig record cannot express per-sibling config variance"
+                )
+            fqn_to_config[pattern] = config
     if not fqn_to_config:
         return None
     record = config_to_dict(FqnToConfig(fqn_to_config=fqn_to_config))
@@ -727,7 +794,7 @@ def _validate_plan_against_shards(
     output_dir: Path,
     shard_names: list[str],
     fqn_to_config_record: dict,
-    quantized: dict[str, int],
+    quantized: dict[str, Any],
 ) -> None:
     """Fail the export unless the ``quant_type`` plan agrees with the shards just written.
 
@@ -857,16 +924,103 @@ def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads
         if value.is_floating_point() and value.dtype != container_dtype and ".engram.table.weight" not in fqn:
             state_dict[fqn] = value.detach().to(container_dtype)
     reader = ParallelFileSystemReader(str(input_dir), thread_count=read_threads)
+    # Safe globals for wrapper-pickled streams are registered once in export_quantized_hf().
     dcp.load(state_dict, storage_reader=reader)
     return state_dict
 
 
+def _reject_recipe_flags_when_replaying(
+    *,
+    plan_source: str,
+    recipe: str | None,
+    enable_mxfp4_qat: bool,
+    dst_type_max: float,
+) -> None:
+    """Fail on any recipe flag: whole-plan knobs have no meaning against embedded configs."""
+    if recipe is None and not enable_mxfp4_qat and not dst_type_max:
+        return
+    raise ValueError(
+        f"--plan_source={plan_source} replays the quantization configs embedded in the checkpoint, but recipe "
+        f"flags were given (--recipe={recipe!r} --enable_mxfp4_qat={enable_mxfp4_qat} --dst_type_max={dst_type_max}). "
+        "No combination of recipe flags is honored in replay mode: drop them to export what training used, or "
+        "pass --plan_source recipe to rebuild the whole plan from the recipe and re-quantize from the master "
+        "weights."
+    )
+
+
+def _reject_quantized_mtp_layers(plan: dict[str, Any]) -> None:
+    """Known limitation: the HF in-memory layout (``_LOGICAL_TO_HF`` / ``_EXPERT_FQN_RE``) spells out the
+    main ``layers.N.*`` stack only, so quantized ``mtp.*`` weights have no name to export to."""
+    if mtp := sorted(fqn for fqn in plan if fqn.startswith("mtp.")):
+        raise ValueError(
+            f"the plan quantizes {len(mtp)} MTP-layer weight(s) (e.g. {mtp[0]!r}), but the HF in-memory "
+            "layout defines no names for MTP weights; this export cannot produce that checkpoint."
+        )
+
+
+def _resolve_plan(
+    *,
+    plan_source: str,
+    recipe: str | None,
+    enable_mxfp4_qat: bool,
+    dst_type_max: float,
+    input_dir: Path,
+    model_name: str,
+    extracted: dict[str, tuple[Any, Any]] | None,
+    hf_state_dict,
+    sd_adapter,
+) -> tuple[dict[str, Any], str]:
+    """Resolve ``--plan_source`` into ``(hf fqn -> ParamSwapConfig plan, description)``."""
+    if plan_source == "recipe":
+        recipe = recipe or _DEFAULT_RECIPE
+        _validate_recipe_model(recipe, model_name)
+        plan = plan_from_recipe(
+            hf_state_dict, recipe=recipe, enable_mxfp4_qat=enable_mxfp4_qat, dst_type_max=dst_type_max
+        )
+        desc = f"recipe={recipe}"
+    elif extracted:
+        _reject_recipe_flags_when_replaying(
+            plan_source=plan_source,
+            recipe=recipe,
+            enable_mxfp4_qat=enable_mxfp4_qat,
+            dst_type_max=dst_type_max,
+        )
+        plan = plan_from_dcp_configs(hf_state_dict, extracted, sd_adapter)
+        desc = f"dcp configs ({len(extracted)} parameter FQN(s))"
+    elif plan_source == "dcp":
+        raise ValueError(
+            f"--plan_source=dcp but {input_dir} carries no wrapper quantization configs; the checkpoint was "
+            "trained in plain precision. Use --plan_source recipe to quantize at export time, "
+            "or --plan_source auto."
+        )
+    else:
+        recipe = recipe or _DEFAULT_RECIPE
+        _validate_recipe_model(recipe, model_name)
+        logger.warning(
+            "no quantization configs embedded in %s; falling back to recipe=%s (PTQ re-quantization at export). "
+            "If this checkpoint was trained with quantization, this export will NOT reproduce the training configs.",
+            input_dir,
+            recipe,
+        )
+        plan = plan_from_recipe(
+            hf_state_dict, recipe=recipe, enable_mxfp4_qat=enable_mxfp4_qat, dst_type_max=dst_type_max
+        )
+        desc = f"recipe={recipe} (auto fallback: plain checkpoint)"
+    _reject_quantized_mtp_layers(plan)
+    return plan, desc
+
+
 @torch.inference_mode()
 def export_quantized_hf(args: argparse.Namespace) -> None:
-    """Run the export: load the DCP, quantize per recipe, save the HF safetensors layout."""
+    """Run the export: resolve the quantization plan (DCP configs or recipe), quantize, save HF safetensors."""
     from torchao_npu.quantized_tensors import MXTensor
     from torchao_npu.serialization.export import save_hf_safetensors
     from torchtitan.config import TORCH_DTYPE_MAP
+
+    from torchtitan_npu.tools.checkpoint_conversion.dcp_quant_configs import register_wrapper_safe_globals
+
+    # Registers the swap handlers the quantization dispatch looks up, and dcp.load's safe globals.
+    register_wrapper_safe_globals()
 
     input_dir = args.input_dir
     output_dir = args.output_dir
@@ -875,14 +1029,30 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
     model_flavor = args.model_flavor
     master_dtype = args.master_dtype
     export_dtype = args.export_dtype
-    recipe = args.recipe
     enable_mxfp4_qat = args.enable_mxfp4_qat
     dst_type_max = args.dst_type_max
     quant_device = args.quant_device
     max_shard_size = args.max_shard_size
     read_threads = args.read_threads
 
-    _validate_recipe_model(recipe, model_name)
+    extracted = None
+    if args.plan_source != "recipe":
+        from torchtitan_npu.tools.checkpoint_conversion.dcp_quant_configs import extract_wrapper_configs
+
+        extracted = extract_wrapper_configs(input_dir)
+        if extracted:
+            # Fail before the model build: recipe flags can never merge into embedded configs.
+            _reject_recipe_flags_when_replaying(
+                plan_source=args.plan_source,
+                recipe=args.recipe,
+                enable_mxfp4_qat=enable_mxfp4_qat,
+                dst_type_max=dst_type_max,
+            )
+
+    # Validate before the expensive load; replay modes rejected any recipe flag above.
+    if args.recipe is not None:
+        _validate_recipe_model(args.recipe, model_name)
+
     model, sd_adapter, model_config = _build_model_and_adapter(model_name, model_flavor, hf_assets_path)
     state_dict = _load_dcp_state_dict(model, input_dir, master_dtype, read_threads)
     logger.info("Loaded DCP checkpoint %s (%d tensors)", input_dir, len(state_dict))
@@ -897,12 +1067,22 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
         if "tid2eid" in fqn:
             hf_state_dict[fqn] = value.to(torch.int64)
 
-    plan = build_recipe_plan(recipe, enable_mxfp4_qat=enable_mxfp4_qat, dst_type_max=dst_type_max)
+    plan, plan_desc = _resolve_plan(
+        plan_source=args.plan_source,
+        recipe=args.recipe,
+        enable_mxfp4_qat=enable_mxfp4_qat,
+        dst_type_max=dst_type_max,
+        input_dir=input_dir,
+        model_name=model_name,
+        extracted=extracted,
+        hf_state_dict=hf_state_dict,
+        sd_adapter=sd_adapter,
+    )
     hf_state_dict, quantized_fqns = quantize_state_dict(hf_state_dict, plan, device=quant_device)
     hf_state_dict, quantized_fqns = _to_in_memory_layout(hf_state_dict, quantized_fqns)
     logger.info(
-        "recipe=%s: quantized %d/%d tensors on %s",
-        recipe,
+        "%s: quantized %d/%d tensors on %s",
+        plan_desc,
         len(quantized_fqns),
         len(hf_state_dict),
         quant_device,
@@ -910,7 +1090,7 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
     if quantized_fqns:
         logger.info("  first matches: %s", ", ".join(sorted(quantized_fqns)[:8]))
     else:
-        logger.warning("recipe=%s matched no weights; all tensors will be exported as plain %s", recipe, export_dtype)
+        logger.warning("%s matched no weights; all tensors will be exported as plain %s", plan_desc, export_dtype)
 
     # Plain (non-quantized) floats land in export_dtype; the MXTensors carry
     # their own low-precision payloads and must pass through untouched.
@@ -928,7 +1108,7 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
         _copy_hf_assets(hf_assets_path, output_dir)
         _apply_model_derived_config(output_dir, model_config)
         # The FqnToConfig keys are in-memory FQNs, so build the record after the relayout.
-        fqn_to_config_record = _build_fqn_to_config_record(quantized_fqns, plan)
+        fqn_to_config_record = _build_fqn_to_config_record(quantized_fqns)
         if fqn_to_config_record is not None:
             _validate_plan_against_shards(output_dir, shard_names, fqn_to_config_record, quantized_fqns)
         _inject_torchao_quant_config(output_dir, fqn_to_config_record)
@@ -955,10 +1135,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model_flavor", type=str, default="8B")
     parser.add_argument(
+        "--plan_source",
+        choices=("auto", "dcp", "recipe"),
+        default="auto",
+        help=(
+            "Where the quantization plan comes from. 'dcp' replays the wrapper configs embedded in the "
+            "checkpoint (what training used is what gets exported); 'recipe' rebuilds the plan from "
+            "--recipe (PTQ at export time, for plain-trained checkpoints); 'auto' picks 'dcp' when the "
+            "checkpoint carries configs, otherwise 'recipe'."
+        ),
+    )
+    parser.add_argument(
         "--recipe",
         choices=_SUPPORTED_RECIPES,
-        default="mix",
-        help="Quantization recipe (same semantics as torchtitan_npu.extensions.adaptor.torchao.converter).",
+        default=None,
+        help=(
+            "Quantization recipe for the recipe plan source (same semantics as "
+            "torchtitan_npu.extensions.adaptor.torchao.converter). Defaults to 'mix' when a recipe plan "
+            "is needed and not given."
+        ),
     )
     parser.add_argument(
         "--enable_mxfp4_qat",
@@ -998,4 +1193,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # CLI-only: a library import must not mutate sys.path.
+    _bootstrap_sys_path()
     main()
