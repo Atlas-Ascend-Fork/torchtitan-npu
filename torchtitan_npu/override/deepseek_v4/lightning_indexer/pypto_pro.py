@@ -27,6 +27,7 @@ from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
     lightning_indexer_indices,
     sparse_lightning_indexer_kl_loss_grad,
 )
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
 from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import kernel_options
@@ -61,9 +62,6 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         if attention_metadata.xchg is not None:
             raise ValueError("PyPTO-Pro does not support context parallel: its kernels read compact frames")
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        cmp_frame = attention_metadata.cmp_k  # pyrefly: ignore [missing-attribute]
-        if idx_k.shape[0] != int(cmp_frame.cu_seqlens[-1]):  # pyrefly: ignore [missing-attribute]
-            raise ValueError("PyPTO-Pro needs the whole row's compressed keys")
         topk_indices = lightning_indexer_indices(
             idx_q,
             idx_k,
@@ -119,7 +117,9 @@ class PyPTOProLightningIndexer(LightningIndexer):
             idx_q_BLHiDi.flatten(0, 1),
             # index_select stays outside the Function so dk scatters back to
             # the gathered whole-row keys before the CP wrapper reduce-scatters.
-            A3KeyWorkaround.indexer_keys(idx_k_BNDi, attention_metadata).unsqueeze(1).contiguous(),
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi.flatten(0, 1), attention_metadata, a5=_IS_A5)
+            .unsqueeze(1)
+            .contiguous(),
             idx_w_BLHi.flatten(0, 1).float(),
             self.index_topk,
             attention_metadata.ratio,
