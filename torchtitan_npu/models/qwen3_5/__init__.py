@@ -25,11 +25,14 @@ from torchtitan.models.qwen3_5 import model_registry as _upstream_model_registry
 
 from torchtitan_npu.override.qwen3_5.parallelize import parallelize_qwen3_5_npu
 
+from .state_dict_adapter import Qwen35StateDictAdapter
+
 
 def model_registry(*args, **kwargs):
     """Return upstream Qwen3.5 specs with the NPU parallelizer."""
     spec = _upstream_model_registry(*args, **kwargs)
     spec.parallelize_fn = parallelize_qwen3_5_npu
+    spec.state_dict_adapter = Qwen35StateDictAdapter
     return spec
 
 

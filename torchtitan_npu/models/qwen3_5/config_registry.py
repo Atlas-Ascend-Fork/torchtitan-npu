@@ -12,12 +12,13 @@ from dataclasses import replace
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader
 from torchtitan.models.qwen3_5 import config_registry as _upstream_config_registry
-from torchtitan.models.qwen3_5 import model_registry
 from torchtitan.models.qwen3_5.config_registry import qwen35_27b
 from torchtitan.models.qwen3_5.parallelize import parallelize_qwen3_5
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.override.qwen3_5.parallelize import parallelize_qwen3_5_cp
+
+from . import model_registry
 
 _TEXT_SPECIAL_TOKEN_IDS = {"image_id": -1, "video_id": -1}
 
