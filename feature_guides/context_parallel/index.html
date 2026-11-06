@@ -267,8 +267,9 @@ position_k：               本 rank flatten 段自己的文档内位置（entry
   时恒等返回、不碰进程组，所以同一条前向路径服务两个 degree，调用点不需要分支。</li>
 <li>本 rank flatten 段自己的文档内位置由 <code>doc_relative_positions(cu_seqlens, 行号)</code> 算出（纯 device），
   它填的就是 entry 的 <code>position_k</code>。</li>
-<li>rank-local entry 由 <code>DeepSeekV4Metadata.doc_chunk_entry(cp_size=…, cp_rank=…)</code> 产出（V4.1 继承
-  同一个方法），两个 port 的 CP 钩子只在它之上重建自己的 AI_CPU records。</li>
+<li>rank-local metadata 由 <code>DeepSeekV4Metadata.doc_chunk_metadata(permutation=…, cp_size=…, cp_rank=…)</code>
+  产出（V4.1 继承同一个方法）；两个 port 的 CP 钩子调 <code>rebuild_cp_metadata(permutation, build=…)</code>，
+  它读 <code>cp_shard_context()</code>、调 <code>doc_chunk_metadata</code>，再按本 rank 的 frame 重建自己的 AI_CPU metadata。</li>
 </ul>
 <p><strong>host 同步的位置</strong>：<code>ExchangeMetadata</code> 的 <code>send_split</code> / <code>recv_split</code> 是其中一处。集合通信按 python
 list 接收 split，这是框架的签名；它们由 plan 推导，而 plan <strong>每个 microbatch 每个 geometry 只建一次</strong>
@@ -294,19 +295,19 @@ entry 的 <code>prepare_cp_metadata</code> 用 rank-local chunk 重建这三个 
 <tr>
 <td>V4</td>
 <td><code>DeepSeekV4Metadata</code> 自带 <code>q</code>/<code>swa_k</code>/<code>cmp_k</code> 与 <code>xchg: ExchangeMetadata</code>（<code>DeepSeekV4Metadata.from_positions</code> 用整行边界构造）</td>
-<td><code>AscV4Metadata.prepare_cp_metadata</code> → <code>doc_chunk_entry</code> → <code>AscV4Metadata.build_aicpu_metadata</code></td>
+<td><code>AscV4Metadata.prepare_cp_metadata</code> → <code>rebuild_cp_metadata</code> → <code>doc_chunk_metadata</code> → <code>AscV4Metadata.build_aicpu_metadata</code></td>
 </tr>
 <tr>
 <td>V4.1</td>
-<td><code>DeepSeekV41Metadata</code> 只有整行边界与位置；frame 由融合 entry <code>AscV41Metadata</code> 携带</td>
-<td><code>AscV41Metadata.prepare_cp_metadata</code> → <code>shard_asc_v41_metadata</code></td>
+<td><code>DeepSeekV41Metadata</code> 只有整行边界与位置；frame 由融合 metadata <code>AscV41Metadata</code> 携带</td>
+<td><code>AscV41Metadata.prepare_cp_metadata</code> → <code>rebuild_cp_metadata</code> → <code>doc_chunk_metadata</code> → <code>AscV41Metadata.build_aicpu_metadata</code></td>
 </tr>
 </tbody>
 </table>
-<p>两栈的重建都从 <code>cp_shard_context()</code> 读 pre-shard <code>positions</code> 与 CP mesh，并要求
-<code>--parallelism.context-parallel-load-balancer doc_chunk</code>：这些 frame 描述的就是 doc-chunk 布局，切分用
-的布局与 frame 描述的不一致会静默错位，所以在 entry 里直接拒绝。V4 的 <code>doc_chunk_entry</code> 重算 frame
-与 <code>restore</code>、<code>position_k</code>；V4.1 的 <code>shard_asc_v41_metadata</code> 同样重建这三样，只是入口不同。</p>
+<p>两栈的重建都经过同一个 <code>rebuild_cp_metadata(permutation, build=…)</code>：它从 <code>cp_shard_context()</code> 读
+CP mesh，<code>doc_chunk_metadata</code> 重算 frame 与 <code>restore</code>、<code>position_k</code>，再交给各自的 builder；两栈都要求
+<code>--parallelism.context-parallel-load-balancer doc_chunk</code>——这些 frame 描述的就是 doc-chunk 布局，切分用
+的布局与 frame 描述的不一致会静默错位，所以在 metadata 里直接拒绝。</p>
 <h2 id="2">2. 启用方式</h2>
 <pre><code class="language-bash"># DeepSeek-V4
 NGPU=2 \
@@ -438,8 +439,8 @@ doc-chunk 行：<code>wo_b</code> 是逐 token 投影，残差、MoE 与 loss �
 plan 搬过的。</p>
 <p><code>AscV4Metadata</code> 的 <code>q</code>/<code>swa_k</code>/<code>cmp_k</code> frame 被 SMLA/SMLAG 与独立的 LI override（前向
 <code>lightning_indexer</code>、反向 SLIKG）直接读取；V4 的 metadata 只有 <code>ratio</code>、三个 frame、<code>position_k</code>、
-<code>xchg</code>，没有 <code>cu_seq_q</code>/<code>cu_seq_k</code>，也没有单独的重切函数（rank-local entry 由
-<code>doc_chunk_entry</code> 产出）。不再有 <code>_assemble_tnd</code>、<code>cmp_k_global_gather_indices</code>、<code>compressed_rows</code>、
+<code>xchg</code>，没有 <code>cu_seq_q</code>/<code>cu_seq_k</code>，也没有单独的重切函数（rank-local metadata 由
+<code>doc_chunk_metadata</code> 产出）。不再有 <code>_assemble_tnd</code>、<code>cmp_k_global_gather_indices</code>、<code>compressed_rows</code>、
 <code>first_indices</code> 或容器网格。</p>
 <h3 id="42-arch22-key">4.2 arch22 的 key 压缩</h3>
 <p>压缩流与滑窗流在 gather 后都是整行，其 <code>seqused</code> 是本 rank 的 reach。arch35 的内核直接读它；arch22
@@ -540,7 +541,7 @@ Sparse core / selector（sharding 声明）
 直接读 <code>attention_metadata.q</code> / <code>.swa_k</code> / <code>.cmp_k</code> 与 <code>aicpu_metadata</code>。</p>
 <h3 id="52-rank-local-frame">5.2 rank-local frame 重建</h3>
 <p><code>AscV41Metadata.prepare_cp_metadata</code>（<code>torchtitan_npu/override/deepseek_v4_1/sparse_attn/ascendc.py</code>）
-从 <code>cp_shard_context()</code> 取 pre-shard <code>positions</code> 与 mesh，调用 <code>shard_asc_v41_metadata</code>：</p>
+从 <code>cp_shard_context()</code> 取 CP mesh，调用 <code>rebuild_cp_metadata</code>（内部 <code>doc_chunk_metadata</code>）：</p>
 <pre><code class="language-text">xchg = ExchangeMetadata.from_permutation(perm, cp_size=cp_size, cp_rank=cp_rank)
 chunk    = row.q.seqused // cp_size                       # Q_d
 reach    = (cp_rank + 1) * chunk                          # K_d
@@ -631,7 +632,7 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/metadata.py</code></td>
-<td><code>DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, position_k, xchg)</code> / <code>KernelFrame</code> / <code>DeepSeekV4Metadata.from_positions</code> / <code>doc_chunk_entry</code>（实例方法，V4.1 继承）</td>
+<td><code>DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, position_k, xchg)</code> / <code>KernelFrame</code> / <code>DeepSeekV4Metadata.from_positions</code> / <code>doc_chunk_metadata</code>（实例方法，V4.1 继承）/ <code>rebuild_cp_metadata</code>（CP 重切 + 交给 builder）</td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/models/deepseek_v4/attention.py</code></td>
@@ -651,7 +652,7 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 </tr>
 <tr>
 <td><code>torchtitan_npu/override/deepseek_v4/asc_metadata.py</code></td>
-<td><code>AicpuMetadata</code> 等类型 / <code>AscV4Metadata</code>（<code>aicpu_metadata</code> + <code>a3_workaround</code>）/ <code>build_aicpu_metadata</code>（组合两个 kernel 模块的 AI_CPU metadata）/ <code>prepare_cp_metadata</code>（<code>doc_chunk_entry</code> + <code>build_aicpu_metadata</code>）</td>
+<td><code>AicpuMetadata</code> 等类型 / <code>AscV4Metadata</code>（<code>aicpu_metadata</code> + <code>a3_workaround</code>）/ <code>build_aicpu_metadata</code>（组合两个 kernel 模块的 AI_CPU metadata）/ <code>prepare_cp_metadata</code>（<code>rebuild_cp_metadata</code>，内部 <code>doc_chunk_metadata</code> + <code>build_aicpu_metadata</code>）</td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py</code></td>

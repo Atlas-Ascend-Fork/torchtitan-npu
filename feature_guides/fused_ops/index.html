@@ -324,9 +324,11 @@
   在其上只补四个算子的记录；<code>sparse_attn.asc</code> 桥接 SparseFlashMLA/SMLAG 的正反向，
   <code>lightning_indexer.asc</code> 桥接 <code>lightning_indexer</code>/<code>sparse_lightning_indexer_kl_loss_grad</code> 的正反向，
   几何（heads/head dim）是该 config 自己的必填字段、无默认值，由 override 参数一次写入，默认值即
-  V4-Flash 的发布形状。CP 下由 <code>AscV4Metadata.prepare_cp_metadata</code> 调 <code>doc_chunk_entry</code> 把 entry
-  换成本 rank 的 frames 与 <code>cp</code> 计划（输入已由模型的 <code>preprocess_inputs</code> 搬到 doc-chunk），再用
-  <code>AscV4Metadata.build_aicpu_metadata</code> 按这些 frames 重建记录；参考契约的 hook 直接拒绝 CP。</p>
+  V4-Flash 的发布形状。CP 下 <code>AscV4Metadata.prepare_cp_metadata</code> 调 metadata 自己的
+  <code>rebuild_cp_metadata(permutation, build=…)</code>：它从 <code>cp_shard_context()</code> 读 mesh、用
+  <code>doc_chunk_metadata</code> 把 metadata 换成本 rank 的 frames 与 <code>cp</code> 计划（输入已由模型的
+  <code>preprocess_inputs</code> 搬到 doc-chunk），再交给 <code>AscV4Metadata.build_aicpu_metadata</code> 按这些
+  frames 重建记录；参考契约的 hook 直接拒绝 CP。</p>
 </li>
 <li>
 <p>MoE token dispatcher 的 <code>npu_moe_token_unpermute</code> 与 <code>npu_moe_re_routing</code> 在
