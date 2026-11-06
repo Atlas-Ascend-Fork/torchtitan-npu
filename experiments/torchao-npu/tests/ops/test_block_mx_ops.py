@@ -1083,6 +1083,31 @@ def test_grouped_mm_accepts_pre_quantized_activation():
     assert wgrad_sqnr > 20.0, f"the wgrad SQNR vs the HP path is too low: {wgrad_sqnr:.2f} db"
 
 
+@pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float4_e2m1fn_x2])
+def test_grouped_mm_backward_reuses_pre_quantized_output_gradient(elem_dtype):
+    """The dgrad consumes a compatible K-axis MX gradient without requantizing it."""
+    torch.manual_seed(0)
+    m, k, n, e = 128, 64, 128, 4
+    a = torch.randn(m, k, device="npu", dtype=torch.bfloat16)
+    b = torch.randn(e, k, n, device="npu", dtype=torch.bfloat16)
+    dY = torch.randn(m, n, device="npu", dtype=torch.bfloat16)
+    offs = _group_list_from_sizes([32, 32, 32, 32])
+    config_a = MXQuantizeConfig(elem_dtype=elem_dtype)
+    config_b = BlockMXQuantizeConfig()
+    mx_dY = MXTensor.from_hp(dY, config_a, axis=-1)
+
+    a_ref = a.clone().detach().requires_grad_(True)
+    b_ref = b.clone().detach().requires_grad_(True)
+    to_block_mx_then_grouped_mm(a_ref, b_ref, offs, config_a, config_b).backward(mx_dY.dequantize())
+
+    a_mx = a.clone().detach().requires_grad_(True)
+    b_mx = b.clone().detach().requires_grad_(True)
+    to_block_mx_then_grouped_mm(a_mx, b_mx, offs, config_a, config_b).backward(mx_dY)
+
+    assert torch.equal(a_mx.grad, a_ref.grad), "reusing the wire dY changed dgrad"
+    assert torch.equal(b_mx.grad, b_ref.grad), "reusing the wire dY changed wgrad"
+
+
 def test_mm_rejects_mx_activation_quantized_along_the_wrong_axis():
     """The forward form must be the K-dim form, quantized along the last dim.
 

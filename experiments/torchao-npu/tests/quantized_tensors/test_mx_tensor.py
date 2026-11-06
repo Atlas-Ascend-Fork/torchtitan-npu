@@ -243,6 +243,24 @@ def test_fp4_shape_ops_track_the_pack_axis():
     )
 
 
+def test_slice_leading_dim_slices_qdata_and_scale():
+    config = MXQuantizeConfig()
+    x = MXTensor.from_hp(torch.randn(4, 64, device="npu", dtype=torch.bfloat16), config, axis=-1)
+
+    y = x[1:3]
+
+    assert torch.equal(y.qdata.view(torch.uint8), x.qdata[1:3].view(torch.uint8))
+    assert torch.equal(y.scale, x.scale[1:3])
+
+
+def test_slice_keyword_dim_rejects_quant_axis():
+    config = MXQuantizeConfig()
+    x = MXTensor.from_hp(torch.randn(4, 64, device="npu", dtype=torch.bfloat16), config, axis=-1)
+
+    with pytest.raises(ValueError, match="quantization blocks"):
+        torch.ops.aten.slice.Tensor(x, dim=1, start=0, end=32)
+
+
 # =========================================================================
 # Re-shaping (view / reshape / _unsafe_view)
 # =========================================================================

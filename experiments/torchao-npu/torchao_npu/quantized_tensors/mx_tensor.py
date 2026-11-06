@@ -43,9 +43,9 @@ class MXTensor(BaseQuantizedTensor):
     leading dims, only when the quant axis is the last dim and
     innermost-contiguous (and, for FP4, the pack axis is that same last dim);
     the last dim may change only between multiples of ``2 * block_size`` (whole
-    packed block pairs). ``mm`` / ``bmm`` / ``addmm`` / ``_grouped_mm`` /
-    ``linear`` / ``matmul`` are intercepted too (see below). Every other op
-    raises ``NotImplementedError``, except the handlers inherited from
+    packed block pairs). ``dequantize`` / ``mm`` / ``bmm`` / ``addmm`` /
+    ``_grouped_mm`` / ``linear`` / ``matmul`` and leading-dimension ``slice``
+    are intercepted too (see below). Every other op raises ``NotImplementedError``, except the handlers inherited from
     :class:`~torchao_npu.quantized_tensors.base_quantized_tensor.BaseQuantizedTensor`.
 
     Matmul: the right operand is the weight and must be an ``MXTensor``
@@ -55,8 +55,9 @@ class MXTensor(BaseQuantizedTensor):
     high-precision tensor, which is quantized on the fly along ``dim=-1`` with
     that config -- a ``RuntimeError`` is raised when it is unset. The product is
     computed by the NPU kernels from the stored ``qdata``/``scale``, without
-    re-quantizing, and returned as a plain high-precision tensor. There is no
-    backward.
+    re-quantizing, and returned as a plain high-precision tensor. These direct
+    quantized matmul handlers are inference-only; training uses the wrapper
+    tensor operators and their custom backward functions.
 
     ``torch.matmul`` is only partially supported: it may apply various shape
     operations to an ``MXTensor`` operand, and raises an error for any of them
@@ -74,8 +75,10 @@ class MXTensor(BaseQuantizedTensor):
             with two values packed per element along ``pack_axis``, so that
             axis is halved.
 
-        scale: ``float8_e8m0fnu`` block scales with ndim = ``qdata.ndim + 1``, readers are
-            referred to the doc of ``torch_npu.npu_dynamic_mx_quant`` for its shape details.
+        scale: E8M0 block scales with ndim = ``qdata.ndim + 1``. NPU dynamic
+            quantization stores their bit pattern in a ``uint8`` tensor; manually
+            constructed tensors may use the semantic ``float8_e8m0fnu`` dtype.
+            See ``torch_npu.npu_dynamic_mx_quant`` for shape details.
 
         dtype: The logical (high-precision) dtype this tensor presents; the dtype the values had before quantization.
 
@@ -199,14 +202,22 @@ class MXTensor(BaseQuantizedTensor):
         Returns:
             A plain tensor of dtype ``output_dtype``
         """
+        logical_dtype = self.dtype  # pyrefly: ignore [missing-attribute]
+        output_dtype = logical_dtype if output_dtype is None else output_dtype
+        if (
+            output_dtype is logical_dtype
+            and self.qdata.dtype is torch.float8_e4m3fn
+            and self.quant_axis == self.qdata.ndim - 1
+        ):
+            # Keep wire gradients opaque to AOTAutograd and handle empty token batches.
+            return _mxfp8_dequantize_tensor(self)
         return mx_dequantize(
             self.qdata,
             self.scale,
             self.quant_axis,
             block_size=self.quant_config.block_size,
             src_dtype=self.quant_config.elem_dtype,
-            # pyrefly: ignore [missing-attribute]
-            output_dtype=self.dtype if output_dtype is None else output_dtype,
+            output_dtype=output_dtype,
         )
 
     def to_block_mx(self, quant_config: BlockMXQuantizeConfig) -> "BlockMXTensor":
@@ -249,6 +260,29 @@ class MXTensor(BaseQuantizedTensor):
 
 
 implements = MXTensor.implements
+
+
+@torch.library.custom_op(  # pyrefly: ignore [missing-attribute]
+    "torchao_npu::mxfp8_dequantize_tensor", mutates_args=(), device_types="npu"
+)
+def _mxfp8_dequantize_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.clone()
+
+
+@_mxfp8_dequantize_tensor.register_fake
+def _mxfp8_dequantize_tensor_fake(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.empty_strided(tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device)
+
+
+@implements(torch.ops.torchao_npu.mxfp8_dequantize_tensor.default)  # pyrefly: ignore [missing-attribute]
+def _(func, types, args, kwargs):
+    x = args[0]
+    if x.qdata.dtype is not torch.float8_e4m3fn or x.quant_axis != x.ndim - 1:
+        raise ValueError("mxfp8_dequantize_tensor requires a last-axis float8_e4m3fn MXTensor")
+
+    from torchao_npu.ops.mxfp8_all_to_all import _mxfp8_dequantize_or_empty
+
+    return _mxfp8_dequantize_or_empty(x.qdata, x.scale, x.quant_config.block_size, x.dtype)
 
 
 def _permute(x: MXTensor, perm: list[int]) -> MXTensor:
@@ -301,6 +335,28 @@ def _(func, types, args, kwargs):
         raise RuntimeError(f"t() expects a tensor with <= 2 dimensions, but self is {x.ndim}D")
     perm = permutation_from_transpose(0, 1, x.ndim) if x.ndim == 2 else list(range(x.ndim))
     return return_and_correct_aliasing(func, args, kwargs, _permute(x, perm))
+
+
+@implements(aten.slice.Tensor)
+def _(func, types, args, kwargs):
+    x = args[0]
+    dim_arg = args[1] if len(args) > 1 else (kwargs or {}).get("dim", 0)
+    dim = normalize_dim(dim_arg, x.ndim)
+    if dim == x.quant_axis:
+        raise ValueError("MXTensor cannot slice through quantization blocks")
+    if x.pack_axis == dim:
+        raise ValueError("MXTensor cannot slice through packed values")
+    sliced = MXTensor(
+        func(x.qdata, *args[1:], **(kwargs or {})),
+        func(x.scale, *args[1:], **(kwargs or {})),
+        x.dtype,
+        x.quant_axis,
+        x.quant_config,
+        x.act_quant_config,
+        x.pack_axis,
+        requires_grad=x.requires_grad,
+    )
+    return return_and_correct_aliasing(func, args, kwargs, sliced)
 
 
 def _view(func, x: MXTensor, new_shape: tuple[int, ...]) -> MXTensor:

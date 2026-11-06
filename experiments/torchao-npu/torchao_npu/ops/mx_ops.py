@@ -540,7 +540,8 @@ class _MXQuantGroupedMM(torch.autograd.Function):
 
 
     Backward (``dY = grad_output``):
-        - dY is quantized using A's config.
+        - A last-axis MXTensor dY is reused; a high-precision dY is quantized
+          using A's config.
         - dgrad ``dA = dY @ B^T`` (contract over N)
         - wgrad ``dB = A^T @ dY`` (contract over M, ``group_type=2``).
         - All multiplications are done in low precision.
@@ -575,13 +576,26 @@ class _MXQuantGroupedMM(torch.autograd.Function):
 
         grouped_mx_A, mx_B, offs = _retrieve_gmm_backward_operands_and_maybe_requantize(ctx)
 
-        # dY is quantized with A's config, providing both GEMMs' operands below: the
-        # N-dim form for the dgrad, the group-aware M-dim form for the wgrad.
-        # dY [M, N] → dY_s1 (N-dim scale) [M, ceil(ceil(N/32)/2), 2]
-        mx_dY = MXTensor.from_hp(dY, grouped_mx_A.quant_config, axis=-1)
+        # The inverse combine exchange can provide dY already quantized along N.
+        # Reuse that wire representation for dgrad; wgrad still needs the logical
+        # values to build its group-aware M-dim form.
+        if isinstance(dY, MXTensor):
+            assert dY.quant_config == grouped_mx_A.quant_config, (
+                "The quantization configuration of the pre-quantized ``dY`` is not consistent with that of ``A``."
+            )
+            assert dY.quant_axis == dY.ndim - 1, (
+                "The pre-quantized ``MXTensor`` ``dY`` must be quantized along its last dim, "
+                f"got quant_axis={dY.quant_axis} for a {dY.ndim}D tensor."
+            )
+            mx_dY = dY
+            logical_dY = dY.dequantize()
+        else:
+            # dY [M, N] → dY_s1 (N-dim scale) [M, ceil(ceil(N/32)/2), 2]
+            mx_dY = MXTensor.from_hp(dY, grouped_mx_A.quant_config, axis=-1)
+            logical_dY = dY
 
         # dY [M, N] → dY_s2 (M-dim scale) [M//64 + E, N, 2]
-        grouped_mx_dY = GroupedMXTensor.from_hp(dY, offs, grouped_mx_A.quant_config)
+        grouped_mx_dY = GroupedMXTensor.from_hp(logical_dY, offs, grouped_mx_A.quant_config)
 
         # dgrad: dA = dY @ B^T (group_type=0, contract over N)
         # - dY's N-dim form against the saved B form transposed.
