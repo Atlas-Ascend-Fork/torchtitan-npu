@@ -11,7 +11,7 @@ the backward so both passes see identical operands.  Its gradient passes straigh
 through to the original input, i.e. the Q/DQ is an identity STE.
 
 The kernels' AI_CPU metadata is *not* a copy step: this core reads what the attention
-override precomputed on the entry, so the quantized and the unquantized core launch the very
+override precomputed on the metadata, so the quantized and the unquantized core launch the very
 same ``metadata`` tensors.
 
 The main KV is *not* quantized here.  It arrives already fake-quantized: the
@@ -40,7 +40,7 @@ _SWA_QUANT_MODE = "mxfp8_bf16"
 
 
 def _kernel_options(attention_metadata, ratio, window_size):
-    """The kernel options, read off the entry's frames.
+    """The kernel options, read off the metadata's frames.
 
     The metadata this backend precomputes and the launches that consume it read them from one
     builder -- ``smla_kernel_options`` -- so the two cannot disagree option-for-option.
@@ -88,7 +88,7 @@ class _SparseMLA(torch.autograd.Function):
         if not hasattr(attention_metadata, "aicpu_metadata"):
             raise ValueError(
                 "the quantized sparse attention needs the AI_CPU metadata its own config builds: "
-                "the entry handed to this forward carries none. Enable the quantized attention "
+                "the metadata handed to this forward carries none. Enable the quantized attention "
                 "(and the quantized selector with it) instead of the unquantized override."
             )
         smla_metadata = attention_metadata.aicpu_metadata.sparse_attn.fwd
@@ -133,7 +133,7 @@ class _SparseMLA(torch.autograd.Function):
         # one -- the backward has to differentiate the same graph the forward built.
         q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
         options = _kernel_options(ctx.attention_metadata, ctx.ratio, ctx.window_size)
-        # The gradient side rides the same entry, so the backward launches nothing either.
+        # The gradient side rides the same metadata, so the backward launches nothing either.
         smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
         dq, dswa_k, dcmp_k, dsinks, _, cmp_softmax_l1_norm = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,

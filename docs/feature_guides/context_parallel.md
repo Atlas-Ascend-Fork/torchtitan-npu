@@ -77,8 +77,9 @@ position_k：               本 rank flatten 段自己的文档内位置（entry
   时恒等返回、不碰进程组，所以同一条前向路径服务两个 degree，调用点不需要分支。
 - 本 rank flatten 段自己的文档内位置由 `doc_relative_positions(cu_seqlens, 行号)` 算出（纯 device），
   它填的就是 entry 的 `position_k`。
-- rank-local entry 由 `DeepSeekV4Metadata.doc_chunk_entry(cp_size=…, cp_rank=…)` 产出（V4.1 继承
-  同一个方法），两个 port 的 CP 钩子只在它之上重建自己的 AI_CPU records。
+- rank-local metadata 由 `DeepSeekV4Metadata.doc_chunk_metadata(permutation=…, cp_size=…, cp_rank=…)`
+  产出（V4.1 继承同一个方法）；两个 port 的 CP 钩子调 `rebuild_cp_metadata(permutation, build=…)`，
+  它读 `cp_shard_context()`、调 `doc_chunk_metadata`，再按本 rank 的 frame 重建自己的 AI_CPU metadata。
 
 **host 同步的位置**：`ExchangeMetadata` 的 `send_split` / `recv_split` 是其中一处。集合通信按 python
 list 接收 split，这是框架的签名；它们由 plan 推导，而 plan **每个 microbatch 每个 geometry 只建一次**
@@ -98,13 +99,13 @@ entry 的 `prepare_cp_metadata` 用 rank-local chunk 重建这三个 frame 以�
 
 | 栈 | 参考 metadata | CP 重建 |
 | --- | --- | --- |
-| V4 | `DeepSeekV4Metadata` 自带 `q`/`swa_k`/`cmp_k` 与 `xchg: ExchangeMetadata`（`DeepSeekV4Metadata.from_positions` 用整行边界构造） | `AscV4Metadata.prepare_cp_metadata` → `doc_chunk_entry` → `AscV4Metadata.build_aicpu_metadata` |
-| V4.1 | `DeepSeekV41Metadata` 只有整行边界与位置；frame 由融合 entry `AscV41Metadata` 携带 | `AscV41Metadata.prepare_cp_metadata` → `shard_asc_v41_metadata` |
+| V4 | `DeepSeekV4Metadata` 自带 `q`/`swa_k`/`cmp_k` 与 `xchg: ExchangeMetadata`（`DeepSeekV4Metadata.from_positions` 用整行边界构造） | `AscV4Metadata.prepare_cp_metadata` → `rebuild_cp_metadata` → `doc_chunk_metadata` → `AscV4Metadata.build_aicpu_metadata` |
+| V4.1 | `DeepSeekV41Metadata` 只有整行边界与位置；frame 由融合 metadata `AscV41Metadata` 携带 | `AscV41Metadata.prepare_cp_metadata` → `rebuild_cp_metadata` → `doc_chunk_metadata` → `AscV41Metadata.build_aicpu_metadata` |
 
-两栈的重建都从 `cp_shard_context()` 读 pre-shard `positions` 与 CP mesh，并要求
-`--parallelism.context-parallel-load-balancer doc_chunk`：这些 frame 描述的就是 doc-chunk 布局，切分用
-的布局与 frame 描述的不一致会静默错位，所以在 entry 里直接拒绝。V4 的 `doc_chunk_entry` 重算 frame
-与 `restore`、`position_k`；V4.1 的 `shard_asc_v41_metadata` 同样重建这三样，只是入口不同。
+两栈的重建都经过同一个 `rebuild_cp_metadata(permutation, build=…)`：它从 `cp_shard_context()` 读
+CP mesh，`doc_chunk_metadata` 重算 frame 与 `restore`、`position_k`，再交给各自的 builder；两栈都要求
+`--parallelism.context-parallel-load-balancer doc_chunk`——这些 frame 描述的就是 doc-chunk 布局，切分用
+的布局与 frame 描述的不一致会静默错位，所以在 metadata 里直接拒绝。
 
 ## 2. 启用方式
 
@@ -203,8 +204,8 @@ plan 搬过的。
 
 `AscV4Metadata` 的 `q`/`swa_k`/`cmp_k` frame 被 SMLA/SMLAG 与独立的 LI override（前向
 `lightning_indexer`、反向 SLIKG）直接读取；V4 的 metadata 只有 `ratio`、三个 frame、`position_k`、
-`xchg`，没有 `cu_seq_q`/`cu_seq_k`，也没有单独的重切函数（rank-local entry 由
-`doc_chunk_entry` 产出）。不再有 `_assemble_tnd`、`cmp_k_global_gather_indices`、`compressed_rows`、
+`xchg`，没有 `cu_seq_q`/`cu_seq_k`，也没有单独的重切函数（rank-local metadata 由
+`doc_chunk_metadata` 产出）。不再有 `_assemble_tnd`、`cmp_k_global_gather_indices`、`compressed_rows`、
 `first_indices` 或容器网格。
 
 ### 4.2 arch22 的 key 压缩
@@ -323,7 +324,7 @@ V4.1 的参考 metadata（`DeepSeekV41Metadata`）只带整行边界与 `positio
 ### 5.2 rank-local frame 重建
 
 `AscV41Metadata.prepare_cp_metadata`（`torchtitan_npu/override/deepseek_v4_1/sparse_attn/ascendc.py`）
-从 `cp_shard_context()` 取 pre-shard `positions` 与 mesh，调用 `shard_asc_v41_metadata`：
+从 `cp_shard_context()` 取 CP mesh，调用 `rebuild_cp_metadata`（内部 `doc_chunk_metadata`）：
 
 ```text
 xchg = ExchangeMetadata.from_permutation(perm, cp_size=cp_size, cp_rank=cp_rank)
@@ -402,12 +403,12 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/models/deepseek_v4/compile_policy.py` | `skip_compile_under_cp`：arch22 + CP 时把编译关掉并告警（见 §4.2） |
 | `torchtitan_npu/models/deepseek_v4/metadata.py` | `KernelFrame`（两栈共用的 frame 原语） |
 | `torchtitan_npu/models/deepseek_v4/model.py` | `DeepSeekV4Model.preprocess_inputs`：MTP 深度与 batch 走同一次 `cp_shard`（布局由 seam 施加，模型不再搬 batch） |
-| `torchtitan_npu/models/deepseek_v4/metadata.py` | `DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, position_k, xchg)` / `KernelFrame` / `DeepSeekV4Metadata.from_positions` / `doc_chunk_entry`（实例方法，V4.1 继承） |
+| `torchtitan_npu/models/deepseek_v4/metadata.py` | `DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, position_k, xchg)` / `KernelFrame` / `DeepSeekV4Metadata.from_positions` / `doc_chunk_metadata`（实例方法，V4.1 继承）/ `rebuild_cp_metadata`（CP 重切 + 交给 builder） |
 | `torchtitan_npu/models/deepseek_v4/attention.py` | 查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 `restore_key_stream` 恢复、压缩器内部恢复+carry、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 `q` / `cmp_k` frame 与预计算的 HCA 选择 |
 | `torchtitan_npu/models/deepseek_v4/cp_compressor.py` | `CarryExchange` / `CarryStream`：ratio-4 carry 的 ring（只换 tokens；位置由 `doc_relative_positions` 算出）、增强 `cu_seqlens` 与 `trim`；cp=1 为 no-op |
 | `torchtitan_npu/models/deepseek_v4/compressor.py` | 压缩器（CP/非 CP 同一实例）：`forward` 用 `restore_key_stream(attention_metadata.cp, …)` 恢复窗口、ratio-4 时内部 carry 并裁掉自己那块；`Indexer` 复用它，`idx_q` 在 chunk 行、`idx_k` 是行内的池化块 |
 | `torchtitan_npu/models/deepseek_v4/sharding.py` | `swa_k` / `cmp_k` / `idx_k` 的 `cp: S(1) -> R` 声明 |
-| `torchtitan_npu/override/deepseek_v4/asc_metadata.py` | `AicpuMetadata` 等类型 / `AscV4Metadata`（`aicpu_metadata` + `a3_workaround`）/ `build_aicpu_metadata`（组合两个 kernel 模块的 AI_CPU metadata）/ `prepare_cp_metadata`（`doc_chunk_entry` + `build_aicpu_metadata`） |
+| `torchtitan_npu/override/deepseek_v4/asc_metadata.py` | `AicpuMetadata` 等类型 / `AscV4Metadata`（`aicpu_metadata` + `a3_workaround`）/ `build_aicpu_metadata`（组合两个 kernel 模块的 AI_CPU metadata）/ `prepare_cp_metadata`（`rebuild_cp_metadata`，内部 `doc_chunk_metadata` + `build_aicpu_metadata`） |
 | `torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py` | `kernel_options` / `kernel_aicpu_metadata`（SMLA/SMLAG 的实参与记录，同处一模块）/ `_SparseMLA` / `AscSparseMLAMixin`（两栈共用的端口：行/TND 翻译、arch22 上 key 压缩） |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | `kernel_options` / `kernel_aicpu_metadata`（indexer 的实参与 metadata）/ `_LightningIndexerTND` / `AscIndexerMixin`（两栈共用的 indexer 端口，V4.1 形状：`candidates_BL1C` 与三元返回） |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/pypto.py` | PyPTO 版 selector：独立实现同一契约（输入准备、排序、teacher 边），只替换 LI/SLIKG kernel 对 |

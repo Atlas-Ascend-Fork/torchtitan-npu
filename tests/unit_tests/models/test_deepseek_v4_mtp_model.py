@@ -355,7 +355,7 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
         .build(seq_len=SEQ_LEN, cp_size=cp_size, attention_metadata=row_entry)
         .generate_permutation()
     )
-    local_entry = row_entry.doc_chunk_entry(permutation=permutation, cp_size=cp_size, cp_rank=rank)
+    local_entry = row_entry.doc_chunk_metadata(permutation=permutation, cp_size=cp_size, cp_rank=rank)
     held = permutation[0, rank * shard_len : (rank + 1) * shard_len]
 
     shard_calls = []

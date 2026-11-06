@@ -88,7 +88,7 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
         query, key, weights, indices = ctx.saved_tensors
         inputs, config = ctx.inputs, ctx.config
         if inputs.backward_metadata is None:
-            raise RuntimeError("Quantized LI training requires the SLIKG backward record")
+            raise RuntimeError("Quantized LI training requires the SLIKG backward metadata")
         # SMLAG already masked padding and applied softmax_scale. Match the BF16 selector's
         # normalization by the row's query-token count: under context parallelism the rank's own
         # ``cu_seqlens_q[-1]`` is one chunk of it, and the ranks' gradients are summed.

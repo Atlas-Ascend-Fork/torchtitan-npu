@@ -6,7 +6,7 @@
 """The DeepSeek-V4 fused attention with a quantized selector.
 
 The quantized stack is a backend of its own: it extends the fused config and builds its own
-metadata entry (the selector's record is a different operator), while the forward is the fused
+metadata (the selector's grid is a different operator), while the forward is the fused
 one, inherited unchanged -- quantizing the selector does not change a single launch of the
 attention.  That is the difference from DeepSeek-V4.1's quantized backend, which also
 fake-quantizes its sliding-window input and therefore copies the forward.
@@ -22,16 +22,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
     AscCompressedSparseInnerAttention,
     AscV4Metadata,
 )
 
-from .attention_metadata import attach_selector_record
+from .attention_metadata import QuantV4Metadata
 
 
 class QuantizedV4SparseAttention(AscCompressedSparseInnerAttention):
-    """The fused attention whose selector record is built by the quantized selector."""
+    """The fused attention whose selector grid is built by the quantized selector."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(AscCompressedSparseInnerAttention.Config):
@@ -46,16 +47,11 @@ class QuantizedV4SparseAttention(AscCompressedSparseInnerAttention):
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
         ) -> AscV4Metadata:
-            """The fused entry, with the selector's record rebuilt by this backend.
+            """This backend's per-microbatch metadata: the model's, plus this backend's builder.
 
-            The parent builder is named explicitly: ``slots=True`` recreates this dataclass, so a
-            zero-argument ``super()`` would bind to the decorated-away class.
+            The frames are the model's; the builder is this backend's, which builds every operator
+            output the fused builder builds and hands the selector's grid to its own operator.
             """
-            metadata = AscCompressedSparseInnerAttention.Config.build_attention_metadata(
-                self,
-                positions,
-                padding_mask=padding_mask,
-                max_num_documents=max_num_documents,
-                max_context_length=max_context_length,
-            )
-            return attach_selector_record(metadata, geometry=self.geometry, quant_mode=self.quant_mode)
+            del padding_mask, max_num_documents, max_context_length
+            metadata = DeepSeekV4Metadata.from_positions(positions, self.compress_ratio)
+            return QuantV4Metadata.build_aicpu_metadata(metadata, geometry=self.geometry, quant_mode=self.quant_mode)

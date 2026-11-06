@@ -6,8 +6,8 @@
 """DeepSeek-V4.1 QLI/QSLI selection with an SLIKG backward edge.
 
 The kernels' AI_CPU schedules are not built here either: the quantized attention's own config
-precomputes them per microbatch at the eager boundary and hands them over on the entry this module
-receives (``attention_metadata`` is the provider).  QSLI's per-row candidate count is derived at the
+precomputes them per microbatch at the eager boundary and hands them over on the metadata this
+module receives (``attention_metadata`` is the provider).  QSLI's per-row candidate count is derived at the
 same time, from the row's lengths -- never read back off QLI's output, which is what lets the
 search's schedule exist before the forward.  This module launches the pair and reads that metadata,
 the way the BF16 selector reads its own.
@@ -52,17 +52,17 @@ def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _selector_metadata(attention_metadata):
-    """The entry's quantized selector schedules.
+    """The metadata's quantized selector schedules.
 
     They are built by the attention backend that owns this stack -- the quantized sparse attention
     -- once per microbatch, before this forward.  There is no second builder here: a stack whose
-    entry carries none is a wiring error, and the two kernels' metadata is not interchangeable
+    metadata carries none is a wiring error, and the two kernels' metadata is not interchangeable
     (an unquantized schedule fed to the quantized kernel yields garbage indices).
     """
     indexer = getattr(attention_metadata.aicpu_metadata, "lightning_indexer", None)
     if indexer is None or getattr(indexer, "fwd", None) is None:
         raise ValueError(
-            "the attention entry carries no quantized selector schedules: the quantized selector "
+            "the attention metadata carries no quantized selector schedules: the quantized selector "
             "runs only with the quantized sparse attention."
         )
     return indexer
@@ -73,7 +73,7 @@ def _validate_role(*, candidate_topk_blocks: int, is_source: bool, candidate: to
 
     A pool's source builds the table and is handed none; a searcher is handed the source's; a layer
     with no pool never sees one.  The branch below picks the kernel from ``candidate`` alone, so a
-    mismatch would silently train a searcher that scores every entry -- the pool's whole point
+    mismatch would silently train a searcher that scores every key -- the pool's whole point
     being that it does not.
     """
     searcher = candidate_topk_blocks > 0 and not is_source
@@ -168,7 +168,7 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
         candidate_topk_blocks,
         candidate_block_size,
     ):
-        # The options and the schedules both come off the same entry, so a launch and the metadata
+        # The options and the schedules both come off the same metadata, so a launch and the
         # it is handed describe one frame set.
         topk_indices, candidate_out = _quantized_forward(
             idx_q,
@@ -209,7 +209,7 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             raise RuntimeError("Set Selector.num_global_queries before training the indexer")
         # Match the BF16 path: the trainer counts queries across the full step and DP mesh.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
-        # The backward rides the same entry, so it launches no AI_CPU operator either, and the
+        # The backward rides the same metadata, so it launches no AI_CPU operator either, and the
         # SLIKG metadata is the one the BF16 selector would read: the teacher edge is BF16 in both.
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
@@ -262,7 +262,7 @@ class QuantV41LightningIndexer(torch.nn.Module):
             raise ValueError("V4.1 QLI/QSLI requires one packed TND row (model batch size 1)")
 
         # Which schedule this layer launches, and whether it builds the pool, follow from its own
-        # role -- which the model states and the entry's schedules were sized for.
+        # role -- which the model states and the metadata's schedules were sized for.
         is_source = self.has_candidate_pool and self.mode == "full"
         topk = self.index_topk
         topk_indices, topk_scores, candidate = _QuantV41LightningIndexerTND.apply(

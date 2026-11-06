@@ -77,7 +77,7 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
         .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
         .generate_permutation()
     )
-    local = row.doc_chunk_entry(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+    local = row.doc_chunk_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
     return AscV4Metadata.build_aicpu_metadata(local, geometry=_GEOMETRY)
 
 

@@ -6,15 +6,16 @@
 """Document-packed attention metadata for DeepSeek-V4.
 
 **One** dataclass with **one** set of fields describes a geometry at every context-parallel
-degree, and only the values differ.  An entry is built once per microbatch per geometry by the
-attention backend's config (the map key is that backend's class plus the layer's compression
-ratio) and handed to every layer of the geometry, exactly as upstream #4897's seam does.
+degree, and only the values differ.  One metadata object is built once per microbatch per
+geometry by the attention backend's config (the map key is that backend's class plus the layer's
+compression ratio) and handed to every layer of the geometry, exactly as upstream #4897's seam
+does.
 
 The row is described by one :class:`KernelFrame` per addressed tensor -- the queries, the
 sliding-window keys and, for a geometry that pools, the compressed keys.
 :meth:`DeepSeekV4Metadata.from_positions` derives them from the row's boundaries, so the reference core and a
-fused port grid the same frames; a vendor backend attaches only the AI_CPU records its kernels
-launch.  A kernel that cannot read these frames as they are -- arch22's TND kernels ignore
+fused port grid the same frames; a vendor backend adds only the AI_CPU metadata its kernels
+produce.  A kernel that cannot read these frames as they are -- arch22's TND kernels ignore
 ``seqused`` and anchor their mask at the frame's end -- restates them at its own call site
 (``override/a3_workaround.py``) rather than here: nothing about the row changes.
 
@@ -22,8 +23,8 @@ Under context parallelism the queries are **chunk ``r`` of every document** whil
 stays the **whole row**.  The input layout (``models/deepseek_v4/cp_attention.py``) moves the
 batch's tokens, positions and labels onto the chunk frame once per batch, so ``q.cu_seqlens`` is
 the rank-local chunk grid and the KV frames address the row; a layer that projects keys restores
-its hidden states onto the flatten slice with the entry's :attr:`DeepSeekV4Metadata.xchg`, which is
-what removes the per-layer query movement and the output un-permutation.  There are no
+its hidden states onto the flatten slice with the metadata's :attr:`DeepSeekV4Metadata.xchg`,
+which is what removes the per-layer query movement and the output un-permutation.  There are no
 ``cu_seq_q`` / ``cu_seq_k`` aliases: read the grid from the frame that addresses it (row grid =
 ``swa_k.cu_seqlens``, query grid = ``q.cu_seqlens``, compressed grid = ``cmp_k.cu_seqlens``).
 
@@ -70,15 +71,15 @@ if KernelFrame not in SUPPORTED_NODES:
 class DeepSeekV4Metadata:
     """One geometry's DeepSeek-V4 attention contract (the V4.1 shape).
 
-    Handed to each DSA layer through the decoder's metadata map, **one entry per geometry**: the
-    map key is the attention config's own class plus the layer's compression ratio, so a layer
-    reads the entry built for the axis its kernels grid.  A vendor backend extends it with its own
-    records (the AscendC entry adds the AI_CPU metadata).
+    Handed to each DSA layer through the decoder's metadata map, **one per geometry**: the map key
+    is the attention config's own class plus the layer's compression ratio, so a layer reads the
+    metadata built for the axis its kernels grid.  A vendor backend subclasses it and adds the
+    operator outputs its kernels produce (``AscV4Metadata`` is the AscendC one).
     """
 
     ratio: int
-    """The compression ratio this entry describes.  Every consumer grids this ratio: a layer reads
-    the entry built for its own, so no consumer checks another geometry's plan."""
+    """The compression ratio this metadata describes.  Every consumer grids this ratio: a layer
+    reads the metadata built for its own, so no consumer checks another geometry's plan."""
 
     q: KernelFrame
     """The query frame: the row's boundaries at one degree, this rank's chunks under context
@@ -113,15 +114,15 @@ class DeepSeekV4Metadata:
 
     @classmethod
     def from_positions(cls, positions: torch.Tensor, ratio: int) -> Self:
-        """Build one geometry's entry from the pre-shard row positions.
+        """Build one geometry's metadata from the pre-shard positions.
 
         Called once per microbatch per geometry by the attention backend's config: the row's
         boundaries (read off the positions), this layer's ratio -- the only per-geometry part of
-        the grid -- and the frames that address them.  A vendor backend adds its records on top
-        of the same entry.
+        the grid -- and the frames that address them.  A vendor backend adds its operator outputs
+        on top of the same.
 
         A ratio of zero addresses no compressed axis: the layer runs the sliding window and the
-        sink only, so its entry carries no compressed frame at all.
+        sink only, so its metadata carries no compressed frame at all.
         """
         if ratio < 0:
             raise ValueError(f"a compression ratio must not be negative, got {ratio}.")
@@ -156,11 +157,11 @@ class DeepSeekV4Metadata:
     ) -> "DeepSeekV4Metadata":
         """Refuse context parallel: only the fused stack has a rank-local form.
 
-        The row is the whole packed sequence and this entry hands one grid to both sides of the
+        The row is the whole packed sequence and this metadata hands one grid to both sides of the
         attention, so a rank that holds a chunk has no metadata a reference consumer could read.
-        A CP run therefore stops here, before any layer runs, and the fused entry
-        (``AscV4Metadata``) overrides this with the frames and records rebuilt from the rank's own
-        chunks.
+        A CP run therefore stops here, before any layer runs, and the fused metadata
+        (``AscV4Metadata``) overrides this with the frames and AI_CPU metadata rebuilt from the
+        rank's own chunks.
         """
         del attention_metadata, permutation
         raise ValueError(
@@ -170,11 +171,37 @@ class DeepSeekV4Metadata:
             "--parallelism.context-parallel-degree."
         )
 
-    def doc_chunk_entry(self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int) -> Self:
-        """This rank's entry: the doc-chunk query frame, the row's KV frames and the movement.
+    def rebuild_cp_metadata(self, permutation: torch.Tensor | None, *, build):
+        """This rank's metadata: the frames re-cut, then the AI_CPU metadata rebuilt for them.
 
-        The frames and the movement are derived from the row's boundaries alone, so the entry
-        crosses no collective.  Each document is assumed to be a whole multiple of
+        ``build`` takes the rank-local metadata and returns it with its operator outputs rebuilt;
+        it is the builder that owns them (the fused stack's, or a subclass's that adds its own),
+        and it is stated by the caller rather than looked up, because the hook is a staticmethod
+        -- as upstream declares it -- and so has no class to dispatch through.  It must therefore
+        be the caller's own builder: a backend that states a ``build_aicpu_metadata`` of its own
+        also overrides the hook that passes it, since nothing here dispatches through
+        ``type(metadata)``.
+        """
+        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
+            cp_shard_context,
+        )
+
+        # ``cp_shard_context`` refuses a transform that runs outside ``Decoder._cp_shard``, and
+        # that call site publishes a context only under context parallel: the mesh is never
+        # absent here.
+        context = cp_shard_context()
+        local = self.doc_chunk_metadata(
+            permutation=permutation,  # pyrefly: ignore [bad-argument-type]
+            cp_size=context.cp_mesh.size(),
+            cp_rank=context.cp_mesh.get_local_rank(),
+        )
+        return build(local)
+
+    def doc_chunk_metadata(self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int) -> Self:
+        """This rank's metadata: the doc-chunk query frame, the row's KV frames and the movement.
+
+        The frames and the movement are derived from the row's boundaries alone, so it crosses no
+        collective.  Each document is assumed to be a whole multiple of
         ``cp_size * ratio`` -- the packing side pads for it -- so every prefix is a whole number
         of chunks and every compressed prefix a whole number of groups.
         """

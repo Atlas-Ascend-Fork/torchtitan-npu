@@ -81,8 +81,8 @@ class DeepSeekV41Metadata(DeepSeekV4Metadata):
 
         The row is the whole packed sequence, and this core hands one grid to both sides of the
         attention, so a rank that holds a chunk has no metadata it could attend with.  A CP run
-        therefore stops here, before any layer runs, and the fused entry (``AscV41Metadata``)
-        overrides this with the frames and records built from the rank's own chunks.
+        therefore stops here, before any layer runs, and the fused metadata (``AscV41Metadata``)
+        overrides this with the frames and AI_CPU metadata built from the rank's own chunks.
         """
         del attention_metadata, permutation
         raise ValueError(
@@ -180,7 +180,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
 def _layer_attention_metadata(attention_metadata: AttentionMetadataMap, layer: nn.Module) -> DeepSeekV41Metadata:
     """The metadata one layer reads: its own map entry, keyed by its backend.
 
-    Upstream #4897 hands every layer the entry its own attention backend named, which is what
+    Upstream #4897 hands every layer the metadata its own attention backend named, which is what
     lets one stack carry several backends -- or, with a geometry key, several geometries of one
     backend -- at once.  The key is the layer's own, so a missing entry means the config built
     no metadata for a backend the layer runs: a failure, not a reason to hand the layer another
@@ -474,8 +474,8 @@ class DeepSeekV41Model(Decoder):
         document*.  Under context parallel those predecessors are not one window of the row: rank
         ``r`` holds chunk ``r`` of every document, so ``[lo - H, lo)`` of the global row is
         another document's tail, and one window cannot state a different set of predecessors per
-        row.  They are built as ``[B, C, H]`` -- entry ``d - 1`` is the ``d``-th token back for
-        each of *this rank's* rows -- from the row the shard started from, and the entry's own
+        row.  They are built as ``[B, C, H]`` -- distance ``d`` is the ``d``-th token back for
+        each of *this rank's* rows -- from the row the shard started from, and the metadata's own
         ``positions`` do the document mask, so a row whose document starts sooner reads none of
         them.  At one degree there is nothing to build: the model's row is its local rows.
 
@@ -503,7 +503,7 @@ class DeepSeekV41Model(Decoder):
         return inputs, labels, extra_kwargs
 
     def _engram_row_history(self, tokens: torch.Tensor, permutation: torch.Tensor, cp_mesh) -> torch.Tensor:
-        """Each of this rank's rows' predecessors, one entry per distance (``[B, C, H]``).
+        """Each of this rank's rows' predecessors (``[B, C, H]``, one distance per slot).
 
         The permutation states which row of the whole row each local row is, so a local row's
         predecessor is the row before it in its document, which the permutation has already placed
@@ -519,7 +519,7 @@ class DeepSeekV41Model(Decoder):
         )
         for distance in range(1, self.engram_history_size + 1):
             # A row with fewer than ``distance`` predecessors in its document has none; clamping
-            # keeps the gather in range and the entry's positions mask the value out.
+            # keeps the gather in range and the metadata's positions mask the value out.
             history[:, :, distance - 1] = tokens[:, (local_rows - distance).clamp(min=0)]
         return history
 
@@ -561,9 +561,9 @@ class DeepSeekV41Model(Decoder):
         modality input: it is ``None`` on the text stack, which never has one, and the
         multimodal stack hands it the mask it derives from ``token_types``.
 
-        ``attention_metadata`` is the seam's per-layer map -- one entry per distinct
-        attention-backend key, built once per microbatch -- and every layer reads the entry
-        its own backend named.
+        ``attention_metadata`` is the seam's per-layer map -- one metadata per distinct
+        attention-backend key, built once per microbatch -- and every layer reads the one its own
+        backend named.
         """
         hidden = self._embedded_inputs(tokens, input_embeds=input_embeds)
         input_ids = tokens.detach().long()

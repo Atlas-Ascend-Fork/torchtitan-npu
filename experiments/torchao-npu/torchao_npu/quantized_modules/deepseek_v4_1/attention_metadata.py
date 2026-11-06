@@ -15,8 +15,8 @@ set.  Where they ride -- which node, which microbatch boundary, which rank -- is
 business, so nothing here imports the host package; frames are read through their attributes.  The
 host that calls it is the quantized attention's config
 (``torchtitan_npu/extensions/adaptor/torchao/converter.py``), which owns the quantized stack's
-entry: the quantized attention is a backend of its own, so it builds its entry here instead of
-extending the unquantized one.
+metadata: the quantized attention is a backend of its own, so it builds its metadata here instead
+of extending the unquantized one.
 
 The SMLA pair is a copy of the unquantized backend's call -- this package replaces that kernel, so
 it restates what the kernel is called with -- and its options are built once, in
@@ -218,8 +218,8 @@ def smla_metadata(*, ratio: int, q, swa_k, cmp_k, window_size: int, num_heads: i
     """The sliding window's AI_CPU metadata pair, for these frames.
 
     The hand-written copy of the AscendC attention's own builder, kept here because this package
-    owns the quantized attention's entry: the two paths read one interface, each building it in its
-    own package.  The geometry is head-major (``num_heads``, ``head_dim``) and the selection width
+    owns the quantized attention's metadata: the two paths read one interface, each building it in
+    its own package.  The geometry is head-major (``num_heads``, ``head_dim``) and the selection width
     sizes the compressed axis' top-k.
     """
     options = smla_kernel_options(ratio=ratio, q=q, swa_k=swa_k, cmp_k=cmp_k, window_size=window_size)
@@ -286,7 +286,7 @@ def build_attention_metadata(
 ) -> QuantAttentionMetadata:
     """This geometry's whole AI_CPU metadata set, built once per microbatch.
 
-    One entry per geometry: the sliding window's pair, the quantized selector's two forward
+    One metadata per geometry: the sliding window's pair, the quantized selector's two forward
     schedules, the teacher edge's backward metadata, and the count the search is bound by.  A
     geometry with no compressed axis carries the pair and nothing else; one with no candidate pool
     keeps its QLI schedule and loses only the search.

@@ -5,6 +5,7 @@
 """V4.1 SMLA attention and SMLAG-backed indexer distillation."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
@@ -28,20 +29,31 @@ class AscV41LightningIndexerMetadata(AscLightningIndexerMetadata):
 
 
 class AscV41Metadata(AscV4Metadata, DeepSeekV41Metadata):  # pyrefly: ignore [inconsistent-inheritance]
-    """The V4.1 entry: V4's, with this stack's indexer ratios and metadata."""
+    """The V4.1 metadata: V4's, with this stack's indexer ratios and its own indexer group."""
 
     indexer_ratios = (1, 2)
 
+    @staticmethod
+    def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
+        attention_metadata,
+        *,
+        permutation,
+    ):
+        """This rank's frames, rebuilt with this stack's coarse-indexer metadata."""
+        return attention_metadata.rebuild_cp_metadata(
+            permutation,
+            build=partial(AscV41Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
+        )
+
     @classmethod
     def build_aicpu_metadata(cls, metadata, *, geometry):
-        entry = super().build_aicpu_metadata(metadata, geometry=geometry)
-        metadata = entry.aicpu_metadata
+        asc = super().build_aicpu_metadata(metadata, geometry=geometry)
         return replace(
-            entry,
+            asc,
             aicpu_metadata=replace(
-                metadata,
+                asc.aicpu_metadata,
                 lightning_indexer=AscV41LightningIndexerMetadata(
-                    fwd=metadata.lightning_indexer.fwd, bwd=metadata.lightning_indexer.bwd
+                    fwd=asc.aicpu_metadata.lightning_indexer.fwd, bwd=asc.aicpu_metadata.lightning_indexer.bwd
                 ),
             ),
         )
@@ -90,7 +102,7 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
 
         @property
         def attention_metadata_key(self):
-            """This layer's own entry: the port's class plus its compression ratio."""
+            """This layer's own key: the port's class plus its compression ratio."""
             return (type(self), self.compress_ratio)
 
         def build_attention_metadata(
@@ -104,11 +116,11 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
             """This geometry's frames and AI_CPU metadata, once per microbatch (upstream #4897)."""
             # ``slots=True`` recreates this dataclass, so a zero-argument ``super()`` would bind
             # to the decorated-away class and raise: the parent builder is named explicitly.
-            row = CompressedSparseInnerAttention2.Config.build_attention_metadata(
+            metadata = CompressedSparseInnerAttention2.Config.build_attention_metadata(
                 self,
                 positions,
                 padding_mask=padding_mask,
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
             )
-            return AscV41Metadata.build_aicpu_metadata(row, geometry=self.geometry)
+            return AscV41Metadata.build_aicpu_metadata(metadata, geometry=self.geometry)

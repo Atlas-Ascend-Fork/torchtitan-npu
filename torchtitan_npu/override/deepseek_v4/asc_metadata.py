@@ -5,9 +5,9 @@
 
 """The DeepSeek-V4 fused attention's AI_CPU metadata and compact-indexer proof.
 
-The model-dir entry (``models/deepseek_v4/metadata.py``) owns the row and its frames; this
-module owns exactly what the AscendC kernels add to it, grouped by the consumer that launches
-it -- one group per pair of kernels, one field per direction::
+The model-dir metadata (``models/deepseek_v4/metadata.py``) owns the frames; this module owns
+exactly what the AscendC kernels add to it, grouped by the consumer that launches it -- one group
+per pair of kernels, one field per direction::
 
     aicpu_metadata
     + sparse_attn
@@ -28,18 +28,20 @@ it -- one group per pair of kernels, one field per direction::
     sized with.
 
 ``AscV4Metadata``
-    the model row with this geometry's AI_CPU metadata and optional compact-indexer proof attached.
-    Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, AI_CPU metadata and proof
-    for this rank.
+    the model metadata with this geometry's AI_CPU metadata and optional compact-indexer proof
+    attached.  Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, AI_CPU
+    metadata and proof for this rank.
 
 The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
 (``models/deepseek_v4/cp_compressor.CarryExchange``), which builds the augmented
 boundaries and the kernel's state table at the call site and passes them as arguments.  The
-quantized indexer is another backend: it owns an entry of its own (a subclass of this one) and
-rebuilds the indexer group with its own contract.  Nothing here knows about quantization.
+quantized indexer is another backend: it owns a metadata class of its own (a subclass of this
+one) and rebuilds the indexer group with its own contract.  Nothing here knows about
+quantization.
 """
 
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar, Self
 
 import torch
@@ -74,7 +76,7 @@ class AscLightningIndexerMetadata:
     """What the indexer's two kernels are called with: forward and backward.
 
     ``fwd`` is what the indexer grids its scores with -- the metadata of whichever indexer
-    backend built this entry -- and ``bwd`` what ``sparse_lightning_indexer_kl_loss_grad``
+    backend built this one -- and ``bwd`` what ``sparse_lightning_indexer_kl_loss_grad``
     consumes.  A layer with no compressed axis runs no indexer, so both are ``None`` there.
     """
 
@@ -112,10 +114,10 @@ class AicpuMetadata:
 
 @dataclass(kw_only=True, slots=True)
 class AscV4Metadata(DeepSeekV4Metadata):
-    """The fused entry: the model row and frames, plus this geometry's AscendC AI_CPU metadata.
+    """The fused metadata: the model's frames, plus this geometry's AscendC AI_CPU metadata.
 
-    The row, the frames and the doc-chunk plan are the model's (they describe the tensors, not
-    the kernels); this entry adds what the fused kernels need on top of them:
+    The frames and the doc-chunk plan are the model's (they describe the tensors, not the
+    kernels); this class adds what the fused kernels need on top of them:
 
     - ``aicpu_metadata``: the operator outputs computed for exactly these frames at the eager
       boundary and rebuilt per rank under context parallelism;
@@ -131,7 +133,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
 
     a3_workaround: A3KeyWorkaround | None = None
     """The two key streams as arch22 must be handed them, or ``None`` where the kernels read the
-    model's own spelling (arch35, and every entry that was not built under ``if not _IS_A5:``).
+    model's own spelling (arch35, and every metadata that was not built under ``if not _IS_A5:``).
 
     Built once per microbatch beside the AI_CPU metadata, so the forward, the backward and the indexer read
     one frame and one gather each instead of re-deriving them per layer.
@@ -146,12 +148,12 @@ class AscV4Metadata(DeepSeekV4Metadata):
 
     @classmethod
     def build_aicpu_metadata(cls, metadata: DeepSeekV4Metadata, *, geometry: AicpuGeometry) -> Self:
-        """This geometry's AscendC AI_CPU metadata tier over one entry's frames (upstream #4897).
+        """This geometry's AscendC AI_CPU metadata over one metadata's frames (upstream #4897).
 
-        The frames are the entry's own (``q`` / ``swa_k`` / ``cmp_k``); because the metadata describes
-        the frames it was computed for, a re-cut entry -- the CP transform's rank-local chunks --
-        runs this again rather than reusing AI_CPU metadata of the frame they came from.  A stack whose
-        indexer metadata adds fields subclasses this and wraps the result.
+        The frames are the metadata's own (``q`` / ``swa_k`` / ``cmp_k``); because the operator
+        outputs describe the frames they were computed for, a re-cut metadata -- the CP transform's
+        rank-local chunks -- runs this again rather than reusing the outputs of the frame it came
+        from.  A stack whose indexer metadata adds fields subclasses this and wraps the result.
         """
         ratio = metadata.ratio
         q, swa_k, cmp_k = metadata.q, metadata.swa_k, metadata.cmp_k
@@ -163,7 +165,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
             )
         # arch22 anchors its mask at the key frame's end and reads no ``seqused``, so its key
         # frames are the per-document reach this rank may read.  The workaround is built here,
-        # once per microbatch (the walk inside it synchronises once), and the entry keeps it.
+        # once per microbatch (the walk inside it synchronises once), and the metadata keeps it.
         workaround = None
         if not _IS_A5:
             workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
@@ -175,14 +177,14 @@ class AscV4Metadata(DeepSeekV4Metadata):
         )
 
         has_indexer = ratio in cls.indexer_ratios
-        li_fwd, li_bwd = indexer_metadata(q=q, cmp_k=cmp_k, ratio=ratio, geometry=geometry, has_indexer=has_indexer)
+        fwd, bwd = indexer_metadata(q=q, cmp_k=cmp_k, ratio=ratio, geometry=geometry, has_indexer=has_indexer)
         smla_fwd, smla_bwd = smla_metadata(
             q=q, swa_k=swa_k, cmp_k=cmp_k, ratio=ratio, geometry=geometry, has_indexer=has_indexer
         )
-        record = AicpuMetadata(
+        aicpu = AicpuMetadata(
             geometry=geometry,
             sparse_attn=AscSparseAttentionMetadata(fwd=smla_fwd, bwd=smla_bwd),
-            lightning_indexer=AscLightningIndexerMetadata(fwd=li_fwd, bwd=li_bwd),
+            lightning_indexer=AscLightningIndexerMetadata(fwd=fwd, bwd=bwd),
         )
         result = cls(
             ratio=ratio,
@@ -191,37 +193,35 @@ class AscV4Metadata(DeepSeekV4Metadata):
             cmp_k=cmp_k,
             position_k=metadata.position_k,
             xchg=metadata.xchg,
-            aicpu_metadata=record,
+            aicpu_metadata=aicpu,
             a3_workaround=workaround,
         )
         _mark_dynamic(result)
         return result
 
-    @classmethod
+    @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
         # The seam dispatches on ``type(metadata)``, so this hook's contract is its own class;
-        # widening the parameter would accept a rejecting row and lose this geometry's AI_CPU metadata.
-        cls,
+        # widening the parameter would accept a rejecting metadata and lose this geometry's AI_CPU metadata.
         attention_metadata: "AscV4Metadata",
         *,
         permutation: torch.Tensor | None,
     ) -> "AscV4Metadata":
         """This rank's frames and its AscendC AI_CPU metadata (upstream #4617).
 
-        The rank-local entry comes from the pre-shard row with the static doc-chunk plan
-        (``DeepSeekV4Metadata.doc_chunk_entry``); the AI_CPU metadata do not carry over, because a metadata
-        describes the frames it was computed for, so they are rebuilt by the same builder that
-        built the global ones.
-        """
-        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
+        The rank-local metadata comes from the pre-shard one with the static doc-chunk plan
+        (``DeepSeekV4Metadata.doc_chunk_metadata``); the AI_CPU operator outputs do not carry over,
+        because they describe the frames they were computed for, so they are rebuilt by the same
+        builder that built the global ones.
 
-        context = cp_shard_context()
-        local = attention_metadata.doc_chunk_entry(
-            permutation=permutation,  # pyrefly: ignore [bad-argument-type]
-            cp_size=context.cp_mesh.size(),
-            cp_rank=context.cp_mesh.get_local_rank(),
+        A subclass that states its own ``build_aicpu_metadata`` overrides this hook as well (or
+        passes its own ``build=``): the hook names ``AscV4Metadata``'s builder explicitly, so a
+        subclass that inherits this one rebuilds with the parent's builder, not its own.
+        """
+        return attention_metadata.rebuild_cp_metadata(
+            permutation,
+            build=partial(AscV4Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
         )
-        return cls.build_aicpu_metadata(local, geometry=attention_metadata.aicpu_metadata.geometry)
 
 
 def _mark_dynamic(metadata: AscV4Metadata) -> None:
@@ -238,7 +238,7 @@ def _mark_dynamic(metadata: AscV4Metadata) -> None:
             tensors.append(metadata.cmp_k.residual)
     if not _IS_A5:
         workaround = metadata.a3_workaround
-        assert workaround is not None, "an arch22 entry states the key workaround"
+        assert workaround is not None, "an arch22 metadata states the key workaround"
         tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
     if metadata.xchg is not None:
         # The restore's scatter table moves with the slab width and the batch's document layout;

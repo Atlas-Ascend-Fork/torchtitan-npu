@@ -72,20 +72,20 @@ def _prepare_quant_lightning_indexer_inputs(
 
     if type(attention_metadata) is not QuantV4Metadata:
         raise TypeError(
-            "the quantized selector consumes its own backend's entry, got "
+            "the quantized selector consumes its own backend's metadata, got "
             f"{type(attention_metadata).__name__}; build the stack with the quantized "
-            "sparse-attention selector (quantized_attention) instead of the BF16 record."
+            "sparse-attention selector (quantized_attention) instead of the BF16 metadata."
         )
     asc = attention_metadata.aicpu_metadata
     li_metadata = None if asc is None else asc.lightning_indexer.fwd
     if li_metadata is None:
-        raise RuntimeError("Quantized LI requires the quantized selector record provider")
+        raise RuntimeError("Quantized LI requires the quantized selector's AI_CPU metadata")
     cmp_k = attention_metadata.cmp_k
     if cmp_k is None or cmp_k.residual is None:
         raise ValueError("Quantized LI requires the geometry's compressed frame.")
     key = idx_k.flatten(0, 1)
     # The compressor emits exactly the row's compressed blocks, and under context parallelism the
-    # entry the selector is handed is this rank's: its record -- and the reach behind it -- are
+    # metadata the selector is handed is this rank's: its grid -- and the reach behind it -- are
     # rebuilt per rank by the quantized backend's own ``prepare_cp_metadata``.
     return DeepSeekV4QuantizedLightningIndexerInputs(
         query=idx_q.flatten(0, 1),
@@ -169,12 +169,12 @@ def _override_kwargs(override_config, suffix: str) -> dict[str, object] | None:
 
 
 def _v4_attention_numbers(model_config) -> dict[str, int]:
-    """The widths the quantized V4 selector's entry is sized with, off the model config.
+    """The widths the quantized V4 selector's metadata is sized with, off the model config.
 
     One config describes one geometry, so they are read once here instead of being restated by
     every layer; a stack that mixes geometries is refused, since one quantized backend cannot
-    describe two.  The selector's record operator and the fused builder both read these, and the
-    kernels are where a wrong statement surfaces.
+    describe two.  The selector's metadata operator and the fused builder both read these, and
+    the kernels are where a wrong statement surfaces.
     """
     layers = [layer for layer in model_config.layers if layer.attention.indexer is not None]
     if not layers:
@@ -233,10 +233,10 @@ class DeepSeekV4QuantLightningIndexerComponent(QuantComponent):
 
 @component("v4_sparse_attention", models=(ModelType.DSV4,))
 class DeepSeekV4QuantSparseAttentionComponent(QuantComponent):
-    """Install the quantized V4 sparse-attention backend that carries the LI records.
+    """Install the quantized V4 sparse-attention backend that carries the LI metadata.
 
     Paired with the ``lightning_indexer`` component: it fires on exactly the same
-    trigger (``ctx.li_quantization is not None``) so the selector's records and
+    trigger (``ctx.li_quantization is not None``) so the selector's metadata and
     this backend always agree on one ``quant_mode`` (shared via ``_v4_li_quant_mode``).
     """
 
@@ -253,7 +253,7 @@ class DeepSeekV4QuantSparseAttentionComponent(QuantComponent):
         assert ctx.li_quantization is not None
         logger.info("[Component] DeepSeekV4QuantSparseAttention: installing quantized V4 backend")
 
-        # The quantized selector is a backend of its own: its config owns the entry's record
+        # The quantized selector is a backend of its own: its config owns the metadata
         # operator and replaces the fused inner attention, so nothing is injected into the
         # fused config and the fused backend never learns that a quantized selector exists.
         #
@@ -271,8 +271,8 @@ class DeepSeekV4QuantSparseAttentionComponent(QuantComponent):
         for name, value in geometry.items():
             if name in asc_kwargs and asc_kwargs[name] != value:
                 raise ValueError(
-                    f"the fused attention entry states {name}={asc_kwargs[name]!r} but the model "
-                    f"config runs {value}: the quantized selector's records are sized by the "
+                    f"the fused attention config states {name}={asc_kwargs[name]!r} but the model "
+                    f"config runs {value}: the quantized selector's metadata is sized by the "
                     "model's own geometry"
                 )
         return [

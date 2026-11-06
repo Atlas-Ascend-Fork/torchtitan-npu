@@ -11,7 +11,8 @@ Registers the V4.1-unique ``lightning_indexer``, ``compressor`` and
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Any
 
 import tyro
@@ -43,9 +44,9 @@ class DeepSeekV41QuantLightningIndexerComponent(QuantComponent):
         if ctx.li_quantization is None:
             return False
         if not ctx.enable_sparse_attention_quantization:
-            # The quantized selector reads the entry the quantized sparse attention builds: its
-            # schedules are that backend's, and the unquantized attention's entry carries a
-            # different kernel's.  One without the other is a mismatch, not a degraded mode.
+            # The quantized selector reads the metadata the quantized sparse attention builds:
+            # its schedules are that backend's, and the unquantized attention's metadata carries
+            # a different kernel's.  One without the other is a mismatch, not a degraded mode.
             raise ValueError(
                 "DeepSeek-V4.1 QLI/QSLI quantization requires "
                 "--extension.quantization.enable-sparse-attention-quantization: the quantized "
@@ -152,16 +153,53 @@ class DeepSeekV41QuantSparseAttentionComponent(QuantComponent):
 
 @dataclass(kw_only=True, slots=True)
 class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
-    """The row, this geometry's frames, and the quantized kernels' metadata.
+    """The model metadata, this geometry's frames, and the quantized kernels' AI_CPU metadata.
 
-    Same interface as the unquantized stack's entry (``aicpu_metadata.sparse_attn`` /
+    Same interface as the unquantized stack's metadata (``aicpu_metadata.sparse_attn`` /
     ``.lightning_indexer``), built by this package because the quantized attention is its own
     backend: it is the fused attention's copy with the sliding-window KV fake-quantized.  The
-    row and its frames are the model metadata's; this entry adds only the operator outputs.
+    model metadata and its frames are V4.1's; this class adds only the operator outputs.
     """
 
     aicpu_metadata: Any
     quant_numbers: dict[str, int]
+    """The numbers this backend's AI_CPU metadata is sized with, so a rank-local one can be rebuilt.
+
+    They are the provider's keyword arguments as-is -- the provider is independent of this
+    package, and its call takes widths rather than a geometry object.
+    """
+
+    @classmethod
+    def build_aicpu_metadata(
+        cls,
+        metadata: _DeepSeekV41Metadata,
+        *,
+        quant_numbers: dict[str, int],
+    ) -> _V41QuantAttentionMetadata:
+        """This backend's entry, with its kernels' AI_CPU metadata for these frames.
+
+        ``metadata`` is the model-dir row on the one-degree build and the re-cut entry on the
+        context-parallel one; either carries the frames the operators are sized by.
+        """
+        from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import (
+            build_attention_metadata,
+        )
+
+        # Every base field, expanded rather than restated: a field added to the base later
+        # carries over here instead of silently taking its default.
+        base = {field.name: getattr(metadata, field.name) for field in fields(_DeepSeekV41Metadata)}
+        return cls(
+            **base,
+            quant_numbers=quant_numbers,
+            aicpu_metadata=build_attention_metadata(
+                ratio=metadata.ratio,
+                q=metadata.q,
+                swa_k=metadata.swa_k,
+                cmp_k=metadata.cmp_k,
+                num_rows=metadata.position_k.numel(),
+                **quant_numbers,
+            ),
+        )
 
     @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
@@ -169,34 +207,12 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
         *,
         permutation,
     ) -> _V41QuantAttentionMetadata:
-        """This rank's frames and the records rebuilt for them.
-
-        The row is the fused stack's; the kernels' records are this backend's operators, sized
-        by the numbers the entry states, so they are rebuilt from the rank-local frames.
-        """
-        from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import (
-            build_attention_metadata as build_quant_metadata,
-        )
-
-        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
-
-        context = cp_shard_context()
-        local = attention_metadata.doc_chunk_entry(
-            permutation=permutation,  # pyrefly: ignore [bad-argument-type]
-            cp_size=context.cp_mesh.size(),
-            cp_rank=context.cp_mesh.get_local_rank(),
-        )
-        return replace(  # pyrefly: ignore [bad-return]
-            local,
-            aicpu_metadata=build_quant_metadata(  # pyrefly: ignore [unexpected-keyword]
-                ratio=local.ratio,
-                q=local.q,
-                swa_k=local.swa_k,
-                cmp_k=local.cmp_k,
-                # The frame's row count is a shape: ``position_k`` is this rank's slice of
-                # the row, so it already holds ``B * S / cp`` tokens.
-                num_rows=local.position_k.numel(),
-                **attention_metadata.quant_numbers,
+        """This rank's frames and the AI_CPU metadata rebuilt for them."""
+        return attention_metadata.rebuild_cp_metadata(
+            permutation,
+            build=partial(
+                _V41QuantAttentionMetadata.build_aicpu_metadata,
+                quant_numbers=attention_metadata.quant_numbers,
             ),
         )
 
@@ -222,30 +238,10 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
         candidate_block_size: int
         _torchao_npu_config: Annotated[Any, tyro.conf.Suppress] = None
 
-        def build_attention_metadata(
-            self,
-            positions: torch.Tensor,
-            *,
-            padding_mask: torch.Tensor | None = None,
-            max_num_documents: int | None = None,
-            max_context_length: int | None = None,
-        ) -> _V41QuantAttentionMetadata:
-            """The row this backend already builds, plus its own kernels' metadata."""
-            from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import (
-                build_attention_metadata as build_quant_metadata,
-            )
-
-            # ``slots=True`` recreates the dataclass, so the parent is named explicitly rather
-            # than reached through a zero-argument ``super()``.
-            row = DeepSeekV41CompressedSparseInnerAttention2.Config.build_attention_metadata(
-                self,
-                positions,
-                padding_mask=padding_mask,
-                max_num_documents=max_num_documents,
-                max_context_length=max_context_length,
-            )
-            q, swa_k, cmp_k = row.q, row.swa_k, row.cmp_k
-            numbers = {
+        @property
+        def quant_numbers(self) -> dict[str, int]:
+            """The numbers the AI_CPU operators are called with, in the provider's spelling."""
+            return {
                 "window_size": self.window_size,
                 "num_heads": self.num_heads,
                 "head_dim": self.head_dim,
@@ -255,23 +251,26 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                 "topk_blocks": self.candidate_topk_blocks,
                 "block_size": self.candidate_block_size,
             }
-            return _V41QuantAttentionMetadata(
-                position_k=row.position_k,
-                xchg=row.xchg,
-                ratio=self.compress_ratio,
-                q=q,
-                swa_k=swa_k,
-                cmp_k=cmp_k,
-                aicpu_metadata=build_quant_metadata(
-                    ratio=self.compress_ratio,
-                    q=q,
-                    swa_k=swa_k,
-                    cmp_k=cmp_k,
-                    num_rows=positions.numel(),
-                    **numbers,
-                ),
-                quant_numbers=numbers,
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> _V41QuantAttentionMetadata:
+            """The model metadata this backend already builds, plus its own kernels' AI_CPU metadata."""
+            # ``slots=True`` recreates the dataclass, so the parent is named explicitly rather
+            # than reached through a zero-argument ``super()``.
+            metadata = DeepSeekV41CompressedSparseInnerAttention2.Config.build_attention_metadata(
+                self,
+                positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+                max_context_length=max_context_length,
             )
+            return _V41QuantAttentionMetadata.build_aicpu_metadata(metadata, quant_numbers=self.quant_numbers)
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)

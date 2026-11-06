@@ -26,7 +26,7 @@ boundary, and the frames' ``seqused`` limits each rank's view.  Every fused
 kernel of arch22, however, anchors its mask at the *end* of the key frame it is
 given (it reads no ``seqused`` there), so on that SoC the options state the reach
 itself as the frame and the wrapper compacts both gathered rows onto it before the
-kernel call -- the entry's ``a3_workaround``, built once per microbatch beside the
+kernel call -- the metadata's ``a3_workaround``, built once per microbatch beside the
 AI_CPU metadata (``override/a3_workaround.py``).  The kernels therefore see the reach as
 their key frame's end, while the picks and indices keep the model's
 document-local numbering.  There is no container or ``_assemble_tnd`` step.
@@ -61,7 +61,7 @@ def kernel_options(
 ):
     """The options the SMLA/SMLAG kernels and their metadata builders share.
 
-    ``swa_k`` / ``cmp_k`` are the frames the kernels are addressed with: the entry's own, which on
+    ``swa_k`` / ``cmp_k`` are the frames the kernels are addressed with: the metadata's own, which on
     arch22 are the per-document reach this rank may read (``a3_workaround``).
     """
     has_cmp = cmp_k is not None
@@ -229,7 +229,7 @@ def _compact_key_rows(swa_k, cmp_k, metadata):
     if _IS_A5:
         return swa_k, cmp_k
     workaround = metadata.a3_workaround
-    assert workaround is not None, "an arch22 entry states the key workaround"
+    assert workaround is not None, "an arch22 metadata states the key workaround"
     if workaround.swa_k_gather is not None:
         swa_k = swa_k.index_select(0, workaround.swa_k_gather)
     if cmp_k is not None and workaround.cmp_k_gather is not None:

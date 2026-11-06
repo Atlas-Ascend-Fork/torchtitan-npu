@@ -178,9 +178,9 @@ def prepare_cp_metadata_map(
 ) -> dict[Hashable, Any]:
     """Rank-local metadata for context parallel (upstream #4617's CP half).
 
-    One rule, per map entry: a metadata that carries ``prepare_cp_metadata`` is rebuilt by
-    it, and every entry that does not passes through unchanged (the Ulysses case, where the
-    metadata stays global).  A backend that cannot be sharded raises from its own metadata's
+    One rule, per map value: a metadata that carries ``prepare_cp_metadata`` is rebuilt by it,
+    and every one that does not passes through unchanged (the Ulysses case, where the metadata
+    stays global).  A backend that cannot be sharded raises from its own metadata's
     transform rather than letting a layer read a layout its rank does not hold.
 
     Upstream hosts the hook on the backend class and finds it through the map key.  Here it
@@ -242,7 +242,7 @@ def apply() -> None:
         # such ``__init__``, and GraphTrainer's SimpleFSDP rewrites the ``__class__`` of every
         # module it wraps, parameter-free ones included.  A build-time type test would skip
         # the default key, so the getter below would read the rewritten runtime class, miss
-        # the entry the config built the map with and hand the layer ``None`` metadata.
+        # the key the config built the map with and hand the layer ``None`` metadata.
         instance = original_build(self, **kwargs)
         instance._attention_metadata_key = self.attention_metadata_key
         return instance
