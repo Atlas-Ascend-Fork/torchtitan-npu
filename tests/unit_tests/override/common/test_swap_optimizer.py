@@ -67,6 +67,12 @@ def _patch_container_global(monkeypatch, name: str, value) -> None:
 def _patch_container_swap_api(monkeypatch, swap_api) -> None:
     if not hasattr(swap_api, "wait_for_device_release"):
         swap_api.wait_for_device_release = lambda _name: None
+    if not hasattr(swap_api, "restore"):
+        swap_api.restore = lambda name: swap_api.execute(name, "H2D")
+    if not hasattr(swap_api, "wait_device_if_needed"):
+        swap_api.wait_device_if_needed = lambda name: swap_api.execute(name, "WAIT_DEVICE")
+    if not hasattr(swap_api, "offload"):
+        swap_api.offload = lambda name: swap_api.execute(name, "D2H")
     monkeypatch.setattr(product_swap, "swap_api", swap_api)
     _patch_container_global(monkeypatch, "swap_api", swap_api)
     monkeypatch.setitem(product_swap._NovaSwapAdamW._submit.__globals__, "swap_api", swap_api)
@@ -1091,6 +1097,10 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
     layout_a = SimpleNamespace(param=parameter_a, fqn="a")
     layout_b = SimpleNamespace(param=parameter_b, fqn="b")
     layout_c = SimpleNamespace(param=parameter_c, fqn="c")
+    plan = SimpleNamespace(
+        redistributed_items=(layout_a, layout_b),
+        unredistributed_items=(layout_c,),
+    )
     events = []
     phases = {}
     streams = []
@@ -1109,6 +1119,7 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
                 parameter_b: {"momentum_buffer": parameter_b.detach().clone()},
                 parameter_c: {"momentum_buffer": parameter_c.detach().clone()},
             }
+            self._bucket_plans = (plan,)
             self._redistribution_runtime = FakeRuntime()
 
         def _momentum(self, compute_layout, grad):
@@ -1121,6 +1132,15 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
         events.append((action, name))
         phases[name] = action
 
+    def register_group(tensors, _name):
+        return SimpleNamespace(members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors))
+
+    def offload(name):
+        execute(name, "D2H")
+
+    def restore(name):
+        execute(name, "H2D")
+
     def stream_context(stream):
         streams.append(stream)
         return nullcontext()
@@ -1128,9 +1148,12 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
     _patch_container_swap_api(
         monkeypatch,
         SimpleNamespace(
-            register_tensor=lambda tensor, name: None,
+            register_group=register_group,
             execute=execute,
+            offload=offload,
+            restore=restore,
             get_handle_phase=lambda name: phases.get(name, "D2H"),
+            wait_for_device_release=lambda _name: None,
         ),
     )
     _patch_container_global(
@@ -1141,11 +1164,6 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
 
     optimizer = FakeMuon()
     OptimizerStateSwapContainer._swap_muon(optimizer, model_part=0)
-    plan = SimpleNamespace(
-        redistributed_items=(layout_a, layout_b),
-        unredistributed_items=(layout_c,),
-    )
-
     transfer_stream = object()
     assert optimizer._redistribution_runtime._enqueue_storage_to_compute(
         plan,
@@ -1155,22 +1173,401 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
     ) == "work"
     assert streams == [transfer_stream]
     assert [event[0] for event in events] == [
-        "H2D",
-        "H2D",
+        "D2H",
+        "D2H",
         "H2D",
         "WAIT_DEVICE",
+        "H2D",
         "prepare",
         "WAIT_DEVICE",
         "prepare",
+        "D2H",
         "a2a",
-        "D2H",
-        "D2H",
     ]
-    assert [event[1] for event in events[:3]] == [
-        product_swap.make_swap_state_name("optimizer_state", 0, "a", "momentum_buffer"),
-        product_swap.make_swap_state_name("optimizer_state", 0, "b", "momentum_buffer"),
-        product_swap.make_swap_state_name("optimizer_state", 0, "c", "momentum_buffer"),
+    assert events[2][1] == "muon.0.plan.0.redistributed.0"
+    assert events[4][1] == "muon.0.plan.0.unredistributed.0"
+    assert events[-2][1] == "muon.0.plan.0.redistributed.0"
+
+
+def test_muon_group_registration_uses_plan_ownership_and_authoritative_offsets(monkeypatch) -> None:
+    parameter_r = torch.nn.Parameter(torch.ones(2))
+    parameter_u = torch.nn.Parameter(torch.ones(3, dtype=torch.float32))
+    layout_r = SimpleNamespace(param=parameter_r, fqn="r")
+    layout_u = SimpleNamespace(param=parameter_u, fqn="u")
+    plan = SimpleNamespace(redistributed_items=(layout_r,), unredistributed_items=(layout_u,))
+    optimizer = SimpleNamespace(
+        _bucket_plans=(plan,),
+        state={
+            parameter_r: {"momentum_buffer": parameter_r.detach().clone()},
+            parameter_u: {"momentum_buffer": parameter_u.detach().clone()},
+        },
+    )
+    calls = []
+
+    def register_group(tensors, name):
+        calls.append(("register", name, tensors))
+        offset = 0
+        members = []
+        for tensor in tensors:
+            offset = (offset + tensor.element_size() - 1) // tensor.element_size() * tensor.element_size()
+            members.append(SimpleNamespace(byte_offset=offset))
+            offset += tensor.numel() * tensor.element_size()
+        return SimpleNamespace(members=tuple(members))
+
+    fake_api = SimpleNamespace(register_group=register_group, offload=lambda name: calls.append(("offload", name)))
+    monkeypatch.setattr(product_swap, "swap_api", fake_api)
+    locations = {}
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, locations)
+
+    adapter.finalize_registration(require_complete=True)
+
+    assert [call[:2] for call in calls] == [
+        ("register", "muon.0.plan.0.redistributed.0"),
+        ("offload", "muon.0.plan.0.redistributed.0"),
+        ("register", "muon.0.plan.0.unredistributed.0"),
+        ("offload", "muon.0.plan.0.unredistributed.0"),
     ]
+    assert locations[(parameter_r, "momentum_buffer")] == ("muon.0.plan.0.redistributed.0", 0)
+    assert locations[(parameter_u, "momentum_buffer")] == ("muon.0.plan.0.unredistributed.0", 0)
+
+
+def test_muon_group_registration_rejects_missing_momentum_state() -> None:
+    parameter = torch.nn.Parameter(torch.ones(2))
+    layout = SimpleNamespace(param=parameter, fqn="missing")
+    plan = SimpleNamespace(redistributed_items=(layout,), unredistributed_items=())
+    optimizer = SimpleNamespace(_bucket_plans=(plan,), state={parameter: {}})
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+
+    with pytest.raises(RuntimeError, match="missing momentum state"):
+        adapter.finalize_registration(require_complete=True)
+
+
+def test_muon_group_skips_layout_without_momentum_until_materialized() -> None:
+    parameter = torch.nn.Parameter(torch.ones(2))
+    layout = SimpleNamespace(param=parameter, fqn="missing")
+    plan = SimpleNamespace(redistributed_items=(layout,), unredistributed_items=())
+    optimizer = SimpleNamespace(_bucket_plans=(plan,), state={parameter: {}})
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+
+    adapter.finalize_registration(require_complete=False)
+
+    assert id(layout) in adapter.owner
+    assert adapter.group_for(layout) is None
+
+
+def test_muon_checkpoint_materialization_reuses_plan_groups_and_waits_for_release(monkeypatch) -> None:
+    parameter_r = torch.nn.Parameter(torch.ones(2))
+    parameter_u = torch.nn.Parameter(torch.ones(3))
+    parameter_local = torch.nn.Parameter(torch.ones(4))
+    layout_r = SimpleNamespace(param=parameter_r, fqn="r")
+    layout_u = SimpleNamespace(param=parameter_u, fqn="u")
+    layout_local = SimpleNamespace(param=parameter_local, fqn="local")
+    grouped_plan = SimpleNamespace(redistributed_items=(layout_r,), unredistributed_items=(layout_u,))
+    local_plan = SimpleNamespace(items=(layout_local,))
+    optimizer = SimpleNamespace(
+        _bucket_plans=(grouped_plan, local_plan),
+        state={parameter_r: {}, parameter_u: {}, parameter_local: {}},
+    )
+    phases, events, locations = {}, [], {}
+
+    def register_group(tensors, name):
+        events.append(("register_group", name))
+        return SimpleNamespace(members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors))
+
+    def offload(name):
+        events.append(("offload", name))
+        phases[name] = "D2H"
+
+    monkeypatch.setattr(
+        product_swap,
+        "swap_api",
+        SimpleNamespace(
+            register_group=register_group,
+            offload=offload,
+            get_handle_phase=lambda name: phases.get(name),
+            wait_for_device_release=lambda name: events.append(("wait", name)),
+        ),
+    )
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, locations)
+
+    def materialize(layout):
+        optimizer.state[layout.param]["momentum_buffer"] = torch.zeros_like(layout.param)
+        if id(layout) not in adapter.owner:
+            name = product_swap.make_swap_state_name("optimizer_state", 0, layout.fqn, "momentum_buffer")
+            locations[(layout.param, "momentum_buffer")] = (name, 0)
+            phases[name] = "D2H"
+
+    adapter.materialize_all_for_checkpoint(materialize)
+
+    assert events == [
+        ("register_group", "muon.0.plan.0.redistributed.0"),
+        ("offload", "muon.0.plan.0.redistributed.0"),
+        ("wait", "muon.0.plan.0.redistributed.0"),
+        ("register_group", "muon.0.plan.0.unredistributed.0"),
+        ("offload", "muon.0.plan.0.unredistributed.0"),
+        ("wait", "muon.0.plan.0.unredistributed.0"),
+        ("register_group", "muon.0.plan.1.local.0"),
+        ("offload", "muon.0.plan.1.local.0"),
+        ("wait", "muon.0.plan.1.local.0"),
+    ]
+
+
+def test_muon_first_step_materializes_only_enqueued_plan_groups(monkeypatch) -> None:
+    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(4)]
+    layouts = [SimpleNamespace(param=parameter, fqn=f"p{index}") for index, parameter in enumerate(parameters)]
+    first = SimpleNamespace(redistributed_items=(layouts[0],), unredistributed_items=(layouts[1],))
+    second = SimpleNamespace(redistributed_items=(layouts[2],), unredistributed_items=(layouts[3],))
+    for parameter in parameters:
+        parameter.grad = torch.ones_like(parameter)
+    created, events, phases = [], [], {}
+
+    class FakeRuntime:
+        def _enqueue_storage_to_compute(self, plan, slot, context, *, prepare):
+            for layout in plan.redistributed_items:
+                prepare(layout, None)
+            return plan
+
+    class FakeMuon:
+        def __init__(self) -> None:
+            self.state = {parameter: {} for parameter in parameters}
+            self._bucket_plans = (first, second)
+            self._parameter_compute_layouts = tuple(layouts)
+            self._first_step_validated = False
+            self._redistribution_runtime = FakeRuntime()
+
+        def _preflight_step(self) -> None:
+            if self._first_step_validated:
+                return
+            for layout in self._parameter_compute_layouts:
+                if layout.param.grad is None:
+                    raise RuntimeError(f"missing gradient: {layout.fqn}")
+            for layout in self._parameter_compute_layouts:
+                self._momentum(layout, layout.param.grad)
+            self._first_step_validated = True
+
+        def _momentum(self, layout, grad):
+            state = self.state[layout.param]
+            if "momentum_buffer" not in state:
+                created.append(layout.fqn)
+                events.append(("materialize", layout.fqn))
+                state["momentum_buffer"] = grad.detach().clone()
+            return state["momentum_buffer"]
+
+        def _prepare_local(self, _layout, _out):
+            return None
+
+    def register_group(tensors, _name):
+        return SimpleNamespace(members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors))
+
+    def offload(name, **_kwargs):
+        events.append(("offload", name))
+        phases[name] = "D2H"
+
+    def restore(name):
+        phases[name] = "H2D"
+
+    _patch_container_swap_api(
+        monkeypatch,
+        SimpleNamespace(
+            register_group=register_group,
+            offload=offload,
+            restore=restore,
+            wait_device_if_needed=lambda _name: None,
+            wait_for_device_release=lambda name: events.append(("wait", name)),
+            get_handle_phase=lambda name: phases.get(name),
+        ),
+    )
+    monkeypatch.setattr(
+        product_swap,
+        "torch_npu",
+        SimpleNamespace(npu=SimpleNamespace(stream=lambda _stream: nullcontext())),
+    )
+
+    optimizer = FakeMuon()
+    OptimizerStateSwapContainer._swap_muon(optimizer, model_part=0)
+    optimizer._preflight_step()
+
+    assert created == []
+    optimizer._redistribution_runtime._enqueue_storage_to_compute(
+        first, slot=None, context=SimpleNamespace(transfer_stream=object()), prepare=optimizer._prepare_local
+    )
+    assert created == ["p0", "p1"]
+    assert all("momentum_buffer" not in optimizer.state[layout.param] for layout in layouts[2:])
+
+    optimizer._redistribution_runtime._enqueue_storage_to_compute(
+        second, slot=None, context=SimpleNamespace(transfer_stream=object()), prepare=optimizer._prepare_local
+    )
+    assert created == ["p0", "p1", "p2", "p3"]
+    assert optimizer._first_step_validated
+    assert [event for event in events if event[0] == "wait"] == [
+        ("wait", "muon.0.plan.0.redistributed.0"),
+        ("wait", "muon.0.plan.0.unredistributed.0"),
+        ("wait", "muon.0.plan.1.redistributed.0"),
+        ("wait", "muon.0.plan.1.unredistributed.0"),
+    ]
+
+
+def test_muon_payload_successor_crosses_local_plans(monkeypatch) -> None:
+    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(4)]
+    layouts = [SimpleNamespace(param=parameter, fqn=f"p{index}") for index, parameter in enumerate(parameters)]
+    first = SimpleNamespace(redistributed_items=(layouts[0],), unredistributed_items=(layouts[1],))
+    local = SimpleNamespace(items=(layouts[2],))
+    second = SimpleNamespace(redistributed_items=(layouts[3],), unredistributed_items=())
+    optimizer = SimpleNamespace(
+        _bucket_plans=(first, local, second),
+        state={parameter: {"momentum_buffer": parameter.detach().clone()} for parameter in parameters},
+    )
+    events = []
+    fake_api = SimpleNamespace(
+        register_group=lambda tensors, name: SimpleNamespace(
+            members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors)
+        ),
+        offload=lambda *_args, **_kwargs: None,
+        get_handle_phase=lambda _name: "D2H",
+        restore=lambda name: events.append(name),
+    )
+    monkeypatch.setattr(product_swap, "swap_api", fake_api)
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+    adapter.finalize_registration(require_complete=True)
+
+    adapter.prefetch_successor(adapter.payloads[1])
+
+    assert events == ["muon.0.plan.1.local.0"]
+
+
+def test_muon_plan_entry_prefetch_uses_first_registered_unredistributed_group(monkeypatch) -> None:
+    parameter_r = torch.nn.Parameter(torch.ones(2))
+    parameter_u = torch.nn.Parameter(torch.ones(3))
+    layout_r = SimpleNamespace(param=parameter_r, fqn="r")
+    layout_u = SimpleNamespace(param=parameter_u, fqn="u")
+    plan = SimpleNamespace(redistributed_items=(layout_r,), unredistributed_items=(layout_u,))
+    optimizer = SimpleNamespace(
+        _bucket_plans=(plan,),
+        state={
+            parameter_r: {},
+            parameter_u: {"momentum_buffer": parameter_u.detach().clone()},
+        },
+    )
+    restored = []
+    monkeypatch.setattr(
+        product_swap,
+        "swap_api",
+        SimpleNamespace(
+            register_group=lambda tensors, _name: SimpleNamespace(
+                members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors)
+            ),
+            offload=lambda *_args, **_kwargs: None,
+            get_handle_phase=lambda _name: "D2H",
+            restore=restored.append,
+        ),
+    )
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+    adapter.finalize_registration(require_complete=False)
+
+    adapter.prefetch_first_plan()
+
+    assert restored == ["muon.0.plan.0.unredistributed.0"]
+
+
+def test_muon_preflight_seeds_first_unredistributed_group(monkeypatch) -> None:
+    parameter = torch.nn.Parameter(torch.ones(3))
+    layout = SimpleNamespace(param=parameter, fqn="u")
+    plan = SimpleNamespace(redistributed_items=(), unredistributed_items=(layout,))
+    restored = []
+
+    class FakeMuon:
+        def __init__(self) -> None:
+            self.state = {parameter: {"momentum_buffer": parameter.detach().clone()}}
+            self._bucket_plans = (plan,)
+            self._first_step_validated = True
+            self._redistribution_runtime = SimpleNamespace(
+                _enqueue_storage_to_compute=lambda *args, **kwargs: None,
+            )
+
+        def _preflight_step(self) -> None:
+            return None
+
+        def _momentum(self, compute_layout, _grad):
+            return self.state[compute_layout.param]["momentum_buffer"]
+
+        def _prepare_local(self, _compute_layout, _out) -> None:
+            return None
+
+    _patch_container_swap_api(
+        monkeypatch,
+        SimpleNamespace(
+            register_group=lambda tensors, _name: SimpleNamespace(
+                members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors)
+            ),
+            offload=lambda *_args, **_kwargs: None,
+            get_handle_phase=lambda _name: "D2H",
+            restore=restored.append,
+        ),
+    )
+    optimizer = FakeMuon()
+    OptimizerStateSwapContainer._swap_muon(optimizer, model_part=0)
+
+    optimizer._preflight_step()
+
+    assert restored == ["muon.0.plan.0.unredistributed.0"]
+
+
+def test_muon_successor_skips_unregistered_group(monkeypatch) -> None:
+    parameter_r = torch.nn.Parameter(torch.ones(2))
+    parameter_u = torch.nn.Parameter(torch.ones(3))
+    parameter_local = torch.nn.Parameter(torch.ones(4))
+    layout_r = SimpleNamespace(param=parameter_r, fqn="r")
+    layout_u = SimpleNamespace(param=parameter_u, fqn="u")
+    layout_local = SimpleNamespace(param=parameter_local, fqn="local")
+    first = SimpleNamespace(redistributed_items=(layout_r,), unredistributed_items=(layout_u,))
+    second = SimpleNamespace(items=(layout_local,))
+    optimizer = SimpleNamespace(
+        _bucket_plans=(first, second),
+        state={
+            parameter_r: {"momentum_buffer": parameter_r.detach().clone()},
+            parameter_u: {},
+            parameter_local: {"momentum_buffer": parameter_local.detach().clone()},
+        },
+    )
+    restored = []
+    monkeypatch.setattr(
+        product_swap,
+        "swap_api",
+        SimpleNamespace(
+            register_group=lambda tensors, _name: SimpleNamespace(
+                members=tuple(SimpleNamespace(byte_offset=0) for _ in tensors)
+            ),
+            offload=lambda *_args, **_kwargs: None,
+            get_handle_phase=lambda _name: "D2H",
+            restore=restored.append,
+        ),
+    )
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+    adapter.finalize_registration(require_complete=False)
+
+    adapter.prefetch_successor(adapter.payloads[0])
+
+    assert restored == ["muon.0.plan.1.local.0"]
+
+
+def test_muon_groups_split_at_byte_budget(monkeypatch) -> None:
+    monkeypatch.setattr(product_swap, "_MUON_SWAP_GROUP_MAX_BYTES", 12)
+    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(3)]
+    layouts = [SimpleNamespace(param=parameter, fqn=f"p{index}") for index, parameter in enumerate(parameters)]
+    plan = SimpleNamespace(redistributed_items=tuple(layouts), unredistributed_items=())
+    optimizer = SimpleNamespace(
+        _bucket_plans=(plan,),
+        state={parameter: {"momentum_buffer": parameter.detach().clone()} for parameter in parameters},
+    )
+
+    adapter = product_swap._MuonSwapAdapter(optimizer, 0, {})
+
+    assert [group.name for group in adapter.payloads] == [
+        "muon.0.plan.0.redistributed.0",
+        "muon.0.plan.0.redistributed.1",
+        "muon.0.plan.0.redistributed.2",
+    ]
+    assert [group.layouts for group in adapter.payloads] == [(layouts[0],), (layouts[1],), (layouts[2],)]
 
 
 @pytest.mark.parametrize("override_name", ["virtual", "swap_optimizer"])
