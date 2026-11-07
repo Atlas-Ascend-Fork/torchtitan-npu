@@ -2,7 +2,6 @@
 
 本文说明 `torchtitan-npu` 中 DeepSeek-V4 GraphTrainer 的激活重计算设计，包括默认 `full` 策略、可选 `dsv4-mhc` / `dsv4-mhc-moe-save` 策略、使用方式和已知限制。
 
-
 ## 1. 特性概述
 
 DeepSeek-V4 同时包含 attention、压缩 attention、MoE、SimpleFSDP 通信和 Ascend 融合算子。若前向激活全部保存，显存峰值较高；若只在 module 边界统一 checkpoint，又会重算昂贵的 attention/MoE 子图。GraphTrainer 先将前向、loss 和 `torch.autograd.grad` 反向捕获为联合 FX 图，再按节点决定保存或重算，从而用计算换取显存。
@@ -79,20 +78,19 @@ flowchart LR
 - dtype、device 和未标记的静态 shape 保持不变；
 - ratio 集合、metadata 字段结构和模块结构保持不变；
 - 只有预先标记为 dynamic 且满足约束的维度可以变化。
-当前 replay 路径不会因为输入契约变化而自动重新 trace。契约变化会导致 guard/replay 失效，必须显式重新捕获和编译；
+当前 replay 路径不会因为输入契约变化而自动重新 trace。契约变化会导致 guard/replay 失效，必须显式重新捕获和编译。
 
 ## 4. 重计算实现
 
 ### 4.1 上游 `full` 策略
 
-上游 full policy 默认使用一层一保存输出的策略，其余节点默认使用重计算方式。
+上游 `full` policy 默认使用一层一保存输出的策略，其余节点默认使用重计算方式。
 
 代码位置：
 
 ```text
 torchtitan/experiments/graph_trainer/memory_policy.py
 ```
-
 
 ### 4.2 NPU 策略框架
 
@@ -129,8 +127,6 @@ flowchart TD
 
 规则依赖 FQN、算子 target 和 occurrence，模型重构后可能静默失配。
 
-
-
 ### 4.4 `dsv4-mhc-moe-save` 策略
 
 该策略继承 `dsv4-mhc`，并额外保存 shared/routed experts 的激活：
@@ -143,15 +139,7 @@ flowchart TD
 
 ### 4.5 前向变异算子的重算保真
 
-原生 SAR 按数据流回放重算节点，无数据输出的前向变异算子（如 partial-RoPE 对
-clone 的原地旋转）不会进入回放链，反向会读到未旋转的值（上游 issue
-[#4688](https://github.com/pytorch/torchtitan/issues/4688)）。DSV4 GraphTrainer 默认
-启用上游 PR [#4708](https://github.com/pytorch/torchtitan/pull/4708) 的
-`functionalize_recompute_mutations_pass`（见 2.1）：在 memory-policy 打标之后、
-CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随之自然重算；对无可
-重算变异的图是 no-op。已验证 A3（CANN w0902，backward 走临时 shim）2p/8p 精度
-对齐；A5 原生反向未验证。固定 TorchTitan 依赖自带等价 pass 后，删除本 backport
-与 `pass_pipeline` 设置即可。
+原生 SAR 按数据流回放重算节点，无数据输出的前向变异算子（如 partial-RoPE 对 clone 的原地旋转）不会进入回放链，反向会读到未旋转的值（上游 issue [#4688](https://github.com/pytorch/torchtitan/issues/4688)）。DSV4 GraphTrainer 默认启用上游 PR [#4708](https://github.com/pytorch/torchtitan/pull/4708) 的 `functionalize_recompute_mutations_pass`（见 2.1）：在 memory-policy 打标之后、CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随之自然重算；对无可重算变异的图是 no-op。已验证 A3（CANN w0902，backward 走临时 shim）2p/8p 精度对齐；A5 原生反向未验证。待固定 TorchTitan 依赖自带等价 pass 后，删除本 backport 与 `pass_pipeline` 设置即可。
 
 ## 5. 支持边界与风险
 - `dsv4-mhc` 依赖 FQN、FX target 和 occurrence，模型或编译器升级后必须检查规则命中数。

@@ -1,6 +1,6 @@
 # DeepSeek-V4 GraphTrainer 编译路径适配
 
-GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式分布式训练实验：用 `minimal_fx_tracer` 把 forward、loss、backward（可选 optimizer.step）整体捕获为单个 FX 图，所有优化都以 graph pass 的形式作用于同一张图。本适配让 DeepSeek-V4（DSV4）在该编译路径上可在 Ascend NPU 运行，与现有 eager 路径并行存在、互不影响。默认不启用：需要显式选择 `graph_trainer_*` 配置名。
+GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式分布式训练实验：用 `minimal_fx_tracer` 把 forward、loss、backward（可选 optimizer.step）整体捕获为单个 FX 图，所有优化都以 graph pass 的形式作用于同一张图。本适配让 DeepSeek-V4（DSV4）可在 Ascend NPU 上经该编译路径运行，与现有 eager 路径并行存在、互不影响。默认不启用：需要显式选择 `graph_trainer_*` 配置名。
 
 ## 上游 GraphTrainer 特性
 
@@ -12,7 +12,7 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 - **Graph pass 流水线**：默认（保数值）pass 与 opt-in 性能 pass 分层，包括 bucketing 通信重叠、异步 TP、regional/full Inductor 编译、CUDA graph、CPU offload、选择性激活重算等。
 - **可组合并行**：FSDP、TP、EP 均在图内表达；EP overlap（MoE chunk 级通信重叠）为实验性 pass。
 
-编译模式固定为 `aot_fx_trace`（上游已弃用 `aot` 与 `jit` 两种旧模式）。NPU 上必须禁用 `cudagraph_pass`（CUDA graph capture 无意义且不兼容），本适配的编译配置已内置该禁用项。
+编译模式固定为 `aot_fx_trace`（上游已弃用 `aot` 与 `jit` 两种旧模式）。NPU 上必须禁用 `cudagraph_pass`（CUDA graph capture 在npu上无意义且不兼容），本适配的编译配置已内置该禁用项。
 
 ## 本仓实现
 
@@ -36,38 +36,32 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 
 ### 并行化
 
-`parallelize_graph_trainer_deepseek_v4`（`parallelize.py`）是 DSV4 专属路径——eager 路径复用 DeepSeek-V3 并行化（DSV4 稀疏注意力分片基于它），而编译路径不能把稀疏注意力计算在 FSDP 下重排，故单独实现：
+`parallelize_graph_trainer_deepseek_v4`（`parallelize.py`）是 DSV4 专属路径——eager 路径复用 DeepSeek-V3 并行化（DSV4 稀疏注意力分片基于它），而编译路径不能在 FSDP 下重排稀疏注意力计算，故单独实现：
 
 1. 对 MoE 的 dispatch / combine / compute 区域与各子模块 FQN 附加图节点标注（`annotate_moe_ep_regions` + `annotate_module_fqns`），供 bucketing、区域编译等下游 pass 消费。
 2. TP / EP 启用时调用 `model.parallelize(parallel_dims)`。
 3. 无条件应用 `apply_simple_fsdp`：fsdp mesh 在 degree 1 时也存在（`ParallelDims._mesh_exist`），因此单卡下 MixedPrecisionPolicy 的 param_dtype cast 仍然生效。
 4. 按模式应用 `apply_graph_trainer_compile`。
 
-入口处有两条硬约束：`spmd_types` backend 不支持（simple_fsdp 构建于 raw DTensor 操作之上，该 backend 会报错）；TP 启用时 `seq_len` 必须整除 `parallel_dims.seq_len_divisor`（TP degree × 2 x CP degree，`use_local_output=True` 使用 plain tensor）。
+入口处有两条硬约束：`spmd_types` backend 不支持（simple_fsdp 构建于 raw DTensor 操作之上，该 backend 会报错）；TP 启用时 `seq_len` 必须整除 `parallel_dims.seq_len_divisor`（TP degree × 2 × CP degree，`use_local_output=True` 使用 plain tensor）。
 
 ### Graph-safe 改造
 
-GraphTrainer 的 trace 约束与 eager 有本质差异：`minimal_fx_tracer` 在 FakeTensor 下联合 trace，数据相关控制流与形状推导无法静态化，aot_autograd recompute 会丢弃 forward 中的 in-place 写。DSV4 稀疏注意力路径中依赖 in-place 写或数据相关形状推断的写法，在编译路径均改为函数式等价实现；注意力元数据 dataclass 注册为 pytree node，使 `minimal_fx_tracer` 能够识别其结构。
+GraphTrainer 的 trace 约束与 eager 有本质差异：`minimal_fx_tracer` 在 FakeTensor 下联合 trace，数据相关控制流与形状推断无法静态化，aot_autograd recompute 会丢弃 forward 中的 in-place 写。DSV4 稀疏注意力路径中依赖 in-place 写或数据相关形状推断的写法，在编译路径均改为函数式等价实现；注意力元数据 dataclass 注册为 pytree node，使 `minimal_fx_tracer` 能够识别其结构。
 
 ### Full Inductor 与 chunk loss
 
 [兼容补丁](../../torchtitan_npu/patches/torchtitan/experiments/graph_trainer/inductor_passes.py)
 在导入 `torchtitan_npu` 时自动启用。设置 `--compile.inductor-compilation full` 时，模型主干仍使用 Inductor 编译；带有
-`loss` / `lm_head` 注解的执行区间保留为独立 FX 子图。该区间包含 chunk 间未标注的梯度累加，
-按捕获时的逐 chunk 前向、反向顺序执行，避免整图编译将多个 chunk 的大中间张量同时保留。
-此兼容行为也适用于普通 loss；`regional` 模式及不含 loss 注解的 full 图沿用上游路径。
+`loss` / `lm_head` 注解的执行区间保留为独立 FX 子图。该区间包含 chunk 间未标注的梯度累加，按捕获时的逐 chunk 前向、反向顺序执行，避免整图编译将多个 chunk 的大中间张量同时保留。此兼容行为也适用于普通 loss；`regional` 模式及不含 loss 注解的 full 图沿用上游路径。
 
-分区之间通过可消费的参数列表传递张量：父图先打包参数并清除最后使用的局部引用，
-FX loss 入口清空列表，主干编译区域通过 Inductor 原生 `steal_arg` 路径消费列表。
-这样可以避免父图或调用包装器把已消费的激活一直持有到整个反向子图返回。
+分区之间通过可消费的参数列表传递张量：父图先打包参数并清除最后使用的局部引用，FX loss 入口清空列表，主干编译区域通过 Inductor 原生 `steal_arg` 路径消费列表。这样可以避免父图或调用包装器把已消费的激活一直持有到整个反向子图返回。
 
-该兼容路径适用于固定的 torchtitan 0.3.0，不改变 loss 公式和重计算策略。
-CPU 回归检查执行顺序、loss、输入和参数梯度，并在子图尚未返回时检查已消费输入的存储是否释放；
-真实 NPU 的峰值显存与吞吐仍需在相同配置下比较。
+该兼容路径适用于固定的 torchtitan 0.3.0，不改变 loss 公式和重计算策略。CPU 回归检查执行顺序、loss、输入和参数梯度，并在子图尚未返回时检查已消费输入的存储是否释放；真实 NPU 的峰值显存与吞吐仍需在相同配置下比较。
 
 ### Inductor runtime estimation patch
 
-`patches/torch_npu/inductor_runtime_estimation.py`（新增，包导入时按需生效）：NPU 上以常量 1200 GB/s 代替 Triton CUDA-driver 探测 DRAM 带宽——该值只进入 graph 调度 roofline 估计，不改变生成算子；同时默认开启 `standalone_compile(donate_graph_module=True)`，避免图模块深拷贝开销。仅在 `torch.npu.is_available()` 时应用。
+`torchtitan_npu/patches/torch_npu/inductor_runtime_estimation.py`（新增，包导入时按需生效）：NPU 上以常量 1200 GB/s 代替 Triton CUDA-driver 探测 DRAM 带宽——该值只进入 graph 调度 roofline 估计，不改变生成算子；同时默认开启 `standalone_compile(donate_graph_module=True)`，避免图模块深拷贝开销。仅在 `torch.npu.is_available()` 时应用。
 
 ## 激活方式
 
@@ -101,7 +95,7 @@ torchrun --nproc_per_node=8 -m torchtitan.train \
 | 并行组合 | FSDP（含 degree 1）、EP 已验证；TP 要求 `seq_len` 整除 `seq_len_divisor` |
 | `spmd_types` backend | 不支持（simple_fsdp 依赖 raw DTensor 操作） |
 | Context Parallel | 不支持（DSV4 稀疏注意力编译路径未适配 CP） |
-| EP overlap（上游实验性 pass） | 已通过patch适配；见 [`graph_trainer_ep_overlap.md`](graph_trainer_ep_overlap.md) |
+| EP overlap（上游实验性 pass） | 已通过 patch 适配；见 [`graph_trainer_ep_overlap.md`](graph_trainer_ep_overlap.md) |
 
 ## 相关文档
 
