@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint, DefaultDeviceType
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 from torchtitan.components.optimizer import ParamGroupConfig
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer import optimizer as host_mod
@@ -192,7 +192,7 @@ def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_s
 
     monkeypatch.setattr(dist_utils, "clip_grad_norm_", dense_clip)
 
-    with pytest.raises(RuntimeError, match="nonfinite .* gradient norm; optimizer update aborted"):
+    with pytest.raises(RuntimeError, match=r"nonfinite .* gradient norm; optimizer update aborted"):
         trainer.clip_grad_norm(model.parameters(), 1.0)
 
     # Clipping may have scaled dense gradients, but must not introduce NaNs
@@ -206,15 +206,15 @@ def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_s
 def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch, anticipatory):
     from torchtitan.components.optimizer import ParamGroupConfig
     from torchtitan.distributed import utils as dist_utils
-    from torchtitan.trainer import Trainer
     from torchtitan.models.common.linear import Linear
+    from torchtitan.trainer import Trainer
 
     from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
     from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
     from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
     from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
     from torchtitan_npu.models.deepseek_v4_1.indexer import FULL
-    from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import AscSelector
+    from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import AscInnerIndexer
 
     class RoutingModel(torch.nn.Module):
         """CPU fixture whose initialization forward visits the real router."""
@@ -228,7 +228,9 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     with torch.no_grad():
         model.table.weight.fill_(1)
     optimizer = host_mod.HostSparseOptimizersContainer.Config(
-        lr=0.1, weight_decay=0.0, implementation="for-loop",
+        lr=0.1,
+        weight_decay=0.0,
+        implementation="for-loop",
         param_groups=[
             ParamGroupConfig(pattern="table.weight", optimizer_name="SparseAdam"),
             ParamGroupConfig(pattern="dense", optimizer_name="AdamW"),
@@ -236,22 +238,31 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     ).build(model_parts=[model])
     trainer = object.__new__(DeepSeekV41Trainer)
     trainer.model_parts, trainer.optimizers = [model], optimizer
-    model.selector = AscSelector.Config(
-        mode=FULL, compress_ratio=1, num_index_heads=1, index_head_dim=4, index_topk=1,
+    model.inner_indexer = AscInnerIndexer.Config(
+        mode=FULL,
+        compress_ratio=1,
+        num_index_heads=1,
+        index_head_dim=4,
+        index_topk=1,
     ).build()
     model.router = AnticipatoryHashRouter.Config(
-        num_experts=2, top_k=1, gate=Linear.Config(in_features=1, out_features=2),
+        num_experts=2,
+        top_k=1,
+        gate=Linear.Config(in_features=1, out_features=2),
     ).build()
     with torch.no_grad():
         model.router.gate.weight.copy_(torch.tensor([[1.0], [-1.0]]))
-    trainer._indexer_selectors = [model.selector]
+    trainer._indexer_selectors = [model.inner_indexer]
     trainer.config = SimpleNamespace(
         training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0, steps=2),
         anticipatory=AnticipatoryRoutingConfig(enable=anticipatory),
         checkpoint=SimpleNamespace(interval=1, keep_latest_k=0),
     )
     trainer.parallel_dims = SimpleNamespace(
-        dp_enabled=False, pp_enabled=False, ep_enabled=False, dp_cp_enabled=False,
+        dp_enabled=False,
+        pp_enabled=False,
+        ep_enabled=False,
+        dp_cp_enabled=False,
         get_optional_mesh=lambda name: None,
     )
     trainer.device = torch.device("cpu")
@@ -267,11 +278,14 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     trainer.post_dataloading_process = preprocess
     events, metrics = [], []
     trainer.lr_schedulers = SimpleNamespace(get_metrics=lambda: {}, step=lambda: events.append("lr"))
-    trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True)
+    trainer.checkpointer = SimpleNamespace(
+        maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True
+    )
     trainer.metrics_processor = SimpleNamespace(
         should_log=lambda step: True,
         log=lambda *args, **kwargs: metrics.append(args),
-        ntokens_since_last_log=0, data_loading_times=[],
+        ntokens_since_last_log=0,
+        data_loading_times=[],
     )
     trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: events.append("sdc"))
 
@@ -292,7 +306,7 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         events.append("forward_backward")
         # Both microbatches, including unsupervised positions, must be counted
         # before the first fused selector consumes the step denominator.
-        assert model.selector.num_global_queries.item() == 3
+        assert model.inner_indexer.num_global_queries.item() == 3
         if anticipatory:
             assert trainer.anticipatory_schedule.engine.in_step
         loss = (3 * model.dense.sum() + 4 * model.table._distributed_lookup(input_dict["input"])[0, 0]) / 2

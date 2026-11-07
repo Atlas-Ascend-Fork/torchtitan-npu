@@ -8,22 +8,20 @@ from types import SimpleNamespace
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1 import config_registry
-from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, InnerIndexer
 
 
-class _FusedStandIn(Selector):
+class _FusedStandIn(InnerIndexer):
     """A stand-in for a fused port: the trainer discovers those by class, not by a flag.
 
-    The real ports subclass :class:`Selector` (and the reference selector is the only module
-    whose exact class is ``Selector``), which is what ``TrainerEx`` keys the step denominator on.
+    The real ports subclass :class:`InnerIndexer` (and the reference selector is the only module
+    whose exact class is ``InnerIndexer``), which is what ``TrainerEx`` keys the step denominator on.
     """
 
 
 def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monkeypatch):
-    config = Selector.Config(
-        mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4
-    )
-    selector, reference = _FusedStandIn(config), Selector(config)
+    config = InnerIndexer.Config(mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4)
+    selector, reference = _FusedStandIn(config), InnerIndexer(config)
 
     def initialize(self, config):
         self.model_parts = [torch.nn.ModuleList([selector, reference])]

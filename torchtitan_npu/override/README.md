@@ -342,7 +342,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | SMLA/SMLAG；SMLAG 反向在 `topk_scores` 梯度上产出 indexer teacher |
-| `lightning_indexer.asc` | `LightningIndexer.Config` | `AscLightningIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
+| `lightning_indexer.asc` | `InnerIndexer.Config` | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -365,7 +365,7 @@ recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它
 
 `sparse_attn.asc` 与 `lightning_indexer.asc` / `lightning_indexer.pypto` 是两组独立的配置节点，
 训练 indexer 时必须成对启用（CANN 侧配 CANN，PyPTO 侧配 PyPTO）：前者产出 teacher，
-后者在 `_LightningIndexerTND.backward` 用 `sparse_lightning_indexer_kl_loss_grad` 消费这条边。
+后者在 `_InnerIndexerTND.backward` 用 `sparse_lightning_indexer_kl_loss_grad` 消费这条边。
 
 metadata 不再是独立入口：每个 microbatch、每个几何一份 entry，由被替换的
 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 直接构建
@@ -443,7 +443,7 @@ kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，�
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | AscendC attention 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 attention 与 indexer 的 metadata（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；kernel geometry 是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状。本入口不声明任何量化：量化 selector 的 metadata 属于量化后的 attention backend，它替换本节点并自建 entry（见下文），本入口在那条路径上不生效 |
-| `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
+| `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
 | `engram.host_offload` | `HostEngramTable.Config`（精确匹配） | `HostOffloadEngramTable.Config` | CANN EngramFetch/EngramFetchGrad |

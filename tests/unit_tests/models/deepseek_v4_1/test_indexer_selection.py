@@ -16,7 +16,7 @@ from itertools import pairwise
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, InnerIndexer
 
 # Three documents of 4, 8 and 2 tokens; at ratio 2 they pool 2, 4 and 1 entries.
 BOUNDS = [0, 4, 12, 14]
@@ -63,8 +63,8 @@ def _masks():
 
 
 def _selector():
-    return Selector(
-        Selector.Config(
+    return InnerIndexer(
+        InnerIndexer.Config(
             mode=FULL,
             compress_ratio=2,
             num_index_heads=HEADS,

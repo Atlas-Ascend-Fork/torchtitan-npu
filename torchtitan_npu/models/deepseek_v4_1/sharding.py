@@ -5,7 +5,7 @@
 
 """The complete V4.1 parameter/activation placement policy.
 
-Derived from the V4 policy; the V4.1 differences: no LightningIndexer
+Derived from the V4 policy; the V4.1 differences: no `InnerIndexer`
 wrapper, no compressor ``ape`` (V4.1 builds no APE parameter), no MTP
 depths, and the V4.1-only placements (vision markers, the VL router
 bias).
@@ -173,7 +173,7 @@ def set_indexer_sharding(indexer_cfg):
     # The selector scores the **whole row's** index keys against this rank's chunks, so the keys
     # get the same ``S(1) -> R`` conversion the sparse core declares for its KV streams; the
     # query side and the candidate pool keep the placements they have at every degree.
-    indexer_cfg.selector.sharding_config = ShardingConfig(
+    indexer_cfg.inner_indexer.sharding_config = ShardingConfig(
         in_src_shardings={
             "idx_q_BLHiDi": replicated_activation,
             "idx_k_BNDi": replicated_activation,

@@ -17,7 +17,7 @@ from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
 from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .compressor import Compressor, Indexer, LightningIndexer
+from .compressor import Compressor, Indexer
 from .metadata import DeepSeekV4Metadata
 
 
@@ -232,11 +232,11 @@ class Attention(BaseAttention):
         wo_a: BatchedLinear.Config
         wo_b: Linear.Config
 
-        # Built only for ``compress_ratio > 1`` layers (``indexer``/``lightning_indexer``
-        # only for ratio-4 CSA layers); the registry passes ``None`` otherwise.
+        # Built only for ``compress_ratio > 1`` layers (``indexer`` only for ratio-4 CSA
+        # layers, and it carries the selection node inside); the registry passes ``None``
+        # otherwise.
         compressor: Compressor.Config | None
         indexer: Indexer.Config | None
-        lightning_indexer: LightningIndexer.Config | None
         # The sparse core the decoder replaces wholesale with ``sparse_attn.asc``.  It is the
         # layer's only metadata backend and the CP boundary for its KV streams; the annotation
         # stays the base type because a port's config is a replacement of this node.
@@ -271,7 +271,6 @@ class Attention(BaseAttention):
 
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
-        self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
         self.inner_attention = cfg.inner_attention.build()
 
     def parallelize(self, parallel_dims) -> None:
@@ -317,12 +316,14 @@ class Attention(BaseAttention):
         swa_k = restore_key_stream(metadata.xchg, swa_k, group=self.cp_group)
 
         cmp_k = None
-        idx_q = idx_k = idx_w = None
+        topk_indices = topk_scores = None
 
         if self.compress_ratio > 1 and self.indexer is not None:
-            # The selector's queries and weights ride the doc-chunk rows with the attention's;
-            # its compressor restores and carries for the keys it pools.
-            idx_q, idx_k, idx_w = self.indexer(
+            # The indexer projects the selection's queries, keys and weights -- they ride the
+            # doc-chunk rows with the attention's -- and selects from the compressed pool.
+            # Both steps live behind this one call, so a fused kernel replaces only the inner
+            # node's forward.
+            topk_indices, topk_scores = self.indexer(
                 x.detach(),
                 qr.detach(),
                 positions=positions,
@@ -338,12 +339,6 @@ class Attention(BaseAttention):
                 cu_seqlens=metadata.swa_k.cu_seqlens,
                 attention_metadata=metadata,
             )
-
-        # Every selector returns indices and scores: the reference exposes student logits,
-        # while the AscendC, PyPTO and quantized backends expose the teacher-gradient carrier.
-        topk_indices = topk_scores = None
-        if self.lightning_indexer is not None:
-            topk_indices, topk_scores = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
 
         # Inner-attention positional contract: sink + swa_k always; the compressed pool and
         # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.

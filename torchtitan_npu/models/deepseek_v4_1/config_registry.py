@@ -33,7 +33,7 @@ from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
 
 from . import model_registry
-from .indexer import Selector
+from .indexer import InnerIndexer
 from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel
 
 
@@ -81,13 +81,13 @@ class DeepSeekV41Trainer(TrainerEx, GradientClippingTrainer):
     def __init__(self, config):
         super().__init__(config)
         # The step denominator is for the selectors that consume the fused teacher.  A port
-        # subclasses :class:`Selector`, so the reference selector -- the only module whose
-        # exact class is ``Selector`` -- is the one that does not.
+        # subclasses :class:`InnerIndexer`, so the reference selector -- the only module whose
+        # exact class is ``InnerIndexer`` -- is the one that does not.
         self._indexer_selectors = [
             module
             for part in self.model_parts
             for module in part.modules()
-            if isinstance(module, Selector) and type(module) is not Selector
+            if isinstance(module, InnerIndexer) and type(module) is not InnerIndexer
         ]
 
     def step_batches(self, batches):

@@ -50,7 +50,7 @@ from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
-from .indexer import HierarchicalIndexer
+from .indexer import Indexer
 from .model import DeepSeekV41Metadata
 
 
@@ -213,7 +213,7 @@ class Attention(BaseAttention):
         inner_attention: CompressedSparseInnerAttention2.Config  # pyrefly: ignore [bad-override]
         rope: RoPE.Config
         compressor: Compressor.Config
-        indexer: HierarchicalIndexer.Config
+        indexer: Indexer.Config
         wq_a: Linear.Config
         q_norm: RMSNorm.Config
         wq_b: Linear.Config

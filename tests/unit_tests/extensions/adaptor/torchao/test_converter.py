@@ -150,7 +150,7 @@ def _v41_attention():
             index_topk=512,
             num_index_heads=32,
             index_head_dim=128,
-            selector=SimpleNamespace(candidate_topk_blocks=2048, candidate_block_size=8),
+            inner_indexer=SimpleNamespace(candidate_topk_blocks=2048, candidate_block_size=8),
         ),
     )
 
@@ -637,7 +637,7 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
     )
 
     for layer in converted.model.layers:
-        selector = layer.attention.indexer.selector
+        selector = layer.attention.indexer.inner_indexer
         inner_attention = layer.attention.inner_attention
         selector_quant = getattr(selector, "_torchao_npu_config", None)
         attention_quant = getattr(inner_attention, "_torchao_npu_config", None)
@@ -647,7 +647,7 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
         if inner_attention.compress_ratio > 0:
             # The trainer discovers instances, not configs, to assign the step denominator.
             selector_module = selector.build()
-            assert isinstance(selector_module, converter_module.DeepSeekV41Selector)
+            assert isinstance(selector_module, converter_module.DeepSeekV41InnerIndexer)
             assert selector_module.num_global_queries is None
 
 

@@ -223,7 +223,7 @@ def _check_indexer_teacher_pair(fused_core: bool, fused_selector: bool) -> None:
 
     Neither half is a usable fallback:
 
-    - Selector without the fused core: ``topk_scores``' gradient is ``None``, so SLIKG
+    - InnerIndexer without the fused core: ``topk_scores``' gradient is ``None``, so SLIKG
       returns zero gradient and the indexer never updates.
     - Fused core without the fused selector: the reference selector does pick the teacher up
       off that edge, but it applies attention-level marginals to summed per-head indexer
@@ -436,8 +436,8 @@ class DeepSeekV41Model(Decoder):
                         # builds or searches it -- so the estimate is read off the same
                         # config the layers read it from and cannot drift from it.  The
                         # positivity test is the kernels' own, matching the module's
-                        # ``Selector.has_candidate_pool``.
-                        selector = indexer.selector
+                        # ``InnerIndexer.has_candidate_pool``.
+                        selector = indexer.inner_indexer
                         if indexer.mode is IndexerMode.REINDEX and selector.candidate_topk_blocks > 0:
                             # MFU counts the model's bounded candidate search, not
                             # wider eager-reference scoring that is masked afterwards.

@@ -28,7 +28,7 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from . import cp_layout  # noqa: F401  registers the doc-chunk layout with the CP shard
 from .attention import Attention, CompressedSparseInnerAttention, UnitScaleRMSNorm
-from .compressor import Compressor, Indexer, LightningIndexer
+from .compressor import Compressor, Indexer, InnerIndexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
     DeepSeekV4Model,
@@ -140,6 +140,7 @@ def _make_indexer_config(
     dim: int,
     num_index_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rope_head_dim: int,
     q_lora_rank: int,
     compress_ratio: int,
@@ -149,6 +150,7 @@ def _make_indexer_config(
     coff = 2  # overlap always True for indexer
     return Indexer.Config(
         rope=dataclasses.replace(rope, split=index_head_dim - rope_head_dim),
+        inner_indexer=InnerIndexer.Config(index_topk=index_topk),
         num_index_heads=num_index_heads,
         index_head_dim=index_head_dim,
         rope_head_dim=rope_head_dim,
@@ -199,7 +201,6 @@ def _make_v4_attn_config(
     softmax_scale = head_dim**-0.5
     compressor_cfg = None
     indexer_cfg = None
-    lightning_indexer_cfg = None
 
     if compress_ratio == 4:
         coff = 2  # 1 + overlap (overlap=True when compress_ratio==4)
@@ -216,13 +217,13 @@ def _make_v4_attn_config(
             dim=dim,
             num_index_heads=index_n_heads,
             index_head_dim=index_head_dim,
+            index_topk=index_topk,
             rope_head_dim=rope_head_dim,
             q_lora_rank=q_lora_rank,
             compress_ratio=compress_ratio,
             norm_eps=norm_eps,
             rope=rope,
         )
-        lightning_indexer_cfg = LightningIndexer.Config(index_topk=index_topk)
     elif compress_ratio > 1:
         coff = 1  # no overlap
         compressor_cfg = _make_compressor_config(
@@ -248,7 +249,6 @@ def _make_v4_attn_config(
         n_groups=n_groups,
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
-        lightning_indexer=lightning_indexer_cfg,
         inner_attention=inner_attention_cfg,
         # Attention sites are head_dim wide; the base rope may be reused by
         # the indexer (index_head_dim wide), so split is pinned per site.
@@ -496,9 +496,9 @@ def _build_mtp_layers(
         attention = cast("Attention.Config", copy.deepcopy(inner_cfg.attention))
         attention.compress_ratio = 0
         attention.compressor = None
+        # MTP attention is dense: no compressor and no indexer, so the selection node
+        # inside the indexer goes with it.
         attention.indexer = None
-        # MTP attention is dense; disable the prebuilt selector branch too.
-        attention.lightning_indexer = None
         # Swap the plain rope in (the main layer may carry the compress-theta
         # variant) while keeping the per-site split pin: rope receives the
         # full-width head_dim tensor and rotates only its trailing channels.

@@ -188,14 +188,14 @@ def test_candidate_pool_reaches_only_its_window_indexers(monkeypatch) -> None:
     """The pool built at layer 20 is the mask the later indexers actually select with."""
     model, _ = _tiny_debug_model(monkeypatch)
     indexer_module = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.indexer")
-    registered_forward = indexer_module.HierarchicalIndexer.forward
+    registered_forward = indexer_module.Indexer.forward
     observed_masks = []
 
     def record_forward(self, x, qr, positions, attention_metadata, **kwargs):
         observed_masks.append(kwargs.get("candidates"))
         return registered_forward(self, x, qr, positions, attention_metadata, **kwargs)
 
-    monkeypatch.setattr(indexer_module.HierarchicalIndexer, "forward", record_forward)
+    monkeypatch.setattr(indexer_module.Indexer, "forward", record_forward)
     _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     with torch.no_grad():
         model(_TOKENS, **kwargs)

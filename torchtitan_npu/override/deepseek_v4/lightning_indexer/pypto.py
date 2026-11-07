@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AscV4Metadata
@@ -60,7 +60,7 @@ def _pypto_sparse_lightning_indexer_kl_loss_grad(*, q: torch.Tensor, **kwargs: A
 
 
 class _PyPTOIndexerTND(torch.autograd.Function):
-    """LightningIndexer forward fused with its SLIKG backward, over the PyPTO kernel pair."""
+    """InnerIndexer forward fused with its SLIKG backward, over the PyPTO kernel pair."""
 
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
@@ -128,7 +128,7 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         return dq.to(idx_q.dtype), dk.to(idx_k.dtype), dw.to(idx_w.dtype), None, None, None
 
 
-class PyPTOLightningIndexer(LightningIndexer):
+class PyPTOInnerIndexer(InnerIndexer):
     """The PyPTO indexer: the same contract, implemented over the PyPTO kernel pair.
 
     It emits the kernel's document-local ``topk_indices`` in ``[B, L, K]`` layout and the
@@ -137,12 +137,12 @@ class PyPTOLightningIndexer(LightningIndexer):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(LightningIndexer.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(self, idx_q_BLHiDi, idx_k_BNDi, idx_w_BLHi, *, attention_metadata):
         if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("PyPTOLightningIndexer requires the entry the fused attention built.")
+            raise TypeError("PyPTOInnerIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOIndexerTND.apply(
             idx_q_BLHiDi.flatten(0, 1),
             # The keys enter the Function already compacted (arch22): the gather is

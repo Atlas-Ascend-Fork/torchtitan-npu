@@ -41,7 +41,7 @@ USE_GOLDEN=0  # wrapper 里的默认测试组合：
         │     负责「前一块 carry + prepend + 压缩 + 裁掉多出块」，输出本地压缩 chunk，由内核边界 all-gather 成整行
         │
         ├─ 默认内核（CompressedSparseInnerAttention）
-        │     gather_attn(q, swa_k, cmp_k, topk_indices) + sink；选择由 LightningIndexer 给出
+        │     gather_attn(q, swa_k, cmp_k, topk_indices) + sink；选择由 InnerIndexer 给出
         │
         └─ AscendC 融合内核（AscCompressedSparseInnerAttention）
              q/swa_k flatten → [T, N, D] / [T, 1, D]
@@ -119,16 +119,16 @@ cmp_k.residual  = [0, 0]        # 对齐后恒 0；CP frame 的 residual 按 cp*
 CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `reach` 是 ratio 的整数倍，因此 residual 恒 0，内核不会遇到半块前缀。
 
 - `r=1`：不生成压缩 KV，仅执行原始 KV 的滑窗注意力。该几何没有压缩 frame（`cmp_k is None`），key 网格就是行网格 `swa_k.cu_seqlens`；融合 entry 仍生成对应的 `aicpu_metadata` 记录，融合算子使用 `has_cmp_kv=False`。
-- `r=4`（CSA）：启用重叠压缩和 LightningIndexer；前驱块必须属于同一文档（`overlap_valid`）。
-- `r=128`（HCA）：生成连续压缩 KV，不执行 LightningIndexer TopK。
+- `r=4`（CSA）：启用重叠压缩和 InnerIndexer；前驱块必须属于同一文档（`overlap_valid`）。
+- `r=128`（HCA）：生成连续压缩 KV，不执行 InnerIndexer TopK。
 
 ## 参考路径（默认内核）
 
-模型目录默认内核是 `CompressedSparseInnerAttention`：它读公共 metadata 的 frame（查询帧 `q` 的偏移、压缩帧 `cmp_k` 的偏移），用 Attention Gym 的 `gather_attn` 在 `cat([swa_k, cmp_k 容器])` 上做滑窗 + sink，并按 ratio 取选择——`r=4` 走 `LightningIndexer` 给出的逐文档 TopK，`r=128` 直接取本查询本自然段内因果可达的全部压缩槽。选择与 `gather_attn` 都按“文档内”下标寻址（见 `models/deepseek_v4/document_intervals.py`），因此不再需要文档感知的 BlockMask，也不再需要额外的 metadata 扩展来预计算参考 tier。
+模型目录默认内核是 `CompressedSparseInnerAttention`：它读公共 metadata 的 frame（查询帧 `q` 的偏移、压缩帧 `cmp_k` 的偏移），用 Attention Gym 的 `gather_attn` 在 `cat([swa_k, cmp_k 容器])` 上做滑窗 + sink，并按 ratio 取选择——`r=4` 走 `InnerIndexer` 给出的逐文档 TopK，`r=128` 直接取本查询本自然段内因果可达的全部压缩槽。选择与 `gather_attn` 都按“文档内”下标寻址（见 `models/deepseek_v4/document_intervals.py`），因此不再需要文档感知的 BlockMask，也不再需要额外的 metadata 扩展来预计算参考 tier。
 
 默认内核就是唯一的参考路径，不再有独立的 golden override：`test_dsv4.py` 以形状/有限值和 pool 梯度的可复现性守护它，融合内核与它做容差对照。
 
-参考组合不训练 indexer：`r=4` 层的 `LightningIndexer` 返回 `(topk_indices, topk_scores)`，`topk_scores` 是可导的 student logits，但参考核心不产生 KL loss；它的 KL 蒸馏目标由融合组合的 `sparse_attn.asc` + `lightning_indexer.asc`（SMLAG → SLIKG）承担。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
+参考组合不训练 indexer：`r=4` 层的 `InnerIndexer` 返回 `(topk_indices, topk_scores)`，`topk_scores` 是可导的 student logits，但参考核心不产生 KL loss；它的 KL 蒸馏目标由融合组合的 `sparse_attn.asc` + `lightning_indexer.asc`（SMLAG → SLIKG）承担。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
 
 因此参考组合目前只能用 AdamW：`DistMuon` 在 step 前要求每个配置的参数都有梯度，会以 `missing gradients: layers.<n>.attention.indexer.*` 报错（`USE_GOLDEN=1` 搭配示例里的 Muon 参数即属此情况）。
 
@@ -139,7 +139,7 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 1. 校验模型输入是 `AscV4Metadata`，读这一层的 `q` / `swa_k` / `cmp_k` frame。
 2. query 转 TND；swa_k / cmp_k 是整行（CP 下由 wrapper 的 `S(1) -> R` 声明式 all-gather 得到），直接转 TND。
 3. selector 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、降序、`-1` 落尾；后者是 teacher 的 carrier）。
-4. 调用 SparseFlashMLA；`_SparseMLA` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把 raw marginal `p` 原样写到 `topk_scores` 的梯度上：`p` 就是算子文档里的 `reduceG(softmax)/G`，`softmax_scale` 已在其中，KL 梯度对未缩放的 index 点积求导（index 侧 scale 在 `idx_w` 的图内），因此这里既不缩放也不再清零 `-1` 槽位。`lightning_indexer.asc` 的 `_LightningIndexerTND.backward` 再除以行内 query 数，用 `sparse_lightning_indexer_kl_loss_grad` 训练 indexer。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
+4. 调用 SparseFlashMLA；`_SparseMLA` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把 raw marginal `p` 原样写到 `topk_scores` 的梯度上：`p` 就是算子文档里的 `reduceG(softmax)/G`，`softmax_scale` 已在其中，KL 梯度对未缩放的 index 点积求导（index 侧 scale 在 `idx_w` 的图内），因此这里既不缩放也不再清零 `-1` 槽位。`lightning_indexer.asc` 的 `_InnerIndexerTND.backward` 再除以行内 query 数，用 `sparse_lightning_indexer_kl_loss_grad` 训练 indexer。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
 
 `cann_ops_transformer` 包负责内核的算子注册（schema、meta/fake 实现），本仓只在融合路径内做前反向桥接，不再自建 `torch.library` 封装。
 

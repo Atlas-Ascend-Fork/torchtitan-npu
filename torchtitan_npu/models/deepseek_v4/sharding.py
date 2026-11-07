@@ -90,10 +90,11 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
         out_dst_shardings=q,
     )
 
-    if attention_cfg.lightning_indexer is not None:
-        # The selector scores the whole row's index keys against this rank's chunks: the query
-        # side stays replicated, the keys get the same ``S(1) -> R`` gather as the KV streams.
-        attention_cfg.lightning_indexer.sharding_config = ShardingConfig(
+    if attention_cfg.indexer is not None:
+        # The indexer's selection node scores the whole row's index keys against this rank's
+        # chunks: the query side stays replicated, the keys get the same ``S(1) -> R`` gather as
+        # the KV streams.
+        attention_cfg.indexer.inner_indexer.sharding_config = ShardingConfig(
             in_src_shardings={
                 "idx_q_BLHiDi": replicated_activation,
                 "idx_k_BNDi": replicated_activation,

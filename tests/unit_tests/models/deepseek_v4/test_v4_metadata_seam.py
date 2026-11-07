@@ -316,10 +316,9 @@ def test_the_inner_attention_and_selector_own_the_cp_boundary():
     assert core_row["swa_k"] != core_sharding.in_src_shardings["swa_k"]
     assert core_row["cmp_k"] != core_sharding.in_src_shardings["cmp_k"]
 
-    selector_sharding = attention.lightning_indexer.sharding_config
-    assert selector_sharding is not None
-    assert set(selector_sharding.in_src_shardings) == {"idx_q_BLHiDi", "idx_k_BNDi", "idx_w_BLHi"}
+    inner_indexer_sharding = attention.indexer.inner_indexer.sharding_config
+    assert inner_indexer_sharding is not None
+    assert set(inner_indexer_sharding.in_src_shardings) == {"idx_q_BLHiDi", "idx_k_BNDi", "idx_w_BLHi"}
     assert (
-        selector_sharding.in_dst_shardings["idx_k_BNDi"]
-        != selector_sharding.in_src_shardings["idx_k_BNDi"]
+        inner_indexer_sharding.in_dst_shardings["idx_k_BNDi"] != inner_indexer_sharding.in_src_shardings["idx_k_BNDi"]
     )

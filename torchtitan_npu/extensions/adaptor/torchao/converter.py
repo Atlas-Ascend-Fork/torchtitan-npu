@@ -36,7 +36,9 @@ from torchtitan.protocols.module import Module  # noqa: F401  (re-exported for t
 from torchtitan.tools.logging import logger
 
 import torchtitan_npu  # noqa: F401  (apply moe/GroupedExperts patch before we bind it below)
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector  # noqa: F401  (re-exported)
+from torchtitan_npu.models.deepseek_v4_1.indexer import (
+    InnerIndexer as DeepSeekV41InnerIndexer,  # noqa: F401  (re-exported)
+)
 from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts  # noqa: F401  (re-exported)
 
 from .components.deepseek_v4 import (

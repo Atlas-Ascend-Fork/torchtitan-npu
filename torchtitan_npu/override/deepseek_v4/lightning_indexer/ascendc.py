@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The DeepSeek-V4 indexer's BF16 port: LightningIndexer fused with SLIKG.
+"""The DeepSeek-V4 indexer's BF16 port: InnerIndexer fused with SLIKG.
 
 The forward runs the CANN ``lightning_indexer`` selection and returns the document-local
 indices plus a ``topk_scores`` carrier.  Nothing reads the carrier's value: it exists so
@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
@@ -37,7 +37,7 @@ from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV
 def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame | None) -> dict:
     """The options the indexer's metadata calls and its kernels must agree on.
 
-    They are read off this geometry's frames, so the metadata call, the LightningIndexer
+    They are read off this geometry's frames, so the metadata call, the InnerIndexer
     forward and the SLIKG backward cannot drift option-for-option.  ``cmp_k`` is the entry's frame
     -- on arch22 the pool this rank's reach covers, which its keys are compacted onto.
     """
@@ -96,8 +96,8 @@ def kernel_aicpu_metadata(
     return li_record, slig_metadata
 
 
-class _LightningIndexerTND(torch.autograd.Function):
-    """LightningIndexer forward fused with its SLIKG backward, over the CANN kernel pair.
+class _InnerIndexerTND(torch.autograd.Function):
+    """InnerIndexer forward fused with its SLIKG backward, over the CANN kernel pair.
 
     The kernels address the packed TND row: ``idx_q`` is ``[T, Hi, Di]``, ``idx_k`` is
     ``[Tk, 1, Di]`` and ``idx_w`` is ``[T, Hi]`` float32, with document-local ``-1`` padding.
@@ -205,7 +205,7 @@ class AscIndexerMixin:
         del candidates_BL1C
         topk = self.index_topk
         batch, seqlen = idx_q.shape[:2]
-        topk_indices, topk_scores = _LightningIndexerTND.apply(
+        topk_indices, topk_scores = _InnerIndexerTND.apply(
             idx_q.flatten(0, 1),
             # The keys enter the Function already compacted (arch22): the gather is
             # differentiable, so the teacher's gradient scatters back onto the gathered row and
@@ -224,7 +224,7 @@ class AscIndexerMixin:
         )
 
 
-class AscLightningIndexer(AscIndexerMixin, LightningIndexer):
+class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
     """The fused BF16 LI/SLIKG indexer for the V4 indexer layers.
 
     ``topk_indices`` crosses the model boundary in the kernels' own document-local numbering,
@@ -232,7 +232,7 @@ class AscLightningIndexer(AscIndexerMixin, LightningIndexer):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(LightningIndexer.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(  # pyrefly: ignore [bad-override]

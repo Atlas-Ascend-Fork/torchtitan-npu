@@ -250,6 +250,7 @@ class Indexer(Module):
         num_index_heads: int
         index_head_dim: int
         rope_head_dim: int
+        inner_indexer: "InnerIndexer.Config"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -263,6 +264,7 @@ class Indexer(Module):
         self.wq_b = cfg.wq_b.build()
         self.weights_proj = cfg.weights_proj.build()
         self.compressor = cfg.compressor.build()
+        self.inner_indexer = cfg.inner_indexer.build()
 
     def forward(self, x, qr, *, positions, attention_metadata):
         """Project raw indexer queries, keys, and per-head weights.
@@ -274,12 +276,9 @@ class Indexer(Module):
         compressed stream.
 
         Returns:
-            idx_q: Indexer queries ``[B, L, num_index_heads, index_head_dim]``
-                with RoPE applied and Hadamard-rotated.
-            idx_k: Indexer compressed keys in the container grid
-                ``[B, L // ratio, index_head_dim]``, Hadamard-rotated.
-            idx_w: Per-head indexer weights ``[B, L, num_index_heads]``
-                (the local rows).
+            ``(topk_indices, topk_scores)``: the inner node's selection over the projected
+            queries, keys and per-head weights -- document-local picks (``-1`` for an unused
+            slot) and the differentiable scores at them.
         """
         bsz, seqlen, _ = qr.size()
         idx_q = self.wq_b(qr)
@@ -297,7 +296,9 @@ class Indexer(Module):
         )
         idx_k = self._rotate_activation(idx_k)
         idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
-        return idx_q, idx_k, idx_w
+        # Selection is the inner node's: it is its own module so a fused kernel replaces only
+        # that ``forward``, while the projections above stay where they are.
+        return self.inner_indexer(idx_q, idx_k, idx_w, attention_metadata=attention_metadata)
 
     @staticmethod
     def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -363,7 +364,7 @@ def student_logits_at_picks(
     the model's own score scale (``select_compressed_slots`` cancels the operator's internal
     division; this pass never divides).
 
-    This is the pass ``LightningIndexer`` returns beside the selection, and the fused
+    This is the pass ``InnerIndexer`` returns beside the selection, and the fused
     selector's backward consumes the same quantity: at the picks, the student logits are the
     only differentiable edge of the selection.
     """
@@ -379,7 +380,7 @@ def student_logits_at_picks(
     return weighted_BLHK.sum(dim=2).masked_fill(topk_indices < 0, -torch.inf)
 
 
-class LightningIndexer(Module):
+class InnerIndexer(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         index_topk: int
@@ -407,7 +408,7 @@ class LightningIndexer(Module):
         # The selector runs on a layer of its own ratio and reads that layer's entry; a
         # geometry without a compressed pool is the only shape it refuses.
         if attention_metadata.ratio <= 1:
-            raise ValueError("LightningIndexer requires a compressed geometry (ratio > 1).")
+            raise ValueError("InnerIndexer requires a compressed geometry (ratio > 1).")
         cu_seqlens = attention_metadata.q.cu_seqlens
         cmp_frame = attention_metadata.cmp_k
         if cmp_frame is None:

@@ -12,11 +12,11 @@ indexer (the quantized one) builds its own entry in its own package instead of e
 
 from dataclasses import dataclass
 
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import AscIndexerMixin
 
 
-class AscSelector(AscIndexerMixin, Selector):  # pyrefly: ignore [inconsistent-inheritance]
+class AscInnerIndexer(AscIndexerMixin, InnerIndexer):  # pyrefly: ignore [inconsistent-inheritance]
     """The fused BF16 LI/SLIKG indexer for the V4.1 indexer layers.
 
     It emits the kernel's own document-local ``topk_indices``, which the fused attention consumes
@@ -25,7 +25,7 @@ class AscSelector(AscIndexerMixin, Selector):  # pyrefly: ignore [inconsistent-i
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Selector.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(  # pyrefly: ignore [inconsistent-inheritance]

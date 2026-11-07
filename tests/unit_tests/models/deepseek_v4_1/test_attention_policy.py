@@ -184,21 +184,21 @@ def test_candidate_pool_roles_are_declared_per_indexer_layer() -> None:
 
     for layer_id, layer in enumerate(config.layers):
         indexer = layer.attention.indexer
-        selector = indexer.selector
+        inner_indexer = indexer.inner_indexer
         if layer_id == V41_CANDIDATE_SOURCE_LAYER:
             # The Full Mode source is the only layer that builds the pool.
             assert indexer.mode is FULL
-            assert selector.candidate_topk_blocks == 4
-            assert selector.candidate_block_size == 8
+            assert inner_indexer.candidate_topk_blocks == 4
+            assert inner_indexer.candidate_block_size == 8
         elif layer_id in pool_consumers:
             # A Reindex Mode layer after the source searches the shared pool.
             assert indexer.mode is REINDEX
-            assert selector.candidate_topk_blocks == 4
-            assert selector.candidate_block_size == 8
+            assert inner_indexer.candidate_topk_blocks == 4
+            assert inner_indexer.candidate_block_size == 8
         else:
             # Everything else scores every visible entry, or checks nothing at all.
-            assert selector.candidate_topk_blocks == -1
-            assert selector.candidate_block_size == -1
+            assert inner_indexer.candidate_topk_blocks == -1
+            assert inner_indexer.candidate_block_size == -1
 
     assert config.layers[V41_CANDIDATE_SOURCE_LAYER].attention.indexer.mode is FULL
     assert config.layers[24].attention.indexer.mode is REINDEX

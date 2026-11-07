@@ -33,7 +33,7 @@ from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
-    AscSelector,
+    AscInnerIndexer,
 )
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Metadata
 
@@ -246,7 +246,9 @@ def _tiny_model(monkeypatch, *, fused: bool):
         for layer in config.layers:
             if layer.attention.inner_attention.compress_ratio == 0:
                 continue
-            layer.attention.indexer.selector = derive(layer.attention.indexer.selector, AscSelector.Config)
+            layer.attention.indexer.inner_indexer = derive(
+                layer.attention.indexer.inner_indexer, AscInnerIndexer.Config
+            )
             # State the geometry the way the recipe's override arguments do: this stack runs the
             # tiny widths, and the records its metadata builder produces are sized from these.
             layer.attention.inner_attention = derive(
@@ -255,7 +257,7 @@ def _tiny_model(monkeypatch, *, fused: bool):
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config)
     for module in model.modules():
-        if isinstance(module, AscSelector):
+        if isinstance(module, AscInnerIndexer):
             module.num_global_queries = torch.tensor(float(_TOKENS.numel()))
     return model
 
@@ -276,8 +278,8 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     # for the same row, which is what carries the frames and the records the kernels take.
     metadata = _metadata([0, _POSITIONS.shape[-1]], ratio=2)
 
-    eager_indexer = eager.layers["2"].attention.indexer.selector
-    fused_indexer = fused.layers["2"].attention.indexer.selector
+    eager_indexer = eager.layers["2"].attention.indexer.inner_indexer
+    fused_indexer = fused.layers["2"].attention.indexer.inner_indexer
     torch.manual_seed(7)
     b, l = 1, 128
     hi, di = eager_indexer.num_index_heads, eager_indexer.index_head_dim
@@ -370,7 +372,7 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", fake_smlag)
     model = _tiny_model(monkeypatch, fused=True)
     for module in model.modules():
-        if isinstance(module, AscSelector):
+        if isinstance(module, AscInnerIndexer):
             module.num_global_queries = torch.tensor(float(num_global_queries))
     for parameter in model.parameters():
         parameter.data = parameter.data.to(torch.bfloat16)
@@ -444,7 +446,7 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", fake_metadata)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad_metadata", fake_metadata)
 
-    original = li._LightningIndexerTND.forward
+    original = li._InnerIndexerTND.forward
 
     def capture(ctx, *args):
         out = original(ctx, *args)
@@ -452,9 +454,9 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
         seen["carrier"] = out[1].device
         return out
 
-    monkeypatch.setattr(li._LightningIndexerTND, "forward", staticmethod(capture))
+    monkeypatch.setattr(li._InnerIndexerTND, "forward", staticmethod(capture))
 
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
+    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
     heads, head_dim = selector.num_index_heads, selector.index_head_dim
     selector.forward(
         torch.zeros(1, 8, heads, head_dim, dtype=torch.bfloat16, device=device),
@@ -562,7 +564,7 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
     _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     metadata = layer_metadata(model.layers["2"], kwargs)
 
-    selector = model.layers["2"].attention.indexer.selector
+    selector = model.layers["2"].attention.indexer.inner_indexer
     # requires_grad on the operands, as in a real layer: an autograd Function only gives
     # its outputs a grad_fn when one of its inputs needs a gradient, and the carrier's edge
     # is the whole point of the second output.
@@ -593,7 +595,7 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
 def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch):
     """The fused node override composes with the blanket norm/rope stacks.
 
-    ``lightning_indexer.asc`` swaps only the parameterless ``Selector`` node, which
+    ``lightning_indexer.asc`` swaps only the parameterless ``InnerIndexer`` node, which
     owns no nested norm or rope, so the blanket ``common.rms_norm.asc`` and
     ``common.rope.asc_complex`` apply alongside it with disjoint claims: the
     indexer's ``k_norm`` and ``rope`` are covered like every other site.
@@ -621,7 +623,7 @@ def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch
     )
 
     indexer = model.layers[2].attention.indexer
-    assert isinstance(indexer.selector, AscSelector.Config)
+    assert isinstance(indexer.inner_indexer, AscInnerIndexer.Config)
     assert isinstance(indexer.rope, ComplexRoPE.Config)
     assert isinstance(model.layers[0].attention.q_norm, AscRMSNorm.Config)
     assert isinstance(model.layers[0].attention_norm, AscRMSNorm.Config)
@@ -685,7 +687,9 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
             if layer.attention.inner_attention.compress_ratio == 0:
                 continue
             if fused_selector:
-                layer.attention.indexer.selector = derive(layer.attention.indexer.selector, AscSelector.Config)
+                layer.attention.indexer.inner_indexer = derive(
+                    layer.attention.indexer.inner_indexer, AscInnerIndexer.Config
+                )
             if fused_core:
                 layer.attention.inner_attention = derive(
                     layer.attention.inner_attention, AscV41SparseAttention.Config, **_TINY_GEOMETRY
@@ -695,7 +699,7 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config(fused_selector=True, fused_core=True))
     assert isinstance(model.layers["2"].attention.inner_attention, AscV41SparseAttention)
-    assert isinstance(model.layers["2"].attention.indexer.selector, AscSelector)
+    assert isinstance(model.layers["2"].attention.indexer.inner_indexer, AscInnerIndexer)
 
 
 @pytest.mark.parametrize(
@@ -750,7 +754,7 @@ def test_the_teacher_sources_are_the_index_source_layers():
 
 
 def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch):
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.selector
+    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
     generator = torch.Generator().manual_seed(42)
     q = torch.rand(1, 8, selector.num_index_heads, selector.index_head_dim, generator=generator, requires_grad=True)
     k = torch.rand(1, 4, selector.index_head_dim, generator=generator, requires_grad=True)

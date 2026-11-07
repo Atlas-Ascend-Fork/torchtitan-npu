@@ -32,8 +32,8 @@ from .indexer import (
     FULL,
     REINDEX,
     REUSE,
-    HierarchicalIndexer,
-    Selector,
+    Indexer,
+    InnerIndexer,
 )
 from .mhc import HcPost, HcPre
 from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel, DeepSeekV41TransformerBlock
@@ -235,7 +235,7 @@ def _make_indexer_config(
     candidate_topk_blocks: int,
     candidate_block_size: int,
     rope: ComplexRoPE.Config | None,
-) -> HierarchicalIndexer.Config:
+) -> Indexer.Config:
     """The indexer config for one layer, in the mode its role implies.
 
     A layer that owns the compressed KV is Full Mode (it projects its own index keys); an
@@ -256,9 +256,9 @@ def _make_indexer_config(
     # only the source and the Reindex Mode layers after it carry a capacity.
     pool_capacity = candidate_topk_blocks if wants_pool else -1
     pool_block_size = candidate_block_size if wants_pool else -1
-    return HierarchicalIndexer.Config(
+    return Indexer.Config(
         mode=mode,
-        selector=Selector.Config(
+        inner_indexer=InnerIndexer.Config(
             mode=mode,
             compress_ratio=compress_ratio,
             num_index_heads=num_index_heads,

@@ -160,7 +160,7 @@ V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`�
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | 同 arch35（V4.1 只跑在 arch35 上） |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `AscV4Metadata.build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 无 |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `xchg: ExchangeMetadata`） | 融合 entry（`AscV41Metadata`） |
-| indexer teacher 归一化 | `_LightningIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]`（量化 selector 同） | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
+| indexer teacher 归一化 | `_InnerIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]`（量化 selector 同） | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
 | 量化 metadata | `QuantV4Metadata` 重建（只换 selector 的 forward 记录） | `_V41QuantAttentionMetadata` 重建（整套记录） |
 
@@ -318,7 +318,7 @@ Sparse core / selector（sharding 声明）
 ```
 
 V4.1 的参考 metadata（`DeepSeekV41Metadata`）只带整行边界与 `position_k`（degree=1 时等于输入的
-`positions`）；CP 的 frame 与记录由融合 entry 重建，消费者（`AscV41SparseAttention`、`AscSelector`）
+`positions`）；CP 的 frame 与记录由融合 entry 重建，消费者（`AscV41SparseAttention`、`AscInnerIndexer`）
 直接读 `attention_metadata.q` / `.swa_k` / `.cmp_k` 与 `aicpu_metadata`。
 
 ### 5.2 rank-local frame 重建
@@ -369,7 +369,7 @@ layer 在本地 flatten 段上做 `ratio` 折叠（ratio==1 是普通投影）�
 
 ### 5.4 indexer teacher 的归一化
 
-V4.1 的 selector 在反向把 teacher 除以 `Selector.num_global_queries`：本 step 全部 accumulation
+V4.1 的 selector 在反向把 teacher 除以 `InnerIndexer.num_global_queries`：本 step 全部 accumulation
 microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
 `metadata.swa_k.cu_seqlens[-1]`（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
 来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。
@@ -410,7 +410,7 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/models/deepseek_v4/sharding.py` | `swa_k` / `cmp_k` / `idx_k` 的 `cp: S(1) -> R` 声明 |
 | `torchtitan_npu/override/deepseek_v4/asc_metadata.py` | `AicpuMetadata` 等类型 / `AscV4Metadata`（`aicpu_metadata` + `a3_workaround`）/ `build_aicpu_metadata`（组合两个 kernel 模块的 AI_CPU metadata）/ `prepare_cp_metadata`（`rebuild_cp_metadata`，内部 `doc_chunk_metadata` + `build_aicpu_metadata`） |
 | `torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py` | `kernel_options` / `kernel_aicpu_metadata`（SMLA/SMLAG 的实参与记录，同处一模块）/ `_SparseMLA` / `AscSparseMLAMixin`（两栈共用的端口：行/TND 翻译、arch22 上 key 压缩） |
-| `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | `kernel_options` / `kernel_aicpu_metadata`（indexer 的实参与 metadata）/ `_LightningIndexerTND` / `AscIndexerMixin`（两栈共用的 indexer 端口，V4.1 形状：`candidates_BL1C` 与三元返回） |
+| `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | `kernel_options` / `kernel_aicpu_metadata`（indexer 的实参与 metadata）/ `_InnerIndexerTND` / `AscIndexerMixin`（两栈共用的 indexer 端口，V4.1 形状：`candidates_BL1C` 与三元返回） |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/pypto.py` | PyPTO 版 selector：独立实现同一契约（输入准备、排序、teacher 边），只替换 LI/SLIKG kernel 对 |
 | `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py` | CANN 融合压缩器（无 carry、无 CP 分支；`_state_inputs` 按 stream 形状内部构造零 tiling 表） |
 | `torchtitan_npu/models/deepseek_v4_1/attention.py` | V4.1 查询交换、本地 KV/压缩、输出 `unpermute` |
