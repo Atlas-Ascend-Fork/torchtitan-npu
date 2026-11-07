@@ -390,7 +390,7 @@ NGPU=2 \
 </tr>
 <tr>
 <td>indexer teacher 归一化</td>
-<td><code>_LightningIndexerTND.backward</code> 除以整行 token 数 <code>swa_k.cu_seqlens[-1]</code>（量化 selector 同）</td>
+<td><code>_InnerIndexerTND.backward</code> 除以整行 token 数 <code>swa_k.cu_seqlens[-1]</code>（量化 selector 同）</td>
 <td><code>num_global_queries</code>（本 step 全部 query 数，按 DP 求和）</td>
 </tr>
 <tr>
@@ -537,7 +537,7 @@ Sparse core / selector（sharding 声明）
   topk_indices, sink:  replicated
 </code></pre>
 <p>V4.1 的参考 metadata（<code>DeepSeekV41Metadata</code>）只带整行边界与 <code>position_k</code>（degree=1 时等于输入的
-<code>positions</code>）；CP 的 frame 与记录由融合 entry 重建，消费者（<code>AscV41SparseAttention</code>、<code>AscSelector</code>）
+<code>positions</code>）；CP 的 frame 与记录由融合 entry 重建，消费者（<code>AscV41SparseAttention</code>、<code>AscInnerIndexer</code>）
 直接读 <code>attention_metadata.q</code> / <code>.swa_k</code> / <code>.cmp_k</code> 与 <code>aicpu_metadata</code>。</p>
 <h3 id="52-rank-local-frame">5.2 rank-local frame 重建</h3>
 <p><code>AscV41Metadata.prepare_cp_metadata</code>（<code>torchtitan_npu/override/deepseek_v4_1/sparse_attn/ascendc.py</code>）
@@ -577,7 +577,7 @@ layer 在本地 flatten 段上做 <code>ratio</code> 折叠（ratio==1 是普通
   给本 rank 的 chunk 打分）。</li>
 </ul>
 <h3 id="54-indexer-teacher">5.4 indexer teacher 的归一化</h3>
-<p>V4.1 的 selector 在反向把 teacher 除以 <code>Selector.num_global_queries</code>：本 step 全部 accumulation
+<p>V4.1 的 selector 在反向把 teacher 除以 <code>InnerIndexer.num_global_queries</code>：本 step 全部 accumulation
 microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
 <code>metadata.swa_k.cu_seqlens[-1]</code>（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
 来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。</p>
@@ -660,7 +660,7 @@ microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）�
 </tr>
 <tr>
 <td><code>torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py</code></td>
-<td><code>kernel_options</code> / <code>kernel_aicpu_metadata</code>（indexer 的实参与 metadata）/ <code>_LightningIndexerTND</code> / <code>AscIndexerMixin</code>（两栈共用的 indexer 端口，V4.1 形状：<code>candidates_BL1C</code> 与三元返回）</td>
+<td><code>kernel_options</code> / <code>kernel_aicpu_metadata</code>（indexer 的实参与 metadata）/ <code>_InnerIndexerTND</code> / <code>AscIndexerMixin</code>（两栈共用的 indexer 端口，V4.1 形状：<code>candidates_BL1C</code> 与三元返回）</td>
 </tr>
 <tr>
 <td><code>torchtitan_npu/override/deepseek_v4/lightning_indexer/pypto.py</code></td>
