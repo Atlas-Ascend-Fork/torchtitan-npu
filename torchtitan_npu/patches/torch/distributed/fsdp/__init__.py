@@ -26,12 +26,12 @@ https://github.com/pytorch/pytorch/issues/202040, with the same relaxation
 proposed in https://github.com/pytorch/pytorch/pull/202101.  Retire this patch
 once a released torch carries the fix.
 
-Optional AG/RS compute-stream allocation adapts the pinned FSDP communication
+Optional AG compute-stream allocation adapts the pinned FSDP communication
 interfaces to NPU stream-local memory reuse. This module owns allocation,
 copy-out and cleanup together; the upstream issues above concern precision
 and input validation, not this allocation policy. AG results retain the native
 ownership protocol and return side-stream usage before storage can be reused.
-Both options are disabled by default and read once at import time. Backend
+The option is disabled by default and read once at import time. Backend
 requirements and supported paths are documented in
 ``docs/feature_guides/fsdp_compute_stream_allocation.md``.
 """
@@ -66,34 +66,28 @@ _ORIGINAL_RESET_ITER_STATE = _fsdp_param_group.FSDPParamGroup._reset_iter_state
 _ORIGINAL_ALL_GATHER_INPUTS = FSDPParam.all_gather_inputs
 # ``property.fget`` is statically ``Callable | None``; this named property has a getter.
 _ORIGINAL_ALL_GATHER_INPUTS_FGET = cast("Callable[[FSDPParam], Any]", _ORIGINAL_ALL_GATHER_INPUTS.fget)
-_FOREACH_REDUCE_SIGNATURE = inspect.signature(_ORIGINAL_FOREACH_REDUCE)
 _FOREACH_ALL_GATHER_SIGNATURE = inspect.signature(_ORIGINAL_FOREACH_ALL_GATHER)
-_RS_ALLOC_ON_COMPUTE_STREAM = os.getenv("TORCHTITAN_NPU_FSDP_RS_ALLOC_ON_COMPUTE_STREAM", "0") == "1"
 _AG_ALLOC_ON_COMPUTE_STREAM = os.getenv("TORCHTITAN_NPU_FSDP_AG_ALLOC_ON_COMPUTE_STREAM", "0") == "1"
 
 
 class _ComputeStreamAllocator:
     """Allocate on compute; preserve native copy and communication streams."""
 
-    def __init__(self, comm, device_handle, kind):
+    def __init__(self, comm, device_handle):
         self._comm = comm
         self._device_handle = device_handle
         self._compute_stream = device_handle.current_stream()
-        self._kind = kind
         self._all_gather_output = None
 
     def allocate(self, size, *, dtype, device):
         caller = self._device_handle.current_stream()
         with self._device_handle.stream(self._compute_stream):
             output = self._comm.allocate(size, dtype=dtype, device=device)
-            if self._kind == "AG":
-                # Keep storage alive until the native result takes ownership.
-                self._all_gather_output = output
+            # Keep storage alive until the native result takes ownership.
+            self._all_gather_output = output
         if caller != self._compute_stream:
             # Order recycled storage and allocation work before side-stream use.
             caller.wait_stream(self._compute_stream)
-            if self._kind != "AG":
-                output.record_stream(caller)
         return output
 
     def __call__(self, *args, **kwargs):
@@ -165,15 +159,6 @@ def _patched_foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs):
     reduce_dtype = fsdp_params[0].reduce_dtype
     if reduce_dtype is not None and len({grad.dtype for grad in unsharded_grads}) > 1:
         unsharded_grads[:] = [grad if grad.dtype == reduce_dtype else grad.to(reduce_dtype) for grad in unsharded_grads]
-    if _RS_ALLOC_ON_COMPUTE_STREAM:
-        bound = _FOREACH_REDUCE_SIGNATURE.bind(fsdp_params, unsharded_grads, *args, **kwargs)
-        values = bound.arguments
-        values["reduce_scatter_comm"] = _ComputeStreamAllocator(
-            values["reduce_scatter_comm"],
-            torch.get_device_module(values["device"]),
-            "RS",
-        )
-        return _ORIGINAL_FOREACH_REDUCE(*bound.args, **bound.kwargs)
     return _ORIGINAL_FOREACH_REDUCE(fsdp_params, unsharded_grads, *args, **kwargs)
 
 
@@ -186,7 +171,6 @@ def _patched_foreach_all_gather(fsdp_params, *args, **kwargs):
     allocator = _ComputeStreamAllocator(
         values["all_gather_comm"],
         torch.get_device_module(values["device"]),
-        "AG",
     )
     values["all_gather_comm"] = allocator
     try:
