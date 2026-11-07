@@ -1,6 +1,6 @@
 # 融合算子接入指南
 
-本文面向在 `torchtitan-npu` 中接入 AscendC、Triton 或者 Tilelang 等融合算子的开发者。
+本文面向在 `torchtitan-npu` 中接入 AscendC、Triton 或者 TileLang 等融合算子的开发者。
 融合算子应作为 NPU 适配层通过 [override 机制](../../torchtitan_npu/override/README.md) 接入，不修改上游 `torchtitan`；默认训练路径不受影响，只有在 `override.imports` 中显式列出入口后才会替换组件。
 
 ## 选择接入入口
@@ -37,7 +37,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 
 注意事项：
 
-- 同一 target 有多个同类实现时，在 variant 后增加职责限定，例如
+- 同一 `target` 有多个同类实现时，在 variant 后增加职责限定，例如
 `rope.asc_complex`、`rope.asc_cossin`、`lightning_indexer.asc` / `lightning_indexer.pypto`。
 
 - replacement 类采用「variant + target」命名，并保留标准缩写大小写，例如
@@ -45,7 +45,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 
 ### 文件组织
 
-简单 target 使用单文件；同一 target 包含多个较大的后端实现时使用 package：
+简单 `target` 使用单文件；同一 target 包含多个较大的后端实现时使用 package：
 
 ```text
 torchtitan_npu/override/<scope>/<target>/
@@ -103,7 +103,7 @@ torchtitan_npu/override/<scope>/<target>/
   `aicpu_metadata.sparse_attn.fwd` 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
   几何（heads/head dim/indexer 三数）是该 config 自己的必填字段、无默认值，由 override 的五个参数
   一次写入，默认值即 V4.1-Flash 的发布形状，因此没有单独的 metadata 入口。这些 metadata 是内核的
-  唯一来源——没有 inline 回退：拿着没经过 override 构建的 metadata 前向会直接失败。
+  唯一来源——没有 inline 回退：使用未经过 override 构建的 metadata 前向会直接失败。
   CP 下由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建。
   attention override 不声明任何量化：量化后的 attention 是**另一个 backend**，由量化适配层
   （`torchtitan_npu/extensions/adaptor/torchao/converter.py`）安装自己的 config 替换本节点，并由

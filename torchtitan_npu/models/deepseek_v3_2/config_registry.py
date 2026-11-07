@@ -25,7 +25,7 @@ def deepseek_v3_2_debugmodel() -> Trainer.Config:
                 global_vocab_size=decoder_vocab_size(model_spec),
             ),
         ),
-        hf_assets_path="./tests/assets/tokenizer",
+        hf_assets_path="./tests/assets/deepseek_v3",
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),

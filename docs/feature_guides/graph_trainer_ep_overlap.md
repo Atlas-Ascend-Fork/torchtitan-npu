@@ -2,9 +2,9 @@
 
 EP overlap 是 torchtitan 上游 `experiments/graph_trainer/` 为 MoE + Expert Parallel（EP）训练提供的通用 graph pass：把 MoE 区域按 token 维切成两个 chunk，使一个 chunk 的 all-to-all 通信与另一个 chunk 的专家计算重叠。该能力的配置接口、pass pipeline 和本文的临时补丁均不绑定具体模型名称。本文描述启用该能力所需的四个 `patches/torchtitan/` 临时补丁；这些问题最先由 DeepSeek-V4（DSV4）验证图暴露，当前整网验证也使用 DSV4。
 
-| 序号 | pass名称 | 内容 |
+| 序号 | pass 名称 | 内容 |
 | --- | --- | --- |
-| 1 | mark_unbacked（前置操作，不属于pass） | 在 trace 前制造 chunk 动态维度及 hint |
+| 1 | mark_unbacked（前置操作，不属于 pass） | 在 trace 前制造 chunk 动态维度及 hint |
 | 2 | populate_chunk_dim_metadata_pass | trace 后识别该符号，并登记“这是 EP chunk symbol” |
 | 3 | ep_overlap_chunk_pass | 利用 EP chunk symbol 符号切图 |
 | 4 | ep_overlap_schedule_pass | 根据两个 chunk 重排通信和计算 |
@@ -144,7 +144,7 @@ ep_overlap_schedule_pass()
 
 节点有确定的 chunk 所有权，但两个 chunk 的调度候选集合可能有交集。例如，节点 N 属于 chunk0，同时又是 chunk1 后续 AllToAll 的依赖，它可能同时出现在两个 chunk 的候选集中。
 
-社区 `_ready_nodes` 对每个 chunk 仅排除此前已经 `emitted` 的节点；`_append_ready_blocks` 要等整个 ready 元组生成后才更新 `emitted`，因此无法排除本轮内部的重复项。若返回结果为 `[N, A, N]`，后续顺序依赖会形成 `N -> A -> N`。
+社区 `_ready_nodes` 对每个 chunk 仅排除此前已经 `emitted` 的节点；`_append_ready_blocks` 要等整个 ready 元组生成后才更新 `emitted`，因此无法排除本轮内部的重复项。若返回结果为 `[N, A, N]`，后续顺序依赖会形成 `N → A → N`。
 
 **Patch 方案：**当前提交保留 `_ready_nodes` 的遍历实现，在一次调用内新增 `selected` 集合；不修改传入的 `emitted`。替换函数的主体如下：
 
@@ -220,7 +220,7 @@ return (*chunked, *moved), tuple(user for user in full if user not in moved_set)
 
 EP overlap 通过 `--compile.ep_overlap.*` 打开。满足前述条件的 GraphTrainer MoE recipe 均通过同一组配置项启用；模型入口、dispatcher、并行配置和算子 override 仍由各模型 recipe 负责。当前 A3 GraphTrainer debug 脚本已设置 `seq` 分块、`graph` 策略和 NPU auto overlap pipeline，调用它时无需重复传这些配置项。自动调度机制见 [`graph_trainer_auto_overlap.md`](graph_trainer_auto_overlap.md)。
 
-下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers/16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。
+下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers / 16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。
 
 ```bash
 NGPU=8 \
@@ -248,7 +248,7 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
 
 本节只记录 DSV4 作为验证载体的结果，用于证明通用 EP overlap 能力及临时补丁在这一具体组合上可以完成整网训练。
 
-在同一台机器上按“关闭 EP overlap -> 开启 EP overlap”的顺序各运行 10 step。两组均使用 8 张 Ascend 910、CANN 9.2.0、TorchTitan `v0.3.0`（`086bf6c166ec85c1298eb5596fa9bf95f6a2d840`）和本仓库 HEAD `ec98b86809e024e105958b50c7714666c8c65ff2`。模型为 flash 43 layers / 16 experts，EP=8、DP shard=8、TP/CP/PP=1，local/global batch size 为 1/64，sequence length 为 4096，seed 为 42。
+在同一台机器上按“关闭 EP overlap → 开启 EP overlap”的顺序各运行 10 step。两组均使用 8 张 Ascend 910、CANN 9.2.0、TorchTitan `v0.3.0`（`086bf6c166ec85c1298eb5596fa9bf95f6a2d840`）和本仓库 HEAD `ec98b86809e024e105958b50c7714666c8c65ff2`。模型为 flash 43 layers / 16 experts，EP=8、DP shard=8、TP/CP/PP=1，local/global batch size 为 1/64，sequence length 为 4096，seed 为 42。
 
 | 指标 | EP overlap 关闭 | EP overlap 开启 |
 | --- | ---: | ---: |
@@ -257,7 +257,7 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
 | EP 图变换 | 无 | seq chunking 86 个 region；scheduling 86 个 region |
 | step 2-10 平均耗时 | 64.975 s | 62.923 s |
 | step 2-10 平均 TPS | 505.000 | 521.222 |
-| loss（step 1 -> 10） | 12.19569 -> 9.91401 | 12.19564 -> 9.94998 |
+| loss（step 1 → 10） | 12.19569 → 9.91401 | 12.19564 → 9.94998 |
 | 日志记录的峰值显存 | 52.22 GiB（85.23%） | 59.37 GiB（96.90%） |
 
 该次顺序单跑中，开启组 step 2-10 的平均 TPS 比关闭组高约 3.2%。
