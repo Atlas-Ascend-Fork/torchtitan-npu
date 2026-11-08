@@ -87,6 +87,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
@@ -173,14 +175,14 @@
 <thead>
 <tr>
 <th>序号</th>
-<th>pass名称</th>
+<th>pass 名称</th>
 <th>内容</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>1</td>
-<td>mark_unbacked（前置操作，不属于pass）</td>
+<td>mark_unbacked（前置操作，不属于 pass）</td>
 <td>在 trace 前制造 chunk 动态维度及 hint</td>
 </tr>
 <tr>
@@ -365,7 +367,7 @@ ep_overlap_schedule_pass()
         -&gt; _stable_topological_sort()
 </code></pre>
 <p>节点有确定的 chunk 所有权，但两个 chunk 的调度候选集合可能有交集。例如，节点 N 属于 chunk0，同时又是 chunk1 后续 AllToAll 的依赖，它可能同时出现在两个 chunk 的候选集中。</p>
-<p>社区 <code>_ready_nodes</code> 对每个 chunk 仅排除此前已经 <code>emitted</code> 的节点；<code>_append_ready_blocks</code> 要等整个 ready 元组生成后才更新 <code>emitted</code>，因此无法排除本轮内部的重复项。若返回结果为 <code>[N, A, N]</code>，后续顺序依赖会形成 <code>N -&gt; A -&gt; N</code>。</p>
+<p>社区 <code>_ready_nodes</code> 对每个 chunk 仅排除此前已经 <code>emitted</code> 的节点；<code>_append_ready_blocks</code> 要等整个 ready 元组生成后才更新 <code>emitted</code>，因此无法排除本轮内部的重复项。若返回结果为 <code>[N, A, N]</code>，后续顺序依赖会形成 <code>N → A → N</code>。</p>
 <p><strong>Patch 方案：</strong>当前提交保留 <code>_ready_nodes</code> 的遍历实现，在一次调用内新增 <code>selected</code> 集合；不修改传入的 <code>emitted</code>。替换函数的主体如下：</p>
 <pre><code class="language-python">ready = []
 selected: set[fx.Node] = set()
@@ -436,7 +438,7 @@ return (*chunked, *moved), tuple(user for user in full if user not in moved_set)
 <p>父模块、其他 root 或缺失 FQN 的 dim-0 query 仍可能被归为 full；若未来要支持这些场景，需要额外定义重建方案，不能将当前补丁的适用范围外推为所有 AllToAll shape live-out 都受支持。</p>
 <h2 id="_4">启用方式</h2>
 <p>EP overlap 通过 <code>--compile.ep_overlap.*</code> 打开。满足前述条件的 GraphTrainer MoE recipe 均通过同一组配置项启用；模型入口、dispatcher、并行配置和算子 override 仍由各模型 recipe 负责。当前 A3 GraphTrainer debug 脚本已设置 <code>seq</code> 分块、<code>graph</code> 策略和 NPU auto overlap pipeline，调用它时无需重复传这些配置项。自动调度机制见 <a href="../graph_trainer_auto_overlap/"><code>graph_trainer_auto_overlap.md</code></a>。</p>
-<p>下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers/16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。</p>
+<p>下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers / 16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。</p>
 <pre><code class="language-bash">NGPU=8 \
 HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
@@ -483,7 +485,7 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
 <p>若需把 EP overlap 固化为某个配置的默认值，在 <code>config_registry.py</code> 的对应工厂中对 <code>config.compile.ep_overlap</code> 赋 <code>EpOverlapConfig(...)</code>。</p>
 <h2 id="dsv4-2026-09-16">DSV4 整网实跑验证（2026-09-16）</h2>
 <p>本节只记录 DSV4 作为验证载体的结果，用于证明通用 EP overlap 能力及临时补丁在这一具体组合上可以完成整网训练。</p>
-<p>在同一台机器上按“关闭 EP overlap -&gt; 开启 EP overlap”的顺序各运行 10 step。两组均使用 8 张 Ascend 910、CANN 9.2.0、TorchTitan <code>v0.3.0</code>（<code>086bf6c166ec85c1298eb5596fa9bf95f6a2d840</code>）和本仓库 HEAD <code>ec98b86809e024e105958b50c7714666c8c65ff2</code>。模型为 flash 43 layers / 16 experts，EP=8、DP shard=8、TP/CP/PP=1，local/global batch size 为 1/64，sequence length 为 4096，seed 为 42。</p>
+<p>在同一台机器上按“关闭 EP overlap → 开启 EP overlap”的顺序各运行 10 step。两组均使用 8 张 Ascend 910、CANN 9.2.0、TorchTitan <code>v0.3.0</code>（<code>086bf6c166ec85c1298eb5596fa9bf95f6a2d840</code>）和本仓库 HEAD <code>ec98b86809e024e105958b50c7714666c8c65ff2</code>。模型为 flash 43 layers / 16 experts，EP=8、DP shard=8、TP/CP/PP=1，local/global batch size 为 1/64，sequence length 为 4096，seed 为 42。</p>
 <table>
 <thead>
 <tr>
@@ -519,9 +521,9 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
 <td style="text-align: right;">521.222</td>
 </tr>
 <tr>
-<td>loss（step 1 -&gt; 10）</td>
-<td style="text-align: right;">12.19569 -&gt; 9.91401</td>
-<td style="text-align: right;">12.19564 -&gt; 9.94998</td>
+<td>loss（step 1 → 10）</td>
+<td style="text-align: right;">12.19569 → 9.91401</td>
+<td style="text-align: right;">12.19564 → 9.94998</td>
 </tr>
 <tr>
 <td>日志记录的峰值显存</td>

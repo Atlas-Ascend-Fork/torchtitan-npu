@@ -123,6 +123,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
@@ -228,10 +230,10 @@ disable_passes = [&quot;cudagraph_pass&quot;]
 - dtype、device 和未标记的静态 shape 保持不变；
 - ratio 集合、metadata 字段结构和模块结构保持不变；
 - 只有预先标记为 dynamic 且满足约束的维度可以变化。
-当前 replay 路径不会因为输入契约变化而自动重新 trace。契约变化会导致 guard/replay 失效，必须显式重新捕获和编译；</p>
+当前 replay 路径不会因为输入契约变化而自动重新 trace。契约变化会导致 guard/replay 失效，必须显式重新捕获和编译。</p>
 <h2 id="4">4. 重计算实现</h2>
 <h3 id="41-full">4.1 上游 <code>full</code> 策略</h3>
-<p>上游 full policy 默认使用一层一保存输出的策略，其余节点默认使用重计算方式。</p>
+<p>上游 <code>full</code> policy 默认使用一层一保存输出的策略，其余节点默认使用重计算方式。</p>
 <p>代码位置：</p>
 <pre><code class="language-text">torchtitan/experiments/graph_trainer/memory_policy.py
 </code></pre>
@@ -268,15 +270,7 @@ disable_passes = [&quot;cudagraph_pass&quot;]
 </ul>
 <p>保存点在 remat 和 EP chunk pass 之前识别。该策略以更多激活显存换取更少的 expert GEMM replay。</p>
 <h3 id="45">4.5 前向变异算子的重算保真</h3>
-<p>原生 SAR 按数据流回放重算节点，无数据输出的前向变异算子（如 partial-RoPE 对
-clone 的原地旋转）不会进入回放链，反向会读到未旋转的值（上游 issue
-<a href="https://github.com/pytorch/torchtitan/issues/4688">#4688</a>）。DSV4 GraphTrainer 默认
-启用上游 PR <a href="https://github.com/pytorch/torchtitan/pull/4708">#4708</a> 的
-<code>functionalize_recompute_mutations_pass</code>（见 2.1）：在 memory-policy 打标之后、
-CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随之自然重算；对无可
-重算变异的图是 no-op。已验证 A3（CANN w0902，backward 走临时 shim）2p/8p 精度
-对齐；A5 原生反向未验证。固定 TorchTitan 依赖自带等价 pass 后，删除本 backport
-与 <code>pass_pipeline</code> 设置即可。</p>
+<p>原生 SAR 按数据流回放重算节点，无数据输出的前向变异算子（如 partial-RoPE 对 clone 的原地旋转）不会进入回放链，反向会读到未旋转的值（上游 issue <a href="https://github.com/pytorch/torchtitan/issues/4688">#4688</a>）。DSV4 GraphTrainer 默认启用上游 PR <a href="https://github.com/pytorch/torchtitan/pull/4708">#4708</a> 的 <code>functionalize_recompute_mutations_pass</code>（见 2.1）：在 memory-policy 打标之后、CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随之自然重算；对无可重算变异的图是 no-op。已验证 A3（CANN w0902，backward 走临时 shim）2p/8p 精度对齐；A5 原生反向未验证。待固定 TorchTitan 依赖自带等价 pass 后，删除本 backport 与 <code>pass_pipeline</code> 设置即可。</p>
 <h2 id="5">5. 支持边界与风险</h2>
 <ul>
 <li><code>dsv4-mhc</code> 依赖 FQN、FX target 和 occurrence，模型或编译器升级后必须检查规则命中数。</li>

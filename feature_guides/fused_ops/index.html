@@ -87,6 +87,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
                   <li class="toctree-l1 current"><a class="reference internal current" href="#">融合算子接入指南</a>
     <ul class="current">
     <li class="toctree-l2"><a class="reference internal" href="#_2">选择接入入口</a>
@@ -174,7 +176,7 @@
             <div class="section" itemprop="articleBody">
               
                 <h1 id="_1">融合算子接入指南</h1>
-<p>本文面向在 <code>torchtitan-npu</code> 中接入 AscendC、Triton 或者 Tilelang 等融合算子的开发者。
+<p>本文面向在 <code>torchtitan-npu</code> 中接入 AscendC、Triton 或者 TileLang 等融合算子的开发者。
 融合算子应作为 NPU 适配层通过 <a href="../../torchtitan_npu/override/README.md">override 机制</a> 接入，不修改上游 <code>torchtitan</code>；默认训练路径不受影响，只有在 <code>override.imports</code> 中显式列出入口后才会替换组件。</p>
 <h2 id="_2">选择接入入口</h2>
 <table>
@@ -243,7 +245,7 @@
 <p>注意事项：</p>
 <ul>
 <li>
-<p>同一 target 有多个同类实现时，在 variant 后增加职责限定，例如
+<p>同一 <code>target</code> 有多个同类实现时，在 variant 后增加职责限定，例如
 <code>rope.asc_complex</code>、<code>rope.asc_cossin</code>、<code>lightning_indexer.asc</code> / <code>lightning_indexer.pypto</code>。</p>
 </li>
 <li>
@@ -252,7 +254,7 @@
 </li>
 </ul>
 <h3 id="_5">文件组织</h3>
-<p>简单 target 使用单文件；同一 target 包含多个较大的后端实现时使用 package：</p>
+<p>简单 <code>target</code> 使用单文件；同一 target 包含多个较大的后端实现时使用 package：</p>
 <pre><code class="language-text">torchtitan_npu/override/&lt;scope&gt;/&lt;target&gt;/
 ├── __init__.py       # @override 注册入口
 ├── ascendc.py        # AscendC 实现
@@ -304,7 +306,7 @@
   <code>aicpu_metadata.sparse_attn.fwd</code> 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
   几何（heads/head dim/indexer 三数）是该 config 自己的必填字段、无默认值，由 override 的五个参数
   一次写入，默认值即 V4.1-Flash 的发布形状，因此没有单独的 metadata 入口。这些 metadata 是内核的
-  唯一来源——没有 inline 回退：拿着没经过 override 构建的 metadata 前向会直接失败。
+  唯一来源——没有 inline 回退：使用未经过 override 构建的 metadata 前向会直接失败。
   CP 下由 <code>AscV41Metadata.prepare_cp_metadata</code> 用 rank-local frames 重建。
   attention override 不声明任何量化：量化后的 attention 是<strong>另一个 backend</strong>，由量化适配层
   （<code>torchtitan_npu/extensions/adaptor/torchao/converter.py</code>）安装自己的 config 替换本节点，并由
@@ -481,7 +483,7 @@ replacement 只支持具体 Config 类型时设置 <code>exact=True</code>；需
             </div>
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
-        <a href="../ep_process_group/" class="btn btn-neutral float-left" title="EP 通信域分离"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../fsdp_compute_stream_allocation/" class="btn btn-neutral float-left" title="FSDP AllGather 缓冲区的计算流分配"><span class="icon icon-circle-arrow-left"></span> Previous</a>
         <a href="../graph_trainer_auto_overlap/" class="btn btn-neutral float-right" title="GraphTrainer NPU Auto Overlap">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
@@ -505,7 +507,7 @@ replacement 只支持具体 Config 类型时设置 <code>exact=True</code>；需
   <span class="rst-current-version" data-toggle="rst-current-version">
     
     
-      <span><a href="../ep_process_group/" style="color: #fcfcfc">&laquo; Previous</a></span>
+      <span><a href="../fsdp_compute_stream_allocation/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
       <span><a href="../graph_trainer_auto_overlap/" style="color: #fcfcfc">Next &raquo;</a></span>
