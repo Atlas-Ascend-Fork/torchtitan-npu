@@ -51,6 +51,36 @@ bash examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh \
 
 DeepSeek-V4/V4.1 不注册 `W4A8_MXFP` 或 `W8A8_MXFP8`，选择这些组合会在转换阶段报错。
 
+### MoE all-to-all 低精度通信
+
+`--extension.quantization.all-to-all-quant-format` 默认未设置（`None`），关闭通信量化。目前只接受 `mxfp8`，用于在标准 EP `AllToAllTokenDispatcher` 路径上启用 MXFP8 token 通信。接收端会直接使用 MXFP8 数据的方向才采用低精度通信。选择 `mxfp8` 时必须同时启用 `enable-quantized-training`，且 recipe 必须是 `all_mxfp8`、`mix` 或 `all_block_fp8`。
+
+以下命令在仓库根目录启动 DeepSeek-V4 单机 8 卡示例。先按[环境要求](#环境要求)安装 TorchAO-NPU，并准备脚本所需的 Tokenizer、数据和 checkpoint 路径：
+
+```bash
+HF_ASSETS_PATH=/path/to/DeepSeek-V4-Flash \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5 \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8 \
+  --extension.quantization.all-to-all-quant-format mxfp8
+```
+
+该脚本默认 `EP=8`、`spmd_types`，并通过 `torchtitan_npu.override.common.token_dispatcher.asc` 选择 NPU 标准 all-to-all dispatcher。只有 `EP>1` 才实际发生跨 rank token all-to-all；`EP=1` 使用本地重排，不产生这项通信。router scores 仍沿原有高精度路径传输。
+
+四个通信阶段的数据格式如下：
+
+| 通信阶段 | 通信格式 | 接收后的用途 |
+| --- | --- | --- |
+| 正向 dispatch | MXFP8 | 接收端按本地专家重排 `qdata` 和 scale，形成沿最后一维量化的 `MXTensor`，供专家 grouped MM 前向直接使用。 |
+| 正向 combine | BF16 | 专家输出返回原 token 所在 rank，随后执行路由分数聚合和后续高精度网络计算，不保留量化表示。 |
+| combine 对应的反向 | MXFP8 | 梯度返回专家所在 rank 后按本地专家重排；grouped MM 反向直接复用沿最后一维量化的 `qdata` 和 scale 计算 dgrad。wgrad 仍需将其恢复为逻辑值，再生成沿分组 M 维的量化表示。 |
+| dispatch 对应的反向 | BF16 | 激活梯度返回原 token 所在 rank，后续反向不直接消费 MXFP8 表示。 |
+
+MXFP8 通信分别对 `qdata` 和 scale 执行一次 all-to-all，不将两者拼接为单个通信张量。通信格式配置不影响 FSDP 参数 all-gather 或梯度 reduce-scatter。权重预量化另由 `enable-fsdp-prequantize` 控制。
+
+当前**不支持 DeepEP dispatcher 的低精度 all-to-all**。若模型选择 `moe_comm_backend="deepep"`，同时指定 `mxfp8` 会在配置转换阶段抛出 `ValueError`。未设置通信量化格式时，DeepEP 仍走原有高精度通信路径。其他非标准 dispatcher 也不在支持范围内。代码已提供标准路径，但此组合的 NPU 多卡训练、编译和数值收敛尚未在本文给出验证记录，不能仅凭配置转换成功判断训练已跑通。
+
 ## MXFP4 QAT
 
 `--extension.quantization.enable-mxfp4-qat` 为 DeepSeek routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。该独立开关仅对 `mix` 和 `all_block_fp8` 中的 routed expert 生效，默认关闭。Qwen3.5 `W4A8_MXFP` 对 dense 权重固有地使用同一 fake quant 机制，不依赖该开关。

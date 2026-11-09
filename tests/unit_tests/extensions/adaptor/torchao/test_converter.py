@@ -8,6 +8,7 @@
 import importlib
 import logging
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 
@@ -467,6 +468,165 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
 
     assert converted is not model_spec
     assert calls[0]["model_type"] == converter_module.ModelType(expected_model_type)
+
+
+def test_alltoall_quantization_requires_compute_quantization(converter_module):
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+
+    with pytest.raises(ValueError, match="requires enable_quantized_training=True"):
+        converter_module.apply_quantization_converter(
+            model_registry("debugmodel", moe_comm_backend="standard"),
+            QuantizationExtensionConfig(
+                enable_quantized_training=False,
+                all_to_all_quant_format="mxfp8",
+            ),
+            model_compile_enabled=False,
+        )
+
+
+@pytest.mark.parametrize("recipe", ["all_mxfp8", "all_block_fp8", "mix"])
+@pytest.mark.parametrize("use_asc_override", [False, True], ids=["plain_standard", "asc_override"])
+def test_alltoall_quantization_replaces_standard_dispatcher(converter_module, recipe, use_asc_override):
+    from torchtitan.config.override import OverrideConfig, apply_overrides
+    from torchtitan.models.common.moe import RoutedExperts
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.override.common.token_dispatcher import AscAllToAllTokenDispatcher
+
+    model_spec = model_registry("debugmodel", moe_comm_backend="standard")
+    if use_asc_override:
+        apply_overrides(
+            OverrideConfig(imports=["torchtitan_npu.override.common.token_dispatcher.asc"]), model_spec.model
+        )
+    original = []
+    for _, config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
+        inner_experts = config.inner_experts  # pyrefly: ignore [missing-attribute]
+        original.append((type(config)._owner, type(inner_experts)._owner))
+    converted = converter_module.apply_quantization_converter(
+        model_spec,
+        QuantizationExtensionConfig(
+            enable_quantized_training=True,
+            recipe=recipe,
+            all_to_all_quant_format="mxfp8",
+        ),
+        model_compile_enabled=False,
+    )
+    routed = list(converted.model.traverse(RoutedExperts.Config))
+    assert routed
+    for (_, routed_config, _, _), (routed_owner, experts_owner) in zip(routed, original, strict=True):
+        dispatcher_cls = type(routed_config.token_dispatcher)._owner
+        assert issubclass(dispatcher_cls, AscAllToAllTokenDispatcher)
+        assert dispatcher_cls.dispatch is AscAllToAllTokenDispatcher.dispatch
+        assert dispatcher_cls.combine is AscAllToAllTokenDispatcher.combine
+        assert (
+            dispatcher_cls._dispatch_activation_exchange is not AscAllToAllTokenDispatcher._dispatch_activation_exchange
+        )
+        assert dispatcher_cls._reroute_activation is not AscAllToAllTokenDispatcher._reroute_activation
+        assert (
+            dispatcher_cls._combine_activation_exchange is not AscAllToAllTokenDispatcher._combine_activation_exchange
+        )
+        activation_config = routed_config.inner_experts._torchao_npu_config.activation_config
+        assert routed_config.token_dispatcher.mxfp8_quant_params == (
+            activation_config.block_size,
+            activation_config.round_mode,
+            activation_config.scale_alg,
+            activation_config.dst_type_max,
+        )
+        routed_owner_after = type(routed_config)._owner
+        experts_owner_after = type(routed_config.inner_experts)._owner
+        assert routed_owner is not None and routed_owner_after is not None
+        assert experts_owner is not None and experts_owner_after is not None
+        assert issubclass(routed_owner_after, routed_owner)
+        assert issubclass(experts_owner_after, experts_owner)
+
+
+def test_alltoall_quantization_uses_expert_activation_block_size(converter_module):
+    from torchtitan.models.common.moe import RoutedExperts
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+
+    model_spec = model_registry("debugmodel", moe_comm_backend="standard")
+    converted = converter_module.apply_quantization_converter(
+        model_spec,
+        QuantizationExtensionConfig(enable_quantized_training=True, recipe="all_block_fp8"),
+        model_compile_enabled=False,
+    )
+    routed = list(converted.model.traverse(RoutedExperts.Config))
+    assert routed
+    for _, routed_config, _, _ in routed:
+        routed_config.inner_experts._torchao_npu_config.activation_config = converter_module.MXQuantizeConfig(
+            block_size=64, scale_alg=0
+        )
+
+    converter = converter_module.NpuAllToAllQuantizeConverter.Config(model_compile_enabled=False).build()
+    converter.convert(converted.model)
+
+    assert all(config.token_dispatcher.mxfp8_quant_params == (64, "rint", 0, 0.0) for _, config, _, _ in routed)
+
+
+def test_alltoall_quantization_reports_unresolved_scale_algorithm_without_replacing_dispatchers(converter_module):
+    from torchtitan.models.common.moe import RoutedExperts
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+
+    model_spec = converter_module.apply_quantization_converter(
+        model_registry("debugmodel", moe_comm_backend="standard"),
+        QuantizationExtensionConfig(enable_quantized_training=True, recipe="all_block_fp8"),
+        model_compile_enabled=False,
+    )
+    routed = list(model_spec.model.traverse(RoutedExperts.Config))
+    assert len(routed) > 1
+    original_dispatchers = [config.token_dispatcher for _, config, _, _ in routed]
+    fqn, last_config, _, _ = routed[-1]
+    # The recipe shares its parameter-swap config across layers.
+    last_expert_quant_config = deepcopy(last_config.inner_experts._torchao_npu_config)
+    last_expert_quant_config.activation_config.scale_alg = None
+    last_config.inner_experts._torchao_npu_config = last_expert_quant_config
+    converter = converter_module.NpuAllToAllQuantizeConverter.Config(model_compile_enabled=False).build()
+
+    with pytest.raises(ValueError, match=r"inner_experts: .*scale_alg") as error:
+        converter.convert(model_spec.model)
+
+    assert f"model_spec.model.{fqn}.inner_experts" in str(error.value)
+    assert all(
+        config.token_dispatcher is original
+        for (_, config, _, _), original in zip(routed, original_dispatchers, strict=True)
+    )
+
+
+def test_alltoall_quantization_rejects_deepep_dispatcher(converter_module):
+    from torchtitan.models.common.moe import RoutedExperts
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+
+    model_spec = model_registry("debugmodel", moe_comm_backend="deepep")
+    original_dispatchers = []
+    for _, config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
+        token_dispatcher = config.token_dispatcher  # pyrefly: ignore [missing-attribute]
+        original_dispatchers.append(type(token_dispatcher)._owner)
+
+    with pytest.raises(ValueError, match=r"supports only standard AllToAllTokenDispatcher.*DeepEP"):
+        converter_module.apply_quantization_converter(
+            model_spec,
+            QuantizationExtensionConfig(
+                enable_quantized_training=True,
+                recipe="all_block_fp8",
+                all_to_all_quant_format="mxfp8",
+            ),
+            model_compile_enabled=False,
+        )
+
+    assert original_dispatchers
+    converted_dispatchers = []
+    for _, config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
+        token_dispatcher = config.token_dispatcher  # pyrefly: ignore [missing-attribute]
+        converted_dispatchers.append(type(token_dispatcher)._owner)
+    assert converted_dispatchers == original_dispatchers
 
 
 @pytest.mark.parametrize("quant_format", ["mx", "block_mx"])

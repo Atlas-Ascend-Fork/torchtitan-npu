@@ -156,6 +156,8 @@ class QuantizationExtensionConfig:
     """
 
     enable_quantized_training: bool = False
+    all_to_all_quant_format: Literal["mxfp8"] | None = None
+    """Standard EP communication format for dispatch forward and combine backward."""
     enable_sparse_attention_quantization: bool = False
     recipe: QuantizationRecipe = "all_block_fp8"
     enable_mxfp4_qat: bool = False
@@ -198,6 +200,16 @@ class QuantizationExtensionConfig:
     list (1-3, cumulative; recipe-independent). Off (0) by default."""
 
     def validate(self) -> None:
+        if self.all_to_all_quant_format not in (None, "mxfp8"):
+            raise ValueError("all_to_all_quant_format must be None or 'mxfp8'")
+        if self.all_to_all_quant_format == "mxfp8":
+            if not self.enable_quantized_training:
+                raise ValueError("all_to_all_quant_format='mxfp8' requires enable_quantized_training=True")
+            if self.recipe not in ("all_mxfp8", "all_block_fp8", "mix"):
+                raise ValueError(
+                    "all_to_all_quant_format='mxfp8' requires an MX-compatible expert recipe "
+                    "(all_mxfp8, all_block_fp8, or mix)"
+                )
         if self.fsdp_prequantize_dtype not in ("fp8", "mxfp4"):
             raise ValueError("fsdp_prequantize_dtype must be fp8 or mxfp4")
         if self.li_quantization not in (None, "mxfp4", "mxfp8", "fp8", "hif8"):

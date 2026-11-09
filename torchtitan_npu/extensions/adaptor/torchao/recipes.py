@@ -300,6 +300,65 @@ class NpuQuantizeConverter(QuantizationConverter):
         return model_config
 
 
+class NpuAllToAllQuantizeConverter(QuantizationConverter):
+    """Replace only the EP dispatcher; experts consume its quantized tensor."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+
+    def convert(self, model_config):
+        from torchao_npu.quantized_modules.token_dispatcher import (
+            get_mxfp8_alltoall_dispatcher_cls,
+            mxfp8_quant_params_from_experts,
+        )
+        from torchtitan.models.common.moe import RoutedExperts
+
+        from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
+        routed_configs = list(model_config.traverse(RoutedExperts.Config))
+        if not routed_configs:
+            raise ValueError("all_to_all_quant_format requires a standard AllToAllTokenDispatcher")
+
+        replacements = []
+        for fqn, routed_config, _, _ in routed_configs:
+            dispatcher_config = routed_config.token_dispatcher
+            if not isinstance(dispatcher_config, AllToAllTokenDispatcher.Config):
+                raise ValueError(
+                    "all_to_all_quant_format supports only standard AllToAllTokenDispatcher; "
+                    f"{type(dispatcher_config).__qualname__} at model_spec.model.{fqn}.token_dispatcher "
+                    "is unsupported (including DeepEP)"
+                )
+            try:
+                quant_params = mxfp8_quant_params_from_experts(routed_config.inner_experts)
+            except ValueError as error:
+                raise ValueError(f"model_spec.model.{fqn}.inner_experts: {error}") from error
+            dispatcher_owner = type(dispatcher_config)._owner
+            if dispatcher_owner is None:
+                raise TypeError(f"Dispatcher config at {fqn + '.token_dispatcher'!r} has no owning module class")
+            quantized_dispatcher = get_mxfp8_alltoall_dispatcher_cls(dispatcher_owner)
+            replacements.append((fqn, routed_config, dispatcher_config, quantized_dispatcher, quant_params))
+
+        for fqn, routed_config, dispatcher_config, quantized_dispatcher, quant_params in replacements:
+            routed_config.token_dispatcher = derive(
+                dispatcher_config, quantized_dispatcher.Config, mxfp8_quant_params=quant_params
+            )
+            logger.info(
+                "[Converter] %s.%s: model_spec.model.%s.token_dispatcher %s -> %s",
+                type(self).__module__,
+                type(self).__qualname__,
+                fqn,
+                type(dispatcher_config).__qualname__,
+                quantized_dispatcher.Config.__qualname__,
+            )
+
+        logger.info("Installed torchao-npu MXFP8 communication on %d all-to-all dispatcher node(s)", len(replacements))
+        return model_config
+
+
 def _get_configs(modules_dict):
     configs = set()
     for cls in modules_dict.values():

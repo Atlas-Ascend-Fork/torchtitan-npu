@@ -156,6 +156,11 @@ class TrainerEx(Trainer):
                 parallelize_fn=partial(config.model_spec.parallelize_fn, decoder_fsdp=shard_experts_across_replicas),
             )
         quantization_config = config.extension.quantization
+        if (
+            quantization_config.all_to_all_quant_format is not None
+            and not quantization_config.enable_quantized_training
+        ):
+            quantization_config.validate()
         if quantization_config.enable_quantized_training:
             from torchtitan_npu.extensions.adaptor.torchao.converter import apply_quantization_converter
 

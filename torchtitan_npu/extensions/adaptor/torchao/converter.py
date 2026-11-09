@@ -66,6 +66,7 @@ from .filters import (  # noqa: F401
 )
 from .param_swaps import block_fp8_param_swap, mxfp8_param_swap
 from .recipes import (
+    NpuAllToAllQuantizeConverter,
     NpuQuantizeConverter,
     _npu_quantized_module_cache,  # noqa: F401  (re-exported for tests)
     _recipe_converters,
@@ -244,6 +245,8 @@ def apply_quantization_converter(
 
     if model_spec is None:
         raise ValueError("TorchAO-NPU quantization requires model_spec to be configured")
+    if quantization_config.enable_quantized_training or quantization_config.all_to_all_quant_format is not None:
+        quantization_config.validate()
     # Recipe-independent, so it is installed here rather than in
     # _hif8_param_swap: these are block ops, not quantized ops, and MXFP8 wants
     # them saved just as much as HiF8 does. Off by default -- at level 0
@@ -252,7 +255,6 @@ def apply_quantization_converter(
     if not quantization_config.enable_quantized_training:
         logger.info("enable_quantized_training=False; skipping TorchAO-NPU quantization")
         return model_spec
-    quantization_config.validate()
 
     model_config = model_spec.model
     model_type = _model_type_for_spec(model_spec)
@@ -272,6 +274,8 @@ def apply_quantization_converter(
         model_config=model_config,
         override_config=override_config,
     )
+    if quantization_config.all_to_all_quant_format == "mxfp8":
+        converter_configs.append(NpuAllToAllQuantizeConverter.Config(model_compile_enabled=model_compile_enabled))
     validate_converter_order(converter_configs)
 
     built_converters: list[object] = []
@@ -296,9 +300,11 @@ def apply_quantization_converter(
     )
 
     logger.info(
-        "Applied TorchAO-NPU recipe=%s, sparse_attention_quantization=%s, mxfp4_qat=%s, "
+        "Applied TorchAO-NPU compute_quantization=%s, recipe=%s, sparse_attention_quantization=%s, mxfp4_qat=%s, "
         "li_quantization=%s, kv_norm_quantization=%s, kv_norm_block_size=%s, "
-        "dst_type_max=%s, enable_fsdp_prequantize=%s, fsdp_prequantize_dtype=%s",
+        "dst_type_max=%s, enable_fsdp_prequantize=%s, fsdp_prequantize_dtype=%s, "
+        "all_to_all_quant_format=%s",
+        quantization_config.enable_quantized_training,
         quantization_config.recipe,
         quantization_config.enable_sparse_attention_quantization,
         quantization_config.enable_mxfp4_qat,
@@ -308,12 +314,14 @@ def apply_quantization_converter(
         quantization_config.dst_type_max,
         quantization_config.enable_fsdp_prequantize,
         quantization_config.fsdp_prequantize_dtype,
+        quantization_config.all_to_all_quant_format,
     )
     return replace(model_spec, model=model_config)
 
 
 __all__ = [
     "ConfigFilterFn",
+    "NpuAllToAllQuantizeConverter",
     "NpuQuantizeConverter",
     "NpuQuantizedAscGroupedExpertsModule",
     "any_config_filter",

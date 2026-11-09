@@ -68,6 +68,7 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
     assert isinstance(config.extension, ExtensionConfig)
     assert isinstance(config.extension.quantization, QuantizationExtensionConfig)
     assert config.extension.quantization.enable_quantized_training is False
+    assert config.extension.quantization.all_to_all_quant_format is None
     assert isinstance(config.training, NPUTrainingConfig)
     assert isinstance(config.training.extension, TrainingExtensionConfig)
     assert config.training.extension.allow_hf32 is True
@@ -229,6 +230,8 @@ def test_config_manager_parses_quantization_extension(
             "--extension.quantization.enable-quantized-training",
             "--extension.quantization.recipe",
             "all_block_fp8",
+            "--extension.quantization.all-to-all-quant-format",
+            "mxfp8",
             "--extension.quantization.enable-mxfp4-qat",
             "--extension.quantization.dst-type-max",
             "7.0",
@@ -244,6 +247,7 @@ def test_config_manager_parses_quantization_extension(
     quantization = config.extension.quantization
     assert quantization.enable_quantized_training is True
     assert quantization.recipe == "all_block_fp8"
+    assert quantization.all_to_all_quant_format == "mxfp8"
     assert quantization.enable_mxfp4_qat is True
     assert quantization.dst_type_max == 7.0
     assert quantization.enable_fsdp_prequantize is False
@@ -595,6 +599,15 @@ def test_trainer_ex_skips_disabled_quantization_and_preserves_model_spec(monkeyp
 
     assert isinstance(trainer, TrainerEx)
     assert initialized_model_specs == [source_model_spec]
+
+
+def test_trainer_ex_rejects_mxfp8_communication_without_compute_quantization():
+    config = TrainerEx.Config(
+        extension=ExtensionConfig(quantization=QuantizationExtensionConfig(all_to_all_quant_format="mxfp8"))
+    )
+
+    with pytest.raises(ValueError, match="requires enable_quantized_training=True"):
+        config.build()
 
 
 def test_trainer_ex_applies_training_hf32_before_base_initialization(monkeypatch):

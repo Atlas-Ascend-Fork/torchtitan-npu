@@ -15,6 +15,7 @@ from torch._inductor.custom_graph_pass import get_custom_graph_passes
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.config.configs import ExtensionConfig
 from torchtitan_npu.extensions.compile import sdc_checksum
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
@@ -397,7 +398,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
             sdc=SimpleNamespace(build=build_sdc),
             parallelism=SimpleNamespace(disable_expert_replication=False),
             anticipatory=SimpleNamespace(enable=False),
-            extension=SimpleNamespace(quantization=SimpleNamespace(enable_quantized_training=False)),
+            extension=ExtensionConfig(),
             training=SimpleNamespace(extension=SimpleNamespace(allow_hf32=True)),
         ),
     )

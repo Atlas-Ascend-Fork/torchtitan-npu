@@ -140,6 +140,44 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     class Config(AllToAllTokenDispatcher.Config):
         pass
 
+    def _dispatch_activation_exchange(
+        self,
+        routed_input_ND: torch.Tensor,
+        pg: "ProcessGroup",
+        output_splits: list[int],
+        input_splits: list[int],
+    ) -> torch.Tensor:
+        """Exchange activations; router scores use ``_dispatch_token_exchange``."""
+        return self._dispatch_token_exchange(routed_input_ND, pg, output_splits, input_splits)
+
+    def _reroute_activation(self, routed_input_RD, expert_token_num_per_rank, routed_scores_rank_major_R):
+        return npu_moe_re_routing(
+            routed_input_RD,
+            expert_token_num_per_rank,
+            per_token_scales=routed_scores_rank_major_R,
+        )
+
+    def _combine_activation_exchange(
+        self,
+        routed_output_RD,
+        restore_indices,
+        pg,
+        input_splits,
+        output_splits,
+    ):
+        """Restore rank-major order and exchange expert outputs."""
+        routed_output_rank_major = npu_moe_token_unpermute(
+            routed_output_RD,
+            restore_indices,
+            probs=None,
+        )
+        return self._combine_token_exchange(
+            routed_output_rank_major,
+            pg,
+            input_splits,
+            output_splits,
+        )
+
     # pyrefly: ignore [bad-override]
     def dispatch(
         self,
@@ -241,7 +279,7 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                     ep_size,
                 )
 
-            routed_input_RD = self._dispatch_token_exchange(
+            routed_input_RD = self._dispatch_activation_exchange(
                 routed_input_ND,
                 pg,
                 output_splits_list,
@@ -269,10 +307,10 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 permuted_scales,
                 restore_indices,
                 num_global_tokens_per_local_expert_e,
-            ) = npu_moe_re_routing(
+            ) = self._reroute_activation(
                 routed_input_RD,
                 expert_token_num_per_rank,
-                per_token_scales=routed_scores_rank_major_R,
+                routed_scores_rank_major_R,
             )
             routed_scores_R = permuted_scales if routed_scores_ND is not None else None
 
@@ -332,13 +370,9 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 if get_spmd_backend() == "spmd_types"
                 else self.ep_mesh.get_group()
             )
-            routed_output_RD = npu_moe_token_unpermute(
+            routed_output_RD = self._combine_activation_exchange(
                 routed_output_RD,
                 metadata.permuted_indices,
-                probs=None,
-            )
-            routed_output_RD = self._combine_token_exchange(
-                routed_output_RD,
                 pg,
                 metadata.input_splits,
                 metadata.output_splits,

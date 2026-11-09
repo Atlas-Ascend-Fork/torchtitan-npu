@@ -132,6 +132,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 | --- | --- | --- |
 | `enable-quantized-training` | `--enable-quantized-training` / `--no-enable-quantized-training` | 启用或关闭低精度训练，默认关闭。 |
 | `recipe` | DeepSeek: `all_mxfp8`、`mix`、`all_block_fp8`、`all_hif8`；Qwen3.5: `W4A8_MXFP`、`W8A8_MXFP8` | DeepSeek 选择 MXFP8/Block FP8/HiF8 recipe；Qwen3.5 两个 recipe 仅支持 dense 模型，不支持 MoE 模型或 shared experts，也不量化视觉编码器；激活为 MXFP8，`W4A8_MXFP` 权重带 MXFP4 fake quant，`W8A8_MXFP8` 权重为 Block FP8。 |
+| `all-to-all-quant-format` | `--all-to-all-quant-format mxfp8` | 默认未设置。指定 `mxfp8` 时，对标准 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，不支持 DeepEP。开启示例及限制见[MoE all-to-all 低精度通信](../feature_guides/low_precision_training.md#moe-all-to-all-低精度通信)。 |
 | `enable-mxfp4-qat` | `--enable-mxfp4-qat` / `--no-enable-mxfp4-qat` | 为 DeepSeek routed expert 启用或关闭 MXFP4 QAT 约束，默认关闭；Qwen3.5 `W4A8_MXFP` 的 dense 权重不依赖该开关。 |
 | `li-quantization` | `fp8`、`mxfp8`、`mxfp4`、`hif8` | 选择 LI Q/K 的量化类型，默认不启用；DeepSeek-V4.1 仅支持 `mxfp4`。 |
 | `kv-norm-quantization.format` | `mxfp8` | 启用 DeepSeek-V4 KV Cache 的 MXFP8 量化。 |
