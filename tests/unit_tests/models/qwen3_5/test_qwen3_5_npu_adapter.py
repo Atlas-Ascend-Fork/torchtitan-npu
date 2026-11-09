@@ -22,10 +22,9 @@ def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override()
     script = (root / "examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
     eager_flex = (root / "torchtitan_npu/extensions/torchtitan/eager_flex.py").read_text(encoding="utf-8")
 
-
     assert "bash scripts/run_train.sh" in script
     assert "TORCHTITAN_REPO:-${TORCHTITAN_DIR:-" in script
-    assert 'if [[ ${OVERRIDE_IMPORTS+x} ]]' in script
+    assert "if [[ ${OVERRIDE_IMPORTS+x} ]]" in script
     assert "HF_ASSETS_PATH:-${TORCHTITAN_REPO}/tests/assets/tokenizer" in script
     assert "DATASET_PATH:-${TORCHTITAN_REPO}/tests/assets/cc12m_test" in script
 
@@ -34,7 +33,7 @@ def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override()
     assert "override.common.attention" not in script
     assert "torchtitan_npu.override.common.token_dispatcher.asc" in script
     assert "ENABLE_NPU_MOE_DISPATCHER" in script
-    assert 'ENABLE_NPU_MOE_DISPATCHER:-0' in script
+    assert "ENABLE_NPU_MOE_DISPATCHER:-0" in script
     assert '--override.imports "${OVERRIDE_IMPORTS}"' in script
     assert 'if [[ -n "${OVERRIDE_IMPORTS}" ]]' not in script
     assert "return_lse=_requests_auxiliary_outputs(return_aux)" in eager_flex
@@ -384,6 +383,8 @@ def test_qwen3_5_cp_parallelizer_uses_v030_spmd_storage_mesh():
         class Model:
             vision_encoder = None
             layers = {}
+            def _cp_shard(self, inputs, labels, extra_kwargs, **kwargs):
+                return inputs, labels, extra_kwargs
             def register_forward_pre_hook(self, hook, *, with_kwargs):
                 self.hook = hook
                 self.with_kwargs = with_kwargs

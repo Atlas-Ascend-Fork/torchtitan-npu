@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -6,6 +7,7 @@
 import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 
 import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -219,6 +221,44 @@ def prepare_sequence_metadata(module, args, kwargs):
     return args, kwargs
 
 
+def _install_qwen_cp_shard(model):
+    """Keep Qwen's varlen CP conversion outside the shared tensor shard."""
+    from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
+    from torchtitan.models.common.attention import VarlenMetadata
+
+    from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+
+    original = model._cp_shard
+
+    @wraps(original)
+    def shard(inputs, labels, extra_kwargs, *, cp_mesh, parallelism):
+        masks = extra_kwargs.get("attention_masks")
+        values = [value for value in masks.values() if value is not None] if isinstance(masks, dict) else [masks]
+        if not values or not all(isinstance(value, VarlenMetadata) for value in values):
+            return original(inputs, labels, extra_kwargs, cp_mesh=cp_mesh, parallelism=parallelism)
+        layout = parallelism.context_parallel_load_balancer
+        if layout not in (None, "headtail"):
+            raise ValueError(f"Qwen3.5 varlen CP supports None or 'headtail' load balancing, got {layout!r}.")
+        batch, length = inputs.shape[:2]
+        forwarded = {key: value for key, value in extra_kwargs.items() if key != "attention_masks"}
+        inputs, labels, forwarded = original(inputs, labels, forwarded, cp_mesh=cp_mesh, parallelism=parallelism)
+        balancer = _HeadTailLoadBalancer(length, cp_mesh.size(), cp_mesh.device_type) if layout == "headtail" else None
+        metadata = {}
+        for value in values:
+            if id(value) not in metadata:
+                metadata[id(value)] = CPVarlenMetadata.from_global(
+                    value, cp_mesh, batch, length, load_balancer=balancer
+                )
+        forwarded["attention_masks"] = (
+            {key: metadata[id(value)] if isinstance(value, VarlenMetadata) else value for key, value in masks.items()}
+            if isinstance(masks, dict)
+            else metadata[id(masks)]
+        )
+        return inputs, labels, forwarded
+
+    model._cp_shard = shard
+
+
 def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
     # Keep this guard here as well as in the public dispatcher: recipes may
     # call the CP helper directly, and VL's mixed multimodal mask path is not
@@ -233,6 +273,7 @@ def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
         )
     mesh = parallel_dims.get_mesh("cp")
     model.context_parallel_mesh = mesh
+    _install_qwen_cp_shard(model)
     model.register_forward_pre_hook(prepare_sequence_metadata, with_kwargs=True)
     for block in model.layers.values():
         module = block.attn.inner_attention if block.full_attn else block.attn
@@ -290,11 +331,10 @@ def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
 def _patch_spmd_type_annotation() -> None:
     """Let rank-local CP masks pass the spmd_types input annotation.
 
-    ``annotate_qwen35_input_spmd_types`` asserts the "deltanet" mask is the
-    global VarlenMetadata; under CP the model pre-hook already replaced the
-    dict entries with rank-local QwenCPMetadata, whose cu_seqlens are ragged
-    across cp ranks and carry no global SPMD type. Strip them (only for the
-    annotation call) instead of failing the assert.
+    ``annotate_qwen35_input_spmd_types`` expects global VarlenMetadata.
+    Rank-local CP metadata has ragged offsets across CP ranks and carries
+    no global SPMD type. Exclude it only from the annotation call, keeping
+    the original masks for the forward pass.
     """
     import functools
 
@@ -304,6 +344,9 @@ def _patch_spmd_type_annotation() -> None:
     except ImportError:
         return
 
+    from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+
+    local_metadata_types = (QwenCPMetadata, CPVarlenMetadata)
     original = getattr(
         qwen3_5_sharding,
         "_annotate_qwen35_input_spmd_types_original",
@@ -316,8 +359,8 @@ def _patch_spmd_type_annotation() -> None:
     @functools.wraps(original)
     def _annotated(*args, **kwargs):
         masks = kwargs.get("attention_masks")
-        if isinstance(masks, dict) and any(isinstance(v, QwenCPMetadata) for v in masks.values()):
-            local = {k: None if isinstance(v, QwenCPMetadata) else v for k, v in masks.items()}
+        if isinstance(masks, dict) and any(isinstance(v, local_metadata_types) for v in masks.values()):
+            local = {k: None if isinstance(v, local_metadata_types) else v for k, v in masks.items()}
             kwargs = dict(kwargs)
             kwargs["attention_masks"] = None if all(v is None for v in local.values()) else local
         return original(*args, **kwargs)
