@@ -28,10 +28,6 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     cu_k = torch.arange(batch + 1, dtype=torch.int32) * 2
     used_q = torch.full((batch,), tokens, dtype=torch.int32)
     used_k = torch.full((batch,), 2, dtype=torch.int32)
-    # The KL term's denominator is the row's query count, which under context parallelism is a
-    # multiple of the chunk the selector is handed; keep the two apart so a rank-local divisor
-    # would fail the assertion below.
-    global_q = torch.tensor(2 * batch * tokens, dtype=torch.int32)
     residual = torch.zeros(batch, dtype=torch.int32)
     metadata = SimpleNamespace(forward=forward_record, backward=backward_record)
     seen = {}
@@ -48,7 +44,6 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
             cmp_residual_k=residual,
-            num_global_queries=global_q,
             backward_metadata=md.backward,
             seqused_q=used_q,
             seqused_k=used_k,
@@ -58,7 +53,9 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
         seen["forward"] = kwargs
         seen["operands"] = q, k, w
         indices = torch.tensor([0, -1, 1, -1], dtype=torch.int32).repeat(batch * tokens, 1).unsqueeze(1)
-        return indices, None
+        # The kernel's own scores at those picks, ``-inf`` on an unused slot.
+        values = torch.zeros(indices.shape, dtype=torch.float32).masked_fill(indices < 0, float("-inf"))
+        return indices, values
 
     def slikg(**kwargs):
         seen["backward"] = kwargs
@@ -82,7 +79,8 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     assert not indices.requires_grad
     assert scores.shape == indices.shape and scores.dtype == torch.float32
     assert scores.grad_fn is not None
-    torch.testing.assert_close(indices[0, 0], torch.tensor([1, 0, -1, -1], dtype=torch.int32))
+    # The port hands the kernel's order on: it does not re-rank the picks.
+    torch.testing.assert_close(indices[0, 0], torch.tensor([0, -1, 1, -1], dtype=torch.int32))
     assert seen["forward"]["metadata"] is forward_record
     assert seen["forward"]["quant_mode"] == 5
     assert seen["forward"]["topk"] == topk
@@ -91,7 +89,7 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     ):
         assert operands.shape == expected_shape
 
-    # The real attention emits teacher mass with padding zeroed and softmax_scale applied.
+    # The real attention emits the teacher mass already scaled; the port forwards it as it came.
     teacher = torch.tensor([8.0, 4.0, 0.0, 0.0]).expand(batch, tokens, topk)
     scores.data.fill_(float("nan"))
     scores.backward(teacher)
@@ -99,7 +97,7 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     backward = seen["backward"]
     assert backward["metadata"] is backward_record
     torch.testing.assert_close(backward["sparse_indices"], indices.reshape(batch * tokens, 1, topk))
-    expected_teacher = torch.tensor([0.5 / batch, 0.25 / batch, 0.0, 0.0]).expand(batch * tokens, 1, topk)
+    expected_teacher = teacher.reshape(batch * tokens, 1, topk)
     torch.testing.assert_close(backward["attn_softmax_l1_norm"], expected_teacher, rtol=0, atol=0)
     for name, expected in [
         ("cu_seqlens_q", cu_q),
@@ -132,14 +130,14 @@ def test_module_swap_rejects_missing_teacher_gradient(monkeypatch):
             cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
             cu_seqlens_k=torch.tensor([0, 1], dtype=torch.int32),
             cmp_residual_k=torch.zeros(1, dtype=torch.int32),
-            num_global_queries=torch.tensor(2, dtype=torch.int32),
             seqused_q=torch.tensor([2], dtype=torch.int32),
             seqused_k=torch.tensor([1], dtype=torch.int32),
             backward_metadata=metadata,
         )
 
     def quant_li(q, *args, **kwargs):
-        return torch.zeros(q.size(0), 1, 1, dtype=torch.int32), None
+        indices = torch.zeros(q.size(0), 1, 1, dtype=torch.int32)
+        return indices, torch.zeros(indices.shape, dtype=torch.float32)
 
     def slikg(**kwargs):
         pytest.fail("SLIKG must not run without a teacher gradient")

@@ -160,7 +160,7 @@ V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`�
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | 同 arch35（V4.1 只跑在 arch35 上） |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `AscV4Metadata.build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 无 |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `xchg: ExchangeMetadata`） | 融合 entry（`AscV41Metadata`） |
-| indexer teacher 归一化 | `_InnerIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]`（量化 selector 同） | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
+| indexer teacher 归一化 | SMLAG 的 `p` 在注意力反向里乘 `coeff / 本步全局有效 token 数`（与参考路径的分母同一个） | 同左 |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
 | 量化 metadata | `QuantV4Metadata` 重建（只换 selector 的 forward 记录） | `_V41QuantAttentionMetadata` 重建（整套记录） |
 
@@ -369,10 +369,10 @@ layer 在本地 flatten 段上做 `ratio` 折叠（ratio==1 是普通投影）�
 
 ### 5.4 indexer teacher 的归一化
 
-V4.1 的 selector 在反向把 teacher 除以 `InnerIndexer.num_global_queries`：本 step 全部 accumulation
-microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
-`metadata.swa_k.cu_seqlens[-1]`（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
-来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。
+teacher 的归一化不按 rank、也不按行：两栈都在**注意力反向**里把 SMLAG 的 `p` 乘以
+`coeff / 本步全局有效 token 数`（`AuxLoss.set_step_denominator` 设的那个分母，DP 维已求和），再把
+结果作为 carrier 的梯度交给 indexer。CP 下参数梯度沿 CP 轴求和，分母是全局量，因此不会被并行度
+放大；indexer 自己不再做任何除法。
 
 ### 5.5 拒绝 CP 的路径
 

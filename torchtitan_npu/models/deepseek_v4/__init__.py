@@ -24,11 +24,13 @@ from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from . import cp_layout  # noqa: F401  registers the doc-chunk layout with the CP shard
 from .attention import Attention, CompressedSparseInnerAttention, UnitScaleRMSNorm
 from .compressor import Compressor, Indexer, InnerIndexer
+from .indexer_loss import IndexerLoss
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
     DeepSeekV4Model,
@@ -72,6 +74,7 @@ def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
     if any(getattr(model, "lora_config", None) is not None for model in model_parts):
         return
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+    register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
 
 
 def _output_linear_init(dim: int) -> dict[str, Callable]:
@@ -240,6 +243,8 @@ def _make_v4_attn_config(
         compress_ratio=compress_ratio,
         softmax_scale=softmax_scale,
         index_topk=index_topk,
+        # Only a geometry with an indexer distils one.
+        aux_loss=IndexerLoss.Config(coeff=1.0) if indexer_cfg is not None else None,
     )
     return Attention.Config(
         n_heads=n_heads,
@@ -503,7 +508,10 @@ def _build_mtp_layers(
         # variant) while keeping the per-site split pin: rope receives the
         # full-width head_dim tensor and rotates only its trailing channels.
         attention.rope = copy.deepcopy(dataclasses.replace(rope, split=attention.head_dim - attention.rope_head_dim))
-        cast("CompressedSparseInnerAttention.Config", attention.inner_attention).compress_ratio = 0
+        inner_attention_cfg = cast("CompressedSparseInnerAttention.Config", attention.inner_attention)
+        inner_attention_cfg.compress_ratio = 0
+        # The depth selects nothing: an objective here would count in the metric's mean only.
+        inner_attention_cfg.aux_loss = None
 
         moe = copy.deepcopy(inner_cfg.moe)
         moe.router.gate.param_init = _depth_init(layer_id)

@@ -63,7 +63,6 @@ def _selector(*, mode="full", candidate_topk_blocks=_POOL):
     selector.candidate_block_size = _BLOCK_SIZE if candidate_topk_blocks > 0 else -1
     selector.mode = mode
     selector.has_candidate_pool = candidate_topk_blocks > 0
-    selector.num_global_queries = torch.tensor(16.0)
     return selector
 
 
@@ -80,17 +79,9 @@ def _inputs():
     )
 
 
-@pytest.mark.parametrize(
-    "query_count, expected_teacher",
-    [(8.0, 1.0), (32.0, 0.25), (None, None)],
-    ids=["two-rows", "eight-rows", "missing-count"],
-)
-def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
-    monkeypatch, bypass_mxfp4_pack, query_count, expected_teacher
-):
+def test_qli_source_keeps_the_kernel_order_and_runs_slikg(monkeypatch, bypass_mxfp4_pack):
     q, k, w = _inputs()
     selector = _selector()
-    selector.num_global_queries = None if query_count is None else torch.tensor(query_count)
     metadata = _metadata()
     metadata.q.seqused = torch.tensor([2], dtype=torch.int32)
     metadata.cmp_k.seqused = torch.tensor([1], dtype=torch.int32)
@@ -103,7 +94,9 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
-        return unsorted, torch.empty(0), candidate_blocks, torch.empty(0)
+        # The kernel's own scores at those picks, ``-inf`` on an unused slot.
+        values = torch.zeros(unsorted.shape, dtype=torch.float32).masked_fill(unsorted < 0, float("-inf"))
+        return unsorted, values, candidate_blocks, torch.empty(0)
 
     def slikg(**kwargs):
         seen["slikg"] = kwargs
@@ -128,17 +121,11 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     )
 
     indices, scores, candidate = selector(q, k, w, metadata, candidates_BL1C=None)
-    # A later microbatch must not change the denominator saved with this graph.
-    selector.num_global_queries = torch.tensor(64.0)
-    if query_count is None:
-        with pytest.raises(RuntimeError, match=r"Set InnerIndexer\.num_global_queries"):
-            scores.backward(torch.full_like(scores, 8.0))
-        assert "slikg" not in seen
-        return
     scores.backward(torch.full_like(scores, 8.0))
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert torch.equal(indices[0, 0], torch.tensor([3, 2, 1, -1], dtype=torch.int32))
+    # The port hands the kernel's order on: it does not re-rank the picks.
+    assert torch.equal(indices[0, 0], torch.tensor([3, -1, 1, 2], dtype=torch.int32))
     assert scores.shape == indices.shape and scores.requires_grad
     assert torch.equal(candidate, candidate_blocks.unsqueeze(0))
     # The pool source launches the schedule that was sized by the capacity, with the same capacity:
@@ -146,11 +133,13 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     assert seen["qli"][1]["metadata"] is indexer.fwd
     assert seen["qli"][1]["candidate_topk_blocks"] == _POOL
     assert seen["qli"][1]["candidate_block_size"] == _BLOCK_SIZE
-    assert seen["qli"][1]["return_value"] is False
+    # The kernel's own scores come back with the picks: they are the carrier the teacher lands on.
+    assert seen["qli"][1]["return_value"] is True
     # The backward reads the BF16 metadata off the same entry, so the teacher edge costs no launch.
     assert seen["slikg"]["metadata"] is indexer.bwd
     assert torch.equal(seen["slikg"]["sparse_indices"], indices.reshape(4, 1, 4))
-    assert torch.equal(seen["slikg"]["attn_softmax_l1_norm"], torch.full((4, 1, 4), expected_teacher))
+    # What the attention hands down travels through untouched: the scaling is its own.
+    assert torch.equal(seen["slikg"]["attn_softmax_l1_norm"], torch.full((4, 1, 4), 8.0))
     for options in (seen["qli"][1], seen["slikg"]):
         torch.testing.assert_close(options["seqused_q"], torch.tensor([2], dtype=torch.int32))
         torch.testing.assert_close(options["seqused_k"], torch.tensor([1], dtype=torch.int32))
@@ -172,7 +161,7 @@ def test_qsli_searcher_searches_the_precomputed_pool_and_passes_it_through(monke
 
     def qsli(*args, **kwargs):
         seen["qsli"] = (args, kwargs)
-        return topk_indices, torch.empty(0)
+        return topk_indices, torch.zeros(topk_indices.shape, dtype=torch.float32)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -207,7 +196,8 @@ def test_qli_without_candidate_pool_runs_the_pool_free_schedule(monkeypatch, byp
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
-        return topk_indices, torch.empty(0), candidate_blocks, torch.ones_like(candidate_blocks)
+        values = torch.zeros(topk_indices.shape, dtype=torch.float32)
+        return topk_indices, values, candidate_blocks, torch.ones_like(candidate_blocks)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -244,7 +234,8 @@ def test_a_pool_free_layer_inside_a_pool_geometry_scores_every_entry(monkeypatch
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
-        return topk_indices, torch.empty(0), candidate_blocks, torch.ones_like(candidate_blocks)
+        values = torch.zeros(topk_indices.shape, dtype=torch.float32)
+        return topk_indices, values, candidate_blocks, torch.ones_like(candidate_blocks)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,

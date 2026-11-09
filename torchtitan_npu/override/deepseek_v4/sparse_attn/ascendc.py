@@ -42,9 +42,11 @@ import cann_ops_transformer  # noqa: F401  (registers the torch.ops below)
 import torch
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, KernelFrame
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
@@ -123,13 +125,31 @@ def kernel_aicpu_metadata(
     return smla_metadata, smla_grad_metadata
 
 
+def score_and_scale(aux_loss, p_TK, topk_scores, teacher):
+    """Record the objective's value and scale the teacher the kernel differentiates.
+
+    A fused port has no injection point: the marginal appears in the attention's backward and the
+    indexer's kernel turns it into parameter gradients, so ``coeff`` over the step's token count is
+    applied here, where the teacher is produced.
+    """
+    denominator = AuxLoss._step_denominator
+    if denominator is None:
+        raise ValueError(
+            "AuxLoss.set_step_denominator() must be called with the step's global valid-token "
+            "count before the first forward."
+        )
+    with torch.no_grad():
+        aux_loss.instance_acc.add_(aux_loss._logged_kl(p_TK, topk_scores) / denominator)
+    return teacher * (aux_loss.coeff / denominator)
+
+
 class _SparseMLA(torch.autograd.Function):
     """SMLA forward with SMLAG backward, in the TND layout of one packed row.
 
     ``cmp_k`` is the pooled container (a ratio above one, addressed by ``topk_indices``) or the
-    full-resolution second stream (ratio one).  ``topk_scores`` is an input only so the teacher
-    SMLAG emits on its gradient has a consumer: the indexer's backward reads that edge and it is
-    never read here.
+    full-resolution second stream (ratio one).  ``topk_scores`` arrives as the indexer's own
+    scores at the selection and leaves as the teacher: SMLAG produces ``p`` in this backward and
+    the loss scales it into that edge, which is the only thing the indexer's backward reads.
     """
 
     @staticmethod
@@ -145,6 +165,7 @@ class _SparseMLA(torch.autograd.Function):
         ratio,
         window_size,
         topk_scores,
+        aux_loss,
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused core needs AscV4Metadata")
@@ -168,8 +189,12 @@ class _SparseMLA(torch.autograd.Function):
             return_softmax_lse=True,
             **options,
         )
-        ctx.save_for_backward(q, swa_k, cmp_k, topk_indices, sinks, output, lse)
+        # Saved so the backward can score the objective: the teacher arrives there, not here.
+        ctx.save_for_backward(q, swa_k, cmp_k, topk_indices, sinks, output, lse, topk_scores)
         ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
+        ctx.aux_loss = aux_loss
+        # Not the same fact as ``aux_loss``: a forward may carry no carrier while the loss stays
+        # configured, and a gradient cannot be returned for an input that was not in the graph.
         ctx.has_carrier = topk_scores is not None
         # A dataclass cannot go through ``save_for_backward``; it holds only the frames the graph
         # already keeps, and is released when this backward has run.
@@ -180,7 +205,7 @@ class _SparseMLA(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, grad_lse):  # pyrefly: ignore [bad-override]
         del grad_lse
-        q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
+        q, swa_k, cmp_k, topk_indices, sinks, output, lse, topk_scores = ctx.saved_tensors
         options = kernel_options(
             q=ctx.attention_metadata.q,
             swa_k=ctx.attention_metadata.swa_k,
@@ -204,8 +229,26 @@ class _SparseMLA(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             **options,
         )
-        # One gradient per forward input, in order.  ``cmp_k`` and the carrier are answered only
-        # where the forward carried them.
+        if not ctx.has_carrier:
+            # No teacher edge was threaded through the forward, so nothing to answer for it.
+            return (
+                dq,
+                dswa_k,
+                dcmp_k if cmp_k is not None else None,
+                None,
+                dsinks,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        # An unused slot holds tiling residue, not a probability: the indexer's kernel stops at the
+        # first ``-1``, and the objective masks those slots for its own ``Z``.  ``p`` travels on.
+        p_TK = teacher.masked_fill(topk_indices < 0, 0.0)
+        teacher_TK = score_and_scale(ctx.aux_loss, p_TK, topk_scores, teacher)
+        # One gradient per forward input, in order.
         return (
             dq,
             dswa_k,
@@ -216,7 +259,8 @@ class _SparseMLA(torch.autograd.Function):
             None,
             None,
             None,
-            teacher if ctx.has_carrier else None,
+            teacher_TK,
+            None,
         )
 
 
@@ -249,6 +293,8 @@ class AscSparseMLAMixin:
     softmax_scale: float
     compress_ratio: int
     window_size: int
+    # ``None`` on a layer without the objective; the fused core only reads it.
+    aux_loss: IndexerLoss | None
 
     def __init__(self, config) -> None:
         super().__init__(config)  # pyrefly: ignore [bad-argument-count]
@@ -278,9 +324,10 @@ class AscSparseMLAMixin:
         if cmp_k is not None:
             cmp_k = cmp_k.unsqueeze(1).contiguous()
         indices = None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1])
-        # The carrier is a training-only by-product: its gradient is the indexer's only edge.
+        # Training-only by-product: its gradient is the indexer's only edge.
+        aux_loss = self.aux_loss
         carrier = None
-        if self.training and topk_scores is not None:
+        if self.training and topk_scores is not None and aux_loss is not None:
             carrier = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
         output, _lse = _SparseMLA.apply(
             q.flatten(0, 1),
@@ -293,6 +340,7 @@ class AscSparseMLAMixin:
             self.compress_ratio,
             self.window_size,
             carrier,
+            aux_loss,
         )
         return output.reshape(batch_size, seqlen, *output.shape[1:])
 
@@ -301,8 +349,8 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
     """Run SMLA/SMLAG in a local TND layout, consuming the indexer's selection.
 
     The core reads this geometry's frames and calls the AscendC ops directly; the indexer is the
-    separate ``lightning_indexer.asc`` override, which emits ``topk_indices`` and the teacher
-    carrier that this core's backward writes onto.
+    separate ``lightning_indexer.asc`` override, which emits ``topk_indices`` and the student
+    scores this core's backward writes the scaled teacher onto.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -316,6 +364,9 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
         index_num_heads: int
         index_head_dim: int
         """The indexer geometry its metadata and SLIKG backward are sized with."""
+
+        aux_loss: IndexerLoss.Config | None = None  # pyrefly: ignore [bad-override]
+        """The indexer objective this core's backward scores the teacher by."""
 
         @property
         def geometry(self) -> AicpuGeometry:

@@ -10,6 +10,7 @@ from functools import partial
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override.deepseek_v4.asc_metadata import (
@@ -87,6 +88,9 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
         index_topk: int
         index_num_heads: int
         index_head_dim: int
+
+        # Inherited from the reference core's config; the mixin reads it in ``forward``.
+        aux_loss: IndexerLoss.Config | None = None  # pyrefly: ignore [bad-override]
 
         @property
         def geometry(self) -> AicpuGeometry:

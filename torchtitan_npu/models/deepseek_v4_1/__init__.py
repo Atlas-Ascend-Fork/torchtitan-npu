@@ -24,6 +24,7 @@ from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseInnerAttention2
@@ -393,6 +394,9 @@ def _make_v41_attn_config(
         window_size=window_size,
         softmax_scale=softmax_scale,
         compress_ratio=compress_ratio,
+        # Every layer that pools consumes a selection -- its own, or one reused from the layer
+        # group's source -- so every one of them distils the indexer that produced it.
+        aux_loss=IndexerLoss.Config(coeff=1.0) if compress_ratio > 0 else None,
     )
     return Attention.Config(
         n_heads=n_heads,
@@ -1035,12 +1039,17 @@ def model_registry(
 
 
 def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
-    """Register the MoE balancing step hook."""
+    """Register the MoE balancing and auxiliary-loss step hooks."""
     from torchtitan.components.optimizer import register_moe_load_balancing_hook
+
+    from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
+        register_aux_loss_zero_hook,
+    )
 
     if any(getattr(model, "lora_config", None) is not None for model in model_parts):
         return
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+    register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
 
 
 __all__ = [

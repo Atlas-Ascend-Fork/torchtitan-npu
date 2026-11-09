@@ -85,8 +85,10 @@ assert not any(name == "cann_ops_transformer" or name.startswith("cann_ops_trans
                for name in sys.modules)
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 model = build_cpu_model(cfg)
 tokens = torch.arange(128).remainder(32).unsqueeze(0)
+AuxLoss.set_step_denominator(torch.tensor(tokens.numel()))
 _, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128).unsqueeze(0))
 out = model(tokens, **kwargs)
 assert torch.isfinite(out).all()

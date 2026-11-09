@@ -6,17 +6,17 @@
 """The DeepSeek-V4 indexer's BF16 port: InnerIndexer fused with SLIKG.
 
 The forward runs the CANN ``lightning_indexer`` selection and returns the document-local
-indices plus a ``topk_scores`` carrier.  Nothing reads the carrier's value: it exists so
-autograd has an output to carry the teacher that SMLAG's backward produces
-(``sparse_flash_mla_grad``'s ``cmp_softmax_l1_norm``).  This Function's backward consumes
-that edge with ``sparse_lightning_indexer_kl_loss_grad`` and emits ``dq/dk/dw``.
+indices plus the scores it selected at.  Those scores are the student side of the indexer's
+distillation objective and the edge its teacher arrives on: SMLAG's backward produces
+``cmp_softmax_l1_norm``, the attention's backward scales it, and this Function's backward
+hands that gradient to ``sparse_lightning_indexer_kl_loss_grad``, which emits ``dq/dk/dw``.
 
 The metadata is the entry the fused attention already built per geometry (``AscV4Metadata``):
 the indexer's two AI_CPU metadata (``lightning_indexer`` and SLIKG) live beside the attention's,
 because the teacher edge crosses both kernels' backwards.
 
 This module owns the whole AscendC indexer -- the autograd bridge, the input preparation,
-the canonical sort, the teacher carrier and the backward -- so its kernel pair is stated once,
+the carrier and the backward -- so its kernel pair is stated once,
 here.  The PyPTO port is a separate implementation of the same contract in
 ``lightning_indexer.pypto``; the two do not share code, so each can follow its runtime's
 calling conventions without a common abstraction between them.
@@ -113,12 +113,11 @@ class _InnerIndexerTND(torch.autograd.Function):
         topk,
         ratio,
         attention_metadata,
-        num_global_queries,
     ):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused indexer needs AscV4Metadata")
         options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
-        topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
+        topk_indices, values = torch.ops.cann_ops_transformer.lightning_indexer(
             idx_q,
             idx_k,
             idx_w,
@@ -127,16 +126,16 @@ class _InnerIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-        # The kernel's order is unspecified, so the selection is canonicalised here, before
-        # anything is saved: the teacher arrives on ``topk_scores``' gradient positioned per slot
-        # by the selection SMLAG was handed, and SLIKG consumes it next to these indices.
-        # Descending gives both properties with one sort -- valid entries keep position order and
-        # ``-1`` lands behind every one of them.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        # Shape, dtype and the autograd edge are the carrier's whole contract: SMLAG replaces the
-        # value, SMLA accepts and ignores it.
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
-        ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
+        # ``topk_scores`` carries the kernel's scores and receives the teacher as its gradient.
+        # Eager can flag the kernel's own output; a compiled region rejects an op intermediate that
+        # had ``requires_grad_()`` called on it, so there the values are copied into a fresh leaf.
+        if torch.compiler.is_compiling():
+            topk_scores = topk_indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
+            with torch.no_grad():
+                topk_scores.copy_(values)
+        else:
+            topk_scores = values.requires_grad_(True)
+        ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         # A dataclass cannot go through ``save_for_backward``; it holds only the frames the graph
         # already keeps, and is released when this backward has run.
@@ -148,12 +147,10 @@ class _InnerIndexerTND(torch.autograd.Function):
     def backward(ctx, grad_indices, attn_softmax_l1_norm):  # pyrefly: ignore [bad-override]
         del grad_indices
         if attn_softmax_l1_norm is None:
-            return (None,) * 7
-        idx_q, idx_k, idx_w, topk_indices, num_global_queries = ctx.saved_tensors
-        # The teacher is normalized once, by the row's query count: under CP every rank owns a
-        # slab of the row and the parameter gradients are summed across the CP axis, so a local
-        # denominator would scale every indexer parameter's gradient by the CP degree.
-        attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
+            return (None,) * 6
+        idx_q, idx_k, idx_w, topk_indices = ctx.saved_tensors
+        # The teacher arrives normalized and scaled: the attention's backward owns both, because
+        # it is the only place that knows the step's denominator and the layer's own ``p``.
         metadata = ctx.attention_metadata
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
@@ -168,7 +165,7 @@ class _InnerIndexerTND(torch.autograd.Function):
             metadata=slig_metadata,
             **options,
         )
-        return dq.to(idx_q.dtype), dk.to(idx_k.dtype), dw.to(idx_w.dtype), None, None, None, None
+        return dq.to(idx_q.dtype), dk.to(idx_k.dtype), dw.to(idx_w.dtype), None, None, None
 
 
 class AscIndexerMixin:
@@ -176,20 +173,14 @@ class AscIndexerMixin:
 
     The caller may hand candidate block indices and receives a third tuple slot back; V4 states
     neither (its reference indexer has no candidate stage), it passes no candidates and drops the
-    slot.  The denominator the KL grad divides by is the microbatch's global query count; a stack
-    that carries one on the indexer states it, and otherwise the entry's row supplies it.
+    slot.  Nothing here normalizes the teacher: it arrives already scaled by ``coeff`` over the
+    step's token count, from the attention backward that produced it.
     """
-
-    def _num_global_queries(self, attention_metadata):
-        configured = getattr(self, "num_global_queries", None)
-        if configured is None:
-            configured = attention_metadata.swa_k.cu_seqlens[-1].to(torch.float32)
-        return configured
 
     # The parameter names are a contract: each stack's sharding config states this node's
     # redistribution by name (in_src_shardings/in_dst_shardings with "idx_q"/"idx_k"/"idx_w"),
     # and the module binds those placements by parameter name. Renaming them silently drops the
-    # row-wide gather of idx_k, which leaves the selector with this rank's slab while
+    # row-wide gather of idx_k, which leaves the indexer with this rank's slab while
     # ``A3KeyWorkaround``'s gather still addresses the whole row.
     index_topk: int
 
@@ -215,7 +206,6 @@ class AscIndexerMixin:
             topk,
             attention_metadata.ratio,
             attention_metadata,
-            self._num_global_queries(attention_metadata),
         )
         return (
             topk_indices.reshape(batch, seqlen, topk),

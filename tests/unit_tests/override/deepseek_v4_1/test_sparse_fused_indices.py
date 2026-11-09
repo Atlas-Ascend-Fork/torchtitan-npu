@@ -166,6 +166,7 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
         2 if with_shared else 0,
         2,
         None,  # topk_scores: no teacher carrier in this test
+        None,  # aux_loss: nothing to distil in this test
     )
     # The LSE passes through as a detached teacher signal.
     assert returned_lse is lse

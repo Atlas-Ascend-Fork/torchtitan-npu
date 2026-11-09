@@ -230,6 +230,10 @@ def test_registry_model_forward_backward_freezes_base_and_differentiates_adapter
         model = spec.model.build()
     model.init_states()
     model = spec.parallelize_fn(model, **parallelize_kwargs)
+    # A step-level forward needs the auxiliary losses' denominator, which a trainer normally sets.
+    from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
+
+    AuxLoss.set_step_denominator(torch.tensor(128.0))
     inputs = torch.arange(128).reshape(1, 128)
     inputs, _, kwargs = preprocess(model, inputs, inputs, torch.arange(128).reshape(1, 128))
     output = model(inputs, **kwargs)
@@ -312,7 +316,7 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
     with torch.device("meta"):
         model = spec.model.build()
     model = spec.parallelize_fn(model, **parallelize_kwargs)
-    spec.post_optimizer_build_fn(None, [model], None)
+    spec.post_optimizer_build_fn(Mock(), [model], None)
     assert register_hook.call_count == (0 if use_lora else 1)
     for name, parameter in model.named_parameters():
         assert parameter.requires_grad == (not use_lora or lora.is_lora_parameter(name))

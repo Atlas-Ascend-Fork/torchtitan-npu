@@ -6,8 +6,8 @@
 """DeepSeek-V4's PyPTO-Pro LI forward and auxiliary KL-gradient backward.
 
 Select ``lightning_indexer.pypto_pro`` together with ``sparse_attn.asc``. The latter
-builds the packed metadata and emits the teacher on ``topk_scores``' gradient;
-this indexer owns the LI/LIG autograd bridge. The optional PyPTO-Pro runtime
+builds the packed metadata and emits the teacher on ``topk_scores``' gradient after the
+indexer loss has normalized it; this indexer owns the LI/LIG autograd bridge. The optional PyPTO-Pro runtime
 is loaded only inside the real NPU callbacks in ``ops.pypto_pro.li_lig_wrapper``.
 
 The kernels require BF16 query/key, FP32 weights, 64 indexer heads of width
@@ -62,7 +62,7 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         if attention_metadata.xchg is not None:
             raise ValueError("PyPTO-Pro does not support context parallel: its kernels read compact frames")
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        topk_indices = lightning_indexer_indices(
+        topk_indices, values = lightning_indexer_indices(
             idx_q,
             idx_k,
             idx_w,
@@ -70,10 +70,14 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
             metadata=li_metadata,
             **_pro_options(attention_metadata, ratio),
         )
-        # Sort before saving: SMLAG emits the teacher in the returned slot order.
-        # Descending puts -1 padding after valid document-local positions.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        # The kernel emits the usable picks first and pads with ``-1``/``-inf``, which is the
+        # order and the mask the teacher edge is already read in.
+        # The carrier is a fresh leaf whose value is the kernel's scores and whose gradient is the
+        # teacher: ``requires_grad_`` on the kernel's output would be an intermediate tensor, which
+        # a compiled region refuses to hand back.
+        topk_scores = topk_indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
+        with torch.no_grad():
+            topk_scores.copy_(values)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         ctx.attention_metadata = attention_metadata
@@ -88,9 +92,7 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
             raise ValueError("the fused indexer needs the entry's backward metadata")
-        # Normalize by the whole row, not the CP slab.
-        query_rows = metadata.swa_k.cu_seqlens[-1].to(torch.float32)
-        teacher = attn_softmax_l1_norm / query_rows
+        teacher = attn_softmax_l1_norm
         dq, dk, dw, _ = sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,

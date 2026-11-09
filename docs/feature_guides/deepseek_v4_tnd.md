@@ -128,9 +128,8 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 
 默认内核就是唯一的参考路径，不再有独立的 golden override：`test_dsv4.py` 以形状/有限值和 pool 梯度的可复现性守护它，融合内核与它做容差对照。
 
-参考组合不训练 indexer：`r=4` 层的 `InnerIndexer` 返回 `(topk_indices, topk_scores)`，`topk_scores` 是可导的 student logits，但参考核心不产生 KL loss；它的 KL 蒸馏目标由融合组合的 `sparse_attn.asc` + `lightning_indexer.asc`（SMLAG → SLIKG）承担。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
+参考组合也训练 indexer：`r=4` 层的 `InnerIndexer` 返回 `(topk_indices, topk_scores)`，后者是可导的 student logits，参考核心用它和自身的 log-sum-exp（已含 window、选中槽与 sink）算出 teacher，交给 `IndexerLoss` 注入注意力输出——这条路径与融合路径用同一个目标函数（见 [aux_loss.md](aux_loss.md#deepseek-v4v41-的-indexer-蒸馏损失)），只是 teacher 的来源不同。
 
-因此参考组合目前只能用 AdamW：`DistMuon` 在 step 前要求每个配置的参数都有梯度，会以 `missing gradients: layers.<n>.attention.indexer.*` 报错（`USE_GOLDEN=1` 搭配示例里的 Muon 参数即属此情况）。
 
 ## AscendC 融合路径
 
@@ -138,8 +137,8 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 
 1. 校验模型输入是 `AscV4Metadata`，读这一层的 `q` / `swa_k` / `cmp_k` frame。
 2. query 转 TND；swa_k / cmp_k 是整行（CP 下由 wrapper 的 `S(1) -> R` 声明式 all-gather 得到），直接转 TND。
-3. selector 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、降序、`-1` 落尾；后者是 teacher 的 carrier）。
-4. 调用 SparseFlashMLA；`_SparseMLA` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把 raw marginal `p` 原样写到 `topk_scores` 的梯度上：`p` 就是算子文档里的 `reduceG(softmax)/G`，`softmax_scale` 已在其中，KL 梯度对未缩放的 index 点积求导（index 侧 scale 在 `idx_w` 的图内），因此这里既不缩放也不再清零 `-1` 槽位。`lightning_indexer.asc` 的 `_InnerIndexerTND.backward` 再除以行内 query 数，用 `sparse_lightning_indexer_kl_loss_grad` 训练 indexer。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
+3. indexer 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、可用槽位在前、`-1` 补齐在尾——端口保留内核给出的顺序，不重排；后者是这些槽位上 indexer 自己的分数，未使用槽为 `-inf`）。
+4. 调用 SparseFlashMLA；`_SparseMLA` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把算子旁路产出的 marginal `p`（`reduceG(softmax)/G`，`softmax_scale` 已在其中）交给这一层的 `IndexerLoss`：**日志值**用把 `-1` 槽清零后的副本算出并累加（`Z` 只统计可用支撑），而写到 `topk_scores` 梯度上的是**原样**的 `p` 乘 `coeff / 本步 token 数`——未使用槽位保留算子 tiling 的残留值，因为 indexer 的内核遇到第一个 `-1` 就停、从不读那些位置。`lightning_indexer.asc` 的 `_InnerIndexerTND.backward` 不再做任何归一化，直接把该梯度交给 `sparse_lightning_indexer_kl_loss_grad`。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
 
 `cann_ops_transformer` 包负责内核的算子注册（schema、meta/fake 实现），本仓只在融合路径内做前反向桥接，不再自建 `torch.library` 封装。
 

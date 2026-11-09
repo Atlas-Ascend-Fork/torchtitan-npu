@@ -18,6 +18,7 @@ from torchtitan_npu.models.deepseek_v4.document_intervals import document_interv
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer
+from .indexer_loss import IndexerLoss
 from .metadata import DeepSeekV4Metadata
 
 
@@ -50,10 +51,10 @@ class CompressedSparseInnerAttention(Module):
     carries, so no document-aware block mask is built per layer:
 
     - ``compress_ratio == 0``: sliding window plus sink, no compressed stream;
-    - ``compress_ratio == 4`` (CSA): the selector's picks, already numbered inside each query's
+    - ``compress_ratio == 4`` (CSA): the indexer's picks, already numbered inside each query's
       own document -- the numbering ``gather_attn`` addresses a packed pool by;
     - a higher ratio (the model's HCA layers): every causally reachable compressed slot of the
-      query's own document, which those layers reach without a selector.
+      query's own document, which those layers reach without an indexer.
 
     NPU overrides replace the whole class; they answer the same contract.  Two limits of this
     default are worth knowing before it is used for training:
@@ -63,9 +64,9 @@ class CompressedSparseInnerAttention(Module):
       debugging and numerics reference rather than the path to train on -- the fused
       ``sparse_attn.asc`` / ``sparse_attn.pypto`` recipes are the ones the model ships (both
       replace this class and keep working under context parallel, which this core refuses);
-    - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
-      SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
-      trains no gradient for the indexer's compressor.
+    - it carries the indexer's distillation objective when one is configured (``aux_loss``):
+      the teacher is recomputed from this operator's own log-sum-exp, so the core trains the
+      indexer by itself.  Left unconfigured, the indexer gets no gradient here.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -78,9 +79,13 @@ class CompressedSparseInnerAttention(Module):
         compress_ratio: int
         softmax_scale: float
         index_topk: int
-        return_lse: bool = False
-        """Hand back the per-head log-sum-exp beside the output.  A test hook: nothing in the
-        model consumes it, and a fused core takes its own from the kernel."""
+        aux_loss: IndexerLoss.Config | None = None
+        """The indexer's distillation objective, on the geometries that consume a selection.
+
+        ``None`` on a layer whose core reaches its pool without an indexer -- a window-only or a
+        heavily-compressed geometry: nothing is selected there, so there is no teacher and no
+        student to compare.
+        """
 
         @property
         def attention_metadata_key(self):
@@ -122,12 +127,12 @@ class CompressedSparseInnerAttention(Module):
         self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
-        self.return_lse = config.return_lse
+        self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
 
     def make_hca_indices(
         self, q: torch.Tensor, cmp_k: torch.Tensor, cu_seqlens: torch.Tensor, cu_seqlens_k: torch.Tensor
     ):
-        """A geometry without a selector reaches every causally complete group of its document.
+        """A geometry without an indexer reaches every causally complete group of its document.
 
         Document-local numbering with ``-1`` for an unreachable slot -- the coordinate system
         ``gather_attn`` reads.  Built here rather than carried on the metadata: only this core
@@ -151,11 +156,8 @@ class CompressedSparseInnerAttention(Module):
         topk_indices=None,
         topk_scores=None,
         attention_metadata: DeepSeekV4Metadata,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # ``topk_scores`` is the selector's student-logit edge (or a fused port's teacher
-        # carrier).  The reference core only gathers by ``topk_indices``, so it accepts the
-        # tensor for the shared forward contract and never reads it.
-        del topk_scores
+    ) -> torch.Tensor:
+        # The indexer's scores at the picks; the distillation objective is their only reader.
         if not isinstance(attention_metadata, DeepSeekV4Metadata):
             raise TypeError(
                 "CompressedSparseInnerAttention requires DeepSeekV4Metadata "
@@ -180,15 +182,16 @@ class CompressedSparseInnerAttention(Module):
             if cmp_frame is None:
                 raise ValueError("a compressed KV needs the entry's compressed frame")
             cu_seqlens_k = cmp_frame.cu_seqlens
-            # The selection is an input: the selector's picks at ratio four, and, for a geometry
-            # without a selector, every causally complete group of the query's own document.
+            # The indexer's picks at ratio four, or, without one, every complete document group.
             if self.compress_ratio == 4:
                 kv_indices = topk_indices
             else:
                 kv_indices = self.make_hca_indices(q, cmp_k, cu_seqlens, cu_seqlens_k)
             sparse_kv = cmp_k.reshape(bsz, 1, n_cmp, head_dim)
 
-        aux = AuxRequest(lse=True) if self.return_lse else None
+        # Bound to a local so the guard below can narrow it.
+        aux_loss = self.aux_loss
+        aux = AuxRequest(lse=True) if aux_loss is not None and self.training else None
         result = gather_attn(
             q.transpose(1, 2),
             swa_k.reshape(bsz, 1, seqlen, head_dim),
@@ -206,7 +209,26 @@ class CompressedSparseInnerAttention(Module):
             assert isinstance(result, torch.Tensor)
             return result.transpose(1, 2)
         output, gathered = result
-        return output.transpose(1, 2), gathered.lse
+        out_BLHD = output.transpose(1, 2)
+        if aux_loss is None or topk_indices is None or topk_scores is None or cmp_k is None:
+            return out_BLHD
+        # This layer's own distribution over the slots it read: the log-sum-exp already carries
+        # the window, the selection and the sink, so the compressed
+        # slots' mass falls out of it without a second pass over the row.  A packed row is one
+        # batch element -- the indexer's picks are numbered against it -- so the objective takes
+        # the row, not a batch.
+        assert bsz == 1, "the reference indexer objective takes one packed row"
+        return aux_loss(
+            q.squeeze(0),
+            cmp_k.squeeze(0),
+            topk_indices.squeeze(0),
+            topk_scores.squeeze(0),
+            gathered.lse.squeeze(0).transpose(0, 1),
+            cu_seqlens,
+            cu_seqlens_k,
+            softmax_scale=self.softmax_scale,
+            carrier=out_BLHD,
+        )
 
 
 class Attention(BaseAttention):
@@ -341,7 +363,7 @@ class Attention(BaseAttention):
             )
 
         # Inner-attention positional contract: sink + swa_k always; the compressed pool and
-        # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
+        # the indexer's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
         o = self.inner_attention(
             q,
             swa_k,

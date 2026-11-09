@@ -33,14 +33,14 @@ def _metadata(dsv4, cu):
     return {ratio: dsv4.metadata.DeepSeekV4Metadata.from_positions(positions, ratio) for ratio in _RATIOS}
 
 
-def _core(dsv4, ratio, *, return_lse=False):
+def _core(dsv4, ratio, *, aux_loss=None):
     return dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
             window_size=_WINDOW,
             compress_ratio=ratio,
             softmax_scale=_SCALE,
             index_topk=_TOPK,
-            return_lse=return_lse,
+            aux_loss=aux_loss,
         )
     )
 
@@ -114,21 +114,6 @@ def test_hca_slots_stay_inside_the_query_document(dsv4):
     assert torch.equal(selection, _visible_local_slots(dsv4, metadata, ratio, seqlen, n_cmp))
 
 
-def test_the_teacher_exit_is_reserved_and_inert(dsv4):
-    """``return_lse`` hands back the per-head log-sum-exp and changes nothing else."""
-    cu = _LONG
-    metadata = _metadata(dsv4, cu)
-    seqlen = int(cu[-1])
-    q, swa_k, cmp_k, sink = _inputs(128, cu)
-
-    with torch.no_grad():
-        plain = _core(dsv4, 128)(q, swa_k, sink, cmp_k=cmp_k, attention_metadata=metadata[128])
-        with_lse, lse = _core(dsv4, 128, return_lse=True)(q, swa_k, sink, cmp_k=cmp_k, attention_metadata=metadata[128])
-
-    assert torch.equal(plain, with_lse)
-    assert lse.shape == (1, 3, seqlen) and torch.isfinite(lse).all()
-
-
 def test_the_reference_core_ignores_the_selector_scores(dsv4):
     """``topk_scores`` is part of the forward contract but never a reference input."""
     common = _metadata(dsv4, _SHORT)
@@ -160,3 +145,67 @@ def test_the_reference_core_ignores_the_selector_scores(dsv4):
     # Bitwise identical, so the scores never reach the reference gather.
     assert torch.equal(without, with_scores)
     assert scores.grad is None
+
+def test_the_objective_produces_the_reference_indexers_gradient(dsv4):
+    """``aux_loss`` gives the selection a gradient; nothing else in the core does.
+
+    The student side of the objective is the scores the indexer emitted, so this pins the
+    reference path's whole training edge in one place: it exists, it is scaled by ``coeff`` over
+    the step's token count, it leaves the attention output untouched, and the slots the
+    selection left unused neither carry a gradient nor influence the rest.
+    """
+    from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
+    from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
+
+    common = _metadata(dsv4, _SHORT)
+    seqlen = int(_SHORT[-1])
+    q, swa_k, cmp_k, sink = _inputs(4, _SHORT)
+    torch.manual_seed(3)
+    picks = dsv4.compressor.select_compressed_slots(
+        torch.randn(1, seqlen, 4, 8),
+        torch.randn(1, seqlen // 4, 8),
+        torch.randn(1, seqlen, 4),
+        common[4].swa_k.cu_seqlens,
+        common[4].cmp_k.cu_seqlens,
+        _TOPK,
+    )
+    # Two unused slots, and the scores the selector emits there: ``-inf``, which is what keeps
+    # them out of the student's softmax.
+    picks[:, :, -2:] = -1
+    torch.manual_seed(7)
+    base = torch.randn(1, seqlen, picks.shape[-1])
+    base[picks < 0] = float("-inf")
+
+    def run(*, coeff, tokens):
+        AuxLoss.set_step_denominator(torch.tensor(float(tokens)))
+        carried = base.clone().requires_grad_(True)
+        out = _core(dsv4, 4, aux_loss=IndexerLoss.Config(coeff=coeff))(
+            q,
+            swa_k,
+            sink,
+            cmp_k=cmp_k,
+            topk_indices=picks,
+            topk_scores=carried,
+            attention_metadata=common[4],
+        )
+        out.sum().backward()
+        return out.detach(), carried.grad
+
+    with torch.no_grad():
+        plain = _core(dsv4, 4)(q, swa_k, sink, cmp_k=cmp_k, topk_indices=picks, attention_metadata=common[4])
+
+    trained, grad = run(coeff=1.0, tokens=8)
+    assert grad is not None and torch.isfinite(grad).all()
+    assert grad.abs().sum() > 0, "the objective must reach the selection"
+    # An identity on the attention output: the objective only adds the carrier's edge.
+    assert torch.equal(trained, plain)
+
+    # ``coeff`` scales the gradient, the step's token count divides it.
+    _, grad_doubled = run(coeff=2.0, tokens=8)
+    torch.testing.assert_close(grad_doubled, grad * 2)
+    _, grad_halved = run(coeff=1.0, tokens=16)
+    torch.testing.assert_close(grad_halved, grad / 2)
+
+    # The slots the selection left unused hold no mass and take no gradient.
+    unused = picks < 0
+    assert torch.equal(grad[unused], torch.zeros_like(grad[unused]))

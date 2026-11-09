@@ -3,13 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The fused V4 InnerIndexer: canonical order, teacher edge, SLIKG dispatch.
+"""The fused V4 InnerIndexer: kernel order, teacher edge, SLIKG dispatch.
 
 The NPU kernels are replaced by eager stand-ins with their exact contract (document-local
 indices, ``-1`` padding, the teacher arriving on ``topk_scores``' gradient), so these cases
-pin the wiring rather than the kernel math: sorting happens inside the Function before the
-indices are saved, the teacher is divided by the microbatch's query-row count exactly once,
-and both kernel calls read the metadata the fused attention precomputed.
+pin the wiring rather than the kernel math: the picks keep the order the kernel reported, the
+teacher travels through untouched, and both kernel calls read the metadata the fused attention
+precomputed.
 """
 
 import pytest
@@ -56,31 +56,45 @@ def _indexer():
 
 
 def _kernel_indices() -> torch.Tensor:
-    """A kernel-order selection with padding in the middle, not at the tail."""
+    """A kernel-order selection: the usable picks first, ``-1`` padding at the tail."""
     return torch.tensor(
         [
-            [[2, -1, 0, 1]],
-            [[-1, 3, 1, 0]],
-            [[1, 0, -1, 2]],
+            [[2, 0, 1, -1]],
+            [[3, 1, 0, -1]],
+            [[1, 0, 2, -1]],
             [[0, 1, 2, 3]],
-            [[3, -1, 2, -1]],
-            [[-1, -1, 0, 2]],
+            [[3, 2, -1, -1]],
+            [[0, 2, -1, -1]],
             [[1, 2, 3, -1]],
-            [[2, 0, -1, 1]],
+            [[2, 0, 1, -1]],
         ],
         dtype=torch.int32,
     )
 
 
-def test_the_selection_is_sorted_before_it_is_saved(monkeypatch, a5_records):
-    """``-1`` lands at the tail and the saved order is the emitted order."""
+def _kernel_values() -> torch.Tensor:
+    """The scores the kernel reports at those slots, ``-inf`` where it selected nothing.
+
+    A distinct value per slot, so a carrier that dropped or reordered the scores is caught by
+    the pairing rather than by the shape.
+    """
+    indices = _kernel_indices()
+    return torch.where(
+        indices >= 0,
+        torch.arange(indices.numel(), dtype=torch.float32).reshape(indices.shape),
+        float("-inf"),
+    )
+
+
+def test_the_selection_is_saved_in_the_kernel_order(monkeypatch, a5_records):
+    """The picks and their scores are forwarded as emitted: usable first, ``-1`` at the tail."""
     md = _metadata()
     captured = {}
 
     def fake_li(q, k, w, topk, *, metadata, return_value, **options):
         captured["metadata"] = metadata
         captured["options"] = options
-        return _kernel_indices(), None
+        return _kernel_indices(), _kernel_values()
 
     def fake_slig(*, q, k, w, sparse_indices, attn_softmax_l1_norm, metadata, **options):
         captured["indices"] = sparse_indices
@@ -105,10 +119,12 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch, a5_records):
 
     assert picks.shape == (1, _TOKENS, _TOPK) and picks.dtype == torch.int32
     assert scores.shape == picks.shape and scores.dtype == torch.float32
-    assert torch.equal(
-        picks,
-        _kernel_indices().sort(dim=-1, descending=True).values.reshape(1, _TOKENS, _TOPK),
-    )
+    # The kernel emits the usable picks first and pads the tail, which is the order SLIKG reads
+    # and the one the teacher is positioned in, so nothing is reordered here.
+    assert torch.equal(picks, _kernel_indices().reshape(1, _TOKENS, _TOPK))
+    # The student's scores travel with their slots, in the same order.
+    assert scores.dtype == torch.float32
+    assert torch.equal(scores.reshape(_TOKENS, _TOPK), _kernel_values().reshape(_TOKENS, _TOPK))
     for row in picks[0]:
         first_pad = (row < 0).nonzero()
         if first_pad.numel():
@@ -127,12 +143,11 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch, a5_records):
     scores.backward(teacher)
 
     # The saved indices are exactly what SMLAG would have been handed, and the teacher reaches
-    # SLIKG divided by the query-row count (the emitter already applied the recipe scaling).
+    # SLIKG as the attention's backward scaled it -- nothing is renormalized here.
     assert torch.equal(captured["indices"], picks.reshape(-1, 1, _TOPK))
     assert captured["metadata_bwd"] is md.aicpu_metadata.lightning_indexer.bwd
     assert captured["options_bwd"] == captured["options"]
-    expected_teacher = teacher.reshape(-1, 1, _TOPK) / _TOKENS
-    torch.testing.assert_close(captured["teacher"], expected_teacher, rtol=0, atol=0)
+    torch.testing.assert_close(captured["teacher"], teacher.reshape(-1, 1, _TOPK), rtol=0, atol=0)
 
     # The kernel's gradients land on the projections the indexer owns.
     for tensor in (idx_q, idx_k, idx_w):
@@ -147,7 +162,7 @@ def test_the_carrier_is_a_function_output(monkeypatch):
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
         "lightning_indexer",
-        lambda *a, **k: (_kernel_indices(), None),
+        lambda *a, **k: (_kernel_indices(), _kernel_values()),
         raising=False,
     )
     idx_q = torch.zeros(1, _TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)
@@ -260,7 +275,9 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
         )
         indices = torch.full((q.shape[0], 1, topk), -1, dtype=torch.int32)
         indices[..., 0], indices[..., 2] = 0, 1
-        return indices
+        values = torch.full((q.shape[0], 1, topk), float("-inf"), dtype=torch.float32)
+        values[..., :2] = 1.0
+        return indices, values
 
     def fake_lig(
         q,
@@ -301,8 +318,9 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
         idx_w = torch.ones(batch_size, tokens, heads, dtype=torch.bfloat16, requires_grad=True)
         call = torch.compile(indexer, backend="aot_eager", fullgraph=True) if compiled else indexer
         picks, scores = call(idx_q, idx_k, idx_w, attention_metadata=metadata)
+        # The port forwards the kernel's order: the fake writes slots 0 and 2.
         expected = torch.full((batch_size, tokens, topk), -1, dtype=torch.int32)
-        expected[..., 0], expected[..., 1] = 1, 0
+        expected[..., 0], expected[..., 2] = 0, 1
         torch.testing.assert_close(picks, expected, rtol=0, atol=0)
         assert not picks.requires_grad
         assert scores.shape == picks.shape and scores.dtype == torch.float32 and scores.requires_grad
@@ -324,12 +342,12 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
             torch.testing.assert_close(actual_record, record, rtol=0, atol=0)
             assert options == ("TND", "TND", 3, 4)
         torch.testing.assert_close(captured["indices"], expected.reshape(-1, 1, topk), rtol=0, atol=0)
-        torch.testing.assert_close(
-            captured["teacher"], teacher.reshape(-1, 1, topk) / (batch_size * tokens), rtol=0, atol=0
-        )
+        # The indexer no longer normalizes: the teacher arrives scaled from the attention's
+        # backward and goes to the kernel as handed over.
+        torch.testing.assert_close(captured["teacher"], teacher.reshape(-1, 1, topk), rtol=0, atol=0)
         torch.testing.assert_close(idx_q.grad, torch.full_like(idx_q, 2), rtol=0, atol=0)
         torch.testing.assert_close(idx_k.grad, torch.full_like(idx_k, 3), rtol=0, atol=0)
-        expected_dw = (torch.arange(1, batch_size * tokens + 1) + 2) / (batch_size * tokens)
+        expected_dw = torch.arange(1, batch_size * tokens + 1) + 2
         expected_dw = expected_dw.reshape(batch_size, tokens, 1).expand_as(idx_w).bfloat16()
         torch.testing.assert_close(idx_w.grad, expected_dw, rtol=0, atol=0)
     finally:

@@ -56,7 +56,7 @@ def _check_compact_guard(guard_tensors: list[torch.Tensor] | None, guard_version
     device_types="npu",
     schema="(Tensor q, Tensor k, Tensor w, SymInt topk, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
     "Tensor cmp_residual_k, Tensor? metadata, str layout_q, str layout_k, SymInt mask_mode, "
-    "SymInt cmp_ratio, Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None) -> Tensor",
+    "SymInt cmp_ratio, Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None) -> (Tensor, Tensor)",
 )
 def lightning_indexer_indices(
     q: torch.Tensor,
@@ -73,12 +73,12 @@ def lightning_indexer_indices(
     cmp_ratio: int,
     guard_tensors: list[torch.Tensor] | None = None,
     guard_versions: list[int] | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     _check_compact_guard(guard_tensors, guard_versions)
     _check_device(q)
     with torch.get_device_module("npu").device(q.device):
         li, _ = _load_operators()
-        indices, _ = li(
+        indices, values = li(
             q.contiguous(),
             k.contiguous(),
             w.contiguous(),
@@ -93,7 +93,7 @@ def lightning_indexer_indices(
             cmp_ratio=cmp_ratio,
             return_value=1,
         )
-        return indices
+        return indices, values
 
 
 @lightning_indexer_indices.register_fake
@@ -113,7 +113,10 @@ def _lightning_indexer_indices_fake(
     guard_tensors=None,
     guard_versions=None,
 ):
-    return q.new_empty((q.shape[0], k.shape[1], topk), dtype=torch.int32)
+    return (
+        q.new_empty((q.shape[0], k.shape[1], topk), dtype=torch.int32),
+        q.new_empty((q.shape[0], k.shape[1], topk), dtype=torch.float32),
+    )
 
 
 @torch.library.custom_op(

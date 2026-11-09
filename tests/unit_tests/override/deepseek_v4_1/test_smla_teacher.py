@@ -2,8 +2,18 @@ import pytest
 import torch
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _SparseMLA
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
+
+
+@pytest.fixture(autouse=True)
+def _step_denominator():
+    """A unit denominator leaves the teacher's own values readable in these cases."""
+    AuxLoss.set_step_denominator(torch.tensor(1.0))
+    yield
+    AuxLoss._step_denominator = None
 
 
 @pytest.mark.parametrize(
@@ -23,14 +33,7 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
     ],
 )
 def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkpointed):
-    """SMLAG's by-product reaches ``topk_scores``' gradient unchanged.
-
-    The teacher is the only thing that trains the indexer, and it travels on
-    ``topk_scores`` because SMLAG's backward runs after the indexer's forward.  So the
-    gradient this port produces must be the kernel's ``cmp_softmax_l1_norm`` verbatim --
-    no loss scaling, no ``Z * Y`` term, no ``-1`` masking -- because SLIKG applies
-    ``dI = Z * Y - p`` itself and would read anything else as the teacher.
-    """
+    """SMLAG's by-product reaches ``topk_scores``' gradient unchanged."""
     meta = torch.zeros(1, dtype=torch.int32)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", lambda *a, **k: meta)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", lambda *a, **k: meta)
@@ -71,6 +74,7 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
     config = ascendc.AscV41SparseAttention.Config(
+        aux_loss=IndexerLoss.Config(coeff=1.0),
         window_size=2,
         softmax_scale=0.5,
         compress_ratio=1,
@@ -119,13 +123,13 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
 
     valid = (indices >= 0).reshape(4, 3)
     grad = scores.grad.reshape(4, 3)
-    # The carrier is FP32 and SMLAG's mass is FP32, and the op returns it in the
-    # selection's own layout, so the port forwards it with no conversion and no
-    # reshaping at all -- the value that lands here is the kernel's tensor, verbatim.
+    # The carrier is FP32 and SMLAG's mass is FP32, and the op returns it in the selection's own
+    # layout, so the port forwards it with no conversion and no reshaping.
     assert scores.dtype == torch.float32
     assert scores.grad.dtype == scores.dtype
-    # Verbatim means the port neither scales nor masks: a ``-1`` slot keeps whatever the
-    # kernel wrote there, and SLIKG -- the only reader -- owns the selection's spelling.
+    # What leaves is the kernel's report verbatim: a slot the selection did not fill keeps
+    # whatever its tiling held there (``junk`` above), because SLIKG never reads a ``-1``
+    # position and the objective is what masks them out of ``Z``.
     expected = torch.zeros(4, 3)
     expected[:, 1] = torch.where(valid[:, 1], torch.tensor(mass[1]), torch.tensor(junk))
     expected[:, 2] = torch.where(valid[:, 2], torch.tensor(mass[2]), torch.tensor(junk))
@@ -157,6 +161,7 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
 
     monkeypatch.setattr(_SparseMLA, "apply", kernel)
     config = ascendc.AscV41SparseAttention.Config(
+        aux_loss=IndexerLoss.Config(coeff=1.0),
         window_size=2,
         softmax_scale=0.5,
         compress_ratio=ratio,

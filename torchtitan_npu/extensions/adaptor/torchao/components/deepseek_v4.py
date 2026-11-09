@@ -96,9 +96,6 @@ def _prepare_quant_lightning_indexer_inputs(
         cu_seqlens_q=attention_metadata.q.cu_seqlens,
         cu_seqlens_k=cmp_k.cu_seqlens,
         cmp_residual_k=cmp_k.residual,
-        # The KL term is a mean over the row, not over this rank's chunk: ``swa_k``'s grid is the
-        # whole row at every degree, which is what the fused selector divides by too.
-        num_global_queries=attention_metadata.swa_k.cu_seqlens[-1],
         backward_metadata=asc.lightning_indexer.bwd,
         seqused_q=attention_metadata.q.seqused,
         seqused_k=cmp_k.seqused,

@@ -185,7 +185,6 @@ class InnerIndexer(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.num_global_queries: torch.Tensor | None = None
         self.mode = config.mode
         self.compress_ratio = config.compress_ratio
         self.num_index_heads = config.num_index_heads
@@ -324,9 +323,9 @@ class InnerIndexer(Module):
             # covers real entries only, so it is gathered at the picks.
             selected_valid_BLK = visible_LN.unsqueeze(0).gather(-1, selected_BLK)
             local_BLK = torch.where(selected_valid_BLK, selected_BLK - pool_start_L1, -1)
-            # Emitted in the fused selector's order: position descending, so ``-1`` padding
-            # lands at the tail.  The values alone are the emission; ``-1`` is the smallest
-            # entry, so it takes the tail without a second index tensor.
+            # Sorted here so ``-1`` lands at the tail, which both consumers rely on (the fused
+            # attention stops at the first ``-1``).  The fused port keeps the kernel's order;
+            # on this reference path the order is the selector's own choice.
             topk_indices_BLK = local_BLK.sort(dim=-1, descending=True).values
 
         # This gradient trains the indexer: into ``wq_b``, ``weights_proj`` and, through

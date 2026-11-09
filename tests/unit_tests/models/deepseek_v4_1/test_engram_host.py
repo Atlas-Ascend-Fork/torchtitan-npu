@@ -304,9 +304,6 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
 
     def forward_backward(self, input_dict, **kwargs):
         events.append("forward_backward")
-        # Both microbatches, including unsupervised positions, must be counted
-        # before the first fused selector consumes the step denominator.
-        assert model.inner_indexer.num_global_queries.item() == 3
         if anticipatory:
             assert trainer.anticipatory_schedule.engine.in_step
         loss = (3 * model.dense.sum() + 4 * model.table._distributed_lookup(input_dict["input"])[0, 0]) / 2

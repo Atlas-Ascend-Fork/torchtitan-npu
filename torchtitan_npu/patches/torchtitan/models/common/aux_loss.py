@@ -178,8 +178,18 @@ class AuxLoss(Module):
         The trainer calls this once per step with the same dp-summed token
         count the main loss normalizes by, so auxiliary losses stay on the
         same scale as the main loss and independent of parallelism degrees.
+
+        The value is written into one tensor rather than rebound to a new one:
+        the read happens inside the model, and a compiled or graph-captured
+        region either guards on the object's identity (recompiling every step)
+        or bakes it as a constant (freezing the scale at the first step).  One
+        stable tensor keeps both of those away -- a replayed graph reads its
+        contents, which this updates.
         """
-        cls._step_denominator = denominator
+        if cls._step_denominator is None:
+            cls._step_denominator = denominator.detach().clone()
+        else:
+            cls._step_denominator.copy_(denominator)
 
     def inject(self, raw_sum: torch.Tensor, *, carrier: torch.Tensor) -> torch.Tensor:
         """Inject the aux-loss gradient on ``carrier``; accumulate the scaled metric.
@@ -197,6 +207,10 @@ class AuxLoss(Module):
             ``carrier`` unchanged (identity forward).
         """
         if AuxLoss._step_denominator is None:
+            # A no-grad forward (shape discovery, validation) optimizes nothing and has no step to
+            # normalize against; only a grad-enabled forward without a denominator is a bug.
+            if not torch.is_grad_enabled():
+                return carrier
             raise ValueError(
                 "AuxLoss.set_step_denominator() must be called with the step's global "
                 "valid-token count before the first forward."

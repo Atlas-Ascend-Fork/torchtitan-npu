@@ -26,6 +26,7 @@ from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
 )
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 def _build_model_config(
@@ -85,6 +86,8 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     labels = (tokens + 1) % VOCAB_SIZE
     positions = torch.arange(SEQ_LEN).view(BATCH_SIZE, -1)
 
+    # A model-level forward is one step: the auxiliary losses need the count their trainer sets.
+    AuxLoss.set_step_denominator(torch.tensor(64.0))
     _, _, extra_kwargs = preprocess(model, tokens, labels, positions)
 
     # One entry per geometry: the stack's ratios -- the MTP depths' uncompressed one (zero)

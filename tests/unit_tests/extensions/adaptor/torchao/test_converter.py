@@ -644,11 +644,6 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
 
         assert isinstance(selector_quant, DeepSeekV41QuantLightningIndexerConfig) is li_enabled
         assert isinstance(attention_quant, DeepSeekV41QuantSparseAttentionConfig) is sparse_enabled
-        if inner_attention.compress_ratio > 0:
-            # The trainer discovers instances, not configs, to assign the step denominator.
-            selector_module = selector.build()
-            assert isinstance(selector_module, converter_module.DeepSeekV41InnerIndexer)
-            assert selector_module.num_global_queries is None
 
 
 @pytest.mark.parametrize("li_quantization", ["mxfp8", "fp8", "hif8"])

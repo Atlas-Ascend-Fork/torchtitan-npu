@@ -5,7 +5,7 @@
 
 """The DeepSeek-V4 indexer's PyPTO port.
 
-Same contract as :mod:`.\u0061scendc` -- LI forward, SLIKG backward, the teacher carrier and
+Same contract as :mod:`.ascendc` -- LI forward, SLIKG backward, the student scores and
 the saved selection -- but the two kernels are the PyPTO module functions, loaded lazily on
 their first NPU call.  This module is a standalone implementation of that contract: it owns
 its autograd bridge and its forward, so the PyPTO runtime's calling conventions stay here and
@@ -79,7 +79,7 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         # The indexer's frame is the entry's: on arch22 the pool this rank's reach covers, which
         # is what the keys below are compacted onto, and what its AI_CPU metadata were built from.
         options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
-        topk_indices, _ = _pypto_lightning_indexer(
+        topk_indices, values = _pypto_lightning_indexer(
             idx_q,
             idx_k,
             idx_w,
@@ -88,12 +88,14 @@ class _PyPTOIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-        # Canonicalise inside the Function: the teacher arrives on ``topk_scores``' gradient,
-        # positioned per slot by whichever selection SMLAG was handed, and SLIKG consumes it
-        # next to these saved indices -- sorting after ``apply`` would desynchronise the two.
-        # Descending keeps position order for the valid entries and puts ``-1`` last.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        # The kernel emits the usable picks first and pads with ``-1``/``-inf``, which is the
+        # order and the mask the teacher edge is already read in.
+        # The carrier is a fresh leaf whose value is the kernel's scores and whose gradient is the
+        # teacher: ``requires_grad_`` on the kernel's output would be an intermediate tensor, which
+        # a compiled region refuses to hand back.
+        topk_scores = topk_indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
+        with torch.no_grad():
+            topk_scores.copy_(values)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         ctx.attention_metadata = attention_metadata
@@ -108,12 +110,8 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
             raise ValueError("the fused indexer needs the entry's backward metadata")
-        # Divide by the **row's** query-token count (the CE loss's denominator), never by
-        # this rank's slab -- under CP the
-        # parameter gradients are summed across the CP axis, so a local denominator would
-        # scale every indexer gradient by the CP degree.
-        query_rows = metadata.swa_k.cu_seqlens[-1].to(torch.float32)
-        attn_softmax_l1_norm = attn_softmax_l1_norm / query_rows
+        # The teacher arrives scaled, unmasked (an unused slot keeps the tiling residue this
+        # kernel never reads), and this port trains from whatever it is handed.
         assert metadata.cmp_k is not None, "the indexer needs the entry's pool"
         options = kernel_options(ratio=ctx.ratio, q=metadata.q, cmp_k=metadata.cmp_k)
         dq, dk, dw, _ = _pypto_sparse_lightning_indexer_kl_loss_grad(
@@ -132,7 +130,7 @@ class PyPTOInnerIndexer(InnerIndexer):
     """The PyPTO indexer: the same contract, implemented over the PyPTO kernel pair.
 
     It emits the kernel's document-local ``topk_indices`` in ``[B, L, K]`` layout and the
-    ``topk_scores`` teacher carrier, exactly as the AscendC port does.  Nothing is inherited
+    ``topk_scores`` it selected at, exactly as the AscendC port does.  Nothing is inherited
     from that port: each runtime keeps its own call site.
     """
 

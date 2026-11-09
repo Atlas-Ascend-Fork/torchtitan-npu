@@ -32,6 +32,7 @@ import torch
 
 from torchao_npu.ops.kv_cache_fake_quant import fake_quantize_mx_bf16
 from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import smla_kernel_options
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import score_and_scale
 
 # The SWA branch's quantization: FP8 with the group size the FP4 main-KV cache does not
 # use, because the two streams carry different precision budgets.
@@ -62,9 +63,9 @@ class _SparseMLA(torch.autograd.Function):
     the same operand the forward used.  The quantized tensor's gradient is the gradient
     the originals would have received, which is the identity STE.
 
-    ``topk_scores`` is an autograd carrier only: forward never reads its value, while
-    backward publishes SMLAG's compressed-attention marginal as its gradient for the
-    LightningIndexer SLIKG backward to consume.
+    ``topk_scores`` carries the indexer's own scores at the selection and is the edge
+    backward publishes SMLAG's compressed-attention marginal on, which the LightningIndexer
+    SLIKG backward consumes after the loss has scored and scaled it.
     """
 
     @staticmethod
@@ -80,7 +81,7 @@ class _SparseMLA(torch.autograd.Function):
         ratio,
         window_size,
         topk_scores,
-        wants_teacher,
+        aux_loss,
     ):
         options = _kernel_options(attention_metadata, ratio, window_size)
         # The metadata this backend built for these frames, not a per-layer AI_CPU launch: the
@@ -114,9 +115,12 @@ class _SparseMLA(torch.autograd.Function):
             sinks,
             output,
             lse,
+            topk_scores,
         )
         ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
-        ctx.wants_teacher = wants_teacher
+        # The loss is attached exactly when the forward carried a teacher edge (see the caller),
+        # so the backward needs no second flag for it.
+        ctx.aux_loss = aux_loss
         # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
         # context attribute instead.  That is not extra retention: it holds the same
         # boundary tensors the graph already keeps for the backward, and the node -- and
@@ -131,7 +135,7 @@ class _SparseMLA(torch.autograd.Function):
         del grad_lse  # the LSE is a teacher signal, never a loss input
         # Nothing but the operand tensors is saved, and ``swa_k`` here is the quantized
         # one -- the backward has to differentiate the same graph the forward built.
-        q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
+        q, swa_k, cmp_k, topk_indices, sinks, output, lse, topk_scores = ctx.saved_tensors
         options = _kernel_options(ctx.attention_metadata, ctx.ratio, ctx.window_size)
         # The gradient side rides the same metadata, so the backward launches nothing either.
         smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
@@ -151,10 +155,28 @@ class _SparseMLA(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             **options,
         )
+        if ctx.aux_loss is None:
+            return (
+                dq,
+                dswa_k,
+                dcmp_k if cmp_k is not None else None,
+                None,
+                dsinks,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        # A slot the selection left unused holds whatever the tiling had there, not a
+        # probability; the objective masks it, scores itself and then scales what the
+        # indexer's kernel differentiates.
+        p_TK = cmp_softmax_l1_norm.masked_fill(topk_indices < 0, 0.0)
+        teacher_TK = score_and_scale(ctx.aux_loss, p_TK, topk_scores, cmp_softmax_l1_norm)
         # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices,
         # sinks, attention_metadata, softmax_scale, ratio, window_size, topk_scores,
-        # wants_teacher). PyTorch silently ignores extra trailing entries, so spell out
-        # every slot to keep the teacher on the carrier input.
+        # aux_loss).
         return (
             dq,
             dswa_k,
@@ -165,7 +187,7 @@ class _SparseMLA(torch.autograd.Function):
             None,
             None,
             None,
-            (cmp_softmax_l1_norm.masked_fill(topk_indices < 0, 0.0) if ctx.wants_teacher else None),
+            teacher_TK,
             None,
         )
 
@@ -196,21 +218,23 @@ class QuantV41SparseAttention(torch.nn.Module):
     ):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
-        wants_teacher = self.training and cmp_k is not None
-        teacher_scores = None
-        if wants_teacher:
-            if topk_scores is None:
-                raise ValueError("QuantV41SparseAttention requires topk_scores to publish the LightningIndexer teacher")
-            teacher_scores = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
+        # Training over a selection distils the indexer: the carrier holds the student's scores at
+        # those slots, and the teacher arrives on its gradient.
+        aux_loss = getattr(self, "aux_loss", None)
+        carrier = None
+        if self.training and cmp_k is not None:
+            if topk_scores is None or aux_loss is None:
+                raise ValueError(
+                    "the quantized fused attention trains its indexer through the indexer loss: "
+                    "state topk_scores and aux_loss on this layer to emit the teacher"
+                )
+            carrier = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
 
-        # The selection arrives document-local from the fused selector, which chose it
-        # with the same kernel: the two share one coordinate system, and ``-1`` is how
-        # both spell an unused slot.  Order is left exactly as it came -- the selector
-        # already put it in position order, and the teacher's slot positions follow that
-        # order.  Only the layout is translated: the model carries ``[B, L, 1, K]`` while
-        # a TND kernel wants ``[T, N2, K]``.
-        # The port returns the attention output alone: the teacher's LSE never leaves
-        # SMLAG, which publishes the marginal on ``topk_scores``' gradient instead.
+        # The selection arrives document-local from the fused indexer, which chose it with the same
+        # kernel: one coordinate system, ``-1`` for an unused slot, order left as emitted.  Only the
+        # layout is translated: ``[B, L, 1, K]`` here, ``[T, N2, K]`` at a TND kernel.
+        # The port returns the attention output alone: the teacher's LSE never leaves SMLAG, which
+        # publishes the marginal on the carrier's gradient instead.
         output, _lse = _SparseMLA.apply(
             q.squeeze(0),
             swa_k.squeeze(0).unsqueeze(1),
@@ -221,7 +245,7 @@ class QuantV41SparseAttention(torch.nn.Module):
             self.softmax_scale,
             self.compress_ratio,
             self.window_size,
-            teacher_scores,
-            wants_teacher,
+            carrier,
+            aux_loss,
         )
         return output.reshape_as(q)

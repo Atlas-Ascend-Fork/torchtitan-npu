@@ -91,8 +91,13 @@ def quant_lightning_indexer(
     metadata: torch.Tensor,
     seqused_q: torch.Tensor,
     seqused_k: torch.Tensor,
+    return_value: bool = False,
 ):
-    """Run QuantLightningIndexerV2 on packed TND quantized Q/K tensors."""
+    """Run QuantLightningIndexerV2 on packed TND quantized Q/K tensors.
+
+    With ``return_value`` the op also returns the scores it selected at, ``-inf`` on an unused
+    slot -- the student side of the indexer's distillation objective.
+    """
 
     q_data, q_descale = quantize_lightning_indexer_input(q, q_config)
     k_data, k_descale = quantize_lightning_indexer_input(k, k_config)
@@ -115,5 +120,5 @@ def quant_lightning_indexer(
         layout_k=layout_k,
         mask_mode=mask_mode,
         cmp_ratio=cmp_ratio,
-        return_value=0,
+        return_value=int(return_value),
     )

@@ -36,6 +36,7 @@ from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     AscInnerIndexer,
 )
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Metadata
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 _TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)]).unsqueeze(0)
 _POSITIONS = torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0)
@@ -256,9 +257,6 @@ def _tiny_model(monkeypatch, *, fused: bool):
             )
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config)
-    for module in model.modules():
-        if isinstance(module, AscInnerIndexer):
-            module.num_global_queries = torch.tensor(float(_TOKENS.numel()))
     return model
 
 
@@ -325,90 +323,6 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
         fused_t = {int(j) for j in fi2[0, t].tolist() if j >= 0}
         eager_t = {int(j) for j in ei2[0, t].tolist() if j >= 0}
         assert fused_t == eager_t, t
-
-
-@pytest.mark.parametrize("num_global_queries", [128, 512], ids=["one-row", "four-rows"])
-def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
-    """All compression ratios share the step denominator; invalid candidates stay zero."""
-    seen = {"calls": 0, "teacher": [], "padding": [], "tokens": [], "emitters": 0}
-    constant = 1024.0
-
-    def fake_slig(q, k, w, sparse_indices, attn_softmax_l1_norm, **kw):
-        seen["teacher"].append(attn_softmax_l1_norm.detach().clone())
-        seen["padding"].append(sparse_indices < 0)
-        seen["tokens"].append(q.shape[0])
-        seen["calls"] += 1
-        return (
-            torch.zeros_like(q),
-            torch.zeros_like(k),
-            torch.zeros_like(w).float(),
-            torch.zeros_like(attn_softmax_l1_norm),
-        )
-
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad", fake_slig)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _fake_li_metadata)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _fake_slig_metadata)
-    monkeypatch.setattr(
-        torch.ops.cann_ops_transformer,
-        "sparse_flash_mla",
-        lambda q, **kw: (q.clone(), q.new_zeros(1, q.shape[0], q.shape[1])),
-    )
-
-    def fake_smlag(q, grad, *args, **kw):
-        indices = kw["cmp_sparse_indices"]
-        teacher = torch.full_like(indices, constant, dtype=torch.float32) if indices is not None else None
-        if teacher is not None:
-            seen["emitters"] += 1
-        shared = kw["cmp_kv"]
-        return (
-            grad,
-            torch.zeros_like(kw["ori_kv"]),
-            torch.zeros_like(shared) if shared is not None else None,
-            torch.zeros_like(kw["sinks"]),
-            None,
-            teacher,
-        )
-
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", fake_smlag)
-    model = _tiny_model(monkeypatch, fused=True)
-    for module in model.modules():
-        if isinstance(module, AscInnerIndexer):
-            module.num_global_queries = torch.tensor(float(num_global_queries))
-    for parameter in model.parameters():
-        parameter.data = parameter.data.to(torch.bfloat16)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        _run_forward_backward(model)
-
-    assert seen["calls"], "SLIKG must be reached for the indexer to train"
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
-    # One SLIKG call per index source: the override trains each source's selection, and the
-    # debug flavor shares the flash topology's tables, so the count comes from there and not
-    # from a number read back out of this run.
-    sources = _teacher_sources(registry.V41_FULL_INDEX_SOURCE_LAYERS)
-    assert seen["calls"] == len(sources), (seen["calls"], sources)
-    assert len(set(seen["tokens"])) == 1, set(seen["tokens"])
-
-    for teacher in seen["teacher"]:
-        tokens = seen["tokens"][0]
-        assert tokens == _TOKENS.shape[1], (tokens, _TOKENS.shape[1])
-        assert constant > num_global_queries
-        # SMLAG's tensor is forwarded verbatim -- its ``-1`` slots included -- and only the
-        # division by the row's query count is the port's.
-        value = teacher.max().item()
-        # Shared index sources accumulate one normalized teacher per contributing layer.
-        contributors = value * num_global_queries / constant
-        assert abs(contributors - round(contributors)) < 1e-6, (
-            f"teacher is not a multiple of constant/num_global_queries ({constant}/{num_global_queries}): {value}"
-        )
-        # No source can carry more contributions than there are layers emitting a teacher, and the
-        # split across sources is the layer table's business -- a per-call count of SLIKG calls, or
-        # a sum over them, would only encode today's topology (some layers feed two sources).
-        assert 1 <= round(contributors) <= seen["emitters"], (
-            f"the teacher implies {round(contributors)} contributors but only {seen['emitters']} "
-            f"layers emitted one, so the seqlen division ({tokens}) is missing"
-        )
-        expected = torch.full_like(teacher, constant * round(contributors) / num_global_queries)
-        torch.testing.assert_close(teacher, expected)
 
 
 def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
@@ -480,15 +394,18 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
     match ``sparse_indices`` exactly.  Both are silent in the CPU fakes -- they accept any
     shape -- so this pins them here, since a wrong rank only surfaces on device.
     """
+    AuxLoss.set_step_denominator(torch.tensor(64.0))
     from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import _SparseMLA
 
     seen = {}
     real_apply = _SparseMLA.apply
 
-    def spy_apply(q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore):
+    def spy_apply(q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore, aux_loss):
         seen["smla_indices"] = tuple(topk_indices.shape)
         seen["smla_carrier"] = None if tscore is None else tuple(tscore.shape)
-        return real_apply(q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore)
+        return real_apply(
+            q, swa_k, cmp_k, topk_indices, sinks, attention_metadata, scale, ratio, window, tscore, aux_loss
+        )
 
     def fake_slig(q, k, w, sparse_indices, attn_softmax_l1_norm, **kw):
         seen["slig_indices"] = tuple(sparse_indices.shape)
@@ -539,27 +456,26 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
     assert seen["slig_indices"] == seen["slig_teacher"] == (seq_len, 1, topk)
 
 
-def test_the_selection_is_sorted_with_padding_last(monkeypatch):
-    """The model contract is one position order with the padding at the tail.
+def test_the_selection_passes_the_kernel_report_through(monkeypatch):
+    """The port forwards the selection and its scores exactly as the kernel reported them.
 
-    The kernel's own order is unspecified, so the port re-sorts.  The direction is ours --
-    neither the kernel schema nor the operator docs fix one, and the reference happens to
-    sort ascending -- and is descending, because keying the sort on ``-index`` pushes
-    ``-1`` behind every valid entry for free.
-
-    The fake is made to emit a deliberately unsorted order, because a fake that
-    pre-sorts cannot see whether the port sorts at all.
-
-    Both the indices and the scores must move together: the scores are the carrier whose
-    gradient is the teacher, and the teacher is per slot.
+    Both tensors are the kernel's own: ``topk_indices`` in document-local numbering with ``-1``
+    for a slot it did not fill, and ``topk_scores`` at those picks as the carrier the teacher
+    arrives on.  Neither order nor value is rearranged here -- the fused attention's merge keys
+    off the first ``-1`` and the objective masks the unused slots, so a re-sort or a mask applied
+    in the port would only risk disagreeing with the numbers the kernel and its metadata were
+    built for.  The fake below reports an unsorted, partially unreachable selection on purpose:
+    a fake that pre-sorted could not tell whether the port rearranges anything.
     """
     real_fake = _fake_lightning_indexer
+    emitted = {}
 
-    def unsorted_fake(*args, **kw):
+    def recording_fake(*args, **kw):
         indices, values = real_fake(*args, **kw)
-        return indices.flip(-1).contiguous(), values.flip(-1).contiguous()
+        emitted["indices"], emitted["values"] = indices, values
+        return indices, values
 
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer", unsorted_fake)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer", recording_fake)
     model = _tiny_model(monkeypatch, fused=True)
     _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     metadata = layer_metadata(model.layers["2"], kwargs)
@@ -573,23 +489,14 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
     w = torch.randn(1, 128, selector.num_index_heads, requires_grad=True)
     indices, scores, _ = selector.forward(q, k, w, metadata, candidates_BL1C=None)
 
-    checked = 0
-    for t in range(indices.shape[1]):
-        row = indices[0, t]
-        valid = row[row >= 0]
-        if valid.numel() < 2:
-            continue
-        # Descending positions, and no valid entry after the first padding.
-        assert torch.all(valid[1:] < valid[:-1]), (t, valid[:8].tolist())
-        first_pad = int((row < 0).nonzero()[0]) if bool((row < 0).any()) else row.numel()
-        assert torch.all(row[first_pad:] < 0), t
-        checked += 1
-    assert checked > 0, "the batch must contain rows with a real selection"
-    # The carrier is a fabricated buffer of the selection's shape, produced by the
-    # autograd Function so that the teacher's gradient has a path back to the indexer.
-    # Its values are read by neither side, so nothing is asserted about them.
-    assert scores.shape == indices.shape
+    topk = indices.shape[-1]
+    assert indices.dtype == torch.int32
+    torch.testing.assert_close(indices.reshape(-1, topk), emitted["indices"].reshape(-1, topk))
+    # The carrier holds the same scores at the same slots -- produced by the autograd Function so
+    # the teacher's gradient has a path back to the indexer -- and it is FP32 like the kernel's.
+    assert scores.shape == indices.shape and scores.dtype == torch.float32
     assert scores.requires_grad
+    torch.testing.assert_close(scores.reshape(-1, topk), emitted["values"].reshape(-1, topk))
 
 
 def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch):
@@ -631,6 +538,7 @@ def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch
 
 
 def test_full_model_smla_trains_the_indexer_through_the_teacher_edge(monkeypatch):
+    AuxLoss.set_step_denominator(torch.tensor(64.0))
     model = _tiny_model(monkeypatch, fused=True)
     for parameter in model.parameters():
         parameter.data = parameter.data.to(torch.bfloat16)
@@ -751,26 +659,3 @@ def test_the_teacher_sources_are_the_index_source_layers():
     # The debug flavor the seqlen test builds shares this topology, so the frame it measures
     # has this many teacher-carrying layers.
     assert len(sources) == 8
-
-
-def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch):
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
-    generator = torch.Generator().manual_seed(42)
-    q = torch.rand(1, 8, selector.num_index_heads, selector.index_head_dim, generator=generator, requires_grad=True)
-    k = torch.rand(1, 4, selector.index_head_dim, generator=generator, requires_grad=True)
-    w = torch.rand(1, 8, selector.num_index_heads, generator=generator, requires_grad=True)
-    selector.num_global_queries = torch.tensor(32.0)
-    indices, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
-    teacher = (indices >= 0).float() * 0.25
-    # A later forward's denominator must not change this graph's backward.
-    selector.num_global_queries = torch.tensor(64.0)
-    scores.backward(teacher)
-
-    qr, kr, wr = [x.detach().clone().requires_grad_() for x in (q, k, w)]
-    selected = kr.squeeze(0)[indices.squeeze(0).clamp_min(0)].unsqueeze(0)
-    logits = (torch.einsum("blhd,blkd->blhk", qr, selected).relu() * wr.unsqueeze(-1)).sum(dim=2)
-    logits = logits.masked_fill(indices < 0, -1e9)
-    loss = -(teacher * logits.log_softmax(dim=-1)).sum() / 32
-    expected = torch.autograd.grad(loss, (qr, kr, wr))
-    for actual, reference in zip((q.grad, k.grad, w.grad), expected, strict=True):
-        torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)

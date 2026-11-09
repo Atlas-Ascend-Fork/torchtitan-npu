@@ -3,20 +3,31 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V4 SMLAG carries the raw teacher to the selector's SLIKG backward.
+"""V4 SMLAG's marginal reaches the indexer's SLIKG backward through the objective.
 
-The sparse core does not train the indexer itself.  SMLAG's by-product -- the marginal
-mass ``p`` over the selected slots -- is written on ``topk_scores``' gradient verbatim: no
-``-1`` masking and no ``softmax_scale`` applied here.  These cases pin that edge, including
-the layers that must not emit one.
+The sparse core owns the teacher's normalization: SMLAG's by-product -- the marginal mass
+``p`` over the selected slots -- is scaled by ``coeff`` over the step's token count and written
+on ``topk_scores``' gradient as the operator emitted it; only the logged value is scored on the
+copy whose unused slots are zeroed.  These cases pin that edge, including the layers that must
+not emit one.
 """
 
 import pytest
 import torch
 
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 pytestmark = pytest.mark.usefixtures("dsv4")
+
+
+@pytest.fixture(autouse=True)
+def _step_denominator():
+    """A unit denominator leaves the teacher's own values readable in these cases."""
+    AuxLoss.set_step_denominator(torch.tensor(1.0))
+    yield
+    AuxLoss._step_denominator = None
 
 
 def _config(*, ratio=4):
@@ -29,6 +40,7 @@ def _config(*, ratio=4):
         head_dim=4,
         index_num_heads=1,
         index_head_dim=4,
+        aux_loss=IndexerLoss.Config(coeff=1.0),
     )
 
 
@@ -73,7 +85,7 @@ def _patch_smla(monkeypatch, *, junk=7.0):
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
 
 
-def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
+def test_the_teacher_reaches_the_carrier_unmasked(monkeypatch):
     _patch_smla(monkeypatch)
     config = _config()
     attention = _attention(config)
@@ -94,15 +106,23 @@ def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
     out.sum().backward()
 
     assert scores.grad is not None
-    # The teacher is forwarded verbatim: SMLAG's mass on every slot, including the junk it
-    # writes for the ``-1`` padding, and with no ``softmax_scale`` applied here.
+    # What leaves is the marginal as the operator emitted it -- including the junk its tiling
+    # left on a slot the selection did not fill -- scaled by ``coeff`` over the step's token
+    # count and with no ``softmax_scale`` (SMLAG already carries it).  The indexer's kernel stops
+    # at the first ``-1``, so those slots are never read; the objective masks them for its own
+    # ``Z`` only.
     expected = torch.zeros(1, 4, 3)
     expected[0, 0] = torch.tensor([0.1, 0.3, 7.0])
     expected[0, 1] = torch.tensor([0.1, 7.0, 7.0])
-    expected[0, 2] = torch.tensor([7.0, 7.0, 7.0])
+    expected[0, 2] = torch.full((3,), 7.0)
     expected[0, 3] = torch.tensor([0.1, 0.3, 0.4])
     torch.testing.assert_close(scores.grad, expected, rtol=0, atol=0)
-    assert (scores.grad[indices < 0] == 7.0).all()
+    # The value it logged is the objective over the same slots, once for this microbatch.
+    p = torch.where(indices < 0, torch.zeros_like(expected), expected)
+    logits = torch.zeros(1, 4, 3)
+    z = p.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    log_y = torch.special.xlogy(p, p / z) - p * logits.log_softmax(dim=-1)
+    torch.testing.assert_close(attention.aux_loss.instance_acc, log_y.sum())
 
 
 @pytest.mark.parametrize("mode", ["eval", "hca"])
@@ -115,7 +135,7 @@ def test_layers_that_must_not_emit_a_teacher(monkeypatch, mode):
     tokens = 128 if ratio == 128 else 4
     metadata = _metadata(config, torch.arange(tokens))
     q = torch.zeros(1, tokens, 1, 4, dtype=torch.bfloat16, requires_grad=True)
-    # A window-only/HCA layer has a compressed pool but no selector, so no indices and no
+    # A window-only/HCA layer has a compressed pool but no indexer, so no indices and no
     # carrier.  There is no teacher edge to feed.
     indices = torch.zeros(1, tokens, 3, dtype=torch.int64) if ratio == 4 else None
     scores = torch.zeros(1, tokens, 3, requires_grad=True) if ratio == 4 else None

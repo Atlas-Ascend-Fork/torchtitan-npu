@@ -29,12 +29,6 @@ class QuantizedLightningIndexerInputs:
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     cmp_residual_k: torch.Tensor
-    num_global_queries: torch.Tensor
-    """The KL term's denominator: the whole row's query-token count at every degree.
-
-    Every rank divides by the row's count, not by its own chunk's: the parameters' gradients are
-    summed across ranks, so a rank-local divisor would scale them by the parallel degree.
-    """
     seqused_q: torch.Tensor
     seqused_k: torch.Tensor
     """The per-document counts each side is masked by: this rank's reach under CP.
@@ -52,7 +46,7 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, weights, inputs, config):  # pyrefly: ignore [bad-override]
         ctx.set_materialize_grads(False)
-        indices, _ = quant_lightning_indexer(
+        indices, values = quant_lightning_indexer(
             query,
             key,
             weights,
@@ -70,10 +64,17 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
             seqused_k=inputs.seqused_k,
             cmp_residual_k=inputs.cmp_residual_k,
             metadata=inputs.metadata,
+            return_value=True,
         )
-        # The saved slots must match the order SMLAG uses for its teacher.
-        indices = indices.sort(dim=-1, descending=True).values
-        scores = indices.new_empty(indices.shape, dtype=torch.float32, requires_grad=True)
+        # The kernel emits the usable picks first and pads with ``-1``/``-inf``: the order and the
+        # mask the teacher edge is read in.  Eager can flag the kernel's own output; a compiled
+        # region rejects an op intermediate that had ``requires_grad_()`` called on it.
+        if torch.compiler.is_compiling():
+            scores = indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
+            with torch.no_grad():
+                scores.copy_(values)
+        else:
+            scores = values.requires_grad_(True)
         ctx.save_for_backward(query, key, weights, indices)
         ctx.inputs = inputs
         ctx.config = config
@@ -89,10 +90,8 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
         inputs, config = ctx.inputs, ctx.config
         if inputs.backward_metadata is None:
             raise RuntimeError("Quantized LI training requires the SLIKG backward metadata")
-        # SMLAG already masked padding and applied softmax_scale. Match the BF16 selector's
-        # normalization by the row's query-token count: under context parallelism the rank's own
-        # ``cu_seqlens_q[-1]`` is one chunk of it, and the ranks' gradients are summed.
-        teacher = teacher / inputs.num_global_queries.to(torch.float32)
+        # The teacher arrives scaled, unmasked: an unused slot keeps the operator's tiling
+        # residue, which this kernel never reads (it stops at the first ``-1``).
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=query,
             k=key,

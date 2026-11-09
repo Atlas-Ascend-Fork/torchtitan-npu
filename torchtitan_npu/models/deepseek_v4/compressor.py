@@ -397,13 +397,11 @@ class InnerIndexer(Module):
         - ``topk_indices`` ``[B, L, K]`` document-local with ``-1`` for an unused slot.  The
           reference path keeps the selection operator's order: ``gather_attn`` sums the
           selected rows in that order, and re-sorting here would perturb the reference
-          numerics (the checked-in golden is exact).  The fused selector canonicalises to
-          descending order inside its Function, because there the saved indices must pair
-          slot-for-slot with the teacher;
+          numerics (the checked-in golden is exact).  The fused port keeps the kernel's own
+          order too -- usable picks first, ``-1`` at the tail -- and re-sorts nothing;
         - ``topk_scores`` ``[B, L, K]``: the student logits at those picks, differentiable in
-          ``idx_q_BLHiDi``/``idx_k_BNDi``/``idx_w_BLHi`` and ``-inf`` on every ``-1`` slot.  This is the value
-          contract the reference path exposes; the fused override returns an unread carrier
-          on the same edge because its teacher arrives on the gradient.
+          ``idx_q_BLHiDi``/``idx_k_BNDi``/``idx_w_BLHi`` and ``-inf`` on every ``-1`` slot --
+          the distribution the indexer loss compares its teacher against.
         """
         # The selector runs on a layer of its own ratio and reads that layer's entry; a
         # geometry without a compressed pool is the only shape it refuses.
@@ -414,9 +412,8 @@ class InnerIndexer(Module):
         if cmp_frame is None:
             raise ValueError("a compressed geometry needs the entry's compressed frame")
         cu_seqlens_k = cmp_frame.cu_seqlens
-        # Selection is discrete: it carries no gradient.  The operator's order is kept as-is
-        # for the reference path; the fused selector emits the canonical descending order
-        # (see the module docstring), so the two paths agree on the *set* and on ``-1``.
+        # Selection is discrete: it carries no gradient.  The operator's order is kept as-is on
+        # both paths, so they agree on the *set* and on ``-1``, not on the order.
         with torch.no_grad():
             topk_indices = select_compressed_slots(
                 idx_q_BLHiDi,

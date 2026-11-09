@@ -24,11 +24,10 @@ numbering -- the indexer emits it document-local, which is also what the fused k
 read -- so nothing is translated here.  ``positions`` is a per-forward argument, not
 metadata, and only drives RoPE.
 
-The indexer's teacher belongs to a port, not to this core.  It is the operator's per-head
-log-sum-exp of the full softmax (window, selected compressed entries and sink), turned
-into the raw marginal mass ``p`` and emitted on ``topk_scores``' gradient, which the
-indexer's SLIKG backward consumes to train the indexer.  A query row with no reachable
-compressed entry contributes nothing.  Nothing in this file holds a loss.
+The indexer's teacher is this operator's per-head log-sum-exp of the full softmax (window,
+selected compressed entries and sink), turned into the mass ``p`` over the selection and
+distilled into the indexer through ``aux_loss``.  A query row with no reachable compressed
+entry contributes nothing.
 
 The projections use the rope module with the site's un-rotated prefix width.
 The reference forward owns Attention Gym attention; fused ports replace the complete
@@ -38,7 +37,7 @@ inner-attention forward.
 from dataclasses import dataclass
 
 import torch
-from attn_gym.sparse import gather_attn
+from attn_gym.sparse import AuxRequest, gather_attn
 from torch import nn
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.linear import Linear
@@ -47,6 +46,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
@@ -65,10 +65,9 @@ class CompressedSparseInnerAttention2(Module):
     sparse pool is addressed on -- a fused port also needs it to translate the metadata's
     document boundaries into its kernel layout -- so it is never guessed from shapes.
 
-    A port that can produce the indexer's teacher replaces this forward wholesale and
-    emits it on ``topk_scores``' gradient; this core has no kernel to make one.  Which port
-    is in place is read off the requested overrides, one stage earlier, by
-    :func:`torchtitan_npu.models.deepseek_v4_1.model._check_indexer_teacher_pair`.
+    The indexer's teacher comes from this core's own log-sum-exp, which already carries the
+    window, the selection and the sink, so the core distils it directly (``aux_loss``).  A
+    backend that can produce the same quantity further down replaces this forward wholesale.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -79,6 +78,12 @@ class CompressedSparseInnerAttention2(Module):
         # Carried explicitly rather than guessed from shapes, and the one piece of *this*
         # layer's geometry at which the row's boundaries are read.
         compress_ratio: int
+        aux_loss: IndexerLoss.Config | None = None
+        """The indexer's distillation objective, on the geometries that consume a selection.
+
+        ``None`` on a window-only layer: it addresses no pooled axis, so it selects nothing and
+        there is no teacher to distil.
+        """
 
         @property
         def attention_metadata_key(self):
@@ -114,6 +119,7 @@ class CompressedSparseInnerAttention2(Module):
         self.window_size = config.window_size
         self.softmax_scale = config.softmax_scale
         self.compress_ratio = config.compress_ratio
+        self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
 
     def forward(
         self,
@@ -137,16 +143,15 @@ class CompressedSparseInnerAttention2(Module):
             topk_indices: Selected compressed entries ``[B, L, K]``, ``-1`` for unused
                 slots.  The indexer emits them document-local, which is the numbering the
                 operator reads, so they are passed through untouched.
-            topk_scores: Accepted for the forward contract and unused here; it exists so
-                a port that produces the indexer's teacher has somewhere to carry it.
+            topk_scores: The indexer's own scores at the picks ``[B, L, K]``; the objective
+                compares its teacher against them.  Unused when no loss is configured.
 
         Returns:
             Attention output of shape ``[B, L, H, Dk]``.
 
-        This core is the plain reference: it computes attention and nothing else.  The
-        indexer's distillation objective is not here -- it needs this operator's softmax
-        denominator, and a port that can produce it emits the teacher on ``topk_scores``'
-        gradient instead of returning it.
+        This core computes attention and, when ``aux_loss`` is configured, its own
+        distillation objective: the teacher is the compressed slots' share of this operator's
+        softmax denominator, so it needs no second pass over the row.
         """
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together.")
@@ -174,6 +179,9 @@ class CompressedSparseInnerAttention2(Module):
         # A window-only geometry has no compressed axis, so its key grid is the row's own.
         cu_seqlens_k = cu_seqlens if attention_metadata.cmp_k is None else attention_metadata.cmp_k.cu_seqlens
 
+        # Bound to a local so the guard below can narrow it.
+        aux_loss = self.aux_loss
+        aux = AuxRequest(lse=True) if aux_loss is not None and self.training else None
         result = gather_attn(
             q.transpose(1, 2),
             local_kv_B1LD,
@@ -187,9 +195,30 @@ class CompressedSparseInnerAttention2(Module):
             # TODO: run the fused kernels once they validate this path; ``impl`` is the
             # pinned attn-gym 0.0.16 argument, ``"reference"`` its eager PyTorch path.
             impl="reference",
+            return_aux=aux,
         )
-        assert isinstance(result, torch.Tensor)
-        return result.transpose(1, 2)
+        if aux is None:
+            assert isinstance(result, torch.Tensor)
+            return result.transpose(1, 2)
+        output, gathered = result
+        out_BLHD = output.transpose(1, 2)
+        if aux_loss is None or topk_indices is None or topk_scores is None or cmp_k is None:
+            return out_BLHD
+        # This layer's own distribution over the entries it read, whichever mode produced the
+        # selection: a Reuse Mode layer distils the shared picks it was handed.  A packed row is
+        # one batch element, so the objective takes the row, not a batch.
+        assert batch == 1, "the reference indexer objective takes one packed row"
+        return aux_loss(
+            q.squeeze(0),
+            cmp_k.squeeze(0),
+            topk_indices.squeeze(0),
+            topk_scores.squeeze(0),
+            gathered.lse.squeeze(0).transpose(0, 1),
+            cu_seqlens,
+            cu_seqlens_k,
+            softmax_scale=self.softmax_scale,
+            carrier=out_BLHD,
+        )
 
 
 class Attention(BaseAttention):

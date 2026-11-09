@@ -58,7 +58,7 @@ def _metadata(*, tokens=4, compressed_tokens=2, ratio=2, quant=False):
 
 
 def _fake_mla_apply(captured):
-    def apply(q, swa_k, cmp_k, indices, sinks, attention_metadata, scale, ratio, window, scores, wants_teacher):
+    def apply(q, swa_k, cmp_k, indices, sinks, attention_metadata, scale, ratio, window, scores, aux_loss):
         captured.update(
             q=q,
             swa_k=swa_k,
@@ -70,7 +70,7 @@ def _fake_mla_apply(captured):
             ratio=ratio,
             window=window,
             scores=scores,
-            wants_teacher=wants_teacher,
+            aux_loss=aux_loss,
         )
         lse = torch.zeros((1, q.shape[0], q.shape[1]), dtype=q.dtype, device=q.device)
         return q, lse
@@ -228,7 +228,7 @@ def test_forward_ratio_zero_passes_window_only_inputs_to_mla(monkeypatch):
     assert captured["ratio"] == 0
     assert captured["window"] == 3
     assert captured["scores"] is None
-    assert captured["wants_teacher"] is False
+    assert captured["aux_loss"] is None
 
 
 def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monkeypatch):
@@ -248,6 +248,8 @@ def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monke
         softmax_scale=0.125,
         compress_ratio=1,
     )
+    teacher = object()
+    module.aux_loss = teacher
     topk_scores = torch.empty((1, 4, 2), device=device, dtype=torch.float32, requires_grad=True)
 
     output = module(
@@ -264,7 +266,7 @@ def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monke
     assert captured["attention_metadata"] is metadata
     assert captured["cmp_k"].shape == (4, 1, 512)
     assert captured["scores"].shape == (4, 1, 2)
-    assert captured["wants_teacher"] is True
+    assert captured["aux_loss"] is teacher
 
 
 def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatch):
@@ -289,6 +291,8 @@ def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatc
         softmax_scale=0.25,
         compress_ratio=2,
     )
+    teacher = object()
+    module.aux_loss = teacher
     topk_scores = torch.empty((1, 4, 2), device=device, dtype=torch.float32, requires_grad=True)
 
     output = module(
@@ -309,7 +313,7 @@ def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatc
     assert captured["cmp_k"].shape == (2, 1, 512)
     assert captured["ratio"] == 2
     assert captured["scores"].shape == (4, 1, 2)
-    assert captured["wants_teacher"] is True
+    assert captured["aux_loss"] is teacher
 
 
 def test_forward_eval_keeps_sparse_quantization_without_teacher_carrier(monkeypatch):
@@ -331,13 +335,13 @@ def test_forward_eval_keeps_sparse_quantization_without_teacher_carrier(monkeypa
 
     assert output.shape == q.shape
     assert captured["scores"] is None
-    assert captured["wants_teacher"] is False
+    assert captured["aux_loss"] is None
 
 
 def test_forward_training_requires_teacher_carrier_for_compressed_kv():
     module = sparse_attention.QuantV41SparseAttention(window_size=3, softmax_scale=0.125, compress_ratio=1)
 
-    with pytest.raises(ValueError, match="requires topk_scores"):
+    with pytest.raises(ValueError, match="state topk_scores and aux_loss"):
         module(
             torch.zeros((1, 4, 2, 4), dtype=torch.bfloat16),
             torch.zeros((1, 4, 4), dtype=torch.bfloat16),
