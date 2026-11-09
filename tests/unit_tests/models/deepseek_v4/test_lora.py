@@ -5,6 +5,9 @@
 
 
 from dataclasses import dataclass
+from datetime import timedelta
+import math
+from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
@@ -50,6 +53,30 @@ def test_dsv4_special_parameters_follow_model_construction_dtype():
 
     adapter_dtypes = {parameter.dtype for name, parameter in model.named_parameters() if lora.is_lora_parameter(name)}
     assert adapter_dtypes == {torch.bfloat16}
+
+
+@pytest.mark.parametrize("rank", [2, 64], ids=["rank2", "rank64"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_grouped_lora_initialization_uses_per_expert_input_dimension(rank, dtype):
+    from torchtitan.tools import utils
+
+    spec = dsv4.model_registry("debugmodel", converters=[lora.DeepSeekV4LoRAConverter.Config(rank_experts=rank)])
+    with torch.device("cpu"), utils.set_default_dtype(dtype):
+        experts = spec.model.layers[0].moe.routed_experts.inner_experts.build()
+    experts.init_states()
+
+    for name in ("w13_lora_a", "w2_lora_a"):
+        value = getattr(experts, name).detach().float()
+        bound = 1 / math.sqrt(value.shape[-1])
+        assert value.abs().max() <= bound
+        torch.testing.assert_close(
+            value.std(dim=(-2, -1), correction=0),
+            torch.full((value.shape[0],), bound / math.sqrt(3)),
+            rtol=0.12,
+            atol=0,
+        )
+    for name in ("w1_lora_b", "w3_lora_b", "w2_lora_b"):
+        assert torch.count_nonzero(getattr(experts, name)) == 0
 
 
 def test_converter_selects_every_dsv4_projection_except_indexer_including_mtp():
@@ -289,3 +316,57 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
     assert register_hook.call_count == (0 if use_lora else 1)
     for name, parameter in model.named_parameters():
         assert parameter.requires_grad == (not use_lora or lora.is_lora_parameter(name))
+
+
+def _initialize_sharded_grouped_adapters(process_rank, rendezvous, shard_dim, dtype):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+    from torch.distributed.tensor.placement_types import _StridedShard
+    from torchtitan.tools import utils
+
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=process_rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        torch.manual_seed(0)
+        mesh = init_device_mesh("cpu", (2,))
+        placements = (_StridedShard(0, split_factor=2),) if shard_dim == "strided" else (Shard(shard_dim),)
+        spec = dsv4.model_registry("debugmodel", converters=[lora.DeepSeekV4LoRAConverter.Config(rank_experts=64)])
+        with torch.device("cpu"), utils.set_default_dtype(dtype):
+            experts = spec.model.layers[0].moe.routed_experts.inner_experts.build()
+        for name in ("w13_lora_a", "w2_lora_a"):
+            value = getattr(experts, name)
+            value = distribute_tensor(torch.full_like(value, float("nan")), mesh, placements)
+            setattr(experts, name, torch.nn.Parameter(value))
+
+        with patch.object(DTensor, "redistribute", side_effect=AssertionError("Initialization must not redistribute")):
+            experts.init_states()
+
+        for name in ("w13_lora_a", "w2_lora_a"):
+            value = getattr(experts, name)
+            assert value.placements == placements
+            assert value.dtype == dtype
+            full = value.full_tensor().float()
+            bound = 1 / math.sqrt(value.shape[-1])
+            assert torch.isfinite(full).all()
+            assert full.abs().max() <= bound
+            torch.testing.assert_close(
+                full.std(dim=(-2, -1), correction=0),
+                torch.full((full.shape[0],), bound / math.sqrt(3)),
+                rtol=0.12,
+                atol=0,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("shard_dim", [0, 2, "strided"], ids=["experts", "input", "strided-experts"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_grouped_lora_initialization_preserves_sharding_without_redistribution(tmp_path, shard_dim, dtype):
+    torch.multiprocessing.spawn(
+        _initialize_sharded_grouped_adapters,
+        args=((tmp_path / "rendezvous").as_uri(), shard_dim, dtype),
+        nprocs=2,
+        join=True,
+    )

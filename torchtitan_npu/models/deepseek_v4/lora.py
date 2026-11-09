@@ -78,6 +78,12 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _init_grouped_lora_a(tensor: torch.Tensor) -> torch.Tensor:
+    # Match per-expert Kaiming(a=sqrt(5)) using the global input dimension.
+    bound = 1 / math.sqrt(tensor.shape[-1])
+    return nn.init.uniform_(tensor, -bound, bound)
+
+
 def adapter_sharding(
     base_sharding: ShardingConfig | None,
 ) -> tuple[ShardingConfig | None, ShardingConfig | None]:
@@ -599,10 +605,10 @@ class DeepSeekV4LoRAConverter(LoRAConverter):
         if grouped:
             values["param_init"] = {
                 **(cfg.param_init or {}),
-                "w13_lora_a": lambda value: nn.init.kaiming_uniform_(value, a=math.sqrt(5)),
+                "w13_lora_a": _init_grouped_lora_a,
                 "w1_lora_b": nn.init.zeros_,
                 "w3_lora_b": nn.init.zeros_,
-                "w2_lora_a": lambda value: nn.init.kaiming_uniform_(value, a=math.sqrt(5)),
+                "w2_lora_a": _init_grouped_lora_a,
                 "w2_lora_b": nn.init.zeros_,
             }
         return lora_cls.Config(
