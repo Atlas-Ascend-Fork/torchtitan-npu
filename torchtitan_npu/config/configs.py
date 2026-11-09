@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 import tyro
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.config import ParallelismConfig as _BaseParallelismConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.tools.profiler import Profiler as _BaseProfiler
 
@@ -231,6 +232,25 @@ class ExtensionConfig:
     quantization: QuantizationExtensionConfig = field(
         default_factory=QuantizationExtensionConfig,
     )
+
+
+@dataclass(kw_only=True, slots=True)
+class ParallelismConfig(_BaseParallelismConfig):
+    """NPU parallelism options."""
+
+    disable_expert_replication: bool = False
+    """Shard routed experts across the dense replica axis as well as EFSDP."""
+
+    def __post_init__(self) -> None:
+        _BaseParallelismConfig.__post_init__(self)
+        if not self.disable_expert_replication:
+            return
+        if self.data_parallel_replicate_degree <= 1 or self.expert_parallel_degree <= 1:
+            raise ValueError("disable_expert_replication requires data_parallel_replicate_degree > 1 and EP > 1")
+        if self.spmd_backend not in ("full_dtensor", "spmd_types"):
+            raise ValueError("disable_expert_replication requires full_dtensor or spmd_types")
+        if (self.tensor_parallel_degree, self.context_parallel_degree, self.pipeline_parallel_degree) != (1, 1, 1):
+            raise ValueError("disable_expert_replication currently requires TP=CP=PP=1")
 
 
 @dataclass(kw_only=True, slots=True)

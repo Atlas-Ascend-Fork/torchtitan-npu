@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -92,6 +93,22 @@ def _dsv4_fp32_overrides(
     return overrides
 
 
+@contextmanager
+def _decoder_fsdp_binding(decoder_fsdp):
+    """Own the upstream MTP binding only during this parallelization call."""
+    if decoder_fsdp is None:
+        yield
+        return
+    import torchtitan.models.deepseek_v3.mtp
+
+    original = torchtitan.models.deepseek_v3.mtp.apply_fsdp_to_decoder
+    torchtitan.models.deepseek_v3.mtp.apply_fsdp_to_decoder = decoder_fsdp
+    try:
+        yield
+    finally:
+        torchtitan.models.deepseek_v3.mtp.apply_fsdp_to_decoder = original
+
+
 def parallelize_deepseek_v4(
     model: DeepSeekV4Model,
     *,
@@ -101,10 +118,11 @@ def parallelize_deepseek_v4(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    decoder_fsdp=None,
 ):
     """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
     compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
-    with policy_overrides(_dsv4_fp32_overrides(model, training)):
+    with policy_overrides(_dsv4_fp32_overrides(model, training)), _decoder_fsdp_binding(decoder_fsdp):
         parallelized_model = parallelize_deepseekv3(
             model,
             parallel_dims=parallel_dims,

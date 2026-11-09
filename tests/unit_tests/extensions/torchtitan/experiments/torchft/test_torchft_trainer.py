@@ -60,6 +60,18 @@ assert small_expert_config.model_spec.model.layers[2].moe.num_experts == 16
 assert small_expert_config.parallelism.expert_parallel_degree == 16
 module.FaultTolerantTrainerEx._validate_supported_config(small_expert_config)
 
+hsdp_config = ConfigManager().parse_args([
+    '--module', 'torchtitan_npu.models.deepseek_v4',
+    '--config', 'deepseek_v4_flash_43layers_16experts_torchft',
+    '--parallelism.data-parallel-shard-degree', '4',
+    '--parallelism.data-parallel-replicate-degree', '2',
+    '--parallelism.expert-parallel-degree', '4',
+    '--parallelism.disable-expert-replication',
+])
+assert isinstance(hsdp_config, module.FaultTolerantTrainerEx.Config)
+assert hsdp_config.parallelism.disable_expert_replication
+module.FaultTolerantTrainerEx._validate_supported_config(hsdp_config)
+
 def set_path(root, path, value):
     target = root
     parts = path.split('.')
@@ -71,7 +83,7 @@ unsupported = (
     ('checkpoint.enable', False, 'requires checkpoint'),
     ('checkpoint.enable_ft_dataloader_checkpoints', False, 'requires checkpoint'),
     ('model_spec.flavor', 'deepseek_v4_dense', 'DeepSeek-V4 Flash'),
-    ('parallelism.data_parallel_replicate_degree', 2, 'elastic DP replicas'),
+    ('parallelism.data_parallel_replicate_degree', 2, 'disable_expert_replication is enabled'),
     ('parallelism.data_parallel_shard_degree', 1, 'requires both FSDP'),
     ('parallelism.expert_parallel_degree', 1, 'requires both FSDP'),
     ('parallelism.tensor_parallel_degree', 2, 'FSDP+EP only'),

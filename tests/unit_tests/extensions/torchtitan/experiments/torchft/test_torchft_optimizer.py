@@ -10,6 +10,7 @@ import torch
 from torchtitan.components.optimizer import ParamGroupConfig
 
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
+from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer_recovery import build_optimizer_recovery
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
 
@@ -74,3 +75,66 @@ def test_rejected_step_skips_optimizer_and_preserves_upstream_scheduler_advancem
     assert optimizer.optimizers[0].param_groups[0]["lr"] == 0.05
     assert not optimizer.hccl_recovery.optimizer_update_completed
     manager.should_commit.assert_called_once_with()
+
+
+def _recovery_validation_worker(rank, store, corrupt):
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+    from torchtitan.distributed.flex_shard.dist_muon import DistMuon
+    from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
+
+    dist.init_process_group("gloo", init_method=store, rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    try:
+        muon = object.__new__(DistMuon)
+        muon.param_groups = [{"params": [torch.nn.Parameter(torch.ones(1))]}]
+        checks = []
+
+        def validate():
+            checks.append(True)
+            signature = torch.tensor(rank if corrupt else 7)
+            peers = [torch.empty_like(signature) for _ in range(2)]
+            dist.all_gather(peers, signature)
+            if any(value.item() != signature.item() for value in peers):
+                raise RuntimeError("optimizer bucket plans differ across ranks")
+
+        muon._validate_plan_across_ranks = validate
+        container = object.__new__(TorchFTOptimizersContainerEx)
+        container.optimizers = [muon]
+        container._optimizer_recovery = build_optimizer_recovery(container.optimizers)
+        container.hccl_recovery = Mock()
+        container._transaction_manager = Mock()
+
+        def load(_container, state):
+            muon.state = state
+            muon._validate_plan_across_ranks()
+
+        with patch.object(TorchFTOptimizersContainer, "load_state_dict", load):
+            if rank == 0:
+                container.load_state_dict({"momentum": torch.tensor([3.0])})
+                assert muon.state["momentum"].item() == 3.0
+        assert not checks
+        assert muon._validate_plan_across_ranks is validate
+        with patch.object(TorchFTOptimizersContainer, "zero_grad", lambda *_args, **_kwargs: None):
+            if corrupt:
+                with pytest.raises(RuntimeError, match="bucket plans differ"):
+                    container.zero_grad()
+            else:
+                container.zero_grad()
+                assert len(checks) == 1  # Donor rank must validate too.
+                assert not container._optimizer_recovery._pending
+                container.zero_grad()
+                assert len(checks) == 1  # No new load, no repeated validation.
+            container._transaction_manager._begin_step.assert_called()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("corrupt", [False, True], ids=["matching-plans", "corrupt-plan"])
+def test_rank_local_healing_validates_muon_on_all_replica_ranks(tmp_path, corrupt):
+    torch.multiprocessing.start_processes(
+        _recovery_validation_worker,
+        args=((tmp_path / "store").as_uri(), corrupt),
+        nprocs=2,
+        start_method="fork",
+    )

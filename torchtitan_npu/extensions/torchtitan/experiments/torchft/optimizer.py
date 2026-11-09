@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 
+from .optimizer_recovery import build_optimizer_recovery
+
 if TYPE_CHECKING:
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 
@@ -27,11 +29,18 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
         self.hccl_recovery = ft_manager.process_group.recovery
         super().__init__(config, model_parts=model_parts, ft_manager=ft_manager)
         self._transaction_manager = ft_manager.manager
+        self._optimizer_recovery = build_optimizer_recovery(self.optimizers)
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # pyrefly: ignore [bad-override]
         self.hccl_recovery.begin_attempt()
+        # Synchronous TorchFT completes quorum and applies local healing before returning.
         self._transaction_manager._begin_step()
+        self._optimizer_recovery.validate()
         super().zero_grad(set_to_none=set_to_none)
+
+    def load_state_dict(self, state_dict) -> None:
+        with self._optimizer_recovery.defer_validation():
+            super().load_state_dict(state_dict)
 
     def step(  # pyrefly: ignore [bad-override]
         self, closure: Callable[[], float] | None = None

@@ -7,7 +7,8 @@
 # this import before the remaining extension dependencies.
 # ruff: noqa: I001
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any
 
 from torchtitan.config import derive
@@ -18,6 +19,7 @@ from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import (
     ExtensionConfig,
     OptimizerConfig,
+    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan_npu.config.converters import TrainerConfigConverter
@@ -31,6 +33,7 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.router import con
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
 
 from .tools.profiler import CANNProfiler
+from .distributed.expert_replication import shard_experts_across_replicas
 
 
 def set_allow_hf32(allow: bool) -> None:
@@ -61,6 +64,9 @@ class TrainerEx(Trainer):
         training: TrainingConfig = field(  # pyrefly: ignore [bad-override]
             default_factory=TrainingConfig,
         )
+        parallelism: ParallelismConfig = field(  # pyrefly: ignore [bad-override]
+            default_factory=ParallelismConfig,
+        )
         sdc: SDC.Config = field(default_factory=SDC.Config)
         anticipatory: AnticipatoryRoutingConfig = field(default_factory=AnticipatoryRoutingConfig)
 
@@ -78,6 +84,19 @@ class TrainerEx(Trainer):
                 self.optimizer._cpu_offload = self.training.enable_cpu_offload
             self._post_init_optimizer()
             validate_anticipatory_config(self)
+            if getattr(self.parallelism, "disable_expert_replication", False):
+                from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+
+                if self.model_spec is None or self.model_spec.name not in ("deepseek_v4", "deepseek_v4_1"):
+                    raise ValueError("disable_expert_replication currently requires DeepSeek-V4 or DeepSeek-V4.1")
+                if (
+                    isinstance(self.optimizer, OptimizerConfig)
+                    and self.optimizer.name == "Muon"
+                    and self.optimizer.muon_enable_hsdp_replica_dedup
+                ):
+                    raise ValueError("disable_expert_replication is incompatible with muon_enable_hsdp_replica_dedup")
+                if isinstance(self.compile, GraphTrainerCompileConfig):
+                    raise ValueError("disable_expert_replication is not supported by GraphTrainer")
 
         def _post_init_optimizer(self) -> None:
             self.optimizer.materialize()
@@ -129,6 +148,13 @@ class TrainerEx(Trainer):
                         )
 
     def __init__(self, config: Config):
+        if getattr(config.parallelism, "disable_expert_replication", False):
+            config = copy(config)
+            assert config.model_spec is not None
+            config.model_spec = replace(
+                config.model_spec,
+                parallelize_fn=partial(config.model_spec.parallelize_fn, decoder_fsdp=shard_experts_across_replicas),
+            )
         quantization_config = config.extension.quantization
         if quantization_config.enable_quantized_training:
             from torchtitan_npu.extensions.adaptor.torchao.converter import apply_quantization_converter
@@ -280,6 +306,7 @@ config_manager.register_config_converter(
             "checkpoint": CheckpointManager.Config,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
+            "parallelism": ParallelismConfig,
         },
     ),
 )

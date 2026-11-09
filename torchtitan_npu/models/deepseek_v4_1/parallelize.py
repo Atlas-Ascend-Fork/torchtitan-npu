@@ -166,6 +166,7 @@ def parallelize_deepseek_v4_1(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    decoder_fsdp=None,
 ):
     """Parallelize V4.1: sharding config, AC, then the decoder FSDP wrap."""
     compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
@@ -211,7 +212,7 @@ def parallelize_deepseek_v4_1(
         edp_mesh_dims=edp_mesh_dims if parallel_dims.ep_enabled else dp_mesh_dims,
         training=training,
     )
-    apply_fsdp_to_decoder(
+    (apply_fsdp_to_decoder if decoder_fsdp is None else decoder_fsdp)(
         model,
         dp_mesh,
         ignored_params=ignored_params,

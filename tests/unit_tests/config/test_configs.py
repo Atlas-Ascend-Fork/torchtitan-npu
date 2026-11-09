@@ -19,6 +19,7 @@ from torchtitan_npu.config import (
     ExtensionConfig,
     MuonOptimizerProfile,
     OptimizerConfig,
+    ParallelismConfig,
     QuantizationExtensionConfig,
     TrainingExtensionConfig,
 )
@@ -73,10 +74,14 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
     assert isinstance(config.optimizer, OptimizerConfig)
     assert config.optimizer.name == "AdamW"
     for config_field in fields(Trainer.Config):
-        if config_field.name in ("optimizer", "profiler", "training", "checkpoint"):
+        if config_field.name in ("optimizer", "profiler", "training", "checkpoint", "parallelism"):
             continue
         assert getattr(config, config_field.name) == getattr(source, config_field.name)
     assert isinstance(config.profiler, CANNProfiler.Config)
+    assert isinstance(config.parallelism, ParallelismConfig)
+    assert config.parallelism.disable_expert_replication is False
+    for config_field in fields(source.parallelism):
+        assert getattr(config.parallelism, config_field.name) == getattr(source.parallelism, config_field.name)
     assert isinstance(config.profiler.build(), CANNProfiler)
     for config_field in fields(source.profiler):
         assert getattr(config.profiler, config_field.name) == getattr(

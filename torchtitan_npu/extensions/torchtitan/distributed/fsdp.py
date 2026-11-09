@@ -173,7 +173,9 @@ def apply_fsdp_to_decoder(
 
             if ep_degree > 1:
                 assert edp_mesh is not None
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
+                shard_axes = edp_mesh_dims.shard if edp_mesh_dims is not None else "efsdp"
+                assert shard_axes is not None
+                efsdp_ep_size = edp_mesh[shard_axes].size() * ep_degree
             else:
                 efsdp_ep_size = fsdp_config["mesh"].size()
 

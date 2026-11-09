@@ -15,7 +15,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
-from torchtitan.config import CompileConfig, ParallelismConfig
+from torchtitan.config import CompileConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.distributed.flex_shard import (
     BlockShard,
@@ -37,6 +37,7 @@ from torchtitan.trainer import Trainer
 from torchtitan_npu.config import (
     MuonOptimizerProfile,
     OptimizerConfig,
+    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler

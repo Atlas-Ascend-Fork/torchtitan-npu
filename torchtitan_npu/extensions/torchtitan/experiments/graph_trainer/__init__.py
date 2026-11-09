@@ -11,7 +11,7 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
 from torchtitan_npu.config import manager as config_manager
-from torchtitan_npu.config.configs import OptimizerConfig, TrainingConfig
+from torchtitan_npu.config.configs import OptimizerConfig, ParallelismConfig, TrainingConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 
@@ -54,6 +54,7 @@ config_manager.register_config_converter(
             "checkpoint": CheckpointManager.Config,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
+            "parallelism": ParallelismConfig,
         },
     ),
 )
