@@ -87,6 +87,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
@@ -104,6 +106,10 @@
     <li class="toctree-l2"><a class="reference internal" href="#_3">当前支持的数据格式</a>
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#mxfp8-block-fp8">MXFP8 与 Block FP8</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#moe-all-to-all">MoE all-to-all 低精度通信</a>
+    </li>
+        </ul>
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#mxfp4-qat">MXFP4 QAT</a>
     </li>
@@ -256,6 +262,51 @@
   --extension.quantization.recipe W8A8_MXFP8
 </code></pre>
 <p>DeepSeek-V4/V4.1 不注册 <code>W4A8_MXFP</code> 或 <code>W8A8_MXFP8</code>，选择这些组合会在转换阶段报错。</p>
+<h3 id="moe-all-to-all">MoE all-to-all 低精度通信</h3>
+<p><code>--extension.quantization.all-to-all-quant-format</code> 默认未设置（<code>None</code>），关闭通信量化。目前只接受 <code>mxfp8</code>，用于在标准 EP <code>AllToAllTokenDispatcher</code> 路径上启用 MXFP8 token 通信。接收端会直接使用 MXFP8 数据的方向才采用低精度通信。选择 <code>mxfp8</code> 时必须同时启用 <code>enable-quantized-training</code>，且 recipe 必须是 <code>all_mxfp8</code>、<code>mix</code> 或 <code>all_block_fp8</code>。</p>
+<p>以下命令在仓库根目录启动 DeepSeek-V4 单机 8 卡示例。先按<a href="#环境要求">环境要求</a>安装 TorchAO-NPU，并准备脚本所需的 Tokenizer、数据和 checkpoint 路径：</p>
+<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V4-Flash \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5 \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8 \
+  --extension.quantization.all-to-all-quant-format mxfp8
+</code></pre>
+<p>该脚本默认 <code>EP=8</code>、<code>spmd_types</code>，并通过 <code>torchtitan_npu.override.common.token_dispatcher.asc</code> 选择 NPU 标准 all-to-all dispatcher。只有 <code>EP&gt;1</code> 才实际发生跨 rank token all-to-all；<code>EP=1</code> 使用本地重排，不产生这项通信。router scores 仍沿原有高精度路径传输。</p>
+<p>四个通信阶段的数据格式如下：</p>
+<table>
+<thead>
+<tr>
+<th>通信阶段</th>
+<th>通信格式</th>
+<th>接收后的用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>正向 dispatch</td>
+<td>MXFP8</td>
+<td>接收端按本地专家重排 <code>qdata</code> 和 scale，形成沿最后一维量化的 <code>MXTensor</code>，供专家 grouped MM 前向直接使用。</td>
+</tr>
+<tr>
+<td>正向 combine</td>
+<td>BF16</td>
+<td>专家输出返回原 token 所在 rank，随后执行路由分数聚合和后续高精度网络计算，不保留量化表示。</td>
+</tr>
+<tr>
+<td>combine 对应的反向</td>
+<td>MXFP8</td>
+<td>梯度返回专家所在 rank 后按本地专家重排；grouped MM 反向直接复用沿最后一维量化的 <code>qdata</code> 和 scale 计算 dgrad。wgrad 仍需将其恢复为逻辑值，再生成沿分组 M 维的量化表示。</td>
+</tr>
+<tr>
+<td>dispatch 对应的反向</td>
+<td>BF16</td>
+<td>激活梯度返回原 token 所在 rank，后续反向不直接消费 MXFP8 表示。</td>
+</tr>
+</tbody>
+</table>
+<p>MXFP8 通信分别对 <code>qdata</code> 和 scale 执行一次 all-to-all，不将两者拼接为单个通信张量。通信格式配置不影响 FSDP 参数 all-gather 或梯度 reduce-scatter。权重预量化另由 <code>enable-fsdp-prequantize</code> 控制。</p>
+<p>当前<strong>不支持 DeepEP dispatcher 的低精度 all-to-all</strong>。若模型选择 <code>moe_comm_backend="deepep"</code>，同时指定 <code>mxfp8</code> 会在配置转换阶段抛出 <code>ValueError</code>。未设置通信量化格式时，DeepEP 仍走原有高精度通信路径。其他非标准 dispatcher 也不在支持范围内。代码已提供标准路径，但此组合的 NPU 多卡训练、编译和数值收敛尚未在本文给出验证记录，不能仅凭配置转换成功判断训练已跑通。</p>
 <h2 id="mxfp4-qat">MXFP4 QAT</h2>
 <p><code>--extension.quantization.enable-mxfp4-qat</code> 为 DeepSeek routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。该独立开关仅对 <code>mix</code> 和 <code>all_block_fp8</code> 中的 routed expert 生效，默认关闭。Qwen3.5 <code>W4A8_MXFP</code> 对 dense 权重固有地使用同一 fake quant 机制，不依赖该开关。</p>
 <p>在训练命令中使用以下参数组合：</p>

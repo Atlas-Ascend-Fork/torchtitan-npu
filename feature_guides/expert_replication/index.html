@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Dense 副本与专家分片 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Dense \u526f\u672c\u4e0e\u4e13\u5bb6\u5206\u7247";
+        var mkdocs_page_input_path = "feature_guides/expert_replication.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../context_parallel/">DeepSeek-V4 系列上下文并行（CP）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Dense 副本与专家分片</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">配置示例</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">原理与边界</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#torchft">TorchFT 外层副本</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">Dense 副本与专家分片</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="dense">Dense 副本与专家分片</h1>
+<p>DeepSeek-V4 和 DeepSeek-V4.1 可在保留 Dense 参数副本的同时，将路由专家权重分片到全部专家数据并行卡上。
+使用 <code>--parallelism.disable-expert-replication</code> 启用，默认关闭，不改变现有切分方式。</p>
+<h2 id="_1">配置示例</h2>
+<p>单机 8 卡，Dense 使用 4 分片、2 副本，路由专家使用 EP4、FSDP2，不保留额外副本：</p>
+<pre><code class="language-bash">bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --parallelism.data-parallel-shard-degree 4 \
+  --parallelism.data-parallel-replicate-degree 2 \
+  --parallelism.expert-parallel-degree 4 \
+  --parallelism.disable-expert-replication \
+  --compile.no-enable \
+  --training.global-batch-size 8 \
+  --training.steps 10
+</code></pre>
+<p>运行前按脚本要求设置 CANN 环境、tokenizer 和 checkpoint 路径，详见
+<a href="../../user-guides/quickstart/">快速上手</a>。序列长度沿用脚本的 4096。</p>
+<table>
+<thead>
+<tr>
+<th>参数范围</th>
+<th>存储布局</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Attention、Embedding、LM head、router、shared experts 等 Dense 参数</td>
+<td>4 分片 × 2 副本</td>
+</tr>
+<tr>
+<td>routed experts，即路由专家权重</td>
+<td>EP4 × FSDP2，无额外副本</td>
+</tr>
+</tbody>
+</table>
+<p>8 张卡仍处理 8 路不同数据，GBS 的含义不变。EP 组内的 token 分发和合并方式不变。
+关闭开关时，以上配置的专家布局为 EP4、FSDP1、2 副本。</p>
+<p>DeepSeek-V4.1 使用相同的并行参数，例如纯文本参考配置：</p>
+<pre><code class="language-bash">CONFIG=deepseek_v4_1_debugmodel_text \
+DATASET=c4_test DATASET_PATH=tests/assets/c4_test \
+USE_GOLDEN=1 OPTIMIZER_OVERRIDES=&quot;&quot; \
+bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
+  --parallelism.data-parallel-shard-degree 4 \
+  --parallelism.data-parallel-replicate-degree 2 \
+  --parallelism.expert-parallel-degree 4 \
+  --parallelism.disable-expert-replication \
+  --optimizer.name AdamW --compile.no-enable \
+  --training.seq-len 512 --training.global-batch-size 8 --training.steps 10
+</code></pre>
+<p>开关仅改变路由专家权重，V4.1 的 Engram 表继续使用其自身的存储和梯度同步策略。</p>
+<h2 id="_2">原理与边界</h2>
+<p>启用后，仅在 FSDP 创建专家存储时，将 <code>dp_replicate</code> 和 <code>efsdp</code> 两个轴共同声明为
+专家的分片轴，并取消专家副本轴。有效专家 FSDP 度为
+<code>dp_replicate * dp_shard / EP</code>，无需额外手工同步或缩放梯度。
+FSDP 在计算时仍会按需聚合专家权重；「没有副本」描述的是分片存储布局。</p>
+<ul>
+<li>当前用于 DeepSeek-V4/V4.1 的常规 Trainer，以及 DeepSeek-V4 Flash 的同步 TorchFT Trainer，要求 <code>dp_replicate &gt; 1</code>、<code>EP &gt; 1</code>、<code>TP=CP=PP=1</code>。</li>
+<li>不支持同时开启 <code>--optimizer.muon-enable-hsdp-replica-dedup</code>；配置阶段会明确报错。</li>
+<li>支持 <code>spmd_types</code> 和 <code>full_dtensor</code> 的专家存储接口；<code>partial_dtensor</code> 和 GraphTrainer 会明确报错。</li>
+<li>A3、<code>spmd_types</code> 下，V4 Flash 43 层 16 专家、4K、Muon 的 eager、MTP、Inductor compile 和 CPU offload 分别完成短步训练；compile/offload 与同初始化、同输入的 eager 基线满足 loss/grad_norm 数值近似阈值。未验证这些功能全部同时开启。</li>
+<li>Muon 要求计算时保持完整专家矩阵；有效专家分片度乘 EP 大于专家数时，FSDP 会选择矩阵维切分 <code>Shard(1)</code>，当前 Muon 明确拒绝这种布局。</li>
+<li>V4.1 纯文本、关闭 Engram 的参考路径完成 50 步同权重对比；默认关闭时逐值一致，开启时满足数值近似阈值。Engram 开启另做 3 步完成性验证，不作为其精度对齐证明。</li>
+<li>V4.1 的验证范围为纯文本；多模态、compile、量化、CPU offload 及切换布局后的 checkpoint 续训尚未验证。</li>
+<li>参数名称和全局形状不变。不同切分方式可能改变初始化与浮点归约顺序，精度比较应加载同一份完整权重，不能只固定 seed。</li>
+</ul>
+<p>本功能不改变 attention、路由和专家计算公式，不承诺性能收益。</p>
+<h2 id="torchft">TorchFT 外层副本</h2>
+<p>每个 TorchFT 副本内部可配置 Dense HSDP 和专家完整分片，外层完整模型副本由 TorchFT 管理。例如两个 8 卡副本，每个副本配置 <code>dp_shard=4</code>、<code>dp_replicate=2</code>、<code>EP=4</code> 并开启本功能，得到内部 Dense 4 分片 × 2 副本和专家 EP4 × EFSDP2。</p>
+<p>TorchFT 优化器配置使用 <code>param_groups</code> 和 optimizer factory，不接受普通 Trainer 的 <code>--optimizer.name</code> 参数。使用 Muon 时需要提供对应模型的 Muon 参数组及计算布局配置。</p>
+<p>恢复时保留 Muon 的本地状态和计划重建，将跨 rank 布局校验放到同步 quorum 完成后的共同入口执行，避免仅部分 rank 加载状态时通信参与者不齐。TorchFT + Muon 每步增加一次副本内标量同步，只有检测到状态加载才执行计划校验。</p>
+<p>已验证两个 8 卡副本、43 层 16 专家、4K、GBS16、Muon 的真实首次状态同步及一步更新。两副本读取不同数据，对应分片的初始化完整摘要一致，逐参数梯度和更新样本一致，完整梯度与更新张量均有限。另有真实两卡 Muon 单 rank 恢复后下一步更新与连续执行参考逐位一致的验证。上述结果不代表磁盘 checkpoint 保存后重启、长期故障恢复或大规模集群验证。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../ep_process_group/" class="btn btn-neutral float-left" title="EP 通信域分离"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../fsdp_compute_stream_allocation/" class="btn btn-neutral float-right" title="FSDP AllGather 缓冲区的计算流分配">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../ep_process_group/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../fsdp_compute_stream_allocation/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

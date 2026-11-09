@@ -145,6 +145,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
@@ -392,8 +394,8 @@ NGPU=2 \
 </tr>
 <tr>
 <td>indexer teacher 归一化</td>
-<td><code>_InnerIndexerTND.backward</code> 除以整行 token 数 <code>swa_k.cu_seqlens[-1]</code>（量化 selector 同）</td>
-<td><code>num_global_queries</code>（本 step 全部 query 数，按 DP 求和）</td>
+<td>SMLAG 的 <code>p</code> 在注意力反向里乘 <code>coeff / 本步全局有效 token 数</code>（与参考路径的分母同一个）</td>
+<td>同左</td>
 </tr>
 <tr>
 <td>参考 metadata</td>
@@ -579,10 +581,10 @@ layer 在本地 flatten 段上做 <code>ratio</code> 折叠（ratio==1 是普通
   给本 rank 的 chunk 打分）。</li>
 </ul>
 <h3 id="54-indexer-teacher">5.4 indexer teacher 的归一化</h3>
-<p>V4.1 的 selector 在反向把 teacher 除以 <code>InnerIndexer.num_global_queries</code>：本 step 全部 accumulation
-microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
-<code>metadata.swa_k.cu_seqlens[-1]</code>（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
-来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。</p>
+<p>teacher 的归一化不按 rank、也不按行：两栈都在<strong>注意力反向</strong>里把 SMLAG 的 <code>p</code> 乘以
+<code>coeff / 本步全局有效 token 数</code>（<code>AuxLoss.set_step_denominator</code> 设的那个分母，DP 维已求和），再把
+结果作为 carrier 的梯度交给 indexer。CP 下参数梯度沿 CP 轴求和，分母是全局量，因此不会被并行度
+放大；indexer 自己不再做任何除法。</p>
 <h3 id="55-cp">5.5 拒绝 CP 的路径</h3>
 <p><code>DeepSeekV4Metadata.prepare_cp_metadata</code> 与 <code>DeepSeekV41Metadata.prepare_cp_metadata</code> 拒绝模型目录
 的参考内核：它们只描述整行的 metadata，CP 下没有一份能交给层去读，所以在任何层执行之前报错，不会

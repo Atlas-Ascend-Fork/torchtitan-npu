@@ -71,9 +71,9 @@
                   </li>
                   <li class="toctree-l1 current"><a class="reference internal current" href="#">辅助损失框架（AuxLoss）</a>
     <ul class="current">
-    <li class="toctree-l2"><a class="reference internal" href="#_1">两条实现路径的指标口径</a>
+    <li class="toctree-l2"><a class="reference internal" href="#deepseek-v4v41-indexer">DeepSeek-V4/V4.1 的 indexer 蒸馏损失</a>
     </li>
-    <li class="toctree-l2"><a class="reference internal" href="#_2">已知限制</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_1">指标口径与已知限制</a>
     </li>
     </ul>
                   </li>
@@ -92,6 +92,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
                   </li>
@@ -150,39 +152,61 @@
             <div class="section" itemprop="articleBody">
               
                 <h1 id="auxloss">辅助损失框架（AuxLoss）</h1>
-<p>torchtitan-npu 通过 <code>torchtitan_npu/patches/torchtitan/models/common/aux_loss.py</code> backport 上游 torchtitan 的 <code>AuxLoss</code>（对应上游 PR <a href="https://github.com/pytorch/torchtitan/pull/3864">#3864</a>）。辅助损失的梯度按 carrier 注入前向图，归一化分母取本步全局有效 token 数，与主 loss 同一分母，使各并行度下的贡献可比。DeepSeek-V3.2 的稀疏 indexer 损失是目前的使用者。</p>
-<h2 id="_1">两条实现路径的指标口径</h2>
+<p>torchtitan-npu 通过 <code>torchtitan_npu/patches/torchtitan/models/common/aux_loss.py</code> backport 上游 torchtitan 的 <code>AuxLoss</code>（对应上游 PR <a href="https://github.com/pytorch/torchtitan/pull/3864">#3864</a>）。辅助损失的梯度按 carrier 注入前向图，归一化分母取本步全局有效 token 数，与主 loss 同一分母，使各并行度下的贡献可比。使用者是 DeepSeek-V3.2 的稀疏 indexer 损失，以及 DeepSeek-V4/V4.1 的 indexer 蒸馏损失。</p>
+<h2 id="deepseek-v4v41-indexer">DeepSeek-V4/V4.1 的 indexer 蒸馏损失</h2>
+<p><code>torchtitan_npu/models/deepseek_v4/indexer_loss.py</code> 的 <code>IndexerLoss</code> 让稀疏 indexer 学会预测主
+注意力在选中压缩槽上的质量。逐层、逐 query 行，记 <code>p</code> 为主注意力在选中槽上的 head 平均概率、
+<code>y = softmax(I)</code> 为 indexer 在同一批槽上的分布，则</p>
+<pre><code>L = Σ_j p_j · (log(p_j / Z) − log y_j),   Z = Σ_j p_j  (&lt; 1：窗口与 sink 占走了其余质量)
+</code></pre>
+<p>即 <code>Z · D_KL(t ‖ y)</code>（<code>t = p / Z</code>）。这个形式由算子固定：<code>sparse_flash_mla_grad</code> 输出未归一化的
+<code>p</code>，<code>sparse_lightning_indexer_kl_loss_grad</code> 求导 <code>dI = Z·y − p</code>；若把 <code>p</code> 在 Python 里先归一化，
+训的就是 <code>D_KL(t ‖ y)</code> 这个不同的目标，所以去往算子的 <code>p</code> 不做归一化。</p>
+<p>两条路径共用一个目标函数，区别只在 teacher 的来源与梯度到达 indexer 的方式：</p>
 <table>
 <thead>
 <tr>
 <th>路径</th>
-<th>指标名</th>
-<th>累加时机</th>
+<th>teacher 来源</th>
+<th>梯度如何到 indexer</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>参考路径（<code>SparseIndexerLoss</code>）</td>
-<td><code>sparse_indexer_loss/mean</code></td>
-<td>前向，<code>_accumulate_and_inject</code></td>
+<td>参考（<code>CompressedSparseInnerAttention</code>、<code>CompressedSparseInnerAttention2</code>）</td>
+<td>算子自己的 log-sum-exp（已含 window、选中槽与 sink）反推</td>
+<td><code>AuxLoss.inject</code>，挂在注意力输出这个 carrier 上</td>
 </tr>
 <tr>
-<td>融合路径（<code>AscSparseIndexerLoss</code>，由 <code>sparse_attn.asc</code> override 替换）</td>
-<td><code>asc_sparse_indexer_loss/mean</code></td>
-<td>反向，<code>ctx.acc_buffer.add_(...)</code></td>
+<td>融合（<code>sparse_attn.asc</code>）</td>
+<td><code>sparse_flash_mla_grad</code> 反向旁路产出的 <code>p</code></td>
+<td>注意力反向里把 <code>p</code> 按 <code>coeff / 本步 token 数</code> 写到 <code>topk_scores</code> 的梯度，由 indexer 的 kernel 求参数梯度</td>
 </tr>
 </tbody>
 </table>
-<p>源码位置：参考路径为 <code>torchtitan_npu/models/deepseek_v3_2/model.py</code>，融合路径为 <code>torchtitan_npu/override/deepseek_v3_2/sparse_attn/ascendc.py</code>。</p>
-<p>融合算子在反向才产出求和后的 KL 值，两条路径的累加时机因此不同，激活检查点（AC）策略对日志值的影响也不同：</p>
+<p><code>coeff</code> 只乘梯度、不进日志，与 <code>AuxLoss</code> 的其它使用者一致。V4.1 的 Reuse Mode 让同一次选择服务
+多层注意力：每层贡献自己的 <code>p</code> 与值，共享的 student logits 收到逐消费者之和，日志仍按层平均。</p>
+<h2 id="_1">指标口径与已知限制</h2>
+<p>两条路径的累加时机不同：参考路径在前向的 <code>_accumulate_and_inject</code> 里累加，融合路径在反向、
+kernel 出值后累加。因此</p>
 <ul>
-<li><code>FullAC</code> 在反向重放所属 block 的前向，参考路径的累加随之重复执行，其指标高于融合路径；两条路径的指标不能直接比较。</li>
-<li>本仓 backport 未引入保留累加区域的 <code>torch_remat</code>（上游用保留区域避免重放，当前 pinned TorchTitan 未提供该机制），重复累加只在 <code>FullAC</code> 下确认过，不能推广到 <code>SelectiveAC</code>、<code>RegionAC</code> 等其他 AC 配置。跨 AC 策略比较日志时应说明两侧策略，必要时按重放次数换算。</li>
-<li>该差异只影响日志指标：<code>loss</code> 与 <code>grad_norm</code> 不受 AC 重放影响。</li>
+<li>激活检查点策略对日志值的影响不同：<code>FullAC</code> 在反向重放所属 block 的前向时，参考路径的累加会
+  重复执行，其指标高于融合路径，两条路径的指标不能直接比较；本仓 backport 未引入上游用的保留
+  区域（<code>torch_remat</code>，<code>recompute=False</code>），重复累加只在 <code>FullAC</code> 下确认过，不能推广到其它 AC
+  配置。跨 AC 策略比较日志时应说明两侧策略。</li>
+<li>一致性判据用 <code>loss</code> 与 <code>grad_norm</code>：两者不受 AC 重放影响；indexer 指标只在相同 AC 策略下比较。</li>
 </ul>
-<p>比较参考路径与融合路径时，以 <code>loss</code> 与 <code>grad_norm</code> 作为一致性判据；indexer loss 指标只在相同 AC 策略下比较。具体测量条件与数值由改动方记录在对应 PR 的验证说明中。</p>
-<h2 id="_2">已知限制</h2>
-<p><strong>与 graph_trainer 图捕获的组合暂时不支持。</strong> <code>AuxLoss</code> 的每步归一化分母当前保存在类级状态上，<code>minimal_fx_tracer</code> 捕获时会把它当作 trace 期常量折叠进图，后续步骤继续用首步分母缩放注入梯度。因此在该路径上启用辅助损失时，aux loss 的梯度与日志值都可能有精度差异，请勿在 graph_trainer 路径上依赖辅助损失结果；相关能力待分母改为运行时输入（或受管理 buffer 且能作为图输入重采样）后另行设计。graph_trainer 的接入方式见 <a href="../deepseek_v4_graph_trainer/">graph_trainer 说明</a>。</p>
+<p>graph_trainer 图捕获路径另有一条限制：</p>
+<ul>
+<li>每步归一化分母保存在类级状态上，模型内部读它。<code>set_step_denominator</code> 把新值<strong>写进同一个张量</strong>
+  而不是换绑新张量：换绑会让被捕获的区域要么每步重编译、要么把首步的值当成常量；同一张量下
+  重放的图每步读到更新后的内容，因此这条路径的梯度注入是有效的。</li>
+<li>指标的累加是前向的原地写副作用，读取它的却是模型之外的优化器 step pre-hook 与
+  <code>MetricsProcessor.log</code>；整步被捕获后这条写没有被带出图，指标因此不可用。上游没有这个问题，
+  差别在两处：上游把累加包在 <code>torch_remat</code> 的保留区里（重算跳过、也不被当死代码丢弃），分母也
+  走显式前向入参而非类级状态。要修就照这两条走，属于后续工作。</li>
+<li>因此该路径上用 <code>loss</code> 与 <code>grad_norm</code> 判断收敛，不要用 indexer 指标。</li>
+</ul>
               
             </div>
           </div><footer>

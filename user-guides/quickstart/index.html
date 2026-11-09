@@ -87,6 +87,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/expert_replication/">Dense 副本与专家分片</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fused_ops/">融合算子接入指南</a>
@@ -274,6 +276,11 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 <td><code>recipe</code></td>
 <td>DeepSeek: <code>all_mxfp8</code>、<code>mix</code>、<code>all_block_fp8</code>、<code>all_hif8</code>；Qwen3.5: <code>W4A8_MXFP</code>、<code>W8A8_MXFP8</code></td>
 <td>DeepSeek 选择 MXFP8/Block FP8/HiF8 recipe；Qwen3.5 两个 recipe 仅支持 dense 模型，不支持 MoE 模型或 shared experts，也不量化视觉编码器；激活为 MXFP8，<code>W4A8_MXFP</code> 权重带 MXFP4 fake quant，<code>W8A8_MXFP8</code> 权重为 Block FP8。</td>
+</tr>
+<tr>
+<td><code>all-to-all-quant-format</code></td>
+<td><code>--all-to-all-quant-format mxfp8</code></td>
+<td>默认未设置。指定 <code>mxfp8</code> 时，对标准 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，不支持 DeepEP。开启示例及限制见<a href="../../feature_guides/low_precision_training/#moe-all-to-all-低精度通信">MoE all-to-all 低精度通信</a>。</td>
 </tr>
 <tr>
 <td><code>enable-mxfp4-qat</code></td>
