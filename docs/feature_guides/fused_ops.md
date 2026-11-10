@@ -180,14 +180,16 @@ python -m torchtitan_npu.train \
   --config deepseek_v4_debugmodel \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \
-    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}'
+    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}' \
+    torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 ```
 
 多个无参数入口可用空格或逗号分隔。带参数的入口必须将 JSON 作为一个 shell 参数，例如：
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}' \
+  torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 ```
 
 同一模块包含多个 override 入口时，只会启用命令中点名的入口函数。`torchtitan` 在配置构造完成、组件
@@ -207,7 +209,7 @@ python -m torchtitan_npu.train \
   自己建（另一条 backend，见上文），池的容量与块大小取自模型 config。它与 `lightning_indexer.asc`
   必须同开（教师边只有两侧都在时才存在），见 `torchtitan_npu/override/README.md#deepseek-v41`。
 - DeepSeek-V4 的 `sparse_attn.asc` 只有一个 attention 入口，metadata（每个几何一份 entry）由该
-  config 自己构建；训练 indexer 时还必须同时启用 selector：CANN 路径用 `lightning_indexer.asc`，
+  config 自己构建；它必须与 selector 成对配置，单边启用会在模型构建前报 `ValueError`。CANN 路径用 `lightning_indexer.asc`，
   PyPTO 路径用 `lightning_indexer.pypto`。前者在 SMLAG 反向产出 teacher，后者消费它。
 - DeepSeek-V4 MHC 的 AscendC 入口声明 `HcPre.Config`/`HcPost.Config`，Triton 入口还包含
   `HcHead.Config`；同一节点只能选择一个实现。

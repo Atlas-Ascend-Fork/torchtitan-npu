@@ -83,6 +83,7 @@
   "activation_order": {
     "torchtitan_npu/extensions/__init__.py": [
       ".torchtitan.ep_process_group",
+      ".torchtitan.config.override",
       ".torchtitan.trainer",
       ".torchtitan.components.metrics",
       ".torchtitan.experiments.graph_trainer",

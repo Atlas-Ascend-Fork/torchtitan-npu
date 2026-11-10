@@ -910,6 +910,15 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
         return torch.tensor([mode, kwargs["cu_seqlens_q"][-1].item()], dtype=torch.int32)
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", record_li_metadata)
+    # Keep this CPU contract independent of real vendor ops registered during imports.
+    for name in (
+        "sparse_flash_mla_metadata",
+        "sparse_flash_mla_grad_metadata",
+        "sparse_lightning_indexer_kl_loss_grad_metadata",
+    ):
+        monkeypatch.setattr(
+            torch.ops.cann_ops_transformer, name, lambda *args, **kwargs: torch.tensor([7], dtype=torch.int32)
+        )
     if chunk_only_metadata:
         # The vendor may omit a field for the full layout but return it for
         # each local layout. Only full-layout roles belong in the FX inputs.
@@ -924,10 +933,17 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(dsv4, chunk_only_
     config.override.imports.append(
         ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"num_heads": 16, "index_num_heads": 8})
     )
+    config.override.imports.append(("torchtitan_npu.override.deepseek_v4.lightning_indexer.asc", {}))
     # The sharding pass the fused override asserts on runs at config
     # resolution, as it does in the trainer (upstream asks for exactly this).
     config.model_spec.model.update_from_config(config=config)
     apply_overrides(config.override, config)
+
+    # The paired selector can be imported after a5_records ran on an A3 host.
+    # Pin its newly loaded metadata port to the same A5 fixture contract.
+    from torchtitan_npu.override.deepseek_v4.lightning_indexer import ascendc as indexer_backend
+
+    monkeypatch.setattr(indexer_backend, "_IS_A5", True)
 
     # Two documents of 128 tokens.  The map holds one entry per geometry, so this case takes
     # the ratio-4 layer's own entry: that is the geometry the LI record belongs to.

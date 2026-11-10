@@ -66,6 +66,28 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         return x
 
 
+def _check_indexer_teacher_pair(override) -> None:
+    """Reject half of the SMLAG/SLIKG bridge before building any modules.
+
+    Quantization replaces the BF16 config nodes before the override pass, but its
+    recipe still declares these ports (and may legitimately leave exact BF16
+    entries unmatched). Check the requested contract, rather than requiring a
+    particular concrete BF16 config type.
+    """
+    requested = {(entry if isinstance(entry, str) else entry[0]).split("=", 1)[0] for entry in override.imports or ()}
+    prefix = "torchtitan_npu.override.deepseek_v4."
+    provider = prefix + "sparse_attn.asc" in requested
+    consumers = {prefix + "lightning_indexer." + backend for backend in ("asc", "pypto", "pypto_pro")}
+    consumer = bool(requested & consumers)
+    if provider != consumer:
+        raise ValueError(
+            "DeepSeek V4 fused indexer teacher requires sparse_attn.asc and one of "
+            "lightning_indexer.{asc,pypto,pypto_pro} together: SMLAG provides the teacher "
+            "and SLIKG consumes it. Enable both or neither, including quantized recipes. "
+            f"Requested teacher ports: {sorted(requested & (consumers | {prefix + 'sparse_attn.asc'}))}"
+        )
+
+
 class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4MTPDecoder.Config):
@@ -74,6 +96,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         n_layers: int
 
         def update_from_config(self, *, config, **kwargs):
+            _check_indexer_teacher_pair(config.override)
             if hasattr(config, "training"):
                 seq_len = config.training.seq_len
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):

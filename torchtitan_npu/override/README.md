@@ -60,6 +60,7 @@ override：
 
 所有匹配都基于修改前的配置树收集。replacement 不会被再次遍历，因此条目顺序不会改变
 匹配结果。成功替换后，日志会记录工厂函数、配置节点 FQN 及替换前后的配置类型。
+包加载的配置观察扩展补充 `[Override entry]` 命中数与 FQN、`[Override zero match]` 的类型/FQN 和量化接管候选，以及 `[Override configured]` 的最终实现与几何和 `[Override quantization]` 的量化配置。解析失败和 claim 冲突分别标记；configured 日志表示构建前选定实现，不证明设备 kernel 已执行。 诊断所依赖的上游私有接口或配置汇总不可用时，会记录 `[Override diagnostics unavailable]` 告警并继续使用原始 `apply_overrides`；原始配置校验、冲突检查和工厂异常仍按上游规则执行。
 
 ## 目录规则
 
@@ -336,6 +337,8 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 `AscSparseIndexerLoss.Config`。
 
 ### DeepSeek-V4
+
+配置更新阶段会检查 teacher 端口：`sparse_attn.asc` 必须与 `lightning_indexer.asc`、`lightning_indexer.pypto` 或 `lightning_indexer.pypto_pro` 中的一项一起请求，也可两侧都不启用。单边配置会在模型构建前抛出 `ValueError`。量化配方仍声明这对端口；converter 接管 exact BF16 节点导致的零命中不作为 teacher 缺失判据。
 
 以下入口省略 `torchtitan_npu.override.deepseek_v4.` 前缀：
 

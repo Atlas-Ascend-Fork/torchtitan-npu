@@ -75,6 +75,8 @@ patch 替换后必须刷新或说明上游 `from ... import ...` 已捕获的绑
 
 `extensions/` 当前还包含 `adaptor/`、`cpu_offload/`、`distributed/`、`mx_storage_reader/`、`novaswap/` 与 `experiment/`。其中仅包入口显式列出的模块自动加载；其余目录由调用路径按需导入。各目录的职责和加载方式见 [extensions 规则](../torchtitan_npu/extensions/AGENTS.md)。
 
+`extensions/torchtitan/config/override.py` 是 `apply_overrides` 配置观察包装的唯一 owner，在 EP process-group 扩展之后、trainer 扩展之前激活，并刷新已加载的 config、trainer、TorchFT 同名捕获绑定。它保留上游替换与成功日志，增加逐入口命中/FQN、零命中候选、解析失败/冲突分类以及最终 Config owner、量化和几何汇总。`[Override configured]` 仅表示构建前选定实现，不表示设备 kernel 已执行；不修改工厂执行次数或张量计算。
+
 ### override、models 与 ops
 
 override 使用 `@override` 注册并由完整 `module.function` 选择；它保持输入输出、DTensor、sharding、checkpoint 与 `torch.compile` 语义。依赖 extension 的 override 显式声明此前提；extension 禁用时 warn-once 是禁用开关落地后的目标行为。

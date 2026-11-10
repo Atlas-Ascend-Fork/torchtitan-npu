@@ -25,6 +25,8 @@ Tracking: PR #688
 - `torchtitan_npu/compile/`、`torchtitan_npu/distributed/`、`torchtitan_npu/interfaces/` 和 `torchtitan_npu/patches/workaround/` 已迁移或删除；可安装的 checkpoint 转换工具放在 `torchtitan_npu/tools/`，与根目录仓库维护脚本区分。
 - `experiments/torchao-npu/` 在它仍以独立实验包发布时保留现位置；不将独立 Python distribution 嵌入 `torchtitan_npu/extensions/experiment/`。
 
+`extensions/torchtitan/config/override.py` 是 `apply_overrides` 配置观察包装的唯一 owner，在 EP process-group 扩展之后、trainer 扩展之前激活，并刷新已加载的 config、trainer、TorchFT 同名捕获绑定。它保留上游替换与成功日志，增加逐入口命中/FQN、零命中候选、解析失败/冲突分类以及最终 Config owner、量化和几何汇总。`[Override configured]` 仅表示构建前选定实现，不表示设备 kernel 已执行；不修改工厂执行次数或张量计算。
+
 ### Migration baseline
 
 | 原路径或当前路径 | 职责 | 决策 | 当前或目标路径 | 验证 | 状态 |
