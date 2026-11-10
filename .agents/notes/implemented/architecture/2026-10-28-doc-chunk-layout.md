@@ -47,7 +47,7 @@ CP 的布局定义为整行的**一个置换**：rank `r` 的窗口是每篇文�
 - CLI 取值 `chunk_r` 改名 `doc_chunk`，示例脚本与数值对齐脚本同步；`parallelize` 侧不再为 CP 准备 batch 维搬移。
 - arch22（910）+ CP>1 不再编译：融合 metadata 带 device 行数（key 压实的 `nonzero`），编译区无法 guard。判为
   不可编译时告警并跑 eager，训练照常；代价是 arch22 上开编译跑 CP 的作业会变慢。
-- 逐位判据（详见 `docs/feature_guides/context_parallel.md` §7）：同一 degree、改动前后逐位（910 双卡）；
+- 逐位判据（详见 `docs/developer_guides/context_parallel.md` §7）：同一 degree、改动前后逐位（910 双卡）；
   跨 degree 在 A5 单卡模拟器上逐位，CP=1 与 CP=2 的 logits、step 1 `loss` 相同，挂 Engram 的用例同样如此。
   arch22 上跨 degree 只有 V4.1 逐位，V4 因 ratio-4 carry 与长归约在该 arch 上没有确定性档位、落到不同内核
   路径而不逐位——改动前既有，不是这次引入的。

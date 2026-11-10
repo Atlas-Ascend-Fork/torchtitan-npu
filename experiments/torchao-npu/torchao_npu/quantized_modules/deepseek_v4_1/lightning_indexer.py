@@ -182,14 +182,15 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             **kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k),
         )
         # The carrier holds the indexer's own scores at the selection (``-inf`` on an unused slot)
-        # and the teacher arrives on its gradient.  Eager can flag the kernel's own output; a
-        # compiled region rejects an op intermediate that had ``requires_grad_()`` called on it.
+        # and the teacher arrives on its gradient.  It is fp32 -- the teacher edge the SLIKG
+        # backward reads is.  Eager casts the kernel's bf16 output; a compiled region refuses to
+        # flag an op intermediate, so there it copies into a fresh leaf.
         if torch.compiler.is_compiling():
             topk_scores = topk_indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
             with torch.no_grad():
                 topk_scores.copy_(values)
         else:
-            topk_scores = values.requires_grad_(True)
+            topk_scores = values.float().requires_grad_(True)
 
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.topk = topk
@@ -260,6 +261,7 @@ class QuantV41LightningIndexer(torch.nn.Module):
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """One fixed query chunk: the QLI/QSLI schedule over its own visible prefix."""
         if idx_q_BLHiDi.shape[0] != 1 or idx_k_BNDi.shape[0] != 1 or weights_BLHi.shape[0] != 1:
             raise ValueError("V4.1 QLI/QSLI requires one packed TND row (model batch size 1)")
 

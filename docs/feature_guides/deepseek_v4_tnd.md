@@ -65,7 +65,7 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 ## 压缩布局：DeepSeekV4Metadata
 
-[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `DeepSeekV4Metadata`（V4.1 形状：一个类、一组字段，CP / 非 CP 只有数值不同）。每个 microbatch 由 attention backend 自己的 config 构建一次（upstream PR #4897 的接缝）：`CompressedSparseInnerAttention.Config.build_attention_metadata` 从 `positions` 用 `DeepSeekV4Metadata.from_positions` 生成这个几何的行与折叠网格；融合路径的 `AscCompressedSparseInnerAttention.Config` 在其上按 `AicpuGeometry` 生成 AscendC 记录（LI record 也由它在同一入口构建）。参考契约的 `prepare_cp_metadata` 直接拒绝 CP；融合路径的 hook 调 metadata 自己的 `rebuild_cp_metadata(permutation, build=…)`，它从 `cp_shard_context()` 取 mesh、用 `DeepSeekV4Metadata.doc_chunk_metadata(permutation=…, cp_size=…, cp_rank=…)`（`ExchangeMetadata.from_permutation` 求 shard 置换的逆）把 metadata 换成本 rank 的 `q` / `swa_k` / `cmp_k` frame 与 `xchg` 交换表，再交给该 backend 的 builder 按这些 frame 重建记录。CP 下输入布局在基类 seam `Decoder.preprocess_inputs` 里**每 batch 一次**搬到 doc-chunk，本层的 KV 侧再用 entry 的 `xchg` 恢复回 flatten 段。`Decoder` 每个 microbatch 为每个几何构建一次，供所有同几何 DSA 层共享：
+[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `DeepSeekV4Metadata`（V4.1 形状：一个类、一组字段，CP / 非 CP 只有数值不同）。每个 microbatch 由 attention backend 自己的 config 构建一次（upstream PR #4897 的接缝）：`CompressedSparseInnerAttention.Config.build_attention_metadata` 从 `positions` 用 `DeepSeekV4Metadata.from_positions` 生成这个几何的行与折叠网格；融合路径的 `AscCompressedSparseInnerAttention.Config` 在其上按 `AicpuGeometry` 生成 AscendC 记录（LI record 也由它在同一入口构建）。参考契约的 `prepare_cp_metadata` 直接拒绝 CP；融合路径的 hook 用 `rebuild_cp_metadata` 重建本 rank 的 `q` / `swa_k` / `cmp_k` frame 与 `xchg` 交换表，细节见 [CP 切分原理](../developer_guides/context_parallel.md)。`Decoder` 每个 microbatch 为每个几何构建一次，供所有同几何 DSA 层共享：
 
 - `ratio`：这个 entry 的压缩比（0、1、2、4、128 之一；0 表示只有滑窗、没有压缩轴）；每个 consumer 都按它寻址。
 - `q` / `swa_k` / `cmp_k`：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk，`swa_k` / `cmp_k` 是整行，`seqused` 是本 rank 的 reach；非 CP 下三者都退化为边界差。没有 `cu_seq_q` / `cu_seq_k` 别名：用哪个 frame 就读哪个网格——行网格 `swa_k.cu_seqlens`、查询网格 `q.cu_seqlens`、压缩网格 `cmp_k.cu_seqlens`，`ratio == 1` 的 key 网格就是 `swa_k.cu_seqlens`。
@@ -96,7 +96,7 @@ cu_seqlens = [0, 3, 5]   # 一行里打包了 2 条序列
 对齐由 `dataloader.per_doc_alignment` 驱动：非 CP 时 registry 从 `compress_ratios` 推出 `lcm`（V4 为 `128`）；CP 时该值提升为 `lcm × cp_size`（V4 为 `128 × cp`，由 recipe/example 传入 `--dataloader.per_doc_alignment`），与压缩器、内核看到的块网格同源。布局构建器把这条契约当作前提：`DeepSeekV4Metadata.from_positions` 对非空且按
 `lcm(compress_ratios)` 对齐的流，直接把这一行按 ratio 除出压缩网格（`cmp_k.cu_seqlens`），没有逐文档扫描、
 也没有「尾部不足一块」的分支；破约的流（含空文档或长度不是对齐倍数）在构建处直接报错。压缩器本身同样是扁平的
-`unflatten(1, (-1, ratio))` 折叠，只有在 ratio-4 重叠时才用 `cu_seqlens` 的段起点做掩码。CP 时文档按 `128 × cp` 对齐（每个 entry 再检查 `cp × max(ratio, 1)`）：查询按文档内部分 cp 片，切分后每段仍要是压缩块的整数倍。`doc_chunk_metadata` 对未按该值对齐的流直接报错。CP=128 面向长文本（1M 序列），把短文档拼成长文本再切分不是目标场景，填充开销在该场景下可接受。
+`unflatten(1, (-1, ratio))` 折叠，只有在 ratio-4 重叠时才用 `cu_seqlens` 的段起点做掩码。CP 下的对齐（`lcm × cp`）与检查见 [CP 切分原理](../developer_guides/context_parallel.md)。CP=128 面向长文本（1M 序列），把短文档拼成长文本再切分不是目标场景，填充开销在该场景下可接受。
 
 同一对齐值也约束后续两条路径：`seq_len` 必须是 `per_doc_alignment` 的倍数（loader 在构建时校验），
 SFT 的 chat 数据集按同一个值补 pad（`chat_dataloader.sft` 把对齐值透传到 `DeepSeekV4ChatDataLoader`）。

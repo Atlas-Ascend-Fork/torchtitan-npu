@@ -216,6 +216,7 @@ class QuantV41SparseAttention(torch.nn.Module):
         topk_indices=None,
         topk_scores=None,
     ):
+        """One fixed query chunk: the quantized SMLA over its own visible prefix."""
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
         # Training over a selection distils the indexer: the carrier holds the student's scores at

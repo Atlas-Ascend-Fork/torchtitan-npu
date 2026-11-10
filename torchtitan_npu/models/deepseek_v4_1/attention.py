@@ -46,6 +46,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelAttentionMixin
 from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -371,3 +372,9 @@ class Attention(BaseAttention):
         # The rows stay this rank's chunks: the window the layer was handed is the window the
         # layer above is handed, so nothing is un-permuted on the way out.
         return (o, cmp_k, idx_k, topk_indices, topk_scores, candidates)
+
+
+class ContextParallelAttention(ContextParallelAttentionMixin, Attention):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Attention.Config):
+        pass

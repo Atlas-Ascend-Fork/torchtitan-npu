@@ -81,7 +81,7 @@ def _worker(rank: int, port: int) -> None:
             .build(seq_len=_ROW, cp_size=_CP, attention_metadata=row)
             .generate_permutation()
         )
-        entry = row.doc_chunk_metadata(permutation=permutation, cp_size=_CP, cp_rank=rank)
+        entry = row.per_doc_cp_metadata(permutation=permutation, cp_size=_CP, cp_rank=rank)
         plan = entry.xchg
 
         # The frames the entry describes: chunk r of every document over the whole-row KV frame.

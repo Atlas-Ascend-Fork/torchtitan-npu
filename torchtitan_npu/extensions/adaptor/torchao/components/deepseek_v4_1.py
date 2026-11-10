@@ -175,6 +175,7 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
         metadata: _DeepSeekV41Metadata,
         *,
         quant_numbers: dict[str, int],
+        zigzag: bool = False,
     ) -> _V41QuantAttentionMetadata:
         """This backend's entry, with its kernels' AI_CPU metadata for these frames.
 
@@ -196,7 +197,10 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
                 q=metadata.q,
                 swa_k=metadata.swa_k,
                 cmp_k=metadata.cmp_k,
-                num_rows=metadata.position_k.numel(),
+                # The candidate length is this entry's query count.  ``position_k`` is the KV
+                # producer's slice -- twice the query rows on a ZigZag kernel entry -- so the
+                # shape states it without a device-to-host read of the frame.
+                num_rows=metadata.position_k.numel() // (2 if zigzag else 1),
                 **quant_numbers,
             ),
         )
@@ -208,13 +212,30 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
         permutation,
     ) -> _V41QuantAttentionMetadata:
         """This rank's frames and the AI_CPU metadata rebuilt for them."""
-        return attention_metadata.rebuild_cp_metadata(
+        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
+
+        # A ZigZag kernel entry carries the rank's KV slice, twice its query rows; the layout the
+        # shard applied states which it is, so the builder reads the shape instead of the frame.
+        # The name is spelled here rather than imported: this package is an extension and must not
+        # reach into the model package (architecture boundary); ``cp_layout`` registers the same
+        # CLI-facing name.
+        zigzag = cp_shard_context().load_balancer == "doc_zigzag"
+        local = attention_metadata.rebuild_cp_metadata(
             permutation,
             build=partial(
                 _V41QuantAttentionMetadata.build_aicpu_metadata,
                 quant_numbers=attention_metadata.quant_numbers,
+                zigzag=zigzag,
             ),
         )
+        # The provider's builder does not mark, so mark the entry the caller reads; on zigzag the
+        # two kernel entries carry their own frames and selector records.
+        local.mark_dynamic()
+        if local.head is not None:
+            assert local.tail is not None, "doc_zigzag builds head and tail together"
+            local.head.mark_dynamic()
+            local.tail.mark_dynamic()
+        return local
 
 
 class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):

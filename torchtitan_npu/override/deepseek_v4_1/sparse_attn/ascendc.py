@@ -17,6 +17,7 @@ from torchtitan_npu.override.deepseek_v4.asc_metadata import (
     AicpuGeometry,
     AscLightningIndexerMetadata,
     AscV4Metadata,
+    _mark_dynamic,
 )
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscSparseMLAMixin
 
@@ -41,10 +42,15 @@ class AscV41Metadata(AscV4Metadata, DeepSeekV41Metadata):  # pyrefly: ignore [in
         permutation,
     ):
         """This rank's frames, rebuilt with this stack's coarse-indexer metadata."""
-        return attention_metadata.rebuild_cp_metadata(
+        local = attention_metadata.rebuild_cp_metadata(
             permutation,
             build=partial(AscV41Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
         )
+        # The rank-local entry is a new object: its frames, ``position_k`` slice and exchange
+        # tables are none the global build marked, so mark them here; ZigZag's ``head`` / ``tail``
+        # are marked by their own builders.
+        _mark_dynamic(local)
+        return local
 
     @classmethod
     def build_aicpu_metadata(cls, metadata, *, geometry):

@@ -139,12 +139,13 @@ class CPShardContext:
 
     Upstream's ``prepare_cp_metadata`` takes the permutation alone because the
     mesh is ambient in the ``ParallelismContext`` its model is called with.
-    0.3.0 has no such context, so ``Decoder._cp_shard`` publishes the one thing
-    its pinned CP entry cannot recover -- the mesh it sharded with -- for the
-    duration of the transform.
+    0.3.0 has no such context, so ``Decoder._cp_shard`` publishes the mesh and selected
+    load-balancer policy for the duration of the transform. The policy distinguishes
+    per-document layouts without inferring one from a tensor's incidental values.
     """
 
     cp_mesh: Any
+    load_balancer: str | None = None
 
 
 _CP_SHARD_CONTEXT: ContextVar[CPShardContext | None] = ContextVar(
@@ -162,9 +163,9 @@ def cp_shard_context() -> CPShardContext:
 
 
 @contextmanager
-def cp_shard_context_set(*, cp_mesh: Any):
+def cp_shard_context_set(*, cp_mesh: Any, load_balancer: str | None = None):
     """Publish the pinned shard context around one metadata transform."""
-    token = _CP_SHARD_CONTEXT.set(CPShardContext(cp_mesh))
+    token = _CP_SHARD_CONTEXT.set(CPShardContext(cp_mesh, load_balancer))
     try:
         yield
     finally:

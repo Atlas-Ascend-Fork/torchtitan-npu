@@ -139,8 +139,7 @@ class PyPTOInnerIndexer(InnerIndexer):
         pass
 
     def forward(self, idx_q_BLHiDi, idx_k_BNDi, idx_w_BLHi, *, attention_metadata):
-        if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("PyPTOInnerIndexer requires the entry the fused attention built.")
+        """One fixed query chunk against the keys the module boundary already gathered."""
         topk_indices, topk_scores = _PyPTOIndexerTND.apply(
             idx_q_BLHiDi.flatten(0, 1),
             # The keys enter the Function already compacted (arch22): the gather is

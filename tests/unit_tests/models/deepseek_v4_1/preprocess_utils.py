@@ -21,7 +21,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT, DOC_ZIGZAG_LAYOUT
 
 # ``preprocess_inputs`` takes the parallelism context; these models run a single process
 # with no CP and the default SPMD backend.
@@ -144,8 +144,8 @@ def install_doc_chunk_cp_shard(monkeypatch) -> None:
         permutation=None,
     ):
         del attention_masks, ptrr_mask_key
-        if load_balancer_type != DOC_CHUNK_LAYOUT or permutation is None:
-            raise AssertionError("the CPU stand-in only reproduces the doc-chunk layout")
+        if load_balancer_type not in (DOC_CHUNK_LAYOUT, DOC_ZIGZAG_LAYOUT) or permutation is None:
+            raise AssertionError("the CPU stand-in only reproduces the per-document layouts")
         slab = inputs[0].size(input_seq_dim) // cp_mesh.size()
         lo = cp_mesh.get_local_rank() * slab
         held = permutation[0][lo : lo + slab]

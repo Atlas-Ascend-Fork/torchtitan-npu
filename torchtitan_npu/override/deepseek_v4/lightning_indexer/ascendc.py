@@ -192,7 +192,8 @@ class AscIndexerMixin:
         attention_metadata: Any,
         *,
         candidates_BL1C: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """One fixed query chunk: the selection its own visible prefix allows."""
         del candidates_BL1C
         topk = self.index_topk
         batch, seqlen = idx_q.shape[:2]

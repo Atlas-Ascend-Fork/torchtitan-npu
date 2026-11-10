@@ -67,14 +67,15 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
             return_value=True,
         )
         # The kernel emits the usable picks first and pads with ``-1``/``-inf``: the order and the
-        # mask the teacher edge is read in.  Eager can flag the kernel's own output; a compiled
-        # region rejects an op intermediate that had ``requires_grad_()`` called on it.
+        # mask the teacher edge is read in.  The carrier is fp32 -- the objective's student side
+        # and the SLIKG teacher's edge both are.  Eager casts the kernel's bf16 output; a compiled
+        # region refuses to flag an op intermediate, so there it copies into a fresh leaf.
         if torch.compiler.is_compiling():
             scores = indices.new_empty(values.shape, dtype=torch.float32, requires_grad=True)
             with torch.no_grad():
                 scores.copy_(values)
         else:
-            scores = values.requires_grad_(True)
+            scores = values.float().requires_grad_(True)
         ctx.save_for_backward(query, key, weights, indices)
         ctx.inputs = inputs
         ctx.config = config

@@ -345,6 +345,10 @@ class DeepSeekV41Model(Decoder):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelConverter
+
+                ContextParallelConverter.Config().build().convert(self)
 
         def _check_context_parallel(self, context_parallel_degree: int, fused_core: bool, fused_selector: bool) -> None:
             """Reject a CP degree this stack cannot run.

@@ -14,6 +14,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
+from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelAttentionMixin
 from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -308,7 +309,8 @@ class Attention(BaseAttention):
     def forward(self, x, attention_metadata, positions):
         """The unified attention forward (CP and non-CP).
 
-        The input layout already put these rows on **chunk ``r`` of every document**, so the
+        The input layout already put these rows on **this rank's per-document pieces** -- chunk
+        ``r`` under ``doc_chunk``, chunk ``r`` and its mirrored chunk under ``doc_zigzag`` -- so the
         query side projects them as they arrive and never moves.  The key side projects, rotates
         and pools the same rows -- every step is per token, so it commutes with the layout -- and
         each consumer restores what it reads on its own: the compressor its pooling window, the
@@ -387,3 +389,9 @@ class Attention(BaseAttention):
         # arrived in: the residual and every other consumer are token-wise, and the loss is
         # taken against labels the same layout moved.
         return o
+
+
+class ContextParallelAttention(ContextParallelAttentionMixin, Attention):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Attention.Config):
+        pass

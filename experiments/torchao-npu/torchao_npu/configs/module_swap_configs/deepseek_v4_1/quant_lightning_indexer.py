@@ -26,7 +26,7 @@ def _quantized_forward(
     idx_q,
     idx_k,
     weights,
-    attention_masks,
+    attention_metadata,
     *,
     candidates_BL1C,
 ):
@@ -37,7 +37,7 @@ def _quantized_forward(
         idx_q,
         idx_k,
         weights,
-        attention_masks,
+        attention_metadata,
         candidates_BL1C=candidates_BL1C,
     )
 

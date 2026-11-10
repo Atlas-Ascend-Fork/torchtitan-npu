@@ -40,6 +40,7 @@ def _build_case(
     extra_override_imports: tuple[str, ...] = (),
     env_vars: dict[str, str] | None = None,
     disabled: bool = False,
+    expected_steps: tuple[tuple[int, ...], ...] | None = None,
 ) -> OverrideDefinitions:
     """Build one DeepSeek-V4 integration case.
 
@@ -58,6 +59,7 @@ def _build_case(
         check_loss=check_loss,
         env_vars=env_vars,
         disabled=disabled,
+        expected_steps=expected_steps,
     )
 
 
@@ -291,6 +293,33 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             # token indices that used to trip the AscendC IndexCheck stay inside each
             # kernel's own key frame.  Re-enabled with that contract; the numeric CP gate
             # (same weights via a seed checkpoint) is the 910 run.
+        ),
+        _build_case(
+            test_name="dsv4_smla_zigzag_cp2",
+            test_descr="DeepSeek-V4 BF16 SMLA per-document ZigZag CP2",
+            ngpu=2,
+            expected_steps=((1, 2),),
+            env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
+            extra_args=(
+                "--training.steps=2",
+                "--optimizer.name=AdamW",
+                "--debug.seed=42",
+                # No --debug.deterministic: SparseFlashMlaGrad's backward rejects deterministic
+                # mode in CANN 9.2.0; the numerics harness enables it where supported.
+                "--checkpoint.no-enable",
+                "--training.seq-len=2048",
+                "--training.global-batch-size=1",
+                "--parallelism.context-parallel-degree=2",
+                "--parallelism.context-parallel-load-balancer=doc_zigzag",
+                "--parallelism.data-parallel-shard-degree=1",
+                "--parallelism.expert-parallel-degree=1",
+                "--parallelism.spmd-backend=spmd_types",
+                "--dataloader.per_doc_alignment=512",
+                "--hf-assets-path=tests/assets/deepseek_v3",
+            ),
+            use_golden=False,
+            # Completion gate only; same-checkpoint CP1/doc_chunk/ZigZag comparison is separate.
+            check_loss=False,
         ),
         _build_case(
             test_name="dsv4_mtp_smla_cp2",

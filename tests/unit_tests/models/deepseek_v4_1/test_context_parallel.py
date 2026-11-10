@@ -104,7 +104,7 @@ def _masks(positions: torch.Tensor, cp_size: int = 1, cp_rank: int = 0) -> DeepS
             .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
             .generate_permutation()
         )
-        row = row.doc_chunk_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+        row = row.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
     return AscV41Metadata.build_aicpu_metadata(row, geometry=_GEOMETRY)
 
 
@@ -226,12 +226,15 @@ def test_the_exchange_carries_the_movement_only():
     """The container holds nothing a consumer could work out for itself.
 
     The held rows' positions are a function of the same boundaries, so the entry states them as
-    its own ``position_k`` rather than carrying them in the exchange's tables.
+    its own ``position_k`` rather than carrying them in the exchange's tables.  The one row order
+    the boundaries do not state is the ZigZag one, so the entry carries a ``recv_index`` only when
+    its layout needs one; the doc-chunk layout leaves it ``None``.
     """
     plan = _plans([0, 8, 24], 2)[1]
     assert isinstance(plan, ExchangeMetadata)
-    assert set(plan.__slots__) == {"send_index", "send_split", "recv_split"}
+    assert set(plan.__slots__) == {"send_index", "send_split", "recv_split", "recv_index"}
     assert plan.send_index.dtype == torch.int64
+    assert plan.recv_index is None
 
 
 def test_the_restore_is_the_identity_without_a_plan():

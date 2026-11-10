@@ -314,6 +314,7 @@ class AscSparseMLAMixin:
         topk_indices=None,
         topk_scores=None,
     ) -> torch.Tensor:
+        """One fixed query chunk against the keys the module boundary already gathered."""
         batch_size, seqlen = q.shape[0], q.shape[1]
         swa_k, cmp_k = _compact_key_rows(
             swa_k.flatten(0, 1),

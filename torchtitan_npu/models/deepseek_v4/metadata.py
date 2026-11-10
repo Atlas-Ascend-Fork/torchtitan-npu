@@ -19,12 +19,10 @@ produce.  A kernel that cannot read these frames as they are -- arch22's TND ker
 ``seqused`` and anchor their mask at the frame's end -- restates them at its own call site
 (``override/a3_workaround.py``) rather than here: nothing about the row changes.
 
-Under context parallelism the queries are **chunk ``r`` of every document** while the KV side
-stays the **whole row**.  The input layout (``models/deepseek_v4/cp_attention.py``) moves the
-batch's tokens, positions and labels onto the chunk frame once per batch, so ``q.cu_seqlens`` is
-the rank-local chunk grid and the KV frames address the row; a layer that projects keys restores
-its hidden states onto the flatten slice with the metadata's :attr:`DeepSeekV4Metadata.xchg`,
-which is what removes the per-layer query movement and the output un-permutation.  There are no
+Under context parallelism KV remains the whole row. Doc-chunk keeps each document's chunk
+``r``; ZigZag pairs it with the mirrored chunk in ``head`` / ``tail``. Their query frames are
+local, while the enclosing entry keeps global KV frames. ``xchg`` restores the projected
+keys to flat rank slices. There are no
 ``cu_seq_q`` / ``cu_seq_k`` aliases: read the grid from the frame that addresses it (row grid =
 ``swa_k.cu_seqlens``, query grid = ``q.cu_seqlens``, compressed grid = ``cmp_k.cu_seqlens``).
 
@@ -82,8 +80,7 @@ class DeepSeekV4Metadata:
     reads the metadata built for its own, so no consumer checks another geometry's plan."""
 
     q: KernelFrame
-    """The query frame: the row's boundaries at one degree, this rank's chunks under context
-    parallelism, with ``seqused`` the per-document query count."""
+    """Local queries in kernel entries; global frame in the enclosing ZigZag entry."""
 
     swa_k: KernelFrame
     """The sliding-window keys' frame: the whole row at every degree, with ``seqused`` how far
@@ -105,12 +102,16 @@ class DeepSeekV4Metadata:
     """
 
     xchg: ExchangeMetadata | None = None
-    """The doc-chunk layout under context parallelism, ``None`` at one degree.
+    """The per-document layout's exchange under context parallelism, ``None`` at one degree.
 
     It carries the movement the key side applies, not the frames and not the positions: those are
     the same fields at every degree.  A consumer reads the stream through
     :func:`~torchtitan_npu.models.deepseek_v4.cp_attention.restore_key_stream`.
     """
+
+    head: "DeepSeekV4Metadata | None" = None
+    tail: "DeepSeekV4Metadata | None" = None
+    """Fixed ZigZag query entries; both absent for doc-chunk."""
 
     @classmethod
     def from_positions(cls, positions: torch.Tensor, ratio: int) -> Self:
@@ -172,61 +173,103 @@ class DeepSeekV4Metadata:
         )
 
     def rebuild_cp_metadata(self, permutation: torch.Tensor | None, *, build):
-        """This rank's metadata: the frames re-cut, then the AI_CPU metadata rebuilt for them.
+        """This rank's entry, dispatched by the layout the shard applied.
 
-        ``build`` takes the rank-local metadata and returns it with its operator outputs rebuilt;
-        it is the builder that owns them (the fused stack's, or a subclass's that adds its own),
-        and it is stated by the caller rather than looked up, because the hook is a staticmethod
-        -- as upstream declares it -- and so has no class to dispatch through.  It must therefore
-        be the caller's own builder: a backend that states a ``build_aicpu_metadata`` of its own
-        also overrides the hook that passes it, since nothing here dispatches through
-        ``type(metadata)``.
+        ``build`` rebuilds a rank-local entry's operator outputs; the caller states it because
+        the hook is a staticmethod and nothing here dispatches through ``type(metadata)``.
         """
+        # ``cp_shard_context`` refuses a transform that runs outside ``Decoder._cp_shard``, and
+        # that call site publishes a context only under context parallel: the mesh is never
+        # absent here.
+        from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_ZIGZAG_LAYOUT
         from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
             cp_shard_context,
         )
 
-        # ``cp_shard_context`` refuses a transform that runs outside ``Decoder._cp_shard``, and
-        # that call site publishes a context only under context parallel: the mesh is never
-        # absent here.
         context = cp_shard_context()
-        local = self.doc_chunk_metadata(
-            permutation=permutation,  # pyrefly: ignore [bad-argument-type]
+        assert permutation is not None, "per-document CP requires a token permutation"
+        local = self.per_doc_cp_metadata(
+            permutation=permutation,
             cp_size=context.cp_mesh.size(),
             cp_rank=context.cp_mesh.get_local_rank(),
+            zigzag=context.load_balancer == DOC_ZIGZAG_LAYOUT,
         )
-        return build(local)
+        if local.head is None:
+            return build(local)
+        return replace(local, head=build(local.head), tail=build(local.tail))
 
-    def doc_chunk_metadata(self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int) -> Self:
-        """This rank's metadata: the doc-chunk query frame, the row's KV frames and the movement.
+    def per_doc_cp_metadata(
+        self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int, zigzag: bool = False
+    ) -> Self:
+        """Per-document query frames and the shared flat-KV positions and exchange."""
+        num_chunks = 2 * cp_size if zigzag else cp_size
+        width = permutation.numel() // cp_size
+        if zigzag:
+            alignment = num_chunks * max(self.ratio, 1)
+            if torch.any(self.q.seqused % alignment):
+                raise ValueError(
+                    f"doc_zigzag ratio={self.ratio} requires document lengths divisible by {alignment}; "
+                    "set dataloader.per_doc_alignment to 2 * CP * max(compress_ratio)."
+                )
+        local = replace(self, position_k=self.position_k[:, cp_rank * width : (cp_rank + 1) * width])
+        if zigzag:
+            local = replace(
+                local,
+                head=local._query_chunk(num_chunks=num_chunks, chunk_index=cp_rank),
+                tail=local._query_chunk(num_chunks=num_chunks, chunk_index=num_chunks - cp_rank - 1),
+            )
+        else:
+            local = local._query_chunk(num_chunks=num_chunks, chunk_index=cp_rank)
+        return replace(local, xchg=ExchangeMetadata.from_permutation(permutation, cp_size=cp_size, cp_rank=cp_rank))
 
-        The frames and the movement are derived from the row's boundaries alone, so it crosses no
-        collective.  Each document is assumed to be a whole multiple of
-        ``cp_size * ratio`` -- the packing side pads for it -- so every prefix is a whole number
-        of chunks and every compressed prefix a whole number of groups.
+    def mark_dynamic(self) -> None:
+        """Mark batch-dependent leading dimensions so Dynamo does not specialize.
+
+        The frames, ``position_k`` and the exchange tables follow the packing; the arch22
+        workaround and the selector's forward record are marked when this stack carries them.
         """
-        cu_seqlens = self.q.cu_seqlens
-        ratio = self.ratio
-        chunk = (self.q.seqused // cp_size).to(torch.int32)
-        reach = ((cp_rank + 1) * chunk).to(torch.int32)
-        # The compressed axis is a property of the row, not of the degree: a geometry that pools
-        # keeps its pool grid here, and one that does not has no frame at either degree.
+        tensors: list[torch.Tensor] = [
+            self.q.cu_seqlens,
+            self.q.seqused,
+            self.swa_k.cu_seqlens,
+            self.swa_k.seqused,
+        ]
+        if self.cmp_k is not None:
+            tensors += [self.cmp_k.cu_seqlens, self.cmp_k.seqused]
+            if self.cmp_k.residual is not None:
+                tensors.append(self.cmp_k.residual)
+        workaround = getattr(self, "a3_workaround", None)
+        if workaround is not None:
+            tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
+        if self.xchg is not None:
+            tensors += [self.position_k, self.xchg.send_index]
+            if self.xchg.recv_index is not None:
+                tensors.append(self.xchg.recv_index)
+        aicpu = getattr(self, "aicpu_metadata", None)
+        lightning = getattr(aicpu, "lightning_indexer", None)
+        forward = getattr(lightning, "fwd", None)
+        if forward is not None:
+            tensors.append(forward)
+        for tensor in tensors:
+            torch._dynamo.maybe_mark_dynamic(tensor, 0)
+            # GraphTrainer's tracer reads the dim-0 annotation; the underscore name is the
+            # dynamo contract (torchtitan experiments/graph_trainer/dynamic_shapes.py).
+            setattr(tensor, "_dynamo_unbacked_indices", {0})  # noqa: B010
+
+    def _query_chunk(self, *, num_chunks: int, chunk_index: int) -> Self:
+        """One equal piece of every document, addressing the unchanged global KV grids."""
+        chunk = (self.q.seqused // num_chunks).to(torch.int32)
+        reach = (chunk_index + 1) * chunk
         cmp_k = None
         if self.cmp_k is not None:
             cmp_k = KernelFrame(
                 cu_seqlens=self.cmp_k.cu_seqlens,
-                seqused=(reach // ratio).to(torch.int32),
-                residual=None if ratio == 1 else (reach % ratio).to(torch.int32),
+                seqused=reach // self.ratio,
+                residual=None if self.ratio == 1 else reach % self.ratio,
             )
-        # The key stream this rank computes is the row's contiguous slice (the queries are the
-        # chunk rows), so its positions are that slice of the row's own positions.
-        flatten_len = permutation.numel() // cp_size
-        start = cp_rank * flatten_len
         return replace(
             self,
-            q=KernelFrame(cu_seqlens=(cu_seqlens // cp_size).to(torch.int32), seqused=chunk),
-            swa_k=KernelFrame(cu_seqlens=cu_seqlens.to(torch.int32), seqused=reach),
+            q=KernelFrame(cu_seqlens=self.q.cu_seqlens // num_chunks, seqused=chunk),
+            swa_k=KernelFrame(cu_seqlens=self.swa_k.cu_seqlens, seqused=reach),
             cmp_k=cmp_k,
-            position_k=self.position_k[:, start : start + flatten_len],
-            xchg=ExchangeMetadata.from_permutation(permutation, cp_size=cp_size, cp_rank=cp_rank),
         )

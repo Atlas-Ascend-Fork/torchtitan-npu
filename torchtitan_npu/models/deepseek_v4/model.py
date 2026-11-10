@@ -106,6 +106,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelConverter
+
+                ContextParallelConverter.Config().build().convert(self)
 
         # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4441
         # Temporary backport of the upstream DeepSeek-V4 sparse FLOPs
@@ -187,9 +191,9 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         layout is the permutation that shard shards by, so the depths land on the
         rows that predict them (a local slice, no communication).
 
-        The layout itself -- **chunk ``r`` of every document**, i.e.
-        ``--parallelism.context-parallel-load-balancer doc_chunk`` -- is the seam's:
-        the shard builds its balancer from the row and permutes the replicated row
+        The layout itself -- **a per-document token order**, named by
+        ``--parallelism.context-parallel-load-balancer`` (``doc_chunk`` or ``doc_zigzag``) -- is
+        the seam's: the shard builds its balancer from the row and permutes the replicated row
         before slicing, so no rank moves anything.  The depths ride the same shard,
         handed the same row's positions, so the two agree row for row by
         construction.  Without context parallel or without MTP depths nothing changes.

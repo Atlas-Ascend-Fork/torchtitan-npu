@@ -122,11 +122,8 @@ torchtitan_npu/override/<scope>/<target>/
   在其上只补四个算子的记录；`sparse_attn.asc` 桥接 SparseFlashMLA/SMLAG 的正反向，
   `lightning_indexer.asc` 桥接 `lightning_indexer`/`sparse_lightning_indexer_kl_loss_grad` 的正反向，
   几何（heads/head dim）是该 config 自己的必填字段、无默认值，由 override 参数一次写入，默认值即
-  V4-Flash 的发布形状。CP 下 `AscV4Metadata.prepare_cp_metadata` 调 metadata 自己的
-  `rebuild_cp_metadata(permutation, build=…)`：它从 `cp_shard_context()` 读 mesh、用
-  `doc_chunk_metadata` 把 metadata 换成本 rank 的 frames 与 `cp` 计划（输入已由模型的
-  `preprocess_inputs` 搬到 doc-chunk），再交给 `AscV4Metadata.build_aicpu_metadata` 按这些
-  frames 重建记录；参考契约的 hook 直接拒绝 CP。
+  V4-Flash 的发布形状。CP 下由 `prepare_cp_metadata` 重建本 rank 的 frames 与记录，见
+  [CP 切分原理](../developer_guides/context_parallel.md)。
 
 - MoE token dispatcher 的 `npu_moe_token_unpermute` 与 `npu_moe_re_routing` 在
   `torchtitan_npu/ops/ascendc/` 中以 `torch.library.custom_op` 做编译兼容封装，并提供 Fake 和

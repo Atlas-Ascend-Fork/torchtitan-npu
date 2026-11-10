@@ -222,7 +222,7 @@ def _cp_shard(
     if attention_metadata:
         # Upstream's loop, with the pinned stand-in for its ambient parallelism context published
         # around it (see ``attention_metadata``).
-        with cp_shard_context_set(cp_mesh=cp_mesh):
+        with cp_shard_context_set(cp_mesh=cp_mesh, load_balancer=layout):
             extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(
                 attention_metadata,
                 permutation=permutation,

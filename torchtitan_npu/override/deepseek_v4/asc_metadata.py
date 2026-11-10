@@ -42,7 +42,7 @@ quantization.
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar, Self
+from typing import Any, ClassVar, Self
 
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
@@ -209,8 +209,8 @@ class AscV4Metadata(DeepSeekV4Metadata):
     ) -> "AscV4Metadata":
         """This rank's frames and its AscendC AI_CPU metadata (upstream #4617).
 
-        The rank-local metadata comes from the pre-shard one with the static doc-chunk plan
-        (``DeepSeekV4Metadata.doc_chunk_metadata``); the AI_CPU operator outputs do not carry over,
+        The rank-local metadata comes from the pre-shard one with the per-document layout
+        (``DeepSeekV4Metadata.per_doc_cp_metadata``); the AI_CPU operator outputs do not carry over,
         because they describe the frames they were computed for, so they are rebuilt by the same
         builder that built the global ones.
 
@@ -218,42 +218,20 @@ class AscV4Metadata(DeepSeekV4Metadata):
         passes its own ``build=``): the hook names ``AscV4Metadata``'s builder explicitly, so a
         subclass that inherits this one rebuilds with the parent's builder, not its own.
         """
-        return attention_metadata.rebuild_cp_metadata(
+        local = attention_metadata.rebuild_cp_metadata(
             permutation,
             build=partial(AscV4Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
         )
+        # The rank-local entry is a new object: its frames, ``position_k`` slice and exchange
+        # tables are none the global build marked, so mark them here; ZigZag's ``head`` / ``tail``
+        # are marked by their own builders.
+        _mark_dynamic(local)
+        return local
 
 
-def _mark_dynamic(metadata: AscV4Metadata) -> None:
-    """Mark batch-dependent leading dimensions so Dynamo does not specialize."""
-    tensors: list[torch.Tensor] = [
-        metadata.q.cu_seqlens,
-        metadata.q.seqused,
-        metadata.swa_k.cu_seqlens,
-        metadata.swa_k.seqused,
-    ]
-    if metadata.cmp_k is not None:
-        tensors += [metadata.cmp_k.cu_seqlens, metadata.cmp_k.seqused]
-        if metadata.cmp_k.residual is not None:
-            tensors.append(metadata.cmp_k.residual)
-    if not _IS_A5:
-        workaround = metadata.a3_workaround
-        assert workaround is not None, "an arch22 metadata states the key workaround"
-        tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
-    if metadata.xchg is not None:
-        # The restore's scatter table moves with the slab width and the batch's document layout;
-        # ``position_k`` is the geometry's own field and is marked here with the rest of the
-        # tensors whose first dimension follows the batch.
-        tensors += [metadata.position_k, metadata.xchg.send_index]
-    if metadata.aicpu_metadata.lightning_indexer.fwd is not None:
-        tensors.append(metadata.aicpu_metadata.lightning_indexer.fwd)
-    for tensor in tensors:
-        torch._dynamo.maybe_mark_dynamic(tensor, 0)
-        # Written via setattr: "_dynamo_unbacked_indices" is the dynamo shape
-        # annotation the GraphTrainer tracer reads (torchtitan
-        # experiments/graph_trainer/dynamic_shapes.py); the underscore name is
-        # deliberate and must stay off the codecheck protected-member list.
-        setattr(tensor, "_dynamo_unbacked_indices", {0})  # noqa: B010
+def _mark_dynamic(metadata: Any) -> None:
+    """Mark the rank-local entry's batch-dependent dimensions; the metadata owns the rule."""
+    metadata.mark_dynamic()
 
 
 if AscSparseAttentionMetadata not in SUPPORTED_NODES:

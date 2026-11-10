@@ -32,7 +32,7 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import (
     tiny_v41_model,
 )
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT, DocChunkCPLoadBalancer
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT, DOC_ZIGZAG_LAYOUT, DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
@@ -527,7 +527,8 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     assert local.ratio == entry.ratio == 2
 
 
-def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
+@pytest.mark.parametrize("layout", [DOC_CHUNK_LAYOUT, DOC_ZIGZAG_LAYOUT], ids=["doc-chunk", "zigzag"])
+def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch, layout):
     """End to end: the framework slices the inputs and every geometry's entry follows them.
 
     The model does not shard its own inputs: ``prepare_context_parallel_input`` does, one
@@ -553,7 +554,7 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
         parallel_dims=cp_parallel_dims(cp_size, cp_rank),
         parallelism=SimpleNamespace(
             spmd_backend="partial_dtensor",
-            context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
+            context_parallel_load_balancer=layout,
             context_parallel_ptrr_mask_key=None,
         ),
     )
@@ -564,9 +565,11 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
     # module that produced them.
     assert extra["positions"].shape[-1] == slab
     held: list[int] = []
-    for start, end in pairwise(row_bounds.tolist()):
-        chunk = (end - start) // cp_size
-        held += range(start + cp_rank * chunk, start + (cp_rank + 1) * chunk)
+    pieces = (cp_rank,) if layout == DOC_CHUNK_LAYOUT else (cp_rank, 2 * cp_size - cp_rank - 1)
+    for piece in pieces:
+        for start, end in pairwise(row_bounds.tolist()):
+            chunk = (end - start) // (cp_size * len(pieces))
+            held += range(start + piece * chunk, start + (piece + 1) * chunk)
     held_rows = torch.tensor(held)
     documents = torch.bucketize(held_rows, row_bounds, right=True) - 1
     assert (held_rows - row_bounds[documents]).tolist() == extra["positions"].reshape(-1).tolist()
@@ -580,15 +583,21 @@ def test_the_seam_transforms_the_map_under_context_parallel(monkeypatch):
         assert port is AscV41SparseAttention.Config
         assert entry.ratio == ratio
         assert entry.xchg is not None
-        assert entry.q.cu_seqlens.tolist() == [0, 4, 12]
-        assert entry.swa_k.seqused.tolist() == [8, 16]
+        if layout == DOC_CHUNK_LAYOUT:
+            assert entry.q.cu_seqlens.tolist() == [0, 4, 12]
+            assert entry.swa_k.seqused.tolist() == [8, 16]
+        else:
+            head, tail = entry.head, entry.tail
+            assert head.q.cu_seqlens.tolist() == tail.q.cu_seqlens.tolist() == [0, 2, 6]
+            assert head.swa_k.seqused.tolist() == [4, 8]
+            assert tail.swa_k.seqused.tolist() == [6, 12]
     # One geometry has no compressed axis at all, the other two carry their own.
     assert metadata[(AscV41SparseAttention.Config, 0)].cmp_k is None
     assert metadata[(AscV41SparseAttention.Config, 1)].cmp_k.seqused.tolist() == [8, 16]
     assert metadata[(AscV41SparseAttention.Config, 2)].cmp_k.seqused.tolist() == [4, 8]
     # One build for the row and one rebuild for this rank's frames, per geometry.
-    assert len(state["smla_fwd"]) == 6
-    assert len(state["li"]) == 4
+    assert len(state["smla_fwd"]) == (6 if layout == DOC_CHUNK_LAYOUT else 9)
+    assert len(state["li"]) == (4 if layout == DOC_CHUNK_LAYOUT else 6)
 
 
 def test_the_override_factory_swaps_the_core_and_its_builder(monkeypatch):

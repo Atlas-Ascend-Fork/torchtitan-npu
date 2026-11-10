@@ -47,7 +47,35 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
             "CONFIG": "deepseek_v4_1_lora_multimodal_training",
         },
     )
-    return [text, multimodal]
+    zigzag = OverrideDefinitions(
+        test_name="dsv41_smla_zigzag_cp2",
+        test_descr="DeepSeek-V4.1 BF16 Full/Reindex/Reuse with per-document ZigZag CP2",
+        env_vars={
+            "MODULE": "torchtitan_npu.models.deepseek_v4_1",
+            "CONFIG": "deepseek_v4_1_stripped",
+        },
+        override_args=[(
+            "--override.imports",
+            "torchtitan_npu.override.common.rms_norm.asc",
+            "torchtitan_npu.override.common.rope.asc_complex",
+            "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
+            "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+            "--hf-assets-path=tests/assets/deepseek_v3",
+            "--training.steps=2", "--training.seq-len=2048", "--training.global-batch-size=1",
+            "--optimizer.name=AdamW",
+            "--debug.seed=42",
+            # No --debug.deterministic: SparseFlashMlaGrad's backward rejects deterministic
+            # mode in CANN 9.2.0; the numerics harness enables it where supported.
+            "--parallelism.context-parallel-degree=2",
+            "--parallelism.context-parallel-load-balancer=doc_zigzag",
+            "--parallelism.data-parallel-shard-degree=1", "--parallelism.expert-parallel-degree=1",
+            "--parallelism.spmd-backend=spmd_types", "--dataloader.per_doc_alignment=8",
+            "--checkpoint.no-enable",
+        )],
+        expected_steps=((1, 2),), ngpu=2, use_golden=False, check_loss=False,
+    )
+    return [text, multimodal, zigzag]
 
 
 def build_deepseek_v4_1_checkpoint_test_list(

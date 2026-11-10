@@ -134,7 +134,7 @@ class QuantV4Metadata(AscV4Metadata):
         ``rebuild_cp_metadata`` re-cuts the frames; this backend's builder then rebuilds every
         operator output, the selector's grid with its own operator.
         """
-        return attention_metadata.rebuild_cp_metadata(
+        local = attention_metadata.rebuild_cp_metadata(
             permutation,
             build=partial(
                 QuantV4Metadata.build_aicpu_metadata,
@@ -142,6 +142,11 @@ class QuantV4Metadata(AscV4Metadata):
                 quant_mode=attention_metadata.quant_mode,
             ),
         )
+        # The zigzag outer entry is not rebuilt by the builder: its frames, position_k slice and
+        # exchange tables are new objects the global build did not mark.  head/tail were marked by
+        # the fused builder they went through.
+        local.mark_dynamic()
+        return local
 
 
 if QuantV4Metadata not in SUPPORTED_NODES:

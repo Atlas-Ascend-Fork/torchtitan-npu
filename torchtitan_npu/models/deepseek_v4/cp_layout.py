@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DeepSeek-V4's context-parallel token layout: chunk ``r`` of every document.
+"""DeepSeek-V4's per-document CP layouts: contiguous chunks or balanced head/tail pairs.
 
 The layout is a property of this stack's attention contract: its rank-local frames are addressed
 per document chunk, so the shard has to hand rank ``r`` chunk ``r`` of each document.  It is a
@@ -27,6 +27,7 @@ from torchtitan_npu.patches.torchtitan.distributed.context_parallel import (
     register_layout,
 )
 
+DOC_ZIGZAG_LAYOUT = "doc_zigzag"
 DOC_CHUNK_LAYOUT = "doc_chunk"
 """The layout's name on ``--parallelism.context-parallel-load-balancer``.
 
@@ -36,7 +37,9 @@ the same boundaries, so the layout needs no exchange and no collective.
 
 __all__ = [
     "DOC_CHUNK_LAYOUT",
+    "DOC_ZIGZAG_LAYOUT",
     "DocChunkCPLoadBalancer",
+    "DocZigZagCPLoadBalancer",
     "PerDocCPLoadBalancer",
 ]
 
@@ -110,8 +113,28 @@ class DocChunkCPLoadBalancer(PerDocCPLoadBalancer):
         return torch.cat(self._document_chunks(self.cp_size), dim=1).reshape(-1).unsqueeze(0)
 
 
+class DocZigZagCPLoadBalancer(PerDocCPLoadBalancer):
+    """Per-document head/tail balancing, with all heads before all tails on each rank."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(PerDocCPLoadBalancer.Config):
+        pass
+
+    def generate_permutation(self) -> torch.Tensor:
+        num_chunks = 2 * self.cp_size
+        lengths = torch.diff(self.cu_seqlens)
+        if torch.any(lengths % num_chunks):
+            raise ValueError(
+                "doc_zigzag requires each document length to be divisible by 2 * CP; "
+                "set dataloader.per_doc_alignment to 2 * CP * max(compress_ratio)."
+            )
+        chunks = torch.cat(self._document_chunks(num_chunks), dim=1)
+        return torch.stack((chunks[: self.cp_size], chunks[self.cp_size :].flip(0)), dim=1).reshape(1, -1)
+
+
 # The shard finds a layout by the name the CLI flag carries, so the package that owns the
 # permutation registers it here, at import time -- exactly like ``@override``.  Without this call
 # ``build_load_balancer`` returns ``None`` and the shard silently falls back to the pinned
 # contiguous split, which is only observable as a numerics change at CP>1.
 register_layout(DOC_CHUNK_LAYOUT, DocChunkCPLoadBalancer)
+register_layout(DOC_ZIGZAG_LAYOUT, DocZigZagCPLoadBalancer)
