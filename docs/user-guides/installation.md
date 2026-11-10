@@ -6,7 +6,7 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
 
 | torchtitan-npu 版本 | torchtitan 分支 | PyTorch 版本 | torch_npu 版本 | CANN 版本 | Python 版本 | Triton Ascend |
 |---------------------|-----------------|--------------|----------------|-----------|-------------|---------------|
-| master | main | 2.14.0(daily) | 2.14.0(daily) | 9.2.0 | Python 3.12.x | 3.2.1 |
+| master | main | 2.14.0+cpu | 2.14.0 (release) | 9.3.0(1021) | Python 3.12.x | 3.2.1 |
 | v0.2.2-dev | v0.2.2 | 2.10.0 | 2.10.0 | 9.0.0 | Python 3.11.x | 3.2.1 |
 
 > [!NOTE]
@@ -58,14 +58,15 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
 ### 2. 下载 torchtitan-npu 源码
 
 
- ```shell
+```shell
 git clone https://gitcode.com/cann/torchtitan-npu.git
- ```
+cd torchtitan-npu
+git checkout master
+```
 
 ### 3. 安装 torchtitan-npu
 
 ```shell
-cd torchtitan-npu
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
