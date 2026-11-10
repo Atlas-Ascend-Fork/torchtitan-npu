@@ -217,11 +217,12 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
         ),
         _build_case(
             test_name="dsv4_golden_1rank",
-            test_descr="DeepSeek-V4 golden 1rank",
+            test_descr="DeepSeek-V4 golden 1rank Muon",
             ngpu=1,
             extra_args=(
                 "--training.steps=30",
                 "--lr-scheduler.total-steps=100",
+                "--optimizer.name=Muon",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
             ),
@@ -230,11 +231,12 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
         ),
         _build_case(
             test_name="dsv4_golden_ep2_fsdp2",
-            test_descr="DeepSeek-V4 golden ep2 fsdp2",
+            test_descr="DeepSeek-V4 golden ep2 fsdp2 Muon",
             ngpu=2,
             extra_args=(
                 "--training.steps=30",
                 "--lr-scheduler.total-steps=100",
+                "--optimizer.name=Muon",
                 "--parallelism.expert-parallel-degree=2",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",

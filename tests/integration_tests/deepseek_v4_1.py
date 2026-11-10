@@ -125,8 +125,11 @@ def build_deepseek_v4_1_quantized_test_list() -> list[OverrideDefinitions]:
 # reduced-width full-structure debug model (real 40-layer compression/source
 # layout, debug widths) and pins its deterministic loss trajectory in
 # tests/assets/losses/dsv41_golden_2p_ep2_fsdp2.txt (2 cards, so the CI smoke
-# pool can schedule it).  The 8-card shape stays available as a manual A/B
-# regression via run_train.sh; its anchor is intentionally not committed.
+# pool can schedule it).  The pinned optimizer is Muon: the Engram table keeps
+# SparseAdam through ``HostSparseOptimizersContainer``, the projections run
+# DistMuon, and the remaining parameters stay on AdamW.  The 8-card shape stays
+# available as a manual A/B regression via run_train.sh; its anchor is
+# intentionally not committed.
 GOLDEN_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rope.workaround",
@@ -173,11 +176,12 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                     "--lr-scheduler.decay-type=cosine",
                     "--lr-scheduler.decay-ratio=1.0",
                     "--lr-scheduler.min-lr-factor=0.01",
+                    "--optimizer.name=Muon",
                     "--checkpoint.no-enable",
                     "--metrics.disable-color-printing",
                 )
             ],
-            test_descr="DeepSeek-V4.1 golden debugmodel 2p fsdp2 ep2 exact loss",
+            test_descr="DeepSeek-V4.1 golden debugmodel 2p fsdp2 ep2 Muon exact loss",
             test_name="dsv41_golden_2p_ep2_fsdp2",
             ngpu=2,
             env_vars=GOLDEN_ENV,

@@ -58,9 +58,9 @@ python -m tests.integration_tests.run_tests \
 
 | Case 名称 | 对应模型 | 并行配置 | 卡数 (ngpu) | Check Loss | 核心校验点与说明 |
 | :--- | :--- | :--- | :---: | :---: | :--- |
-| **`dsv4_golden_1rank`** | DeepSeek-V4 | 1 Rank 参考配置 | 1 | **是** | 严格 Deterministic 模式，精确逐值比对参考 Loss |
-| **`dsv4_golden_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 | 2 | **是** | 分布式并行环境下的数值 Loss 精确比对 |
-| **`dsv41_golden_2p_ep2_fsdp2`** | DeepSeek-V4.1 | Golden recipe、EP2 + FSDP2、30 steps | 2 | **是** | V4.1 text debug model，30 步参考 Loss 精确逐值比对 |
+| **`dsv4_golden_1rank`** | DeepSeek-V4 | 1 Rank 参考配置、Muon | 1 | **是** | 严格 Deterministic 模式，精确逐值比对参考 Loss |
+| **`dsv4_golden_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2、Muon | 2 | **是** | 分布式并行环境下的数值 Loss 精确比对 |
+| **`dsv41_golden_2p_ep2_fsdp2`** | DeepSeek-V4.1 | Golden recipe、EP2 + FSDP2、Muon、30 steps | 2 | **是** | V4.1 text debug model，30 步参考 Loss 精确逐值比对 |
 | **`dsv4_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + AdamW NovaSwap | 2 | **动态比对** | 两阶段连续训练 vs 断点恢复训练，逐步比对 Loss 与 Grad Norm |
 | **`dsv4_lora_ep2_fsdp2`** | DeepSeek-V4 LoRA | EP2 + FSDP2，训练 LoRA A/B | 2 | 否 | 校验基座参数冻结、Adapter 权重更新及 PEFT 导出完整性 |
 | **`dsv41_lora_engram_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、AdamW | 2 | 否 | 校验基座与 Engram 冻结、adapter 更新及 PEFT 导出 |
