@@ -50,11 +50,13 @@ def _to_chunks(tensor: torch.Tensor, plan, *, group) -> torch.Tensor:
     from torch.distributed._functional_collectives import all_to_all_single
 
     moved = all_to_all_single(
-        tensor.squeeze(0)[plan.send_index],
-        output_split_sizes=plan.recv_split,
-        input_split_sizes=plan.send_split,
+        tensor.squeeze(0)[torch.argsort(plan.recv_index)],
+        output_split_sizes=plan.send_split,
+        input_split_sizes=plan.recv_split,
         group=group,
     )
+    if plan.send_index is not None:
+        moved = moved[torch.argsort(plan.send_index)]
     return moved.unsqueeze(0)
 
 
@@ -69,7 +71,11 @@ def _worker(rank: int, port: int) -> None:
         from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
         from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
+        from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressorMixin
+
         group = dist.group.WORLD
+        compressor = ContextParallelCompressorMixin()
+        compressor.group = group
         tokens = torch.arange(_ROW).reshape(1, -1) + 100
         positions = torch.cat([torch.arange(length) for length in _LENGTHS]).reshape(1, -1)
         labels = tokens + 1
@@ -81,8 +87,8 @@ def _worker(rank: int, port: int) -> None:
             .build(seq_len=_ROW, cp_size=_CP, attention_metadata=row)
             .generate_permutation()
         )
-        entry = row.per_doc_cp_metadata(permutation=permutation, cp_size=_CP, cp_rank=rank)
-        plan = entry.xchg
+        entry = row.per_doc_cp_metadata(permutation=permutation, cp_size=_CP, cp_rank=rank, window_size=128)
+        plan = entry.xchg.cmp
 
         # The frames the entry describes: chunk r of every document over the whole-row KV frame.
         chunk = torch.tensor([length // _CP for length in _LENGTHS], dtype=torch.int32)
@@ -100,13 +106,13 @@ def _worker(rank: int, port: int) -> None:
 
         # The restore is the exact inverse, its positions come from the entry, and its backward is
         # the reverse exchange.
-        assert torch.equal(plan.apply(moved, group=group), tokens[:, slab])
+        assert torch.equal(compressor._restore_flat_input(moved, plan), tokens[:, slab])
         # The key stream is the row's contiguous slice, so its positions are that slice of the
         # row's own positions -- the loader built them document-relative already.
         assert torch.equal(entry.position_k, positions[:, slab])
 
         x = (torch.randn(1, _SLAB, 3, dtype=torch.float64) + 10.0 * rank).requires_grad_()
-        slabbed = plan.apply(x, group=group)
+        slabbed = compressor._restore_flat_input(x, plan)
         weight = torch.arange(slabbed.numel(), dtype=torch.float64).reshape(slabbed.shape)
         (slabbed * weight).sum().backward()
         assert x.grad is not None

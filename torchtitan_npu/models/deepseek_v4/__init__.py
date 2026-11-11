@@ -23,7 +23,6 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -116,7 +115,6 @@ def _make_compressor_config(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
-        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
         param_init=_APE_INIT,
         wkv=Linear.Config(
             in_features=dim,

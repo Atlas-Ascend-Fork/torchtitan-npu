@@ -175,6 +175,7 @@ def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
     chunks = (doc_chunk_records(first), doc_chunk_records(second))
     return BatchChunkAscV4Metadata(
         ratio=metadata.ratio,
+        cu_seqlens=metadata.cu_seqlens,
         q=metadata.q,
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,

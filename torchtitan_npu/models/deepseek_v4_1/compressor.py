@@ -33,8 +33,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
-
 
 class Compressor(Module):
     """Pool ``compress_ratio`` tokens into one main-KV entry.
@@ -59,9 +57,6 @@ class Compressor(Module):
         super().__init__()
         self.compress_ratio = config.compress_ratio
         self.is_source = config.is_source
-        # The CP mesh: wired by the framework's ``Module.parallelize`` recursion, ``None`` at one
-        # degree.  A reusing layer never restores anything, so this is set before the early return.
-        self.group = None
         if not self.is_source:
             return
         if config.rope is None or config.wkv is None or config.norm is None:
@@ -74,11 +69,6 @@ class Compressor(Module):
             self.wgate = config.wgate.build()
         self.norm = config.norm.build()
         self.rope = config.rope.build()
-
-    def parallelize(self, parallel_dims) -> None:
-        """Take the CP mesh the framework hands down to every module."""
-        self.group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
 
     def forward(
         self,
@@ -111,10 +101,7 @@ class Compressor(Module):
         if not self.is_source:
             return cmp_k, None
 
-        if attention_metadata is not None:
-            # The pooling is the row's, so a source layer restores the stream onto this rank's
-            # window first (the identity at one degree); the caller hands over the chunks it holds.
-            x_BLD = restore_key_stream(attention_metadata.xchg, x_BLD, group=self.group)
+        del attention_metadata
 
         ratio = self.compress_ratio
         seqlen = x_BLD.size(1)

@@ -13,8 +13,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
-from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelAttentionMixin
 from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -276,10 +274,6 @@ class Attention(BaseAttention):
         self.norm_eps = cfg.norm_eps
         self.rope = cfg.rope.build()
 
-        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
-        # one degree, where the metadata carries no plan and nothing moves.
-        self.cp_group = None
-
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
         self.q_head_norm = cfg.q_head_norm.build()
@@ -296,26 +290,8 @@ class Attention(BaseAttention):
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
         self.inner_attention = cfg.inner_attention.build()
 
-    def parallelize(self, parallel_dims) -> None:
-        """Take the CP mesh the layer's key stream is restored on, then recurse.
-
-        The compressor and its carry exchange take the same mesh through their own
-        ``parallelize`` (the framework recurses into every child module), so nothing here wraps
-        them: their module paths, sharding and checkpoint entries stay as they are.
-        """
-        self.cp_group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
-
     def forward(self, x, attention_metadata, positions):
-        """The unified attention forward (CP and non-CP).
-
-        The input layout already put these rows on **this rank's per-document pieces** -- chunk
-        ``r`` under ``doc_chunk``, chunk ``r`` and its mirrored chunk under ``doc_zigzag`` -- so the
-        query side projects them as they arrive and never moves.  The key side projects, rotates
-        and pools the same rows -- every step is per token, so it commutes with the layout -- and
-        each consumer restores what it reads on its own: the compressor its pooling window, the
-        core this rank's swa window, whose sharding then gathers the whole row at its boundary.
-        """
+        """Project queries and SWA keys in input order; compressors own their input streams."""
         bsz, seqlen, _ = x.size()
         metadata = attention_metadata
 
@@ -328,16 +304,11 @@ class Attention(BaseAttention):
         # positions are the ones the input layout carried with these rows.
         q = self.rope(q, positions=positions)
 
-        # The key stream's own positions are the entry's: the input's at one degree, this rank's
-        # window under CP.  The queries rotate at the positions the input carried.
         position_k = metadata.position_k
 
-        # The swa projection + RoPE run on the rows the layout produced: RoPE is per token, so it
-        # commutes with the movement.  The restore then hands the core this rank's window, whose
-        # sharding gathers the rows to the whole row at the core's own boundary.
+        # RoPE is per token, so SWA keys retain the input's positions before any exchange.
         swa_k = self.kv_norm(self.wkv(x))
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = restore_key_stream(metadata.xchg, swa_k, group=self.cp_group)
 
         cmp_k = None
         topk_indices = topk_scores = None
@@ -360,7 +331,7 @@ class Attention(BaseAttention):
             cmp_k = self.compressor(
                 x,
                 position_k,
-                cu_seqlens=metadata.swa_k.cu_seqlens,
+                cu_seqlens=metadata.cu_seqlens,
                 attention_metadata=metadata,
             )
 
@@ -389,9 +360,3 @@ class Attention(BaseAttention):
         # arrived in: the residual and every other consumer are token-wise, and the loss is
         # taken against labels the same layout moved.
         return o
-
-
-class ContextParallelAttention(ContextParallelAttentionMixin, Attention):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Attention.Config):
-        pass

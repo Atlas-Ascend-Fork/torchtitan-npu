@@ -22,9 +22,8 @@ def _gather_worker(rank, rendezvous, kind):
     from torchtitan.protocols.module import Module
     from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
 
-    from torchtitan_npu.models.deepseek_v4.cp_attention import ExchangeMetadata
-    from torchtitan_npu.models.deepseek_v4.cp_dispatch import CPAttention, CPIndexer
-    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+    from torchtitan_npu.models.deepseek_v4.context_parallel import CPAttention, CPIndexer, ContextParallelCompressorMixin
+    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, FlattenMetadata
     from torchtitan_npu.patches.torchtitan.distributed.context_parallel import build_load_balancer
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
@@ -37,14 +36,24 @@ def _gather_worker(rank, rendezvous, kind):
         permutation = build_load_balancer(
             "doc_zigzag", seq_len=8, cp_size=2, attention_metadata=row
         ).generate_permutation()
-        plan = ExchangeMetadata.from_permutation(permutation, cp_size=2, cp_rank=rank)
-        key = plan.apply(source, group=dist.group.WORLD)
+        plan = FlattenMetadata.build(permutation, cp_size=2, cp_rank=rank)
+        compressor = ContextParallelCompressorMixin()
+        compressor.group = dist.group.WORLD
+        key = compressor._restore_flat_input(source, plan)
         torch.testing.assert_close(key.flatten(), torch.arange(rank * 4 + 1, rank * 4 + 5).float())
         weights = torch.ones(1, 4, 1, requires_grad=True)
         seen = []
 
         class PackedAttentionOracle(Module):
             def forward(self, q, swa_k, attn_sink, attention_metadata, **kwargs):
+                expected_keys = (
+                    ([1, 5], [2, 3, 4, 6, 7, 8]) if rank == 0
+                    else ([1, 2, 5, 6], [1, 2, 3, 5, 6, 7])
+                )[0 if attention_metadata.factor == 1 else 1]
+                torch.testing.assert_close(swa_k.flatten(), torch.tensor(expected_keys).float())
+                length = len(expected_keys) // 2
+                assert attention_metadata.swa_k.cu_seqlens.tolist() == [0, length, 2 * length]
+                swa_k = kwargs["cmp_k"]
                 seen.append(swa_k)
                 torch.testing.assert_close(kwargs["topk_indices"], q[..., 0].int())
                 torch.testing.assert_close(kwargs["topk_scores"], q[..., 0])
@@ -58,14 +67,21 @@ def _gather_worker(rank, rendezvous, kind):
                 return idx_q_BLHiDi[..., 0].int(), scores, candidates_BL1C
 
         inner = PackedAttentionOracle() if kind == "attention" else PackedIndexerOracle()
-        key_name = "swa_k" if kind == "attention" else "idx_k_BNDi"
+        key_name = "cmp_k" if kind == "attention" else "idx_k_BNDi"
         inner._sharding_config = ShardingConfig(
             in_src_shardings={key_name: SpmdLayout({MeshAxisName.CP: spmd.S(1)})},
             in_dst_shardings={key_name: SpmdLayout({MeshAxisName.CP: spmd.R})},
         )
         module = CPAttention(inner) if kind == "attention" else CPIndexer(inner)
-        module.parallelize(SimpleNamespace(spmd_backend="spmd_types"))
-        metadata = SimpleNamespace(head=SimpleNamespace(factor=1), tail=SimpleNamespace(factor=3))
+        module.parallelize(SimpleNamespace(spmd_backend="spmd_types", get_optional_mesh=lambda name: mesh))
+        frames = row.per_doc_cp_metadata(
+            permutation=permutation, cp_size=2, cp_rank=rank, window_size=3, zigzag=True,
+        )
+        metadata = SimpleNamespace(
+            head=SimpleNamespace(factor=1, swa_k=frames.head.swa_k),
+            tail=SimpleNamespace(factor=3, swa_k=frames.tail.swa_k),
+            xchg=frames.xchg,
+        )
         real_redistribute = framework.spmd_redistribute_per_axis
         with set_current_spmd_mesh(mesh), patch.object(
             framework, "spmd_redistribute_per_axis", wraps=real_redistribute
@@ -73,7 +89,7 @@ def _gather_worker(rank, rendezvous, kind):
             if kind == "attention":
                 scores = held.reshape(1, 4, 1).clone().requires_grad_()
                 output = module(
-                    q, key, torch.zeros(1), attention_metadata=metadata,
+                    q, source, torch.zeros(1), attention_metadata=metadata, cmp_k=key,
                     topk_indices=scores.detach().int(), topk_scores=scores,
                 )
             else:
@@ -114,4 +130,62 @@ def test_cp_dispatch_gathers_once_before_both_halves_and_reduces_shared_gradient
         nprocs=2,
         join=True,
         start_method="spawn",
+    )
+
+
+_WINDOW_CASES = {
+    "doc_chunk": ([8, 4], 2, 3, [([0, 1, 2, 3, 8, 9], None), ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11], None)]),
+    "doc_zigzag": ([12, 6], 3, 5, [
+        ([0, 1, 12], [6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]),
+        ([0, 1, 2, 3, 12, 13], [4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16]),
+        ([0, 1, 2, 3, 4, 5, 12, 13, 14], [2, 3, 4, 5, 6, 7, 12, 13, 14, 15]),
+    ]),
+}
+
+
+def _window_worker(rank, rendezvous, layout):
+    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
+    from torchtitan_npu.patches.torchtitan.distributed.context_parallel import build_load_balancer
+
+    lengths, degree, window, expected = _WINDOW_CASES[layout]
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=degree)
+    try:
+        positions = torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
+        row = DeepSeekV4Metadata.from_positions(positions, 1)
+        permutation = build_load_balancer(layout, seq_len=sum(lengths), cp_size=degree, attention_metadata=row).generate_permutation()
+        metadata = row.per_doc_cp_metadata(
+            permutation=permutation, cp_size=degree, cp_rank=rank, window_size=window, zigzag=layout == "doc_zigzag",
+        )
+        held = permutation.flatten().chunk(degree)[rank]
+        keys = (held + 1).double().reshape(1, -1, 1).requires_grad_()
+        from torchtitan.protocols.module import Module
+        from torchtitan_npu.models.deepseek_v4.context_parallel import CPAttention
+
+        attention = CPAttention(Module())
+        attention.group = dist.group.WORLD
+        head, tail = attention._exchange_window(keys, metadata.xchg.swa)
+        loss = head.square().sum() * (rank + 1)
+        if tail is not None:
+            loss = loss + tail.square().sum() * (rank + 4)
+        loss.backward()
+
+        torch.testing.assert_close(head.flatten(), torch.tensor(expected[rank][0]).double() + 1)
+        if tail is not None:
+            torch.testing.assert_close(tail.flatten(), torch.tensor(expected[rank][1]).double() + 1)
+        weights = torch.zeros(sum(lengths), dtype=torch.float64)
+        for peer, (front, back) in enumerate(expected):
+            weights[front] += peer + 1
+            if back is not None:
+                weights[back] += peer + 4
+        torch.testing.assert_close(keys.grad.flatten(), 2 * (held + 1) * weights[held], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
+@pytest.mark.parametrize("layout", ["doc_chunk", "doc_zigzag"])
+def test_swa_windows_exchange_prefixes_and_accumulate_owner_gradients(tmp_path, layout):
+    torch.multiprocessing.start_processes(
+        _window_worker, args=(f"file://{tmp_path / 'window'}", layout),
+        nprocs=_WINDOW_CASES[layout][1], join=True, start_method="spawn",
     )

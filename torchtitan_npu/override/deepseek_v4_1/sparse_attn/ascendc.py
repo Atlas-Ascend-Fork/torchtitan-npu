@@ -44,6 +44,7 @@ class AscV41Metadata(AscV4Metadata, DeepSeekV41Metadata):  # pyrefly: ignore [in
         """This rank's frames, rebuilt with this stack's coarse-indexer metadata."""
         local = attention_metadata.rebuild_cp_metadata(
             permutation,
+            window_size=attention_metadata.aicpu_metadata.geometry.window_size,
             build=partial(AscV41Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
         )
         # The rank-local entry is a new object: its frames, ``position_k`` slice and exchange

@@ -492,8 +492,9 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
     # (``q``), and how far those queries reach into each document (``swa_k``).
     assert local.q.cu_seqlens.tolist() == [0, 4, 10]
     assert local.q.seqused.tolist() == [4, 6]
-    assert local.swa_k.cu_seqlens.tolist() == ([0, 16, 40] if _IS_A5 else [0, 12, 30])
-    assert local.swa_k.seqused.tolist() == [12, 18]
+    assert local.cu_seqlens.tolist() == [0, 16, 40]
+    assert local.swa_k.cu_seqlens.tolist() == [0, 5, 12]
+    assert local.swa_k.seqused.tolist() == [5, 7]
     # The compressed axis is that reach at this geometry's own ratio -- not the row's frame,
     # and not a grid this rank divided for itself.
     assert local.cmp_k is not None
@@ -698,5 +699,5 @@ def _prepare_for_rank(attention_metadata, mesh, positions, *, cp_size: int = 2, 
         .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=attention_metadata)
         .generate_permutation()
     )
-    with cp_shard_context_set(cp_mesh=mesh):
+    with cp_shard_context_set(cp_mesh=mesh, load_balancer=DOC_CHUNK_LAYOUT):
         return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)

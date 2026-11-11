@@ -110,6 +110,7 @@ class QuantV4Metadata(AscV4Metadata):
         setattr(fwd, "_dynamo_unbacked_indices", {0})  # noqa: B010
         return cls(
             ratio=asc.ratio,
+            cu_seqlens=asc.cu_seqlens,
             position_k=asc.position_k,
             q=asc.q,
             swa_k=asc.swa_k,
@@ -136,6 +137,7 @@ class QuantV4Metadata(AscV4Metadata):
         """
         local = attention_metadata.rebuild_cp_metadata(
             permutation,
+            window_size=attention_metadata.aicpu_metadata.geometry.window_size,
             build=partial(
                 QuantV4Metadata.build_aicpu_metadata,
                 geometry=attention_metadata.aicpu_metadata.geometry,

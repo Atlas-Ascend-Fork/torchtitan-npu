@@ -76,7 +76,7 @@ def test_zigzag_covers_every_token_and_balances_causal_work(cp_size):
 
 @pytest.mark.parametrize("a5", [True, False], ids=["a5-seqused", "a3-prefix"])
 @pytest.mark.parametrize("ratio", [0, 4], ids=["swa", "csa"])
-def test_query_frames_preserve_global_kv_and_causal_positions(monkeypatch, a5, ratio):
+def test_query_frames_preserve_global_documents_and_local_swa_windows(monkeypatch, a5, ratio):
     monkeypatch.setattr(asc_metadata, "_IS_A5", a5)
     for rank in range(2):
         entry = _metadata(_port(ratio), cp_size=2, rank=rank)
@@ -85,20 +85,19 @@ def test_query_frames_preserve_global_kv_and_causal_positions(monkeypatch, a5, r
         head, tail = entry.head, entry.tail
         assert head.q.cu_seqlens.tolist() == tail.q.cu_seqlens.tolist() == [0, 8, 20, 24]
         for half, chunk in enumerate((head, tail)):
-            qpos = torch.cat(
-                [
-                    torch.arange(int(reach - length), int(reach))
-                    for length, reach in zip(chunk.q.seqused, chunk.swa_k.seqused, strict=True)
-                ]
-            )
-            assert torch.equal(qpos, _positions()[0, _held_tokens(2, rank)][half * 24 : (half + 1) * 24])
+            positions = _positions()[0, _held_tokens(2, rank)][half * 24 : (half + 1) * 24]
+            starts, ends = positions[[0, 8, 20]], positions[[7, 19, 23]] + 1
+            lengths = torch.tensor([8, 12, 4]) + starts.clamp(max=7)
+            expected_cu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+            assert chunk.cu_seqlens.tolist() == [0, 32, 80, 96]
+            assert torch.equal(chunk.swa_k.cu_seqlens, expected_cu)
+            assert torch.equal(chunk.swa_k.seqused, lengths)
             if a5:
-                assert chunk.swa_k.cu_seqlens.tolist() == [0, 32, 80, 96]
                 assert chunk.a3_workaround is None
             else:
-                assert torch.equal(torch.diff(chunk.swa_k.cu_seqlens), chunk.swa_k.seqused)
+                assert chunk.a3_workaround.swa_k_gather is None
             if ratio:
-                assert torch.equal(chunk.cmp_k.seqused * ratio, chunk.swa_k.seqused)
+                assert torch.equal(chunk.cmp_k.seqused * ratio, ends)
 
 
 @pytest.mark.parametrize("length", [512, 768], ids=["aligned-hca128", "misaligned-hca128"])

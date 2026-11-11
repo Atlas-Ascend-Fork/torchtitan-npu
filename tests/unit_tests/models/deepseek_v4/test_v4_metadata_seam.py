@@ -18,7 +18,8 @@ import torch
 
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelConverter
+from torchtitan_npu.models.deepseek_v4.cp_layout import DOC_CHUNK_LAYOUT, DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
 from torchtitan_npu.override import _IS_A5
@@ -249,7 +250,7 @@ def _prepare_for_rank(attention_metadata, positions, *, rank: int, cp_size: int 
         .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=attention_metadata)
         .generate_permutation()
     )
-    with cp_shard_context_set(cp_mesh=_FakeCPMesh(rank, cp_size)):
+    with cp_shard_context_set(cp_mesh=_FakeCPMesh(rank, cp_size), load_balancer=DOC_CHUNK_LAYOUT):
         return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=permutation)
 
 
@@ -281,10 +282,8 @@ def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
         assert metadata.cmp_k is not None
         assert torch.equal(metadata.q.cu_seqlens, (row // 2).to(torch.int32))
         assert torch.equal(metadata.q.seqused, chunk)
-        # The key frames are the ones the kernels read: the row itself where they honour
-        # ``seqused``, the reach where they anchor their mask at the frame's end.
-        expected_window = row if _IS_A5 else _prefix_of_reach
-        assert torch.equal(metadata.swa_k.cu_seqlens, expected_window)
+        # Both backends receive the compact SWA window; compressed KV stays global on A5.
+        assert torch.equal(metadata.swa_k.cu_seqlens, _prefix_of_reach)
         assert torch.equal(metadata.swa_k.seqused, (rank + 1) * chunk)
         expected_pool = (row // 4).to(torch.int32) if _IS_A5 else _prefix_of_reach // 4
         assert torch.equal(metadata.cmp_k.cu_seqlens, expected_pool)
@@ -292,28 +291,22 @@ def test_the_fused_cp_transform_rebuilds_rank_local_frames(dsv4, monkeypatch):
         assert metadata.ratio == 4
         assert metadata.aicpu_metadata.sparse_attn.fwd is not global_metadata.aicpu_metadata.sparse_attn.fwd
         assert metadata.aicpu_metadata.geometry == global_metadata.aicpu_metadata.geometry
-        assert metadata.xchg is not None and metadata.xchg.send_index is not None
+        assert metadata.xchg is not None
     # The restore is rank-dependent even though the row is.
     assert rank_metadata[0].position_k.tolist() != rank_metadata[1].position_k.tolist()
 
 
-def test_the_inner_attention_and_selector_own_the_cp_boundary():
-    """The core gathers its KV streams; the selector gathers the index keys it scores.
-
-    Both conversions are the V4.1 ``S(1) -> R`` pattern, declared by the modules the layer
-    calls directly (there is no wrapper between them any more).
-    """
-    config = _model_config((4,), ascendc=True)
+def test_cp_conversion_gathers_compressed_keys_and_keeps_swa_sharded():
+    config = ContextParallelConverter.Config().build().convert(_model_config((4,), ascendc=True))
     attention = config.layers[0].attention
     core_sharding = attention.inner_attention.sharding_config
     assert core_sharding is not None
     names = set(core_sharding.in_src_shardings)
     assert not names & {"idx_q_BLHiDi", "idx_k_BNDi", "idx_w_BLHi"}
     assert {"q", "swa_k", "cmp_k", "topk_indices", "topk_scores", "attn_sink"} <= names
-    # Positional forward args are (q, swa_k, attn_sink): the KV streams are gathered on the
-    # way in, so their destination placement is the whole row.
+    # CPAttention exchanges the SWA halo; compressed and index keys are gathered once.
     core_row = core_sharding.in_dst_shardings
-    assert core_row["swa_k"] != core_sharding.in_src_shardings["swa_k"]
+    assert core_row["swa_k"] == core_sharding.in_src_shardings["swa_k"]
     assert core_row["cmp_k"] != core_sharding.in_src_shardings["cmp_k"]
 
     inner_indexer_sharding = attention.indexer.inner_indexer.sharding_config
@@ -322,3 +315,21 @@ def test_the_inner_attention_and_selector_own_the_cp_boundary():
     assert (
         inner_indexer_sharding.in_dst_shardings["idx_k_BNDi"] != inner_indexer_sharding.in_src_shardings["idx_k_BNDi"]
     )
+
+
+@pytest.mark.parametrize("layout", ["headtail", None], ids=["pinned", "unset"])
+def test_a_layout_without_a_rank_local_form_is_refused(dsv4, layout):
+    """A pinned balancer permutes the row into halves these chunk frames cannot describe."""
+    positions = _positions_for((_WINDOW, _WINDOW // 2))
+    model = _model_config((1, 4), ascendc=True).build()
+    global_metadata = _entry(model, 4, positions)
+    permutation = (
+        DocChunkCPLoadBalancer.Config()
+        .build(seq_len=positions.numel(), cp_size=2, attention_metadata=global_metadata)
+        .generate_permutation()
+    )
+    with (
+        cp_shard_context_set(cp_mesh=_FakeCPMesh(0, 2), load_balancer=layout),
+        pytest.raises(ValueError, match="has no rank-local metadata"),
+    ):
+        type(global_metadata).prepare_cp_metadata(global_metadata, permutation=permutation)

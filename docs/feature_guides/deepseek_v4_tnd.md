@@ -37,7 +37,7 @@ USE_GOLDEN=0  # wrapper 里的默认测试组合：
         │      └─ DeepSeekV4Metadata（attention backend 的 config 每 microbatch 构建一次公共契约；
         │         AscendC 记录由 AscCompressedSparseInnerAttention.Config 一并注入）
         │
-        ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流；CP 下由 CarryExchange 提供 carry
+        ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流；CP 下由 CP compressor 补 carry
         │     负责「前一块 carry + prepend + 压缩 + 裁掉多出块」，输出本地压缩 chunk，由内核边界 all-gather 成整行
         │
         ├─ 默认内核（CompressedSparseInnerAttention）
@@ -65,19 +65,19 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 ## 压缩布局：DeepSeekV4Metadata
 
-[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `DeepSeekV4Metadata`（V4.1 形状：一个类、一组字段，CP / 非 CP 只有数值不同）。每个 microbatch 由 attention backend 自己的 config 构建一次（upstream PR #4897 的接缝）：`CompressedSparseInnerAttention.Config.build_attention_metadata` 从 `positions` 用 `DeepSeekV4Metadata.from_positions` 生成这个几何的行与折叠网格；融合路径的 `AscCompressedSparseInnerAttention.Config` 在其上按 `AicpuGeometry` 生成 AscendC 记录（LI record 也由它在同一入口构建）。参考契约的 `prepare_cp_metadata` 直接拒绝 CP；融合路径的 hook 用 `rebuild_cp_metadata` 重建本 rank 的 `q` / `swa_k` / `cmp_k` frame 与 `xchg` 交换表，细节见 [CP 切分原理](../developer_guides/context_parallel.md)。`Decoder` 每个 microbatch 为每个几何构建一次，供所有同几何 DSA 层共享：
+[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `DeepSeekV4Metadata`（V4.1 形状：一个类、一组字段，CP / 非 CP 只有数值不同）。每个 microbatch 由 attention backend 自己的 config 构建一次（upstream PR #4897 的接缝）：`CompressedSparseInnerAttention.Config.build_attention_metadata` 从 `positions` 用 `DeepSeekV4Metadata.from_positions` 生成这个几何的行与折叠网格；融合路径的 `AscCompressedSparseInnerAttention.Config` 在其上按 `AicpuGeometry` 生成 AscendC 记录（LI record 也由它在同一入口构建）。参考契约的 `prepare_cp_metadata` 直接拒绝 CP；融合路径的 hook 用 `rebuild_cp_metadata` 重建本 rank 的 `q` / `swa_k` / `cmp_k` frame 与 `xchg.cmp` 交换表，细节见 [CP 切分原理](../developer_guides/context_parallel.md)。`Decoder` 每个 microbatch 为每个几何构建一次，供所有同几何 DSA 层共享：
 
 - `ratio`：这个 entry 的压缩比（0、1、2、4、128 之一；0 表示只有滑窗、没有压缩轴）；每个 consumer 都按它寻址。
-- `q` / `swa_k` / `cmp_k`：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk，`swa_k` / `cmp_k` 是整行，`seqused` 是本 rank 的 reach；非 CP 下三者都退化为边界差。没有 `cu_seq_q` / `cu_seq_k` 别名：用哪个 frame 就读哪个网格——行网格 `swa_k.cu_seqlens`、查询网格 `q.cu_seqlens`、压缩网格 `cmp_k.cu_seqlens`，`ratio == 1` 的 key 网格就是 `swa_k.cu_seqlens`。
+- `cu_seqlens` 保存全局文档边界；`q` / `swa_k` / `cmp_k` 各自描述实际操作数。CP 下 query 按文档切分，SWA 使用局部窗口，压缩 KV 保持整行并由 `seqused` 表达可见前缀，详见 [CP 切分原理](../developer_guides/context_parallel.md)。
 - `position_k`：key 流自己的文档内位置（纯算术，零通信）。degree=1 时就是输入的 `positions`，CP 下是本 rank slab 的——消费者的 RoPE 读它，不自己推、也不需要知道流被搬过。
-- `xchg`（`ExchangeMetadata`）：只有 CP 下存在，带 `send_index` / `send_split` / `recv_split`，即 KV 侧恢复回 flatten 段的移动（`apply`）；恢复后流自己的位置由 entry 的 `position_k` 承载。
+- `xchg.cmp`（`FlattenMetadata`）：只有 CP 下存在，带 `send_index` / `send_split` / `recv_split`，即 KV 侧恢复回 flatten 段的移动（`apply`）；恢复后流自己的位置由 entry 的 `position_k` 承载。
 融合注意力在 CP=1 时支持 `local_batch_size > 1`，输入布局按批展平、输出保留 `[B, S]`；CP>1 暂不支持多 batch。参考选择器仍仅支持 MBS1。
 - `aicpu_metadata`（`AscV4Metadata`）：只有融合 entry 才有，按 kernel 分组保存 `sparse_attn.fwd/bwd` 与 `lightning_indexer.fwd/bwd`（arch22 上 `lightning_indexer.fwd` 为 `None`：该 SoC 的 selector 自己算调度、按 `metadata=None` 调用；其余三条照建）；模型目录的 `DeepSeekV4Metadata` 不携带这些张量。
 - `a3_workaround`（`AscV4Metadata`，`override/a3_workaround.py`）：arch22 的融合内核按 key frame 的**末端**对齐 mask 且不读 key 侧 `seqused`，所以 reach 只是文档前缀的 rank 要把两路 key 换成 reach 自己写成的帧并压行；两个流各带一个可微 `index_select`。arch35 不建这个字段。
 
 压缩器没有自己的 metadata 字段：输入为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍。公共入口把整批展平成一条 `[1, B * L, D]` 打包流，完成压缩和 RoPE 后还原为 `[B, L // ratio, D]`。每行 positions 从 0 开始，`DeepSeekV4Metadata.from_positions` 据此把行首加入整批 `cu_seq_q`，使 ratio-4 的重叠不会跨行借 token。
 
-CP 的重叠 carry 在 `models/deepseek_v4/cp_compressor.CarryExchange` 里，是压缩器的子模块：`Compressor.forward` 内部拿到增强流（`CarryStream`：`x` / `positions` / `cu_seqlens` / `trim`），以 keyword 参数 `cu_seqlens` 传给同一个压缩器实例的实现，最后按 `trim` 裁掉 carry 输出块；调用方看不到这一步。融合实现的 `_state_inputs` 在内部按流的形状符号构造 kernel 的零 tiling 表。`varlen` / `plan` / `CompressedBlockLayout` / `CompressorFrames` / `window` 字段都已删除。
+CP 的重叠 carry 在 `models/deepseek_v4/context_parallel.ContextParallelCompressor` 的 `_prepare_input` 中：CP compressor 得到增强流（`CompressorInput`：`x` / `positions` / `cu_seqlens` / `trim`），以 keyword 参数 `cu_seqlens` 传给同一个压缩器实例的实现，最后按 `trim` 裁掉 carry 输出块；调用方看不到这一步。融合实现的 `_state_inputs` 在内部按流的形状符号构造 kernel 的零 tiling 表。`varlen` / `plan` / `CompressedBlockLayout` / `CompressorFrames` / `window` 字段都已删除。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
 
@@ -118,7 +118,7 @@ cmp_k.residual  = [0, 0]        # 对齐后恒 0；CP frame 的 residual 按 cp*
 
 CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `reach` 是 ratio 的整数倍，因此 residual 恒 0，内核不会遇到半块前缀。
 
-- `r=1`：不生成压缩 KV，仅执行原始 KV 的滑窗注意力。该几何没有压缩 frame（`cmp_k is None`），key 网格就是行网格 `swa_k.cu_seqlens`；融合 entry 仍生成对应的 `aicpu_metadata` 记录，融合算子使用 `has_cmp_kv=False`。
+- `r=1`：不生成压缩 KV，仅执行原始 KV 的滑窗注意力。该几何没有压缩 frame（`cmp_k is None`），key 网格取 `swa_k.cu_seqlens`：非 CP 时它就是行网格，CP 下是本 rank 的窗口网格；融合 entry 仍生成对应的 `aicpu_metadata` 记录，融合算子使用 `has_cmp_kv=False`。
 - `r=4`（CSA）：启用重叠压缩和 InnerIndexer；前驱块必须属于同一文档（`overlap_valid`）。
 - `r=128`（HCA）：生成连续压缩 KV，不执行 InnerIndexer TopK。
 
@@ -136,7 +136,7 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 [`sparse_attn/ascendc.py`](../../torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py) 中的 `AscCompressedSparseInnerAttention` 执行以下步骤：
 
 1. 校验模型输入是 `AscV4Metadata`，读这一层的 `q` / `swa_k` / `cmp_k` frame。
-2. query 转 TND；swa_k / cmp_k 是整行（CP 下由 wrapper 的 `S(1) -> R` 声明式 all-gather 得到），直接转 TND。
+2. query 转 TND；`cmp_k` 是整行（CP 下由 converter 声明 `S(1) -> R` 的 all-gather），`swa_k` 是本 rank 的窗口（CP 下由 `CPAttention` 内部交换缺失前缀后组装），两者都直接转 TND。
 3. indexer 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、可用槽位在前、`-1` 补齐在尾——端口保留内核给出的顺序，不重排；后者是这些槽位上 indexer 自己的分数，未使用槽为 `-inf`）。
 4. 调用 SparseFlashMLA；`_SparseMLA` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把算子旁路产出的 marginal `p`（`reduceG(softmax)/G`，`softmax_scale` 已在其中）交给这一层的 `IndexerLoss`：**日志值**用把 `-1` 槽清零后的副本算出并累加（`Z` 只统计可用支撑），而写到 `topk_scores` 梯度上的是**原样**的 `p` 乘 `coeff / 本步 token 数`——未使用槽位保留算子 tiling 的残留值，因为 indexer 的内核遇到第一个 `-1` 就停、从不读那些位置。`lightning_indexer.asc` 的 `_InnerIndexerTND.backward` 不再做任何归一化，直接把该梯度交给 `sparse_lightning_indexer_kl_loss_grad`。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
 
@@ -145,7 +145,7 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 | 参数 | 来源 |
 | --- | --- |
 | `cu_seqlens_q` / `seqused_q` | `metadata.q`（CP 下是 chunk 前缀和；非 CP 是整行） |
-| `cu_seqlens_ori_kv` / `seqused_ori_kv` | `metadata.swa_k`（CP 下整行，`seqused` 是 reach） |
+| `cu_seqlens_ori_kv` / `seqused_ori_kv` | `metadata.swa_k`（CP 下是本 rank 的局部窗口，`seqused` 是每个窗口的完整长度；非 CP 时窗口即整行） |
 | `cu_seqlens_cmp_kv` / `seqused_cmp_kv` / `cmp_residual_kv` | `metadata.cmp_k` |
 | `layout_q` / `layout_kv` | 固定为 `TND` |
 | 四个 `*_metadata` 张量 | metadata 的 `asc`（融合 backend 的 config 在 metadata 边界预计算；CP 下按 rank-local frame 重建） |
@@ -156,7 +156,7 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 | --- | --- |
 | `positions` | 必须提供 `[B, S]`，且每条序列从 0 连续递增 |
 | Padding | varlen 流必须覆盖本 rank 的全部 `B * S` 个 token，metadata 不表达 padding token |
-| Context Parallel | 支持（AscendC 融合路径，CLI 指定 `NGPU=2 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --parallelism.context-parallel-degree 2 --parallelism.spmd-backend spmd_types --parallelism.context-parallel-load-balancer doc_chunk --dataloader.per_doc_alignment 256`）；**静态 doc-chunk 布局**：`cp_shard` 在切之前按 `DocChunkCPLoadBalancer.generate_permutation()` 重排整行（零通信），所以输入（token / positions / labels / MTP 深度）一次就是「每篇文档的第 r 个 chunk」，本层 KV 侧再用 `xchg` 恢复到 flatten 段，KV/压缩 KV 整行；布局在 `models/deepseek_v4/cp_layout.py`，还原在 `models/deepseek_v4/cp_attention.py`（`ExchangeMetadata.from_permutation` / `apply`），两栈共用；ratio-4 carry 仍在 `models/deepseek_v4/cp_compressor.py` 的 `CarryExchange`（压缩器本身 CP-agnostic） |
+| Context Parallel | 支持（AscendC 融合路径，CLI 指定 `NGPU=2 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --parallelism.context-parallel-degree 2 --parallelism.spmd-backend spmd_types --parallelism.context-parallel-load-balancer doc_chunk --dataloader.per_doc_alignment 256`）；**静态 doc-chunk 布局**：`cp_shard` 在切之前按 `DocChunkCPLoadBalancer.generate_permutation()` 重排整行（零通信），所以输入（token / positions / labels / MTP 深度）一次就是「每篇文档的第 r 个 chunk」，本层 KV 侧再用 `xchg.cmp` 恢复到 flatten 段，压缩 KV 整行，SWA 仅交换窗口前缀；布局在 `models/deepseek_v4/cp_layout.py`，路由在 `metadata.py`，平坦化和 ratio-4 carry 由 `context_parallel.py` 的 CP compressor 执行（普通压缩器保持 CP-agnostic） |
 | Tensor Parallel | DSA 路径固定 TP=1（indexer score 对 head 维求和），TP 方案待 CP 之后另行设计 |
 | 空压缩流 | doc-packing 场景要求每条序列至少产生一个完整压缩块；融合路径在 metadata 边界对 `ratio > 1` 且无完整块直接报错（AscendC CSA/HCA 不接受空 `cmp_kv`） |
 | 运行环境 | 需要 `torch_npu`、CANN、HCCL、Ascend NPU，以及匹配的 `cann_ops_transformer` |

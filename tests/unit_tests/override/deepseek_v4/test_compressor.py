@@ -7,7 +7,7 @@
 
 The fused compressor is CP-agnostic: it compresses the local stream it is handed, addressed by
 that stream's own ``cu_seqlens``.  Under context parallelism the ratio-4 overlap's carry is
-``CarryExchange``'s job, so the CP cases here compose the exchange with the same kernel module
+``ContextParallelCompressor``'s job, so the CP cases here compose the exchange with the same kernel module
 and compare each rank's kept blocks with the whole row's pool.
 """
 
@@ -27,7 +27,7 @@ from torchtitan_npu.models.deepseek_v4.compressor import (
     Compressor,
     CompressorImplementation,
 )
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressor
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
@@ -154,13 +154,17 @@ def compressor_factory(monkeypatch):
         scoped.setitem(sys.modules, "cann_ops_transformer.ops.compressor", fake_module)
         torch.manual_seed(93)
 
-        def build(ratio, indexer=False):
+        def build(ratio, indexer=False, *, cp=False):
             cfg = _debugmodel()
             apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.asc"]), cfg)
             attention = cfg.layers[2 if ratio == 4 else 3].attention
             compressor_cfg = attention.indexer.compressor if indexer else attention.compressor
             compressor_cfg.wkv.in_features = 1024
             compressor_cfg.wgate.in_features = 1024
+            if cp:
+                from torchtitan.config import derive
+
+                compressor_cfg = derive(compressor_cfg, ContextParallelCompressor.Config)
             module = compressor_cfg.build()
             assert isinstance(module.implementation, ascendc.AscCompressor)
             module.init_states(buffer_device=torch.device("cpu"))
@@ -337,7 +341,7 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
     own.  The fake kernel is the same per-document pool the unsharded tests use, so any
     difference is the CP framing itself.
     """
-    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
+    from torchtitan_npu.models.deepseek_v4 import context_parallel as carry_module
 
     cp_size = 4
     total = 16 * ratio
@@ -346,7 +350,7 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
     positions = _positions(boundaries)
     slab = total // cp_size
 
-    module = compressor_factory(ratio, indexer).float()
+    module = compressor_factory(ratio, indexer, cp=True).float()
     reference = copy.deepcopy(module)
     generator = torch.Generator().manual_seed(42)
     x = (torch.randn(total, module.wkv.in_features, generator=generator) * 0.1).requires_grad_()
@@ -398,15 +402,14 @@ def test_compressor_cp_carry_trim_matches_the_global_pool(compressor_factory, mo
     losses, expected_losses = [], []
     for rank in range(cp_size):
         current[0] = rank
-        exchange = CarryExchange(CarryExchange.Config(ratio=ratio))
-        exchange.group = _FakeMesh(rank, cp_size)
-        carry = exchange(
+        module.group = _FakeMesh(rank, cp_size)
+        stream_x, stream_positions, bounds, trim = module._prepare_input(
             shards[rank : rank + 1],
             positions[..., rank * slab : (rank + 1) * slab],
             boundaries,
         )
-        pooled = module(carry.x, carry.positions, cu_seqlens=carry.cu_seqlens)
-        pooled = pooled.narrow(1, carry.trim, pooled.size(1) - carry.trim)
+        pooled = module(stream_x, stream_positions, cu_seqlens=bounds)
+        pooled = pooled.narrow(1, trim, pooled.size(1) - trim)
         actual = pooled.squeeze(0)
         expected = global_expected[rank * (slab // ratio) : (rank + 1) * (slab // ratio)]
         # The CP segments and full documents use different CPU GEMM batch shapes.

@@ -33,7 +33,7 @@ per pair of kernels, one field per direction::
     metadata and proof for this rank.
 
 The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
-(``models/deepseek_v4/cp_compressor.CarryExchange``), which builds the augmented
+(``models/deepseek_v4/context_parallel.ContextParallelCompressor``), which builds the augmented
 boundaries and the kernel's state table at the call site and passes them as arguments.  The
 quantized indexer is another backend: it owns a metadata class of its own (a subclass of this
 one) and rebuilds the indexer group with its own contract.  Nothing here knows about
@@ -188,6 +188,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
         )
         result = cls(
             ratio=ratio,
+            cu_seqlens=metadata.cu_seqlens,
             q=q,
             swa_k=swa_k,
             cmp_k=cmp_k,
@@ -220,6 +221,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
         """
         local = attention_metadata.rebuild_cp_metadata(
             permutation,
+            window_size=attention_metadata.aicpu_metadata.geometry.window_size,
             build=partial(AscV4Metadata.build_aicpu_metadata, geometry=attention_metadata.aicpu_metadata.geometry),
         )
         # The rank-local entry is a new object: its frames, ``position_k`` slice and exchange

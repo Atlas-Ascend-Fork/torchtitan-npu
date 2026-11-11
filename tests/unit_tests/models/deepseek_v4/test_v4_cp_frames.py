@@ -8,7 +8,7 @@
 The queries are chunk ``r`` of every document while the KV streams stay the whole row; the
 frames' ``seqused`` is what limits a rank's view.  The compressor is CP-agnostic, so the
 ratio-4 overlap's carry -- the predecessor's last block, prepended and trimmed -- is applied by
-``CarryExchange`` beside it, and the two halves of this file pin those two contracts: the frames
+``ContextParallelCompressor`` beside it, and the two halves of this file pin those two contracts: the frames
 the kernels grid, and the carry that makes a slab compress like the row.
 
 Neither key stream can stay the whole row under context parallelism: an arch22 fused kernel
@@ -27,7 +27,7 @@ from torch import nn
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
+from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressor
 from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
@@ -77,7 +77,7 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _
         .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
         .generate_permutation()
     )
-    local = row.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+    local = row.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank, window_size=128)
     return AscV4Metadata.build_aicpu_metadata(local, geometry=_GEOMETRY)
 
 
@@ -141,10 +141,8 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     chunk = _lengths(bounds) // cp_size
     reach = (cp_rank + 1) * chunk
     entry = _masks(bounds, cp_size, cp_rank, ratio=ratio)
-    # The row never becomes a rank-local grid: the KV side stays the whole row, which the entry's
-    # own boundaries state.  The key frames are the frames the kernels are addressed with: the row
-    # itself where they read ``seqused``, the reach where they anchor their mask at the frame's end.
-    assert torch.equal(entry.swa_k.cu_seqlens, _kernel_grid(reach, row))
+    assert torch.equal(entry.cu_seqlens, row)
+    assert torch.equal(entry.swa_k.cu_seqlens, torch.cat((reach.new_zeros(1), reach.cumsum(0))))
     assert torch.equal(entry.q.cu_seqlens, (row // cp_size).to(torch.int32))
     assert torch.equal(entry.q.seqused, chunk)
     assert torch.equal(entry.swa_k.seqused, reach)
@@ -165,16 +163,7 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
         if ratio > 1:
             assert _gather_of(entry, "cmp_k") is None
     else:
-        starts = row[:-1].to(torch.int64)
-        assert torch.equal(
-            _gather_of(entry, "swa_k"),
-            torch.cat(
-                [
-                    torch.arange(int(start), int(start) + int(length))
-                    for start, length in zip(starts, reach, strict=True)
-                ]
-            ),
-        )
+        assert _gather_of(entry, "swa_k") is None
         if ratio > 0:
             pool_starts = (row // ratio)[:-1].to(torch.int64)
             assert torch.equal(
@@ -214,7 +203,7 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
     # The entry keeps the frames its kernels read: arch35 states the whole row, arch22 hands the
     # kernels this rank's reach as the frame (the branch below pins both).
     assert entry.cmp_k.cu_seqlens.tolist() == ([0, 8, 12] if _IS_A5 else [0, 4, 6])
-    assert entry.swa_k.cu_seqlens.tolist() == ([0, 32, 48] if _IS_A5 else [0, 16, 24])
+    assert entry.swa_k.cu_seqlens.tolist() == [0, 16, 24]
 
     # The pool the selector reads is each document's prefix, in document order, and the sliding
     # window is this rank's token prefix -- both stated by the entry, both applied to the rows.
@@ -225,11 +214,11 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
         # arch35 reads ``seqused`` itself: the frames stay the row's and nothing is compacted.
         assert entry.a3_workaround is None
         assert entry.cmp_k.cu_seqlens.tolist() == [0, 8, 12]
-        assert entry.swa_k.cu_seqlens.tolist() == [0, 32, 48]
+        assert entry.swa_k.cu_seqlens.tolist() == [0, 16, 24]
     else:
         # arch22 is handed the reach as the frame, and the rows are compacted onto it.
         assert _gather_of(entry, "cmp_k").tolist() == [0, 1, 2, 3, 8, 9]
-        assert _gather_of(entry, "swa_k").tolist() == [*range(16), *range(32, 40)]
+        assert _gather_of(entry, "swa_k") is None
         assert entry.cmp_k.cu_seqlens.tolist() == [0, 4, 6]
         assert entry.swa_k.cu_seqlens.tolist() == [0, 16, 24]
 
@@ -238,7 +227,7 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
     # ``seqused``.  Only SLIKG's and the attention's are launched here: arch22 builds no selector
     # *forward* record, and this CPU run is an arch22 one.
     pool_grid = [0, 8, 12] if _IS_A5 else [0, 4, 6]
-    token_grid = [0, 32, 48] if _IS_A5 else [0, 16, 24]
+    token_grid = [0, 16, 24]
     slig_calls = [call for call in dsv4.cann_ops.calls if call[0] == "sparse_lightning_indexer_kl_loss_grad_metadata"]
     assert slig_calls
     assert slig_calls[-1][2]["cu_seqlens_k"].tolist() == pool_grid
@@ -255,7 +244,7 @@ def test_the_selector_is_handed_this_ranks_prefix_pool(dsv4):
 
 
 # ---------------------------------------------------------------------------
-# The CP carry: CarryExchange outside the compressor
+# The CP carry: ContextParallelCompressor outside the compressor
 # ---------------------------------------------------------------------------
 
 
@@ -287,13 +276,12 @@ class _Norm(nn.Module):
 def _compressor(ratio: int = _RATIO) -> Compressor:
     torch.manual_seed(7)
     coff = 2 if ratio == 4 else 1
-    compressor = Compressor(
-        Compressor.Config(
+    compressor = ContextParallelCompressor(
+        ContextParallelCompressor.Config(
             rope=_Build(_IdentityRoPE),
             head_dim=_HEAD_DIM,
             rope_head_dim=_ROPE_HEAD_DIM,
             compress_ratio=ratio,
-            carry_exchange=CarryExchange.Config(ratio=ratio),
             wkv=_Build(lambda: nn.Linear(_DIM, coff * _HEAD_DIM, bias=False)),
             wgate=_Build(lambda: nn.Linear(_DIM, coff * _HEAD_DIM, bias=False)),
             norm=_Build(lambda: _Norm(_HEAD_DIM)),
@@ -303,12 +291,12 @@ def _compressor(ratio: int = _RATIO) -> Compressor:
     return compressor
 
 
-def _carry(module: Compressor, exchange: CarryExchange, x, positions, cu_seqlens):
+def _carry(module, x, positions, cu_seqlens):
     """The call site's composition: exchange -> compress -> trim."""
-    carry = exchange(x, positions, cu_seqlens)
-    out = module(carry.x, carry.positions, cu_seqlens=carry.cu_seqlens)
-    if carry.trim:
-        out = out.narrow(1, carry.trim, out.size(1) - carry.trim)
+    stream_x, stream_positions, bounds, trim = module._prepare_input(x, positions, cu_seqlens)
+    out = module(stream_x, stream_positions, cu_seqlens=bounds)
+    if trim:
+        out = out.narrow(1, trim, out.size(1) - trim)
     return out
 
 
@@ -334,7 +322,7 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     its own, the ones starting inside a document merge it into that document's first segment.
     Both cases must reproduce the global pool, which is what pins the merge rule.
     """
-    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
+    from torchtitan_npu.models.deepseek_v4 import context_parallel as carry_module
 
     ratio = _RATIO
     total = 16 * ratio
@@ -368,13 +356,11 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
     monkeypatch.setattr(carry_module, "all_to_all_single", fake_all_to_all)
 
     for rank in range(cp_size):
-        exchange = CarryExchange(CarryExchange.Config(ratio=ratio))
-        exchange.group = _FakeMesh(rank, cp_size)
+        module.group = _FakeMesh(rank, cp_size)
         first = rank * slab
         with torch.no_grad():
             local = _carry(
                 module,
-                exchange,
                 x[:, first : first + slab, :],
                 positions[..., first : first + slab],
                 cu,
@@ -386,7 +372,7 @@ def test_the_carry_reproduces_the_whole_row_pool(cp_size, monkeypatch):
 
 def test_the_rank_that_starts_the_row_carries_nothing(monkeypatch):
     """Rank 0 still enters the collective, but prepends nothing."""
-    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
+    from torchtitan_npu.models.deepseek_v4 import context_parallel as carry_module
 
     calls = []
 
@@ -398,13 +384,12 @@ def test_the_rank_that_starts_the_row_carries_nothing(monkeypatch):
 
     monkeypatch.setattr(carry_module, "all_to_all_single", fake_all_to_all)
     module = _compressor()
-    exchange = CarryExchange(CarryExchange.Config(ratio=_RATIO))
-    exchange.group = _FakeMesh(0, 2)
+    module.group = _FakeMesh(0, 2)
     cu = torch.tensor([0, 16, 32], dtype=torch.int32)
     positions = torch.cat([torch.arange(16), torch.arange(16)]).unsqueeze(0)
     x = torch.randn(1, 16, _DIM)
 
-    local = _carry(module, exchange, x, positions, cu)
+    local = _carry(module, x, positions, cu)
 
     # One collective (the tokens alone -- the block's positions are computed, not sent): it sends
     # one block to the successor and receives nothing, but every rank still enters it.
@@ -420,7 +405,7 @@ def test_every_rank_keeps_the_carry_in_the_autograd_graph(monkeypatch):
     and prune *only that rank's* backward exchange -- a hang the next collective would report as
     a timeout.  The empty concat keeps the graph symmetric.
     """
-    from torchtitan_npu.models.deepseek_v4 import cp_compressor as carry_module
+    from torchtitan_npu.models.deepseek_v4 import context_parallel as carry_module
 
     module = _compressor()
     slab = 16
@@ -429,8 +414,7 @@ def test_every_rank_keeps_the_carry_in_the_autograd_graph(monkeypatch):
     carry_source = torch.randn(1, 2 * slab, _DIM).requires_grad_()
     positions = torch.cat([torch.arange(slab), torch.arange(slab)]).unsqueeze(0)
     cu = torch.tensor([0, slab, 2 * slab], dtype=torch.int32)
-    exchange = CarryExchange(CarryExchange.Config(ratio=_RATIO))
-    exchange.group = _FakeMesh(0, 2)
+    module.group = _FakeMesh(0, 2)
 
     def fake_all_to_all(send, *, output_split_sizes, input_split_sizes, group):
         del input_split_sizes, group
@@ -441,7 +425,7 @@ def test_every_rank_keeps_the_carry_in_the_autograd_graph(monkeypatch):
 
     monkeypatch.setattr(carry_module, "all_to_all_single", fake_all_to_all)
 
-    out = _carry(module, exchange, x, positions[..., :slab], cu)
+    out = _carry(module, x, positions[..., :slab], cu)
     out.square().sum().backward()
 
     # The empty carry flows back into its own leaf: a ``None`` here is the pruned collective.

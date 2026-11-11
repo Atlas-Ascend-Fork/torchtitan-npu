@@ -60,16 +60,9 @@ def dense_token_ids_sequence_parallel_placement() -> SpmdLayout:
 
 
 def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
-    """The CP boundary of the sparse core and its selector (the V4.1 pattern).
-
-    ``replicated_activation`` is TP-replicated and CP-sharded at the producer side; ``row`` is
-    the gathered whole row the consumer addresses.  The core's ``ShardingConfig`` turns the
-    former into the latter for both KV streams, and the selector gathers the index keys the
-    same way; both are the ``S(1) -> R`` conversion V4.1 declares at its own call sites.
-    """
+    """Tensor and sequence placements for the sparse core and selector."""
     q = dense_activation_placement(tp=spmd.S(2))
     replicated_activation = dense_activation_placement(tp=spmd.R)
-    row = dense_activation_placement(tp=spmd.R, cp=spmd.R)
     sink = _attn_sink_placement
 
     placements = {
@@ -80,20 +73,14 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
         "topk_scores": replicated_activation,
         "attn_sink": sink,
     }
-    # The core consumes the gathered KV streams, the local query chunks and the sink, while
-    # the selection arrives from the selector already in the model's document-local numbering.
-    consumed = {**placements, "swa_k": row, "cmp_k": row}
     attention_cfg.inner_attention.sharding_config = ShardingConfig(
         in_src_shardings=placements,
-        in_dst_shardings=consumed,
+        in_dst_shardings=placements,
         out_src_shardings=q,
         out_dst_shardings=q,
     )
 
     if attention_cfg.indexer is not None:
-        # The indexer's selection node scores the whole row's index keys against this rank's
-        # chunks: the query side stays replicated, the keys get the same ``S(1) -> R`` gather as
-        # the KV streams.
         attention_cfg.indexer.inner_indexer.sharding_config = ShardingConfig(
             in_src_shardings={
                 "idx_q_BLHiDi": replicated_activation,
@@ -102,7 +89,7 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
             },
             in_dst_shardings={
                 "idx_q_BLHiDi": replicated_activation,
-                "idx_k_BNDi": row,
+                "idx_k_BNDi": replicated_activation,
                 "idx_w_BLHi": replicated_activation,
             },
         )
@@ -124,7 +111,6 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         state_shardings={"attn_sink": _attn_sink_placement},
     )
 
-    # The core and the selector are the CP boundary for the KV/index streams.
     set_compressed_sparse_attention_sharding(at)
 
     # Attention submodule configs are explicit fields, so their parameter

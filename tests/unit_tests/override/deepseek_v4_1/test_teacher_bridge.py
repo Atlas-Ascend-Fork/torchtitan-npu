@@ -11,6 +11,7 @@ import torch
 from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.override.deepseek_v4.lightning_indexer import ascendc as v4_li
+from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc as v4_attn
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as v41_li
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as v41_attn
@@ -58,7 +59,12 @@ def test_packed_teacher_preserves_slots_global_scale_and_compact_gradients(monke
             )
             .generate_permutation()
         )
-        local = metadata.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=0)
+        local = metadata.per_doc_cp_metadata(
+            permutation=permutation,
+            cp_size=cp_size,
+            cp_rank=0,
+            window_size=config.geometry.window_size,
+        )
         metadata = type(metadata).build_aicpu_metadata(local, geometry=config.geometry)
     tokens_per_doc = 16 // cp_size
     total = tokens_per_doc * 2
@@ -161,5 +167,10 @@ def test_packed_teacher_preserves_slots_global_scale_and_compact_gradients(monke
         assert actual.grad is not None
         torch.testing.assert_close(actual.grad, expected.grad)
     torch.testing.assert_close(seen["teacher"], teacher * (0.5 / 32), rtol=0, atol=0)
-    expected_keys = [doc * pool_per_doc + offset + 1 for doc in range(2) for offset in range(pool_per_doc // cp_size)]
+    # The wrapper gathers the index keys to the row.  A5 reads that row; arch22 compacts it onto
+    # the frame this rank's entry may reach first, so the selector sees this rank's slab.
+    if _IS_A5:
+        expected_keys = list(range(1, pool_per_doc * 2 + 1))
+    else:
+        expected_keys = [doc * pool_per_doc + offset + 1 for doc in range(2) for offset in range(pool_per_doc // cp_size)]
     assert seen["keys"].flatten().tolist() == expected_keys

@@ -45,8 +45,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
-from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelAttentionMixin
 from torchtitan_npu.models.deepseek_v4.indexer_loss import IndexerLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -271,14 +269,6 @@ class Attention(BaseAttention):
         self.compressor = cfg.compressor.build()
         self.indexer = cfg.indexer.build()
         self.inner_attention = cfg.inner_attention.build()
-        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
-        # one degree, where the metadata carries no plan and nothing moves.
-        self.cp_group = None
-
-    def parallelize(self, parallel_dims) -> None:
-        """Take the CP mesh the layer restores its key side on, then recurse."""
-        self.cp_group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
 
     def forward(
         self,
@@ -305,23 +295,13 @@ class Attention(BaseAttention):
         computed where the layer is a source, otherwise the inputs unchanged.
         """
         bsz, seqlen, _ = x.size()
-        # The input layout already put these rows on **chunk ``r`` of every document**, so the
-        # query side projects them as they arrive and never moves.  The key side projects and
-        # rotates the same rows -- every step is per token, so it commutes with the layout -- and
-        # each consumer restores what it reads on its own: the compressor its pooling window, the
-        # core this rank's swa window, whose sharding gathers the whole row at its boundary.
-        # The key stream's own positions are the entry's: the input's at one degree, this rank's
-        # window under CP.  The queries rotate at the positions the input carried.
         position_k = attention_metadata.position_k
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).view(bsz, seqlen, -1, self.head_dim)
         swa_k = self.kv_norm(self.wkv(x))
 
-        # Every layer compresses and indexes: a source publishes new tensors, a reusing
-        # layer hands back the ones in flight (asserted inside those modules).  A source restores
-        # the stream onto this rank's window inside the compressor, so the layer hands over the
-        # chunks it holds rather than a pre-restored copy.
+        # Sources publish new KV; reusing layers return the tensors already in flight.
         cmp_k, latent = self.compressor(x, position_k, cmp_k, attention_metadata=attention_metadata)
         # The indexer is trained by distillation alone, so it reads the trunk as
         # constants.  The shared index keys are the exception: a Reindex Mode layer keeps
@@ -347,7 +327,6 @@ class Attention(BaseAttention):
         # rows' own positions -- per token, so it commutes with the movement -- and the restore
         # then hands the core this rank's window for its own gather.
         swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
-        swa_k = restore_key_stream(attention_metadata.xchg, swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
         o = self.inner_attention(
@@ -372,9 +351,3 @@ class Attention(BaseAttention):
         # The rows stay this rank's chunks: the window the layer was handed is the window the
         # layer above is handed, so nothing is un-permuted on the way out.
         return (o, cmp_k, idx_k, topk_indices, topk_scores, candidates)
-
-
-class ContextParallelAttention(ContextParallelAttentionMixin, Attention):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Attention.Config):
-        pass

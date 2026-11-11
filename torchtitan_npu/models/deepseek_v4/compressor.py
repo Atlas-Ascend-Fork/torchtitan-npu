@@ -17,8 +17,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.deepseek_v4.cp_attention import restore_key_stream
-from torchtitan_npu.models.deepseek_v4.cp_compressor import CarryExchange
 from torchtitan_npu.models.deepseek_v4.document_intervals import document_intervals
 
 
@@ -54,21 +52,7 @@ class CompressorImplementation(Configurable):
 
 
 class Compressor(Module):
-    """Document-packed key compression.
-
-    The compressor sees one local token stream, that stream's own document-relative positions and
-    (for the ratio-4 overlap only) the **row's** document boundaries.  Pooling is a flat fold of
-    ``ratio`` consecutive tokens, and the overlap's crossing-block state is masked at the first
-    block of every segment.
-
-    Under context parallelism the stream it is handed is this rank's chunks while the pooling it
-    must reproduce is the row's: the module therefore owns both movements -- the restoration onto
-    this rank's window (``restore_key_stream``, the identity at one degree) and the
-    ratio-4 carry
-    (:class:`~torchtitan_npu.models.deepseek_v4.cp_compressor.CarryExchange`) -- and returns the row's
-    blocks with the carry's own block trimmed off.  A caller hands over the stream exactly as the
-    layout produced it and never learns that either step happened.
-    """
+    """Pool a document-packed stream, masking ratio-4 overlap at each segment start."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -79,9 +63,6 @@ class Compressor(Module):
         head_dim: int
         rope_head_dim: int
         compress_ratio: int
-        # The ratio-4 overlap's cross-rank block.  The compressor owns it, so the modules that
-        # call this one never learn that the overlap continues on another rank.
-        carry_exchange: CarryExchange.Config
         implementation: "CompressorImplementation.Config" = field(
             default_factory=lambda: CompressorImplementation.Config()
         )
@@ -95,9 +76,6 @@ class Compressor(Module):
         self.nope_head_dim = cfg.head_dim - cfg.rope_head_dim
         self.compress_ratio = cfg.compress_ratio
         self.overlap = cfg.compress_ratio == 4
-        # The CP mesh: wired by the framework's ``Module.parallelize`` recursion, exactly like
-        # the exchange's own.  ``None`` at one degree, where nothing moves.
-        self.group = None
         self.rope = cfg.rope.build()
         self.wkv = cfg.wkv.build()
         self.wgate = cfg.wgate.build()
@@ -106,12 +84,6 @@ class Compressor(Module):
         # projection; own it directly like the upstream implementation.  Its
         # param_init is declared on the Config (registry-side, ``_APE_INIT``).
         self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32))
-        self.carry_exchange = cfg.carry_exchange.build()
-
-    def parallelize(self, parallel_dims) -> None:
-        """Take the CP mesh the framework hands down to every module."""
-        self.group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
 
     @staticmethod
     def _overlap_transform(
@@ -154,38 +126,12 @@ class Compressor(Module):
         cu_seqlens: torch.Tensor | None = None,
         attention_metadata=None,
     ) -> torch.Tensor:
-        """Compress one stream into the row's blocks.
+        """Compress ``[B, L, D]`` using stream-local positions and document boundaries.
 
-        ``cu_seqlens`` and ``attention_metadata`` are keyword-only: a module with a sharding
-        config is called through the framework's positional contract, which requires every
-        positional-or-keyword parameter to be passed positionally.
-
-        Args:
-            x: The stream as the layout produced it, ``[B, L, D]``: the row at one degree, this
-                rank's chunks under context parallelism.
-            positions: The **key stream's** own document-relative positions, ``[B, L]`` (the
-                entry's ``position_k``: the input's at one degree, this rank's window under CP).
-                The pooled blocks rotate at ``positions[..., ::ratio]``.
-            cu_seqlens: The **row's** document boundaries (``[n + 1]``), required by the ratio-4
-                overlap: the first block of every segment has no predecessor block, and the carry
-                window is clipped from the same grid.  The non-overlap pooling ignores it.
-            attention_metadata: The entry describing this rank's geometry.  ``None`` means an
-                unsharded caller (a test or a reference forward): nothing is restored and no
-                carry is prepended.
-
-        Returns:
-            The row's pooled key blocks ``[B, L // ratio, D]``, the carry block already trimmed.
+        ``attention_metadata`` is reserved for the CP subclass. The keyword-only arguments
+        preserve the framework's positional sharding contract.
         """
-        # The aligned dataloader and trainer validate the grid before model execution.
-        trim = 0
-        if attention_metadata is not None:
-            # The window this rank's pooling must reproduce: identity at one degree, the restored
-            # slab under CP.  The carry then completes the document the window starts inside.
-            x = restore_key_stream(attention_metadata.xchg, x, group=self.group)
-            if self.overlap:
-                carry = self.carry_exchange(x, positions, cu_seqlens)
-                x, positions, cu_seqlens = carry.x, carry.positions, carry.cu_seqlens
-                trim = carry.trim
+        del attention_metadata
         batch_size = x.size(0)
         # Implementations consume one packed stream whose boundaries already include every
         # batch row. Restore the container shape only after pooling, including RoPE.
@@ -196,9 +142,7 @@ class Compressor(Module):
             cu_seqlens=cu_seqlens,
         )
         pooled = pooled.reshape(batch_size, -1, pooled.size(-1))
-        # The carry's own block is the head of the pooled stream: dropping it leaves exactly the
-        # blocks this rank holds of the row.
-        return pooled.narrow(1, trim, pooled.size(1) - trim) if trim else pooled
+        return pooled
 
     def _forward(
         self,
@@ -291,7 +235,7 @@ class Indexer(Module):
         idx_k = self.compressor(
             x,
             attention_metadata.position_k,
-            cu_seqlens=attention_metadata.swa_k.cu_seqlens,
+            cu_seqlens=attention_metadata.cu_seqlens,
             attention_metadata=attention_metadata,
         )
         idx_k = self._rotate_activation(idx_k)

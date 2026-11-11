@@ -222,6 +222,7 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
         zigzag = cp_shard_context().load_balancer == "doc_zigzag"
         local = attention_metadata.rebuild_cp_metadata(
             permutation,
+            window_size=attention_metadata.quant_numbers["window_size"],
             build=partial(
                 _V41QuantAttentionMetadata.build_aicpu_metadata,
                 quant_numbers=attention_metadata.quant_numbers,

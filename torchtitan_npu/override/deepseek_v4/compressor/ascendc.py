@@ -6,7 +6,7 @@
 """CANN compressor using the operator's native autograd implementation.
 
 The fused kernel compresses one local stream, addressed by that stream's own ``cu_seqlens``: the
-ratio-4 overlap's carry is not its business (``CarryExchange`` prepends the
+ratio-4 overlap's carry is not its business (``ContextParallelCompressor`` prepends the
 predecessor block, passes the augmented boundaries and trims the extra output block), so this
 module has no process group and no CP branch.  The kernel's zero tiling table is an operator
 input built here, from the stream's own shape symbols, never from a host maximum that a traced

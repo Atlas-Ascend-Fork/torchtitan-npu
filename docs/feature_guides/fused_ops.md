@@ -118,7 +118,7 @@ torchtitan_npu/override/<scope>/<target>/
   `DeepSeekV4Metadata.from_positions` 建好这个几何的 entry（一条 entry 一个 ratio）：整行 document 边界、按自身
   `compress_ratio` 折好的池网格，以及三个 kernel frame（`q`/`swa_k`/`cmp_k`）——frame 属于模型
   metadata（`models/deepseek_v4/metadata.py`），参考内核和融合端口读同一份，entry 另带 CP 的交换表
-  （`xchg: ExchangeMetadata`）。`AscCompressedSparseInnerAttention.Config`
+  （`xchg.cmp: FlattenMetadata`、`xchg.swa: WindowMetadata`）。`AscCompressedSparseInnerAttention.Config`
   在其上只补四个算子的记录；`sparse_attn.asc` 桥接 SparseFlashMLA/SMLAG 的正反向，
   `lightning_indexer.asc` 桥接 `lightning_indexer`/`sparse_lightning_indexer_kl_loss_grad` 的正反向，
   几何（heads/head dim）是该 config 自己的必填字段、无默认值，由 override 参数一次写入，默认值即

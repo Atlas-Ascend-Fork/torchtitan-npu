@@ -35,7 +35,7 @@ def test_zigzag_candidate_lengths_follow_half_queries_not_kv_positions(monkeypat
     positions = torch.arange(8).repeat(2).unsqueeze(0)
     global_entry = _V41QuantAttentionMetadata.build_aicpu_metadata(
         DeepSeekV4Metadata.from_positions(positions, ratio=2),
-        quant_numbers={"topk_blocks": 2, "block_size": 2},
+        quant_numbers={"topk_blocks": 2, "block_size": 2, "window_size": 3},
     )
     permutation = torch.tensor([[0, 1, 8, 9, 6, 7, 14, 15, 2, 3, 10, 11, 4, 5, 12, 13]])
     mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 0)
@@ -46,7 +46,7 @@ def test_zigzag_candidate_lengths_follow_half_queries_not_kv_positions(monkeypat
     assert local.position_k.numel() == 8
     head, tail = local.head, local.tail
     torch.testing.assert_close(head.q.cu_seqlens, torch.tensor([0, 2, 4], dtype=torch.int32))
-    for entry, expected in [(head, [0, 1, 0, 1]), (tail, [2, 2, 2, 2])]:
+    for entry, expected, window in [(head, [0, 1, 0, 1], [0, 2, 4]), (tail, [2, 2, 2, 2], [0, 4, 8])]:
         actual = entry.aicpu_metadata.lightning_indexer.sparse_length.flatten()
         torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.int32))
-        torch.testing.assert_close(entry.swa_k.cu_seqlens, torch.tensor([0, 8, 16], dtype=torch.int32))
+        torch.testing.assert_close(entry.swa_k.cu_seqlens, torch.tensor(window, dtype=torch.int32))

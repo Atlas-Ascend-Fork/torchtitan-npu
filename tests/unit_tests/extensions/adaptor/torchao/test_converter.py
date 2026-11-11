@@ -838,11 +838,17 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
         ),
         model_compile_enabled=False,
     )
+    from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressor41, ContextParallelConverter
+    from torchtitan_npu.models.deepseek_v4_1.sharding import set_deepseek_v4_1_sharding_config
+
+    set_deepseek_v4_1_sharding_config(converted.model, enable_sp=False, enable_ep=False)
+    ContextParallelConverter.Config().build().convert(converted.model)
     layer_id = _source_compressor_layer(reference_spec, ratio)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(17)
         reference = _build_cpu_compressor(reference_spec.model.layers[layer_id].attention.compressor)
         quantized = _build_cpu_compressor(converted.model.layers[layer_id].attention.compressor)
+    assert isinstance(quantized, ContextParallelCompressor41)
     quantized.load_state_dict(reference.state_dict())
     d = reference_spec.model.layers[layer_id].attention.compressor.wkv.out_features
     captured = _capture_compressor_encoding(monkeypatch, d)
@@ -895,6 +901,7 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     backward_record = torch.tensor([9], dtype=torch.int32)
     metadata = QuantV4Metadata(
         ratio=row.ratio,
+        cu_seqlens=row.cu_seqlens,
         position_k=row.position_k,
         q=row.q,
         swa_k=row.swa_k,

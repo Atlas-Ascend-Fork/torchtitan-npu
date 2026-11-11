@@ -235,6 +235,7 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
     fwd_record, bwd_record = torch.tensor([11], dtype=torch.int32), torch.tensor([23], dtype=torch.int32)
     metadata = AscV4Metadata(
         ratio=base.ratio,
+        cu_seqlens=base.cu_seqlens,
         q=base.q,
         swa_k=base.swa_k,
         cmp_k=base.cmp_k,

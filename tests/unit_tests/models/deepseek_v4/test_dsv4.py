@@ -149,7 +149,6 @@ def build_compressor(dsv4, ratio):
             head_dim=HD,
             rope_head_dim=RD,
             compress_ratio=ratio,
-            carry_exchange=dsv4.compressor.CarryExchange.Config(ratio=ratio),
             wkv=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             wgate=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             norm=BuildCfg(lambda: RMS(HD)),

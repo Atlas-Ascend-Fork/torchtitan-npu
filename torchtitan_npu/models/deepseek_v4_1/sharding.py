@@ -120,15 +120,8 @@ def dense_token_ids_sequence_parallel_placement():
 
 
 def set_inner_attention_sharding(inner_cfg) -> None:
-    """Placement for Attention Gym's ``gather_attn`` call.
-
-    Under context parallelism the KV streams are the **whole row** -- gathered declaratively at
-    this boundary, the V4 compressed-container pattern -- while ``q``, ``topk_indices`` and the
-    sink keep the placements they have at every degree: the model does the query side's slicing
-    and movement itself, so a producer needs no ``S(1)`` source declaration.
-    """
+    """Tensor and sequence placements for the sparse core."""
     replicated_activation = dense_activation_placement(tp=spmd.R)
-    row = dense_activation_placement(tp=spmd.R, cp=spmd.R)
 
     placements = {
         "q": dense_activation_placement(tp=spmd.S(2)),
@@ -137,12 +130,9 @@ def set_inner_attention_sharding(inner_cfg) -> None:
         "topk_indices": replicated_activation,
         "attn_sink": _attn_sink_placement,
     }
-    # ``swa_k`` and ``cmp_k`` are the gathered row on the consumer side; their frames' ``seqused``
-    # is what limits a rank's view, so the gather is the whole of the CP conversion here.
-    consumed = {**placements, "swa_k": row, "cmp_k": row}
     inner_cfg.sharding_config = ShardingConfig(
         in_src_shardings=placements,
-        in_dst_shardings=consumed,
+        in_dst_shardings=placements,
         out_src_shardings=placements["q"],
         out_dst_shardings=placements["q"],
     )
@@ -170,9 +160,6 @@ def set_indexer_sharding(indexer_cfg):
             "qr": replicated_activation,
         },
     )
-    # The selector scores the **whole row's** index keys against this rank's chunks, so the keys
-    # get the same ``S(1) -> R`` conversion the sparse core declares for its KV streams; the
-    # query side and the candidate pool keep the placements they have at every degree.
     indexer_cfg.inner_indexer.sharding_config = ShardingConfig(
         in_src_shardings={
             "idx_q_BLHiDi": replicated_activation,
@@ -180,7 +167,7 @@ def set_indexer_sharding(indexer_cfg):
         },
         in_dst_shardings={
             "idx_q_BLHiDi": replicated_activation,
-            "idx_k_BNDi": dense_activation_placement(tp=spmd.R, cp=spmd.R),
+            "idx_k_BNDi": replicated_activation,
         },
     )
     indexer_cfg.rope.sharding_config = ShardingConfig(

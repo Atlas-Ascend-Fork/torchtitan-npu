@@ -20,10 +20,8 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4.cp_attention import (
-    ExchangeMetadata,
-    restore_key_stream,
-)
+from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressorMixin
+from torchtitan_npu.models.deepseek_v4.metadata import FlattenMetadata
 from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import (
@@ -77,10 +75,10 @@ def _permalink(cu: list[int], cp_size: int) -> torch.Tensor:
     )
 
 
-def _plans(cu: list[int], cp_size: int) -> list[ExchangeMetadata]:
+def _plans(cu: list[int], cp_size: int) -> list[FlattenMetadata]:
     """Each rank's movement, derived from that one permutation."""
     permutation = _permalink(cu, cp_size)
-    return [ExchangeMetadata.from_permutation(permutation, cp_size=cp_size, cp_rank=rank) for rank in range(cp_size)]
+    return [FlattenMetadata.build(permutation, cp_size=cp_size, cp_rank=rank) for rank in range(cp_size)]
 
 
 def _prefix(lengths: torch.Tensor) -> torch.Tensor:
@@ -104,7 +102,7 @@ def _masks(positions: torch.Tensor, cp_size: int = 1, cp_rank: int = 0) -> DeepS
             .build(seq_len=positions.numel(), cp_size=cp_size, attention_metadata=row)
             .generate_permutation()
         )
-        row = row.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank)
+        row = row.per_doc_cp_metadata(permutation=permutation, cp_size=cp_size, cp_rank=cp_rank, window_size=128)
     return AscV41Metadata.build_aicpu_metadata(row, geometry=_GEOMETRY)
 
 
@@ -162,19 +160,14 @@ def test_the_bounds_are_read_off_the_row():
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
 def test_the_plan_matches_the_row(cu, cp_size):
-    """Both split vectors, against a derivation that counts every row.
-
-    The receive side is the one worth arguing about: it is a closed form over the documents'
-    chunk intervals rather than a histogram of the rows this rank receives, so it is checked
-    against the row-by-row matrix and not against itself.
-    """
+    """The oracle matrix counts flat-owner -> query-owner; restoration reverses it."""
     cu = list(cu)
     seq_len = cu[-1] // cp_size
     matrix = _oracle_splits(cu, cp_size, seq_len)
     assert matrix.sum().item() == cu[-1], "the splits must partition the row"
     for rank, plan in enumerate(_plans(cu, cp_size)):
-        assert list(plan.send_split) == matrix[rank].tolist()
-        assert list(plan.recv_split) == matrix[:, rank].tolist()
+        assert list(plan.send_split) == matrix[:, rank].tolist()
+        assert list(plan.recv_split) == matrix[rank].tolist()
 
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
@@ -202,17 +195,11 @@ def test_the_permutation_is_the_layout(cu, cp_size):
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
 def test_the_movement_is_a_permutation_of_the_slab(cu, cp_size):
-    """Every rank presents one slab and receives one slab, addressed row by row.
-
-    ``send_index`` being a permutation is what makes the reverse movement the inverse rather
-    than the adjoint (nothing is copied, so nothing accumulates), and it is also what makes
-    the receiver's buffer the held rows' own order -- which is why there is no scatter index.
-    """
     cu = list(cu)
     seq_len = cu[-1] // cp_size
     chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
     for rank, plan in enumerate(_plans(cu, cp_size)):
-        assert sorted(plan.send_index.tolist()) == list(range(seq_len))
+        assert sorted(plan.recv_index.tolist()) == list(range(seq_len))
         assert sum(plan.send_split) == seq_len
         assert sum(plan.recv_split) == seq_len
         # A document's chunk is one interval and spans at most two slabs; the closed form
@@ -220,21 +207,6 @@ def test_the_movement_is_a_permutation_of_the_slab(cu, cp_size):
         start = torch.tensor(cu[:-1]) + rank * chunk
         span = (start + chunk - 1) // seq_len - start // seq_len + 1
         assert int(span.max()) <= 2
-
-
-def test_the_exchange_carries_the_movement_only():
-    """The container holds nothing a consumer could work out for itself.
-
-    The held rows' positions are a function of the same boundaries, so the entry states them as
-    its own ``position_k`` rather than carrying them in the exchange's tables.  The one row order
-    the boundaries do not state is the ZigZag one, so the entry carries a ``recv_index`` only when
-    its layout needs one; the doc-chunk layout leaves it ``None``.
-    """
-    plan = _plans([0, 8, 24], 2)[1]
-    assert isinstance(plan, ExchangeMetadata)
-    assert set(plan.__slots__) == {"send_index", "send_split", "recv_split", "recv_index"}
-    assert plan.send_index.dtype == torch.int64
-    assert plan.recv_index is None
 
 
 def test_the_restore_is_the_identity_without_a_plan():
@@ -245,21 +217,13 @@ def test_the_restore_is_the_identity_without_a_plan():
     fall back onto the default group.
     """
     tensor = torch.arange(12, dtype=torch.float32).reshape(1, -1, 1)
-    assert restore_key_stream(None, tensor, group=None) is tensor
+    assert ContextParallelCompressorMixin()._restore_flat_input(tensor, None) is tensor
     with pytest.raises(RuntimeError, match="process group"):
-        _plans([0, 8, 24], 2)[0].apply(tensor, group=None)
+        ContextParallelCompressorMixin()._restore_flat_input(tensor, _plans([0, 8, 24], 2)[0])
 
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
 def test_the_movement_round_trips_the_whole_row(cu, cp_size):
-    """Moving the query side out and back is the identity, row for row.
-
-    Emulated in process: each rank presents ``slab[send_index]``, the slices are routed to
-    their peer's inbox in peer order, the receiver takes the concatenation as its own order
-    (no scatter index), and the reverse swaps the split vectors and scatters through
-    ``send_index``.  Every rank's present is taken from **its own** slab, which is the
-    property that makes the tables usable at all.
-    """
     cu = list(cu)
     seq_len = cu[-1] // cp_size
     plans = _plans(cu, cp_size)
@@ -272,14 +236,14 @@ def test_the_movement_round_trips_the_whole_row(cu, cp_size):
         torch.testing.assert_close(back[rank], slabs[rank])
 
 
-def _emulate(tensors: list[torch.Tensor], plans: list[ExchangeMetadata], *, inverse: bool = False):
+def _emulate(tensors: list[torch.Tensor], plans: list[FlattenMetadata], *, inverse: bool = False):
     """Run the pair of collectives over every rank, in process."""
     size = len(tensors)
-    presents = [t if inverse else t[plans[r].send_index] for r, t in enumerate(tensors)]
-    splits = [
-        (plans[r].recv_split, plans[r].send_split) if inverse else (plans[r].send_split, plans[r].recv_split)
-        for r in range(size)
+    presents = [
+        t if inverse and p.send_index is None else t[p.send_index] if inverse else t[torch.argsort(p.recv_index)]
+        for t, p in zip(tensors, plans, strict=True)
     ]
+    splits = [(p.send_split, p.recv_split) if inverse else (p.recv_split, p.send_split) for p in plans]
     offsets = []
     for send, _ in splits:
         running, rows = [0], 0
@@ -292,12 +256,11 @@ def _emulate(tensors: list[torch.Tensor], plans: list[ExchangeMetadata], *, inve
         received = torch.cat(
             [presents[source][offsets[source][rank] : offsets[source][rank + 1]] for source in range(size)]
         )
-        if inverse:
-            slab = torch.empty((sum(splits[rank][0]), *received.shape[1:]), dtype=received.dtype)
-            slab[plans[rank].send_index] = received
-            outs.append(slab)
-        else:
-            outs.append(received)
+        plan = plans[rank]
+        out = received[plan.recv_index] if inverse else received
+        if not inverse and plan.send_index is not None:
+            out = out[torch.argsort(plan.send_index)]
+        outs.append(out)
     return outs
 
 
@@ -318,9 +281,11 @@ def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_ro
             reach = (rank + 1) * chunk
             # The key frames are the ones the kernels read: the row itself where they honour
             # ``seqused``, the reach where they anchor their mask at the frame's end.
-            window_grid = list(cu) if _IS_A5 else _prefix(reach).tolist()
+            window = chunk + (rank * chunk).clamp(max=127)
+            window_grid = _prefix(window).tolist()
+            assert masks.cu_seqlens.tolist() == list(cu)
             assert masks.swa_k.cu_seqlens.tolist() == window_grid
-            assert masks.swa_k.seqused.tolist() == reach.tolist()
+            assert masks.swa_k.seqused.tolist() == window.tolist()
             frame = masks.cmp_k
             assert frame is not None and masks.ratio == _RATIO
             pool_grid = (torch.tensor(cu) // _RATIO).tolist() if _IS_A5 else _prefix(reach // _RATIO).tolist()
@@ -364,11 +329,11 @@ def test_the_cp_transform_carries_the_plan_and_recuts_the_frames():
         for cp_rank in range(cp_size):
             slab = row.numel() // cp_size
             masks = _masks(row, cp_size, cp_rank)
-            plan = masks.xchg
+            plan = masks.xchg.cmp
             assert plan is not None
-            assert list(plan.send_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
+            assert list(plan.recv_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
             assert sum(plan.recv_split) == slab
-            assert sorted(plan.send_index.tolist()) == list(range(slab))
+            assert sorted(plan.recv_index.tolist()) == list(range(slab))
             # The key stream's positions are this rank's window, counted row by row.
             assert masks.position_k.reshape(-1).tolist() == _oracle_flatten_positions([0, 8, 24], cp_size, cp_rank)
             assert masks.q.seqused.tolist() == [8 // cp_size, 16 // cp_size]

@@ -282,7 +282,8 @@ class DeepSeekV41Model(Decoder):
                 # V4.1 packs one row per rank: the document boundaries, the compressor's
                 # group grid and the fused kernels' ragged layout are all defined on that
                 # single row.  The model relies on it, so it is checked here rather than
-                # left to each launcher.
+                # left to each launcher — and it covers context parallelism a fortiori,
+                # since CP addresses the same packed row.
                 raise ValueError(
                     "DeepSeek V4.1 requires one packed row per rank "
                     f"(training.local_batch_size=1), got {config.training.local_batch_size}"
@@ -346,7 +347,7 @@ class DeepSeekV41Model(Decoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
             if parallelism.context_parallel_degree > 1:
-                from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelConverter
+                from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelConverter
 
                 ContextParallelConverter.Config().build().convert(self)
 

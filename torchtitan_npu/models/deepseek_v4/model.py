@@ -104,6 +104,16 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
             DeepSeekV4MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+            training = getattr(config, "training", None)
+            local_batch_size = getattr(training, "local_batch_size", 1)
+            if parallelism.context_parallel_degree > 1 and local_batch_size != 1:
+                # CP addresses one packed row per rank: the permutation, the routing tables and
+                # the kernels' ragged layout are all defined on a single sequence, so a batched
+                # row is refused here rather than per forward call.
+                raise ValueError(
+                    "DeepSeek V4 runs context parallelism on one packed row per rank "
+                    f"(training.local_batch_size=1), got {local_batch_size}"
+                )
 
             tp = parallelism.tensor_parallel_degree
             if tp > 1:
@@ -121,7 +131,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             # rank-local frames when the model's preprocessing hands the CP mesh
             # to the seam, and only the fused kernels take those frames through
             # their own metadata.  The compressor is CP-agnostic either way: its
-            # carry is applied by ``CarryExchange`` outside it.
+            # carry is applied by ``ContextParallelCompressor`` outside it.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -130,7 +140,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
             if parallelism.context_parallel_degree > 1:
-                from torchtitan_npu.models.deepseek_v4.cp_dispatch import ContextParallelConverter
+                from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelConverter
 
                 ContextParallelConverter.Config().build().convert(self)
 

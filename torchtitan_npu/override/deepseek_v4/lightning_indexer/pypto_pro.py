@@ -59,7 +59,9 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("the fused indexer needs AscV4Metadata")
         # Absent on arch22, whose indexer schedules itself: the kernel takes ``metadata=None``.
-        if attention_metadata.xchg is not None:
+        # ZigZag hands the selector a ``head`` / ``tail`` entry, and those are built before the
+        # routing is attached to the outer entry, so a sub-entry is what this call receives.
+        if attention_metadata.xchg is not None or attention_metadata.head is not None:
             raise ValueError("PyPTO-Pro does not support context parallel: its kernels read compact frames")
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
         topk_indices, values = lightning_indexer_indices(
