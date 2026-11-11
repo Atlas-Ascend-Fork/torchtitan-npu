@@ -26,7 +26,8 @@ export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_p
                        torchtitan_npu.override.common.swiglu_group.asc \
                        torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
                        torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
-                       torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc}"
+                       torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
+                       torchtitan_npu.override.common.token_dispatcher.asc_deepep}"
 
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training

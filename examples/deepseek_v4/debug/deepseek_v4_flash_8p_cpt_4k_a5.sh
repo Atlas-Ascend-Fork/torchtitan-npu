@@ -13,6 +13,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# A5 dispatches MoE through DeepEP by default; USE_GOLDEN=1 keeps the reference
+# recipe (the standard dispatcher), matching the A3 script's own default config.
+if [[ "${USE_GOLDEN:-0}" == "1" ]]; then
+    export CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts}"
+else
+    export CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_deepep}"
+fi
 
 # Use the command line `npu-smi info -t topo` to query the CPU affinity of the
 # NPU cards for configuration.
@@ -23,7 +30,8 @@ if [[ "${USE_GOLDEN:-0}" != "1" ]]; then
     export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_partial \
                                            torchtitan_npu.override.deepseek_v4.compressor.asc \
                                            torchtitan_npu.override.common.swiglu_group.asc \
-                                           torchtitan_npu.override.common.swiglu_group.asc_shared_experts}"
+                                           torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
+                                           torchtitan_npu.override.common.token_dispatcher.asc_deepep}"
 fi
 
 # Disable swap optimizer for better performance

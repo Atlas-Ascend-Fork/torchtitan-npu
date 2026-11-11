@@ -14,7 +14,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal}"
+# A5 dispatches MoE through DeepEP by default; USE_GOLDEN=1 keeps the reference
+# recipe on the standard dispatcher (the A3 script's own default config).
+if [[ "${USE_GOLDEN:-0}" == "1" ]]; then
+    export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal}"
+else
+    export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_deepep}"
+fi
 
 # Use the command line `npu-smi info -t topo` to query the CPU affinity of the
 # NPU cards for configuration.
@@ -33,14 +39,16 @@ if [[ "${USE_GOLDEN:-0}" != "1" ]]; then
                               torchtitan_npu.override.common.swiglu_group.asc \
                               torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
                               torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
-                              torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc}"
+                              torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
+                              torchtitan_npu.override.common.token_dispatcher.asc_deepep}"
     else
         export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_partial \
                                                torchtitan_npu.override.common.swiglu_group.asc \
                                                torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
                                                torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
                                                torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
-                                               torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn}"
+                                               torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn \
+                                               torchtitan_npu.override.common.token_dispatcher.asc_deepep}"
     fi
 fi
 

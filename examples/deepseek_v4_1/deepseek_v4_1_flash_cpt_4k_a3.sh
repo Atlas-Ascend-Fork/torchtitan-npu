@@ -157,13 +157,18 @@ OPTIMIZER_ARGS="
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
 # The text-rope entry is a hardware choice: A3 defaults to asc_complex; the A5
-# wrapper supplies asc_partial through the same CLI_OVERRIDES channel. Set the
-# default in both branches so `set -u` never sees it unbound.
+# wrapper supplies asc_partial through the same CLI_OVERRIDES channel. The MoE
+# token dispatcher also rides this channel (the A5 wrapper substitutes asc_deepep).
+# Set the default in both branches so `set -u` never sees it unbound.
 if [[ "${USE_GOLDEN}" == "1" ]]; then
-    DEFAULT_CLI_OVERRIDES=""
+    DEFAULT_CLI_OVERRIDES=()
     NPU_OPS_OVERRIDES=(torchtitan_npu.override.common.rope.workaround)
 else
-    DEFAULT_CLI_OVERRIDES="torchtitan_npu.override.common.rope.asc_complex"
+    DEFAULT_CLI_OVERRIDES=(
+        torchtitan_npu.override.common.rope.asc_complex
+        # MoE token dispatcher
+        torchtitan_npu.override.common.token_dispatcher.asc
+    )
     MHC_POST_OVERRIDE="${MHC_POST_OVERRIDE:-torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post}"
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rms_norm.asc
@@ -171,13 +176,16 @@ else
         torchtitan_npu.override.common.rope.asc_half_rotation
         # MHC
         ${MHC_POST_OVERRIDE}
-        # MoE token dispatcher
-        torchtitan_npu.override.common.token_dispatcher.asc
     )
 fi
 
-# Wrapper defaults extend override.imports after the base targets.
-CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_CLI_OVERRIDES}}"
+# Wrapper defaults extend override.imports after the base targets. A wrapper that
+# exports CLI_OVERRIDES replaces the default list, entry by entry.
+if [[ -n "${CLI_OVERRIDES:-}" ]]; then
+    read -r -a CLI_OVERRIDES <<< "${CLI_OVERRIDES}"
+else
+    CLI_OVERRIDES=("${DEFAULT_CLI_OVERRIDES[@]}")
+fi
 
 # To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
@@ -198,5 +206,5 @@ bash scripts/run_train_multinodes.sh \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
     --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
-    $CLI_OVERRIDES \
+    "${CLI_OVERRIDES[@]}" \
     "$@"

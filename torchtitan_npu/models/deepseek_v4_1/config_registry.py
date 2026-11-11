@@ -251,8 +251,13 @@ def _text_dataloader_config(model_spec: ModelSpec):
     return AlignedHuggingfaceDataloader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
 
 
-def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
-    model_spec = model_registry(flavor, converters=converters)
+def _make_trainer_config(
+    flavor: str,
+    *,
+    converters=None,
+    moe_comm_backend: str = "standard",
+) -> TrainerEx.Config:
+    model_spec = model_registry(flavor, converters=converters, moe_comm_backend=moe_comm_backend)
     if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
         raise ValueError("registered V4.1 model does not describe every configured layer")
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
@@ -286,8 +291,16 @@ def deepseek_v4_1_flash() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash")
 
 
+def deepseek_v4_1_flash_deepep() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash", moe_comm_backend="deepep")
+
+
 def deepseek_v4_1_flash_text() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_text")
+
+
+def deepseek_v4_1_flash_text_deepep() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash_text", moe_comm_backend="deepep")
 
 
 def deepseek_v4_1_flash_40layers_16experts_multimodal() -> TrainerEx.Config:
@@ -300,6 +313,13 @@ def deepseek_v4_1_flash_40layers_16experts_text() -> TrainerEx.Config:
 
 def deepseek_v4_1_flash_40layers_24experts_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_multimodal")
+
+
+def deepseek_v4_1_flash_40layers_24experts_multimodal_deepep() -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_40layers_24experts_multimodal",
+        moe_comm_backend="deepep",
+    )
 
 
 def deepseek_v4_1_flash_40layers_24experts_text() -> TrainerEx.Config:
@@ -336,12 +356,14 @@ def deepseek_v4_1_debugmodel_lora() -> TrainerEx.Config:
     return _make_lora_trainer_config("deepseek_v4_1_debugmodel_text")
 
 
-def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
+def _make_lora_trainer_config(flavor: str, moe_comm_backend: str = "standard") -> TrainerEx.Config:
     from .checkpoint import DeepSeekV41LoRACheckpointManager
     from .lora import DeepSeekV41LoRAConverter
 
     config = _make_trainer_config(
-        flavor, converters=[DeepSeekV41LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)]
+        flavor,
+        converters=[DeepSeekV41LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)],
+        moe_comm_backend=moe_comm_backend,
     )
     config.checkpoint = derive(config.checkpoint, DeepSeekV41LoRACheckpointManager.Config)
     config.checkpoint.enable = True

@@ -21,7 +21,7 @@ WORLD_SIZE=$((NGPU * NNODES))
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-CONFIG="${CONFIG:-deepseek_v4_1_flash_text}"
+CONFIG="${CONFIG:-deepseek_v4_1_flash_text_deepep}"
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
@@ -159,7 +159,7 @@ OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimi
 NPU_OPS_OVERRIDES=(
     torchtitan_npu.override.common.rms_norm.asc \
     torchtitan_npu.override.common.rope.asc_partial \
-    torchtitan_npu.override.common.token_dispatcher.asc \
+    torchtitan_npu.override.common.token_dispatcher.asc_deepep \
     torchtitan_npu.override.common.swiglu_group.asc \
     torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
     torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn \

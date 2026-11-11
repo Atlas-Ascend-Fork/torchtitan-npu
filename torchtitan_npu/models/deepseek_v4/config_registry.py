@@ -281,8 +281,14 @@ def _make_trainer_config(
     seq_len: int,
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
+    moe_comm_backend: str = "standard",
 ) -> Trainer.Config:
-    model_spec = model_registry(flavor, num_mtp_layers=num_mtp_layers, converters=converters)
+    model_spec = model_registry(
+        flavor,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend=moe_comm_backend,
+    )
     if num_mtp_layers > 0:
         loss = MTPChunkedLossWrapper.Config(
             mtp_scale=0.3,
@@ -375,8 +381,29 @@ def deepseek_v4_flash(
     )
 
 
+def deepseek_v4_flash_deepep(
+    *,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_flash",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend="deepep",
+    )
+
+
 def deepseek_v4_flash_lora() -> Trainer.Config:
     return deepseek_v4_flash(
+        converters=[DeepSeekV4LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)],
+    )
+
+
+def deepseek_v4_flash_lora_deepep() -> Trainer.Config:
+    return deepseek_v4_flash_deepep(
         converters=[DeepSeekV4LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)],
     )
 
@@ -392,6 +419,21 @@ def deepseek_v4_flash_43layers_16experts(
         seq_len=4096,
         num_mtp_layers=num_mtp_layers,
         converters=converters,
+    )
+
+
+def deepseek_v4_flash_43layers_16experts_deepep(
+    *,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_flash_43layers_16experts",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend="deepep",
     )
 
 
@@ -492,6 +534,21 @@ def deepseek_v4_pro_61layers_32experts(
     )
 
 
+def deepseek_v4_pro_61layers_32experts_deepep(
+    *,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_pro_61layers_32experts",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend="deepep",
+    )
+
+
 def deepseek_v4_pro_61layers_12experts(
     *,
     num_mtp_layers: int = 0,
@@ -503,6 +560,21 @@ def deepseek_v4_pro_61layers_12experts(
         seq_len=4096,
         num_mtp_layers=num_mtp_layers,
         converters=converters,
+    )
+
+
+def deepseek_v4_pro_61layers_12experts_deepep(
+    *,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_pro_61layers_12experts",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend="deepep",
     )
 
 

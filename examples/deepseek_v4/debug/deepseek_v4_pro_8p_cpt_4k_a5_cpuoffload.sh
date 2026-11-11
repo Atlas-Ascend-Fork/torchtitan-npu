@@ -21,7 +21,13 @@ WORLD_SIZE="${NGPU}"
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
-CONFIG="${CONFIG:-deepseek_v4_pro_61layers_12experts}"
+# A5 dispatches MoE through DeepEP by default; USE_GOLDEN=1 keeps the reference
+# recipe on the standard dispatcher.
+if [[ "${USE_GOLDEN:-0}" == "1" ]]; then
+    CONFIG="${CONFIG:-deepseek_v4_pro_61layers_12experts}"
+else
+    CONFIG="${CONFIG:-deepseek_v4_pro_61layers_12experts_deepep}"
+fi
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
@@ -149,7 +155,7 @@ else
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
         # MoE token dispatcher
-        torchtitan_npu.override.common.token_dispatcher.asc
+        torchtitan_npu.override.common.token_dispatcher.asc_deepep
         # MoE SwiGLU Group
         torchtitan_npu.override.common.swiglu_group.asc
         torchtitan_npu.override.common.swiglu_group.asc_shared_experts

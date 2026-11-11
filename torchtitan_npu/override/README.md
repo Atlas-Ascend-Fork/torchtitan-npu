@@ -30,15 +30,6 @@ python -m torchtitan_npu.train \
   'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":128}'
 ```
 
-NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模型配置选择
-`deepep` 后，显式启用以下 override 即可；`hidden_dim` 和
-`num_max_tokens_per_rank` 会由 `update_from_config()` 根据模型及训练形状填充。
-
-```bash
---override.imports \
-  torchtitan_npu.override.common.token_dispatcher.asc_deepep
-```
-
 也可以直接设置配置：
 
 ```python
@@ -276,6 +267,8 @@ target，可以在同一 recipe 中并用（V4.1 A3 脚本即视觉 `asc_half_ro
 `asc_complex`）。
 `AscComplexRoPE` 和 `AscCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
 并使用第一行位置构造 batch 共享的 cosine/sine 表。
+
+`token_dispatcher.asc` / `token_dispatcher.asc_deepep` 不能同时启用；DeepEP 路径的 dispatch/combine见[DeepEP 特性说明](../../docs/feature_guides/deepep.md)。
 
 ### Common SwiGLU
 

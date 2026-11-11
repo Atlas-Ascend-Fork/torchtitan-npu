@@ -138,12 +138,17 @@ OPTIMIZER_ARGS="
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
 if [[ "${USE_GOLDEN}" == "1" ]]; then
-    DEFAULT_CLI_OVERRIDES=""
+    DEFAULT_CLI_OVERRIDES=()
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
     )
 else
-    DEFAULT_CLI_OVERRIDES="torchtitan_npu.override.common.rope.asc_complex"
+    DEFAULT_CLI_OVERRIDES=(
+        torchtitan_npu.override.common.rope.asc_complex
+        # MoE token dispatcher: the A3 default (AllToAll). An A5 wrapper that
+        # enables DeepEP replaces it with token_dispatcher.asc_deepep.
+        torchtitan_npu.override.common.token_dispatcher.asc
+    )
     NPU_OPS_OVERRIDES=(
         # Attention / DSA
         torchtitan_npu.override.common.rms_norm.asc
@@ -154,13 +159,16 @@ else
         # MHC
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
-        # MoE token dispatcher
-        torchtitan_npu.override.common.token_dispatcher.asc
     )
 fi
 
-# Wrapper defaults extend override.imports after the base targets.
-CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_CLI_OVERRIDES}}"
+# Wrapper defaults extend override.imports after the base targets. A wrapper that
+# exports CLI_OVERRIDES replaces the default list, entry by entry.
+if [[ -n "${CLI_OVERRIDES:-}" ]]; then
+    read -r -a CLI_OVERRIDES <<< "${CLI_OVERRIDES}"
+else
+    CLI_OVERRIDES=("${DEFAULT_CLI_OVERRIDES[@]}")
+fi
 
 # To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
@@ -180,5 +188,5 @@ bash scripts/run_train_multinodes.sh \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
     --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
-    $CLI_OVERRIDES \
+    "${CLI_OVERRIDES[@]}" \
     "$@"
