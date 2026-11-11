@@ -125,4 +125,4 @@ python -m pre_commit run --all-files --show-diff-on-failure
 - 需要精度验证的改动，必须在 PR 描述中提供对应验证记录：比较双方的代码版本及基线来源、运行环境与关键配置、可复现命令、指标和判定结果，以及原始日志或结果文件的可访问链接。未执行或未通过的项目必须明确状态、原因及待完成项，不得写为验证通过；无需精度验证时，须说明开发指南中的跳过依据。
 - PR 描述解释「为什么」而非只写「做了什么」；非简单改动附数值证据，模型变更说明 checkpoint 兼容性。
 - 准备、修改或 review PR 时，若改动涉及公开行为、模型支持、配置、训练或测试入口、依赖或软件栈，或用户明确要求检查文档遗漏，使用 `.agents/skills/check-pr-docs/`。默认只读；仅在用户明确要求同步修改文档或依赖时进入修改模式，已有授权继续有效。纯内部重构、普通新增测试且公开契约不变时不自动触发；仅推送已审查且未变化的内容时也不触发。只读模式不编辑文件、不运行可能改文件的检查。
-- 已安装 `gitcode-pr` skill 时，创建或推送 PR、读取改动与评论使用该 skill，并按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写。标题使用正确的英文类型标签，如 `feat`、`fix`、`refactor`、`docs` 或 `test`；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。
+- 创建或推送 PR、读取改动与评论使用 `.agents/skills/submit-pr/`；如果同时安装 `gitcode-pr`，以 `.agents/skills/submit-pr/` 的模板和流程为准。标题使用 `[type] 描述` 格式（如 `[feat]`、`[fix]`、`[refactor]`、`[docs]`、`[test]`）；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。

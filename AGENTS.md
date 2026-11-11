@@ -24,4 +24,4 @@
 
 `requirements.txt` 声明 torchtitan 版本，`.ci/setup_torchtitan.sh` 从该版本推导对应 tag。更新版本时同步核对 patch 目标、接口和测试。
 
-完整 lint、测试分层和数值验证要求见[完整开发指南](.agents/AGENTS.md)及[测试规则](tests/AGENTS.md)。`gitcode-pr` 与 `gitcode-pipeline` 是已安装相应 skill 时的可选工作流；仓库本身不提供这些 skill。
+完整 lint、测试分层和数值验证要求见[完整开发指南](.agents/AGENTS.md)及[测试规则](tests/AGENTS.md)。创建或更新 GitCode PR 使用 `.agents/skills/submit-pr/`；如果同时安装 `gitcode-pr`，以 `.agents/skills/submit-pr/` 的模板和流程为准。`gitcode-pipeline` 是已安装时的可选流水线 workflow。

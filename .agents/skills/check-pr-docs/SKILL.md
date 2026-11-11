@@ -47,9 +47,9 @@ description: "检查 torchtitan-npu PR 涉及的文档、示例命令、依赖�
 
 ### 1. 确定 PR 范围和修复基线
 
-先确认目标仓库、目标分支、PR 状态和 base/head；已安装 `gitcode-pr` 时可用其读取元数据，
-否则使用用户给出的信息或 GitCode 页面/API。不要默认 fork 的 `origin/master` 就是目标仓
-最新代码。用户明确指定修复仓库或基线时按其要求，并记录与 PR 目标仓的差异。
+先确认目标仓库、目标分支、PR 状态和 base/head；用 `submit-pr` skill 读取元数据，或使用
+用户给出的信息或 GitCode 页面/API。不要默认 fork 的 `origin/master` 就是目标仓最新代码。
+用户明确指定修复仓库或基线时按其要求，并记录与 PR 目标仓的差异。
 
 对仍待合并的 GitCode PR，可替换下面三个值后获取目标分支和 PR head；每次 fetch 成功后
 立即保存 SHA，任一步失败就停止这组命令，不能继续使用旧的 `FETCH_HEAD`：
