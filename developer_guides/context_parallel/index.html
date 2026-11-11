@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DeepSeek-V4 系列上下文并行：切分原理 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DeepSeek-V4 \u7cfb\u5217\u4e0a\u4e0b\u6587\u5e76\u884c\uff1a\u5207\u5206\u539f\u7406";
+        var mkdocs_page_input_path = "developer_guides/context_parallel.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DeepSeek-V4 系列上下文并行：切分原理</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 坐标与不变式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 切分：布局与置换</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3-metadatarank-local-frame">3. metadata：rank-local frame</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4-kv">4. KV 恢复与通信</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 启用</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6">6. 验证方法</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#7">7. 代码入口</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#8">8. 相关文档</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Developer guides</li>
+      <li class="breadcrumb-item active">DeepSeek-V4 系列上下文并行：切分原理</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="deepseek-v4">DeepSeek-V4 系列上下文并行：切分原理</h1>
+<p>DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）的 CP 是「查询按文档切分、KV 保持整行」的静态切分：
+切分在 forward 之前由布局置换完成，层内不移动 query；KV 与压缩 KV 在消费点声明式 all-gather 成整行，
+再用 frame 的 <code>seqused</code> 把可见范围限制在本 rank 的查询之前。布局有两种：</p>
+<ul>
+<li><code>doc_chunk</code>（默认）：rank <code>r</code> 取每篇文档的第 <code>r</code> 片；</li>
+<li><code>doc_zigzag</code>：每篇文档切 <code>2 × CP</code> 片，rank <code>r</code> 取第 <code>r</code> 片和镜像片，均衡因果负载。</li>
+</ul>
+<p>CP 仅适用于 AscendC 融合路径、单个 packed batch row（<code>B = 1</code>）和 <code>spmd_types</code> 后端。</p>
+<h2 id="1">1. 坐标与不变式</h2>
+<p>设 CP 度 <code>R</code>、rank <code>r</code>、文档长度 <code>L_d</code>、flatten 宽度 <code>C = N / R</code>。一行由三个 <code>KernelFrame</code> 描述：</p>
+<table>
+<thead>
+<tr>
+<th>frame</th>
+<th>网格</th>
+<th><code>seqused</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>q</code></td>
+<td>每篇文档本地 query 片的前缀和</td>
+<td>每篇文档的 query 数</td>
+</tr>
+<tr>
+<td><code>swa_k</code></td>
+<td>整行文档边界</td>
+<td>本 rank 的可见前缀 <code>reach_d</code></td>
+</tr>
+<tr>
+<td><code>cmp_k</code></td>
+<td>整行边界 <code>// ratio</code></td>
+<td><code>reach_d // ratio</code>，<code>residual = reach_d % ratio</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>position_k</code> 是<strong>本 rank flatten 段</strong>的文档内位置；查询位置随输入的 <code>positions</code> 走，不单列字段。</p>
+<p>三条不变式：</p>
+<ul>
+<li>KV 与压缩 KV 永远是整行；rank 只持有自己的 query 片和 KV 的平坦切片。</li>
+<li>consumer 只读 entry 的 frame：行网格 <code>swa_k.cu_seqlens</code>、查询网格 <code>q.cu_seqlens</code>、压缩网格
+  <code>cmp_k.cu_seqlens</code>；没有 <code>cu_seq_q</code> / <code>cu_seq_k</code> 别名。</li>
+<li>A5 内核直接读 <code>seqused</code>；A3（arch22）内核不读 key 侧 <code>seqused</code>，由算子封装把 key 前缀压紧并改写
+  <code>cu_seqlens</code>，反向再散射回整行（<code>A3KeyWorkaround</code>）。</li>
+</ul>
+<h2 id="2">2. 切分：布局与置换</h2>
+<p><code>Decoder._cp_shard</code> 从第一层 attention 的 entry 构造布局对象，拿到 <code>generate_permutation()</code> 后由
+<code>shard_tensors</code> 先重排<strong>复制在每个 rank 的整行</strong>、再均分切片：切分本身零通信，反向是置换的逆。
+tokens、labels、positions 各切一次；MTP 的 rolled tokens 先在全局行上生成，再用同一份置换
+（<code>_cp_permutation</code>）单独 <code>cp_shard</code>，所以 future-token shift 不会跨 rank 边界。</p>
+<p>每篇文档的对齐值是布局的前提：</p>
+<ul>
+<li><code>doc_chunk</code>：<code>lcm(正压缩比) × R</code>（V4 为 <code>128 × R</code>，V4.1 为 <code>2 × R</code>）；</li>
+<li><code>doc_zigzag</code>：<code>2 × R × lcm(正压缩比)</code>（V4 CP2 为 512，V4.1 CP2 为 8）。</li>
+</ul>
+<p>每个 chunk 自身也必须是 <code>ratio</code> 的整数倍，否则压缩前缀会停在组中间；对齐由
+<code>--dataloader.per_doc_alignment</code> 在数据侧保证，违反时 metadata 构建或内核网格检查直接报错。</p>
+<p><code>doc_zigzag</code> 的物理顺序是「所有文档的 Head | 所有文档的 Tail」，两半等长。rank <code>r</code> 的 Head 取第 <code>r</code>
+片、Tail 取第 <code>2R-r-1</code> 片，因此同一 rank 同时拥有短前缀和长前缀的 query：</p>
+<table>
+<thead>
+<tr>
+<th>entry</th>
+<th><code>q</code> 网格</th>
+<th>KV 网格</th>
+<th><code>swa_k.seqused</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>外层</td>
+<td>全局文档网格（供 KV 生产）</td>
+<td>全局</td>
+<td>全部 <code>L_d</code></td>
+</tr>
+<tr>
+<td><code>head</code></td>
+<td>每文档 <code>L_d/(2R)</code> 的前缀和</td>
+<td>全局</td>
+<td><code>(r+1)·L_d/(2R)</code></td>
+</tr>
+<tr>
+<td><code>tail</code></td>
+<td>与 <code>head</code> 相同</td>
+<td>全局</td>
+<td><code>(2R-r)·L_d/(2R)</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-metadatarank-local-frame">3. metadata：rank-local frame</h2>
+<ul>
+<li><code>build_attention_metadata</code> 在切分前构建全局 frames 与后端记录，每个 geometry 每个 microbatch
+  一次，同 key 的层共享。</li>
+<li><code>prepare_cp_metadata</code> 读 <code>CPShardContext</code>（CP mesh + 布局名），调用 <code>rebuild_cp_metadata</code>。</li>
+<li><code>rebuild_cp_metadata</code> 统一走 <code>per_doc_cp_metadata(zigzag=…)</code>：先切本 rank 的 <code>position_k</code>，再按块数
+  生成 query 片；<code>doc_zigzag</code> 时追加 <code>head</code> / <code>tail</code> 两个子 entry，最后挂 <code>xchg</code>
+  （<code>ExchangeMetadata.from_permutation</code> 的逆置换）。</li>
+<li>构建由 <code>local.head is None</code> 决定：<code>doc_chunk</code> 只重建外层；<code>doc_zigzag</code> 只重建 <code>head</code> / <code>tail</code>
+  的 AI_CPU 记录，外层保留全局记录供 KV 生产。</li>
+</ul>
+<p>外层保留全局 <code>q</code> / <code>swa_k</code> / <code>cmp_k</code> 与整行 <code>xchg</code> 的语义；<code>head</code> / <code>tail</code> 的 <code>position_k</code> 都是
+本 rank 的 KV slice。量化 adaptor 同样按每个 entry 的 frames 重建自己的记录，候选长度由
+<code>position_k</code> 的形状按布局折半得到，不读 frame 的内容。</p>
+<h2 id="4-kv">4. KV 恢复与通信</h2>
+<p><code>ExchangeMetadata.from_permutation</code> 求 shard 置换的逆：<code>send_index</code> / <code>send_split</code> 是本 rank flatten
+段每行要去的 peer，<code>recv_split</code> 是应从每个 peer 收到的行数。<code>doc_zigzag</code> 持有的是两段文档列表，
+另有 <code>recv_index</code> 在 all-to-all 前把它们排回平坦 token 序；接收侧仍按 <code>send_index</code> scatter。</p>
+<p><code>restore_key_stream</code> 在每个需要「本 rank 窗口」的消费方内部恢复，<code>cp=None</code> 时恒等：</p>
+<ul>
+<li>压缩器在池化前恢复；</li>
+<li>核心在取 <code>swa_k</code> 前恢复；indexer 的 <code>idx_k</code> 走自己的压缩器；</li>
+<li>V4 的 ratio-4 重叠前驱由 <code>CarryExchange</code> 交换、prepend，池化后裁掉；V4.1 对齐到组边界，
+  压缩器天然 CP-agnostic，没有 carry。</li>
+</ul>
+<p>KV all-gather 由模型边界的一次声明完成：<code>cp_dispatch.py</code> 的 <code>CPAttention</code> / <code>CPIndexer</code> 包装内层
+attention/indexer，接管 <code>_sharding_config</code>，在 Head/Tail 两次调用外只 gather 一次；AscendC、
+PyPTO 与量化后端只跑单块、不感知 CP。<code>head is None</code> 时回退为一次直接调用。包装器只包住无参数的
+inner 子树，<code>state_dict</code> 键与 CP=1 一致。</p>
+<p>arch22 + CP 下 <code>A3KeyWorkaround</code> 的压实行数是 device 值，与 <code>fullgraph=True</code> 的编译不兼容；栈在
+<code>parallelize</code> 里按 <code>is_a5() or cp &lt;= 1</code> 关闭编译（<code>compile_policy.py</code>），退化为 eager 并告警。</p>
+<h2 id="5">5. 启用</h2>
+<pre><code class="language-bash">--parallelism.context-parallel-degree 2 \
+--parallelism.context-parallel-load-balancer doc_zigzag \
+--parallelism.spmd-backend spmd_types \
+--dataloader.per_doc_alignment 512
+</code></pre>
+<p>布局必须显式命名；上游默认的 <code>headtail</code> 不在本仓的布局注册表里，融合 metadata 在 CP 下没有它的
+rank-local 形式。CP&gt;1 仅支持 <code>local_batch_size = 1</code>，DSA 路径 TP 固定为 1。</p>
+<h2 id="6">6. 验证方法</h2>
+<p>CP 的验收分三层，越往下越严格：</p>
+<ol>
+<li>CPU 契约：布局的纯函数（置换覆盖、send/recv 一致、<code>apply</code> 为逆、frame 与 <code>seqused</code>、拒绝路径）；</li>
+<li>双 rank Gloo：真实 <code>all_to_all_single</code>，验移动、逆向与梯度；</li>
+<li>单机数值：A5 单卡 + <code>--comm.mode local_tensor</code> 模拟 CP2，比较 CP1/CP2 的 logits、loss 与梯度。</li>
+</ol>
+<p>判据分层：首步 logits 与 loss 用逐位；梯度与 step 2 只给量级，因为 CP 轴的 reduce-scatter 改变了加法树。</p>
+<p>取数要点：</p>
+<ul>
+<li>两侧加载同一份 checkpoint（<code>--checkpoint.enable</code> + <code>--checkpoint.load-only</code>），日志中确认加载行；
+  只给 <code>load_only</code> 不给 <code>enable</code> 等于没对齐。</li>
+<li>同一 seed 重新初始化不算对齐：world size 会改变分片抽样位置；单卡模拟器还要按 shard 规则手工镜像权重。</li>
+<li><code>NGPU</code> 必须等于 <code>CP</code>；两侧 <code>--dataloader.per_doc_alignment</code> 相同。</li>
+<li>A5 两侧同时打开 <code>set_deterministic_level(3)</code>；不加时不同 degree 可能落到不同 kernel 实现。</li>
+<li>logits 按 rank dump，用 entry 的 <code>restore</code> 还原成 flatten 行后拼接比较。</li>
+<li>判断一次改动是否中性，先用同一棵树确认「改动前后、同一配置」逐位相同，再谈跨 degree。</li>
+</ul>
+<p>arch22（910）没有确定性等级：跨 degree 不作为逐位判据，主要看「同一 degree、改动前后逐位」以及长跑 loss
+间距是否稳定；CP&gt;1 时 <code>--compile.enable</code> 会被 <code>compile_policy</code> 关闭并告警。</p>
+<p>Engram 的取数用 <code>deepseek_v4_1_stripped</code>（released 几何 + debug Engram 表，只挂一层），同样需要镜像
+权重与两侧 level 3；逐行 history 由 shard 置换生成，跨 rank 不通信。</p>
+<h2 id="7">7. 代码入口</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>models/deepseek_v4/cp_layout.py</code></td>
+<td><code>doc_chunk</code> / <code>doc_zigzag</code> 的 LoadBalancer 与置换</td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/metadata.py</code></td>
+<td><code>KernelFrame</code>、<code>DeepSeekV4Metadata</code>、<code>rebuild_cp_metadata</code> / <code>per_doc_cp_metadata</code></td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/cp_attention.py</code></td>
+<td><code>ExchangeMetadata</code>（置换求逆）与 <code>restore_key_stream</code></td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/cp_dispatch.py</code></td>
+<td>模型级 <code>CPAttention</code> / <code>CPIndexer</code> 包装器与配置转换</td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/cp_compressor.py</code></td>
+<td>V4 ratio-4 的 <code>CarryExchange</code></td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/compile_policy.py</code></td>
+<td>arch22 + CP 时关闭编译</td>
+</tr>
+<tr>
+<td><code>override/deepseek_v4*/</code></td>
+<td>融合后端、量化 adaptor、A3 前缀压紧</td>
+</tr>
+</tbody>
+</table>
+<h2 id="8">8. 相关文档</h2>
+<ul>
+<li><a href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a></li>
+<li><a href="../../feature_guides/fused_ops/">融合算子使用与开发</a></li>
+<li><a href="../numerical_alignment/">数值对齐</a></li>
+<li><a href="../../feature_guides/mtp/">MTP</a></li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../config_extensions/" class="btn btn-neutral float-left" title="NPU 配置扩展指南"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../lint_guide/" class="btn btn-neutral float-right" title="Lint 指南">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../config_extensions/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../lint_guide/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
