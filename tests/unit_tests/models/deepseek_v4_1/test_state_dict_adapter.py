@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceStorageWriter
 
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.models.deepseek_v4_1 import (
     model_registry,
 )
@@ -349,3 +351,39 @@ def test_engram_hf_distributed_roundtrip(tmp_path):
         timeout=180,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required")
+def test_last_step_hf_dtype_conversion_preserves_engram_tail_shard():
+    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    table = config.layers[1].engram.table
+    table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
+    table.num_embeddings = 48
+    table.embedding_dim = 32
+    adapter = DeepSeekV41StateDictAdapter(config, None)
+    weight = torch.arange(12 * 32, dtype=torch.float32).reshape(12, 32)
+    native = checkpoint_shard(weight, offset=36, logical_rows=48)
+    manager = object.__new__(CheckpointManager)
+    manager.states = {"model": SimpleNamespace(state_dict=lambda: {"layers.1.engram.table.weight": native})}
+    manager.last_save_model_only = True
+    manager.last_save_in_hf = True
+    manager.export_dtype = torch.bfloat16
+    manager._create_checkpoint_id = lambda step: f"step-{step}"
+    exported = {}
+
+    def save(state_dict, **kwargs):
+        assert kwargs["to_hf"] is True
+        exported.update(adapter.to_hf(state_dict))
+
+    manager.dcp_save = save
+    manager._save_last_step(5)
+
+    result = exported["layers.1.engram.embed.weight"]
+    assert result.dtype == torch.bfloat16
+    assert result.global_shape == (41, 32)
+    assert result.global_offsets == ((36, 0),)
+    assert result.local_sizes == ((5, 32),)
+    assert result._engram_valid_rows == 5
+    torch.testing.assert_close(result[:5], weight[:5].to(torch.bfloat16), rtol=0, atol=0)
+    assert native.global_shape == (48, 32)
+    assert native.dtype == torch.float32

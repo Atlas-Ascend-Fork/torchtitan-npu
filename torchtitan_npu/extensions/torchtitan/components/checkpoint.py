@@ -14,12 +14,14 @@ import torch.distributed.checkpoint as dcp
 import torchtitan.components.checkpoint
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torchtitan.components.checkpoint import (
+    MODEL,
     AsyncMode,
 )
 from torchtitan.components.checkpoint import (
     CheckpointManager as _CheckpointManager,
 )
 from torchtitan.observability import structured_logger as sl
+from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import GarbageCollection
 
 from torchtitan_npu.extensions.components.validation import (
@@ -67,6 +69,33 @@ class CheckpointManager(_CheckpointManager):
 
         self.verify_hash_manifest = config.extensions.verify_hash_manifest
         super().__init__(config=config, **kwargs)
+
+    @torch.no_grad()
+    def _save_last_step(self, curr_step: int) -> None:
+        if self.last_save_in_hf:
+            assert self.last_save_model_only, "Only model can be saved when saving in HF safetensors format."
+        if not self.last_save_model_only:
+            return super()._save_last_step(curr_step)
+
+        # TorchTitan 0.3.0 drops row-shard attributes during dtype conversion.
+        # Recheck this model-only branch when upgrading the upstream checkpointer.
+        states = dict(self.states[MODEL].state_dict())
+        for key, value in states.items():
+            if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.dtype == self.export_dtype:
+                continue
+            converted = value.to(self.export_dtype)
+            for name in ("global_shape", "global_offsets", "local_offsets", "local_sizes"):
+                if hasattr(value, name):
+                    setattr(converted, name, getattr(value, name))
+            states[key] = converted
+        logger.info(f"Saving a model only checkpoint in {self.export_dtype} at last step, step {curr_step}.")
+        self.dcp_save(
+            states,
+            checkpoint_id=self._create_checkpoint_id(curr_step),
+            async_mode=AsyncMode.DISABLED,
+            enable_garbage_collection=True,
+            to_hf=self.last_save_in_hf,
+        )
 
     @torch.no_grad()
     def dcp_save(

@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed.checkpoint  # Load distributed modules before isolating the TorchTitan imports.
 
 
 class _AsyncMode(str, Enum):
@@ -51,6 +52,7 @@ components_stub = types.ModuleType("torchtitan.components")
 components_stub.__path__ = []
 torchtitan_stub.components = components_stub
 checkpoint_stub = types.ModuleType("torchtitan.components.checkpoint")
+checkpoint_stub.MODEL = "model"
 checkpoint_stub.AsyncMode = _AsyncMode
 checkpoint_stub.CheckpointManager = _CheckpointManager
 components_stub.checkpoint = checkpoint_stub
@@ -63,6 +65,8 @@ torchtitan_stub.tools = tools_stub
 utils_stub = types.ModuleType("torchtitan.tools.utils")
 utils_stub.GarbageCollection = MagicMock()
 tools_stub.utils = utils_stub
+logging_stub = types.ModuleType("torchtitan.tools.logging")
+logging_stub.logger = MagicMock()
 validation_stub = types.ModuleType("torchtitan_npu.extensions.components.validation")
 validation_stub.mark_checkpoint_manifest_pending = MagicMock()
 validation_stub.verify_checkpoint_manifest = MagicMock()
@@ -82,6 +86,7 @@ with patch.dict(
         "torchtitan.observability": observability_stub,
         "torchtitan.tools": tools_stub,
         "torchtitan.tools.utils": utils_stub,
+        "torchtitan.tools.logging": logging_stub,
         "torchtitan_npu.extensions.components.validation": validation_stub,
     },
 ):
@@ -329,3 +334,37 @@ def test_checkpoint_manager_delegates_async_and_hf_paths(async_mode, to_hf):
         enable_garbage_collection=False,
         to_hf=to_hf,
     )
+
+
+@pytest.mark.parametrize("to_hf", [False, True], ids=["dcp", "hf"])
+def test_last_step_dtype_conversion_preserves_row_shards(to_hf):
+    manager = object.__new__(product_checkpoint.CheckpointManager)
+    weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    metadata = {
+        "global_shape": (8, 3),
+        "global_offsets": ((4, 0),),
+        "local_offsets": ((0, 0),),
+        "local_sizes": ((4, 3),),
+    }
+    weight.__dict__.update(metadata)
+    cached_state = {"table": weight}
+    manager.states = {"model": types.SimpleNamespace(state_dict=lambda: cached_state)}
+    manager.last_save_model_only = True
+    manager.last_save_in_hf = to_hf
+    manager.export_dtype = torch.bfloat16
+    manager._create_checkpoint_id = lambda step: f"step-{step}"
+    manager.dcp_save = MagicMock()
+
+    manager._save_last_step(5)
+
+    saved_state = manager.dcp_save.call_args.args[0]
+    assert saved_state is not cached_state
+    assert cached_state["table"] is weight
+    saved = saved_state["table"]
+    assert saved.dtype == torch.bfloat16
+    assert saved is not weight
+    torch.testing.assert_close(saved.float(), weight)
+    for name, expected in metadata.items():
+        assert getattr(saved, name) == expected
+    assert weight.dtype == torch.float32
+    assert manager.dcp_save.call_args.kwargs["to_hf"] is to_hf
