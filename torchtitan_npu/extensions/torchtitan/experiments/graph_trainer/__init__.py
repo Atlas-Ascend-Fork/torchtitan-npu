@@ -17,7 +17,7 @@ from torchtitan_npu.extensions.torchtitan.components.checkpoint import Checkpoin
 
 from ...tools.profiler import CANNProfiler
 from ...trainer import TrainerEx
-from . import auto_overlap
+from . import auto_overlap, ep_overlap_deepep_guard
 
 
 def _apply_auto_overlap_runtime_context_patch(config) -> None:
@@ -40,6 +40,10 @@ class GraphTrainerEx(TrainerEx, GraphTrainer):
         )
 
     def __init__(self, config: Config) -> None:
+        # DeepEP has no all-to-all token exchanges, so the EP overlap
+        # stack (graph chunking + NPU auto-overlap scheduling) cannot
+        # apply and would fail the graph build; drop it up front.
+        ep_overlap_deepep_guard.disable_ep_overlap_for_deepep(config)
         # This patch must wrap GraphTrainer before its first trace.
         _apply_auto_overlap_runtime_context_patch(config)
         super().__init__(config)

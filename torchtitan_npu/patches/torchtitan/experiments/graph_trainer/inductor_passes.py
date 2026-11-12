@@ -33,8 +33,34 @@ from torchtitan.tools.logging import logger
 _original_full_compile = torchtitan.experiments.graph_trainer.inductor_passes.full_inductor_compilation_pass
 
 
-def _compile_boxed_region(gm):
-    inputs = [node.meta["val"] for node in gm.graph.nodes if node.op == "placeholder"]
+def _compile_boxed_region(gm, attr_sources=None):
+    inputs = []
+    recovered = 0
+    for node in gm.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        if "val" in node.meta:
+            inputs.append(node.meta["val"])
+        elif attr_sources is not None and isinstance(node.target, str) and node.target in attr_sources:
+            # split_module lifts non-module get_attrs into region placeholders.
+            # DeepEP's dispatcher threads its dispatch metadata as an opaque
+            # custom-class object: tracing lifts it to a get_attr that carries
+            # no tensor 'val' meta. Recover the example value from the
+            # pre-split module so standalone_compile can trace the region;
+            # at runtime the wrapper still receives the live object.
+            inputs.append(attr_sources[node.target])
+            recovered += 1
+        else:
+            raise KeyError(
+                f"Region placeholder {node.name!r} (target={node.target!r}) has no "
+                "'val' metadata and no recoverable module attribute"
+            ) from None
+    if recovered:
+        logger.info(
+            "Full Inductor: recovered %d non-tensor region input(s) (e.g. DeepEP "
+            "dispatch metadata) from module attributes",
+            recovered,
+        )
     options = {}
     for module in gm.modules():
         if isinstance(module, fx.GraphModule):
@@ -115,6 +141,22 @@ def full_inductor_compilation_pass(gm, example_inputs, *, boxed_codegen=False):
     # split_module can lift loss constants into the parent graph. Migrate the
     # whole graph (including nested graphs) before any partition is extracted.
     torchtitan.experiments.graph_trainer.inductor_passes._migrate_cpu_get_attrs_to_cuda(gm)
+    # Example values for get_attr inputs that tracing lifted without tensor
+    # 'val' meta (DeepEP dispatch metadata opaque objects), keyed by target.
+    # Collect after the CPU->device migration so tensor values stay current.
+    # split_module names each region placeholder after the source node's NAME,
+    # and recompute duplication re-uses one attr target under several node
+    # names (_opaque_obj0_1 -> _opaque_obj0), so index both spellings.
+    attr_sources = {}
+    for node in gm.graph.find_nodes(op="get_attr"):
+        if not (isinstance(node.target, str) and "val" not in node.meta):
+            continue
+        try:
+            value = _get_attr(gm, node.target)
+        except AttributeError:
+            continue
+        attr_sources[node.name] = value
+        attr_sources.setdefault(node.target, value)
     positions = {node: index for index, node in enumerate(nodes)}
     first, last = min(positions[node] for node in loss_nodes), max(positions[node] for node in loss_nodes)
     # Include unannotated gradient accumulation between chunks. Separate FX
@@ -133,7 +175,7 @@ def full_inductor_compilation_pass(gm, example_inputs, *, boxed_codegen=False):
             continue
         if name not in {"submod_0", "submod_2"}:
             continue
-        result.add_submodule(name, _compile_boxed_region(child))
+        result.add_submodule(name, _compile_boxed_region(child, attr_sources))
     for node in result.graph.nodes:
         if node.op == "call_module" and node.target in {"submod_0", "submod_1", "submod_2"}:
             # Packing must be a separate node: FX then drops last-use locals

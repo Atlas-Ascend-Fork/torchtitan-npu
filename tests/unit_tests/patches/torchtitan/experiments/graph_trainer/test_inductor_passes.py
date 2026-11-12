@@ -5,6 +5,7 @@
 
 """Preserve the real chunk-loss schedule around compiled model regions."""
 
+import operator
 from types import SimpleNamespace
 
 import pytest
@@ -222,3 +223,66 @@ def test_full_releases_partition_input_storage_before_partition_returns(residenc
     torch.testing.assert_close(actual, -x.sum() if probe_region == "loss" else 2 * x.sum(), rtol=0, atol=0)
     # Inspect storage while the consumer is STILL running, not after the whole step exits.
     assert released == [[True]]
+
+
+@pytest.mark.parametrize("boxed_codegen", [False, True], ids=["unboxed", "boxed"])
+def test_full_recovers_non_tensor_attrs_with_recomputed_node_names(boxed_codegen):
+    x = torch.arange(8, dtype=torch.float32)
+
+    def step(x):
+        loss = compute_annotated_loss(lambda h, _: h.sum(), x.sin() * 2.0, None)
+        return loss.neg() * 2.0
+
+    with torch.fx.traceback.preserve_node_meta():
+        gm = make_fx(step, tracing_mode="fake")(x)
+    # A tuple represents non-tensor metadata without requiring a CANN opaque class.
+    # Both regions read the same attribute, with the recomputed node using a suffix.
+    gm._opaque_obj0 = (2.0,)
+    for index, node in enumerate([node for node in gm.graph.nodes if node.target == torch.ops.aten.mul.Tensor]):
+        with gm.graph.inserting_before(node):
+            attr = gm.graph.get_attr("_opaque_obj0")
+            scalar = gm.graph.call_function(operator.getitem, (attr, 0))
+        assert attr.name == ("_opaque_obj0" if index == 0 else "_opaque_obj0_1")
+        # Only the lifted attribute lacks val; the getitem's scalar metadata is known.
+        scalar.meta["val"] = 2.0
+        node.args = (node.args[0], scalar)
+    gm.recompile()
+    (compile_pass,) = final_inductor_compile_passes(
+        SimpleNamespace(inductor_compilation="full"), boxed_codegen=boxed_codegen
+    )
+
+    compiled = compile_pass(gm, (x,))
+    runtime_metadata = tuple([2.0])
+    compiled._opaque_obj0 = runtime_metadata
+    received = []
+
+    def observe_region_inputs(module, args):
+        received.append(any(value is runtime_metadata for value in args[0]))
+
+    handles = [
+        compiled.get_submodule(name).register_forward_pre_hook(observe_region_inputs)
+        for name in ("submod_0", "submod_2")
+    ]
+    try:
+        actual = compiled([x]) if boxed_codegen else compiled(x)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert received == [True, True]
+    torch.testing.assert_close(actual, -4.0 * x.sin().sum(), rtol=0, atol=0)
+    for name in ("submod_0", "submod_2"):
+        assert any(
+            isinstance(getattr(node.target, "__wrapped__", None), CompiledArtifact)
+            for node in compiled.get_submodule(name).graph.nodes
+        )
+
+
+def test_boxed_region_reports_unrecoverable_placeholder():
+    graph = torch.fx.Graph()
+    missing = graph.placeholder("missing_metadata")
+    graph.output(missing)
+    gm = torch.fx.GraphModule({}, graph)
+
+    with pytest.raises(KeyError, match="missing_metadata.*no recoverable module attribute"):
+        inductor_passes._compile_boxed_region(gm, {})

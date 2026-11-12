@@ -47,6 +47,14 @@ def is_npu_auto_overlap_pipeline(name: str) -> bool:
     return name in _AUTO_OVERLAP_PIPELINES.values()
 
 
+def revert_npu_auto_overlap_pipeline(name: str) -> str:
+    """Return the base pipeline name for an NPU auto-overlap composition."""
+    for base, composed in _AUTO_OVERLAP_PIPELINES.items():
+        if name == composed:
+            return base
+    return name
+
+
 def npu_moe_auto_overlap_pass(
     gm,
     _example_inputs,
