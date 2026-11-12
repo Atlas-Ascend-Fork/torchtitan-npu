@@ -93,6 +93,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
@@ -164,9 +166,9 @@
             <div class="section" itemprop="articleBody">
               
                 <h1 id="deepseek-v4">DeepSeek-V4 系列上下文并行：切分原理</h1>
-<p>DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）的 CP 是「查询按文档切分、KV 保持整行」的静态切分：
-切分在 forward 之前由布局置换完成，层内不移动 query；KV 与压缩 KV 在消费点声明式 all-gather 成整行，
-再用 frame 的 <code>seqused</code> 把可见范围限制在本 rank 的查询之前。布局有两种：</p>
+<p>DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）的 CP 在 forward 前按文档预排序 query，层内保持其布局。
+压缩 KV 与 index KV 在消费点 all-gather 成整行，再用 <code>seqused</code> 限制因果可见范围；SWA 只交换缺失的
+窗口前缀，不做整行 all-gather。布局有两种：</p>
 <ul>
 <li><code>doc_chunk</code>（默认）：rank <code>r</code> 取每篇文档的第 <code>r</code> 片；</li>
 <li><code>doc_zigzag</code>：每篇文档切 <code>2 × CP</code> 片，rank <code>r</code> 取第 <code>r</code> 片和镜像片，均衡因果负载。</li>
@@ -190,8 +192,8 @@
 </tr>
 <tr>
 <td><code>swa_k</code></td>
-<td>整行文档边界</td>
-<td>本 rank 的可见前缀 <code>reach_d</code></td>
+<td>本地 query 片及前方最多 <code>W−1</code> 个 key 的文档边界</td>
+<td>每个局部窗口的完整长度</td>
 </tr>
 <tr>
 <td><code>cmp_k</code></td>
@@ -203,9 +205,9 @@
 <p><code>position_k</code> 是<strong>本 rank flatten 段</strong>的文档内位置；查询位置随输入的 <code>positions</code> 走，不单列字段。</p>
 <p>三条不变式：</p>
 <ul>
-<li>KV 与压缩 KV 永远是整行；rank 只持有自己的 query 片和 KV 的平坦切片。</li>
-<li>consumer 只读 entry 的 frame：行网格 <code>swa_k.cu_seqlens</code>、查询网格 <code>q.cu_seqlens</code>、压缩网格
-  <code>cmp_k.cu_seqlens</code>；没有 <code>cu_seq_q</code> / <code>cu_seq_k</code> 别名。</li>
+<li>压缩 KV 与 index KV 保持完整平坦布局；SWA 窗口按 query 的文档顺序拼接。</li>
+<li><code>cu_seqlens</code> 始终保存全局文档边界；consumer 读取其操作数的 <code>q</code> / <code>swa_k</code> / <code>cmp_k</code> frame，
+  不再通过 <code>swa_k</code> 推断全局网格。</li>
 <li>A5 内核直接读 <code>seqused</code>；A3（arch22）内核不读 key 侧 <code>seqused</code>，由算子封装把 key 前缀压紧并改写
   <code>cu_seqlens</code>，反向再散射回整行（<code>A3KeyWorkaround</code>）。</li>
 </ul>
@@ -223,65 +225,49 @@ tokens、labels、positions 各切一次；MTP 的 rolled tokens 先在全局行
 <code>--dataloader.per_doc_alignment</code> 在数据侧保证，违反时 metadata 构建或内核网格检查直接报错。</p>
 <p><code>doc_zigzag</code> 的物理顺序是「所有文档的 Head | 所有文档的 Tail」，两半等长。rank <code>r</code> 的 Head 取第 <code>r</code>
 片、Tail 取第 <code>2R-r-1</code> 片，因此同一 rank 同时拥有短前缀和长前缀的 query：</p>
-<table>
-<thead>
-<tr>
-<th>entry</th>
-<th><code>q</code> 网格</th>
-<th>KV 网格</th>
-<th><code>swa_k.seqused</code></th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>外层</td>
-<td>全局文档网格（供 KV 生产）</td>
-<td>全局</td>
-<td>全部 <code>L_d</code></td>
-</tr>
-<tr>
-<td><code>head</code></td>
-<td>每文档 <code>L_d/(2R)</code> 的前缀和</td>
-<td>全局</td>
-<td><code>(r+1)·L_d/(2R)</code></td>
-</tr>
-<tr>
-<td><code>tail</code></td>
-<td>与 <code>head</code> 相同</td>
-<td>全局</td>
-<td><code>(2R-r)·L_d/(2R)</code></td>
-</tr>
-</tbody>
-</table>
+<p>设 query 片为文档内 <code>[a, b)</code>，其 SWA 操作数是 <code>[max(0, a−W+1), b)</code>，query 仍靠右对齐。
+Head/Tail 的 query 网格相同，SWA 网格各自描述实际窗口；<code>cmp_k.seqused</code> 仍由各自的原始可见前缀决定。</p>
 <h2 id="3-metadatarank-local-frame">3. metadata：rank-local frame</h2>
 <ul>
 <li><code>build_attention_metadata</code> 在切分前构建全局 frames 与后端记录，每个 geometry 每个 microbatch
   一次，同 key 的层共享。</li>
 <li><code>prepare_cp_metadata</code> 读 <code>CPShardContext</code>（CP mesh + 布局名），调用 <code>rebuild_cp_metadata</code>。</li>
-<li><code>rebuild_cp_metadata</code> 统一走 <code>per_doc_cp_metadata(zigzag=…)</code>：先切本 rank 的 <code>position_k</code>，再按块数
-  生成 query 片；<code>doc_zigzag</code> 时追加 <code>head</code> / <code>tail</code> 两个子 entry，最后挂 <code>xchg</code>
-  （<code>ExchangeMetadata.from_permutation</code> 的逆置换）。</li>
+<li><code>rebuild_cp_metadata</code> 统一走 <code>per_doc_cp_metadata(zigzag=…)</code>：先切本 rank 的 <code>position_k</code>，按文档分段从
+  permutation 读取实际 query 区间；<code>doc_zigzag</code> 保留独立的 <code>head</code> / <code>tail</code>，最后挂 <code>xchg.cmp</code>
+  （压缩输入的逆置换）与 <code>xchg.swa</code>（SWA 窗口路由）。</li>
 <li>构建由 <code>local.head is None</code> 决定：<code>doc_chunk</code> 只重建外层；<code>doc_zigzag</code> 只重建 <code>head</code> / <code>tail</code>
   的 AI_CPU 记录，外层保留全局记录供 KV 生产。</li>
 </ul>
-<p>外层保留全局 <code>q</code> / <code>swa_k</code> / <code>cmp_k</code> 与整行 <code>xchg</code> 的语义；<code>head</code> / <code>tail</code> 的 <code>position_k</code> 都是
+<p>ZigZag 外层保留全局 <code>q</code> / <code>swa_k</code> / <code>cmp_k</code>；<code>head</code> / <code>tail</code> 的 <code>position_k</code> 都是
 本 rank 的 KV slice。量化 adaptor 同样按每个 entry 的 frames 重建自己的记录，候选长度由
 <code>position_k</code> 的形状按布局折半得到，不读 frame 的内容。</p>
 <h2 id="4-kv">4. KV 恢复与通信</h2>
-<p><code>ExchangeMetadata.from_permutation</code> 求 shard 置换的逆：<code>send_index</code> / <code>send_split</code> 是本 rank flatten
-段每行要去的 peer，<code>recv_split</code> 是应从每个 peer 收到的行数。<code>doc_zigzag</code> 持有的是两段文档列表，
-另有 <code>recv_index</code> 在 all-to-all 前把它们排回平坦 token 序；接收侧仍按 <code>send_index</code> scatter。</p>
-<p><code>restore_key_stream</code> 在每个需要「本 rank 窗口」的消费方内部恢复，<code>cp=None</code> 时恒等：</p>
+<p><code>xchg</code> 统一承载 CP 交换元数据，非 CP 时为 <code>None</code>。<code>xchg.cmp</code> 描述压缩器所需的连续全局 token 区间，
+<code>xchg.swa</code> 描述 Head/Tail 所需的窗口。两者共用 <code>_xchg_metadata</code>：输入 token 的物理位置及每个 rank 的需求，
+输出发送索引、收发数量和按来源 rank 排列的接收 token；它不解释布局名称。</p>
+<p><code>DocumentRanges</code> 保存每篇文档的全局起止位置，由 permutation 和 query 分段构造。query frame、SWA frame 与
+窗口交换使用同一份区间，因此 <code>WindowMetadata.build</code> 无需 <code>zigzag</code> 参数。Head/Tail 即使相邻也分别保留。
+<code>send_split</code> / <code>recv_split</code> 直接对应 collective 的输入 / 输出分段；压缩器用 <code>recv_index</code> 恢复连续顺序，
+SWA 的 <code>head_index</code> / <code>tail_index</code> 从「本地 key + 接收 key」组装窗口。metadata 不持有进程组或执行通信。</p>
+<p><code>ContextParallelConverter</code> 按 pinned 上游的 <code>ModelConfigConverter</code> 接口，在模型配置阶段选择独立的
+CP attention/compressor。普通模型不持有 CP 进程组或通信流程；已选的量化 compressor 子类通过继承保留，
+参数模块不增加包装层，因此参数 FQN 不变。inner attention/indexer 仍使用 override 选中的后端。</p>
 <ul>
-<li>压缩器在池化前恢复；</li>
-<li>核心在取 <code>swa_k</code> 前恢复；indexer 的 <code>idx_k</code> 走自己的压缩器；</li>
-<li>V4 的 ratio-4 重叠前驱由 <code>CarryExchange</code> 交换、prepend，池化后裁掉；V4.1 对齐到组边界，
-  压缩器天然 CP-agnostic，没有 carry。</li>
+<li><code>ContextParallelCompressor</code> 在池化前通过 <code>_restore_flat_input</code> 还原布局；ratio-4 再通过 <code>_prepend_carry</code> 交换前驱块，
+  池化后裁掉 carry 输出。其他压缩比只裁剪本地文档网格。V4.1 的 CP compressor 只恢复输入布局。</li>
+<li><code>CPAttention._exchange_window</code> 按 <code>WindowMetadata</code> 一次 all-to-all 获取远端 key；本地 key 直接复用。
+  同一 peer 请求的重复 key 只发送一次，Head/Tail 的重复使用在反向累加，短文档的窗口可跨多个 rank。</li>
+<li><code>CPAttention</code> / <code>CPIndexer</code> 接管 inner 的 sharding 声明，压缩 KV / index KV 在两次调用外各 gather 一次；
+  <code>CPAttention</code> 在内部组装 SWA 窗口，再按 Head/Tail 的 frames 调用后端并拼接输出。</li>
 </ul>
-<p>KV all-gather 由模型边界的一次声明完成：<code>cp_dispatch.py</code> 的 <code>CPAttention</code> / <code>CPIndexer</code> 包装内层
-attention/indexer，接管 <code>_sharding_config</code>，在 Head/Tail 两次调用外只 gather 一次；AscendC、
-PyPTO 与量化后端只跑单块、不感知 CP。<code>head is None</code> 时回退为一次直接调用。包装器只包住无参数的
-inner 子树，<code>state_dict</code> 键与 CP=1 一致。</p>
+<p>这与上游 <a href="https://github.com/pytorch/torchtitan/pull/5746">SelectiveGather CP 草案 #5746</a> 的
+「attention 持有窗口交换、路由与执行分离」一致。我们的 per-document 置换随 batch 改变，
+因此路由随 metadata 重建；不沿用其固定全局分片缓存，也不依赖 CUDA copy-engine 后端。</p>
+<p>与上游 <code>AllGatherKVVarlen</code> 一样，CP 模块拥有通信与两次调用，后端只消费 metadata。区别在于本实现
+按每篇文档切 query，并在压缩前恢复平坦输入；上游沿全局序列切分、全量 gather 后裁剪 KV。
+SWA 前缀交换是本仓扩展。</p>
+<p>布局还原、carry 与窗口交换各自独立：前者是置换，carry 只补一个压缩块，窗口交换允许重复使用 key。
+平坦化与窗口交换共用路由构造；carry 直接使用邻居关系。SWA 无需按窗口宽度额外 padding。</p>
 <p>arch22 + CP 下 <code>A3KeyWorkaround</code> 的压实行数是 device 值，与 <code>fullgraph=True</code> 的编译不兼容；栈在
 <code>parallelize</code> 里按 <code>is_a5() or cp &lt;= 1</code> 关闭编译（<code>compile_policy.py</code>），退化为 eager 并告警。</p>
 <h2 id="5">5. 启用</h2>
@@ -290,8 +276,9 @@ inner 子树，<code>state_dict</code> 键与 CP=1 一致。</p>
 --parallelism.spmd-backend spmd_types \
 --dataloader.per_doc_alignment 512
 </code></pre>
-<p>布局必须显式命名；上游默认的 <code>headtail</code> 不在本仓的布局注册表里，融合 metadata 在 CP 下没有它的
-rank-local 形式。CP&gt;1 仅支持 <code>local_batch_size = 1</code>，DSA 路径 TP 固定为 1。</p>
+<p>布局必须显式命名；上游默认的 <code>headtail</code> 不在本仓的布局注册表里，融合 metadata 的 query 区间按
+<code>doc_chunk</code> / <code>doc_zigzag</code> 的块数读置换，其他名字不会得到正确的 rank-local frame。CP&gt;1 仅支持
+<code>local_batch_size = 1</code>，DSA 路径 TP 固定为 1。</p>
 <h2 id="6">6. 验证方法</h2>
 <p>CP 的验收分三层，越往下越严格：</p>
 <ol>
@@ -325,23 +312,15 @@ rank-local 形式。CP&gt;1 仅支持 <code>local_batch_size = 1</code>，DSA �
 <tbody>
 <tr>
 <td><code>models/deepseek_v4/cp_layout.py</code></td>
-<td><code>doc_chunk</code> / <code>doc_zigzag</code> 的 LoadBalancer 与置换</td>
+<td><code>doc_chunk</code> / <code>doc_zigzag</code> 的 LoadBalancer、置换与 <code>DocumentRanges</code></td>
 </tr>
 <tr>
 <td><code>models/deepseek_v4/metadata.py</code></td>
-<td><code>KernelFrame</code>、<code>DeepSeekV4Metadata</code>、<code>rebuild_cp_metadata</code> / <code>per_doc_cp_metadata</code></td>
+<td><code>KernelFrame</code>、<code>CPExchanges</code>（<code>xchg.cmp</code> / <code>xchg.swa</code>）、<code>DeepSeekV4Metadata</code>、<code>rebuild_cp_metadata</code></td>
 </tr>
 <tr>
-<td><code>models/deepseek_v4/cp_attention.py</code></td>
-<td><code>ExchangeMetadata</code>（置换求逆）与 <code>restore_key_stream</code></td>
-</tr>
-<tr>
-<td><code>models/deepseek_v4/cp_dispatch.py</code></td>
-<td>模型级 <code>CPAttention</code> / <code>CPIndexer</code> 包装器与配置转换</td>
-</tr>
-<tr>
-<td><code>models/deepseek_v4/cp_compressor.py</code></td>
-<td>V4 ratio-4 的 <code>CarryExchange</code></td>
+<td><code>models/deepseek_v4/context_parallel.py</code></td>
+<td>CPAttention 组装 SWA 窗口；CPCompressor 还原 slab 与 ratio-4 carry；配置转换</td>
 </tr>
 <tr>
 <td><code>models/deepseek_v4/compile_policy.py</code></td>

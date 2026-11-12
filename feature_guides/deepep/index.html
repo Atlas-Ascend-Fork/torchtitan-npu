@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DeepEP - NPU MoE dispatch/combine - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DeepEP - NPU MoE dispatch/combine";
+        var mkdocs_page_input_path = "feature_guides/deepep.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DeepEP - NPU MoE dispatch/combine</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">背景与挑战</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">特性概述</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">启用方式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">架构</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">组件清单</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#score-absorption">数据路径与 score absorption</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_6">通信域与容量</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">支持组合</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_8">与其他特性的关系</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_9">限制</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">DeepEP - NPU MoE dispatch/combine</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="deepep-npu-moe-dispatchcombine">DeepEP - NPU MoE dispatch/combine</h1>
+<h2 id="_1">背景与挑战</h2>
+<p>MoE 的专家并行（EP）把 token 按路由结果发送到持有目标专家的 rank，再把各专家的输出
+还原到原 token 顺序。dispatch 和 combine 同时承担数据重排、跨 rank 通信以及 routing
+score 的传递，任一处的张量顺序或 metadata 不一致都可能导致输出错位。</p>
+<p>仓库已有标准 all-to-all 路径。dispatch 先调用 <code>npu_moe_token_permute</code> 重排 token，交换
+token 计数并执行 token all-to-all，再调用 <code>npu_moe_re_routing</code> 将收到的 rank-major 布局
+重排为 expert-major。EP&gt;1 时，combine 依次调用两次 <code>npu_moe_token_unpermute</code>，中间执行
+一次返回方向的 all-to-all：第一次把 expert-major 输出恢复为通信前的 rank-major 布局，第二次把
+结果恢复到原 token 顺序并完成 top-k 聚合。它在语义上
+完整，中小 EP 或通信阶段不构成瓶颈时足够使用，也是默认路径。DeepEP 要解决的不是
+「有没有 dispatch/combine」，而是标准路径在每层都要付出的固定通信与 host 侧准备成本：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>标准 all-to-all</th>
+<th>DeepEP / ElasticBuffer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>token 计数与 split</td>
+<td>每层先做 count all-to-all，再阻塞 D2H 得到 <code>input_splits</code>/<code>output_splits</code> 两个 host 列表；据此执行 token all-to-all</td>
+<td>由 buffer 协议完成计数；host 只等待接收 token 数，不生成这两个 split 列表</td>
+</tr>
+<tr>
+<td>forward 通信（EP&gt;1）</td>
+<td>dispatch 执行 count 和 token all-to-all；开启 score absorption 时再单独执行 score all-to-all。combine 在两次 <code>npu_moe_token_unpermute</code> 之间执行一次 all-to-all，将专家输出传回 token 所在 rank。关闭 score absorption 时在该 rank 使用本地保留的 score 加权，无需发送 score</td>
+<td>一次 <code>deepep::dispatch</code> 将 token 与 score 发送到专家所在 rank，一次 <code>deepep::combine</code> 将专家输出传回 token 所在 rank</td>
+</tr>
+<tr>
+<td>backward 通信（EP&gt;1）</td>
+<td>combine 的梯度经 all-to-all 传向专家所在 rank；dispatch 的 token 梯度经 all-to-all 传回 token 所在 rank。开启 score absorption 且 score 需要求导时，再经单独的 score 梯度 all-to-all 传回；关闭时 score 梯度在 token 所在 rank 本地计算，无需单独的 score 梯度通信。count 不参与求导</td>
+<td><code>deepep::combine_backward</code> 调用 cached dispatch 向专家所在 rank 发送梯度；<code>deepep::dispatch_backward</code> 调用 cached combine 传回 token 梯度及所需的 score 梯度。两步仍执行跨 rank 梯度通信；cached handle 复用路由与接收计数等 metadata</td>
+</tr>
+<tr>
+<td>接收容量</td>
+<td>根据本层路由结果动态确定接收 token 数，运行时构造接收 token tensor，并生成对应的 <code>input_splits</code>/<code>output_splits</code> 列表</td>
+<td>用 <code>num_max_tokens_per_rank</code> 约定每 rank 输入 token 上限，作为 <code>ElasticBuffer</code> 申请 buffer 空间的入参；本仓不另行分配 HCCL 通信 buffer</td>
+</tr>
+<tr>
+<td>默认状态</td>
+<td>moe_comm_backend="standard" 的默认路径</td>
+<td>需要 <code>moe_comm_backend="deepep"</code> 与 <code>asc_deepep</code></td>
+</tr>
+</tbody>
+</table>
+<p>这些成本在大 EP、token 数大、每层都要重复 count/split 准备和 score 通信时累积。DeepEP
+把计数、score 传递和 token 交换收进一个带容量上限的 <code>ElasticBuffer</code>：dispatch 直接带 topk
+scores 发出，combine 只做 reduction，backward 复用同一 handle 中的 metadata 执行梯度通信。代价是需要给出
+<code>num_max_tokens_per_rank</code> 上限、依赖 CANN <code>ElasticBuffer</code>，并接受 buffer 生命周期和容量
+配置的约束；HCCL 通信 buffer 实际由 <code>ElasticBuffer</code> 内部底层算子按这组参数计算并申请，本仓只传
+所需参数。</p>
+<p>上游 torchtitan 的 DeepEP dispatcher 通过 CUDA DeepEP
+包创建通信 buffer，这条初始化路径不能在 Ascend NPU 上直接复用。NPU 适配需要以 CANN
+<code>cann_ops_transformer.ElasticBuffer</code> 替换 buffer 和通信算子，同时继续提供上游
+<code>DeepEPTokenDispatcher</code> 约定的 dispatch/combine metadata，才能接入现有 MoE 和反向路径。</p>
+<h2 id="_2">特性概述</h2>
+<p>DeepEP 是 MoE 专家并行（EP）训练中的 token dispatch/combine 路径。模型配置选择
+<code>moe_comm_backend="deepep"</code> 后，<code>torchtitan_npu.override.common.token_dispatcher.asc_deepep</code>
+把上游 <code>DeepEPTokenDispatcher</code> 替换为基于 CANN <code>cann_ops_transformer.ElasticBuffer</code> 的
+<code>AscDeepEPTokenDispatcher</code>，由 <code>deepep::dispatch</code> / <code>deepep::combine</code> 自定义算子完成 NPU 侧
+token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override 时生效，且要求
+<code>expert_parallel_degree &gt; 1</code>；当前只有 A5 入口默认选择它，A3 入口与 graph_trainer A5 入口都
+不使用。</p>
+<ul>
+<li><strong>CANN ElasticBuffer 实现</strong>：<code>AscDeepEPTokenDispatcher</code> 使用
+  <code>cann_ops_transformer.ElasticBuffer</code> 完成 compact（非缓存、可反向）的训练 dispatch/combine。</li>
+<li><strong>Pre-W2 score absorption</strong>：routed experts 在 SwiGLU 之后、W2 之前乘 routing score；
+  combine 不再重复加权。</li>
+<li><strong>专用 EP 通信域</strong>：<code>get_deepep_group()</code> 创建独立 HCCL group，与其他通信域隔离。</li>
+<li><strong>训练 recipe</strong>：DeepSeek-V4 的 <code>deepseek_v4_flash_deepep</code>、
+  <code>deepseek_v4_flash_43layers_16experts_deepep</code>、
+  <code>deepseek_v4_pro_61layers_32experts_deepep</code>、
+  <code>deepseek_v4_pro_61layers_12experts_deepep</code>；DeepSeek-V4.1 的
+  <code>deepseek_v4_1_flash_deepep</code>、<code>deepseek_v4_1_flash_text_deepep</code>、
+  <code>deepseek_v4_1_flash_40layers_24experts_multimodal_deepep</code>。</li>
+</ul>
+<h2 id="_3">启用方式</h2>
+<p>DeepEP 由模型配置和 override 两处共同选择：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>moe_comm_backend="deepep"</code></td>
+<td>让模型工厂生成 <code>DeepEPTokenDispatcher.Config</code>；recipe 已内置</td>
+</tr>
+<tr>
+<td><code>asc_deepep</code> override</td>
+<td>把 dispatcher 换成 <code>AscDeepEPTokenDispatcher</code>；未启用时走上游 CUDA DeepEP，NPU 上不可用</td>
+</tr>
+</tbody>
+</table>
+<p>DeepEP 要求 <code>expert_parallel_degree &gt; 1</code>。<code>hidden_dim</code> 与 <code>num_max_tokens_per_rank</code> 由配置
+阶段的 <code>update_from_config()</code> 按固定训练参数填写（公式与校验见下文「通信域与容量」）；绕过该
+阶段手工构造配置时必须自行提供。<code>seq_len</code> 必须能被
+<code>context_parallel_degree * tensor_parallel_degree</code> 整除。</p>
+<p>当前默认选择 DeepEP 的入口是 A5 脚本：DeepSeek-V4 的 <code>deepseek_v4_flash_cpt_4k_a5.sh</code>、
+<code>debug/deepseek_v4_flash_8p_cpt_4k_a5.sh</code>、<code>debug/deepseek_v4_flash_8p_cpt_4k_a5_hif8.sh</code>、
+<code>debug/deepseek_v4_pro_32p_cpt_4k_a5.sh</code>、
+<code>debug/deepseek_v4_pro_8p_cpt_4k_a5_cpuoffload.sh</code>，DeepSeek-V4.1 的
+<code>deepseek_v4_1_flash_cpt_4k_a5.sh</code>、<code>deepseek_v4_1_flash_cpt_1m_a5.sh</code>、
+<code>debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh</code>，以及它们的 qat / sft / 1M 派生入口。这些脚本
+默认把 <code>CONFIG</code> 指向对应的 <code>*_deepep</code> recipe，并在 <code>CLI_OVERRIDES</code> 中带上 <code>asc_deepep</code>：</p>
+<pre><code class="language-bash">bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh
+</code></pre>
+<p><code>USE_GOLDEN=1</code> 时这些入口回到标准 dispatcher 的 reference 组合：<code>CONFIG</code> 换回非 deepep
+recipe，<code>CLI_OVERRIDES</code> 不再包含 <code>asc_deepep</code>。</p>
+<p>graph_trainer A5 入口暂不开启 DeepEP：它们用 <code>graph_trainer_*</code> 配置，并在自己的
+<code>CLI_OVERRIDES</code> 里显式选择标准 all-to-all dispatcher 的 <code>token_dispatcher.asc</code>。LoRA 只增加
+adapter 参数，与 dispatcher 的选择无关。</p>
+<h2 id="_4">架构</h2>
+<pre><code class="language-text">model config (moe_comm_backend=&quot;deepep&quot;)
+  → DeepEPTokenDispatcher.Config
+      ├─ absorb_router_scores（模型工厂默认 True）
+      └─ update_from_config(): hidden_dim / num_max_tokens_per_rank / EP&gt;1 校验
+  → asc_deepep override
+  → AscDeepEPTokenDispatcher
+      ├─ get_deepep_group(ep_mesh) ── 独立 HCCL group（缓存）
+      ├─ ElasticBuffer(group, num_max_tokens_per_rank=..., hidden=..., num_topk=...)
+      ├─ dispatch → deepep::dispatch ── hidden_states / recv_scores / handle
+      ├─ routed experts ── SwiGLU 后、W2 前乘 score（absorb=True）
+      └─ combine → deepep::combine ── 纯 reduction
+</code></pre>
+<p><code>AscDeepEPTokenDispatcher</code> 不走上游 <code>DeepEPTokenDispatcher.__init__</code>（该构造函数会导入 CUDA
+DeepEP 包），而是直接初始化 <code>BaseEPTokenDispatcher</code> 并接入 CANN buffer；<code>deepep::*</code> 的反向
+复用 ElasticBuffer 的 cached dispatch/combine。</p>
+<h2 id="_5">组件清单</h2>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>override/common/token_dispatcher.py</code></td>
+<td><code>AscDeepEPTokenDispatcher</code>、<code>ElasticBuffer</code> 生命周期、<code>asc_deepep</code></td>
+</tr>
+<tr>
+<td><code>patches/torchtitan/models/common/token_dispatcher.py</code></td>
+<td>为 DeepEP 配置补 <code>absorb_router_scores</code>；保留上游 metadata 契约</td>
+</tr>
+<tr>
+<td><code>patches/torchtitan/models/common/moe.py</code></td>
+<td><code>_RouterScoreAbsorbingRoutedExperts</code>、<code>HashMoE</code></td>
+</tr>
+<tr>
+<td><code>ops/ascendc/deepep.py</code></td>
+<td><code>deepep::dispatch/combine</code> 及反向、opaque handles、fake/meta</td>
+</tr>
+<tr>
+<td><code>extensions/torchtitan/ep_process_group.py</code></td>
+<td><code>get_deepep_group</code>、专用 EP group、dispatcher wiring</td>
+</tr>
+<tr>
+<td><code>models/deepseek_v4/config_registry.py</code>、<code>models/deepseek_v4_1/config_registry.py</code></td>
+<td>DeepEP recipe</td>
+</tr>
+<tr>
+<td><code>examples/deepseek_v4/</code>、<code>examples/deepseek_v4_1/</code> 下的 A5 脚本</td>
+<td>默认入口与 qat / sft / 1M 派生入口</td>
+</tr>
+</tbody>
+</table>
+<h2 id="score-absorption">数据路径与 score absorption</h2>
+<p><strong>dispatch</strong>：<code>AscDeepEPTokenDispatcher.dispatch</code> 调 <code>torch.ops.deepep.dispatch</code>，输入
+<code>x_TD</code>、<code>topk_idx</code>、<code>topk_weights</code>、专家数、本地专家数和 buffer handle。op 内使用
+<code>ElasticBuffer.dispatch(..., do_cpu_sync=True)</code> 的 compact 非缓存路径：先在 host 上等待
+接收 token 数，再分配接收 token tensor；返回 <code>hidden_states_RD</code>、<code>recv_scores</code>、每专家 token
+数和 <code>DispatchHandle</code>。<code>DispatchState</code> 保存 <code>recv_scores</code>、<code>handle</code>，并在
+<code>absorb_router_scores=True</code> 时把 <code>recv_scores</code> 作为 <code>routed_scores_R</code> 传给专家。</p>
+<p><strong>score absorption</strong>：当前模型工厂默认 <code>absorb_router_scores=True</code>，
+<code>_RouterScoreAbsorbingRoutedExperts</code> 把 <code>routed_scores_R</code> 传给<code>_ClampGroupedExperts</code>；
+后者在 SwiGLU 之后、W2 之前乘 score。<code>combine</code> 在吸收模式下只做纯 reduction（<code>topk_weights=None</code>），
+不再重复加权；<code>recv_scores</code> 复用 dispatch 已收到的数据，不增加额外通信或拷贝。
+<code>absorb_router_scores=False</code>则保留 combine 前按 <code>recv_scores</code> 加权的路径。</p>
+<p><strong>反向路径</strong>：<code>deepep::dispatch</code> 与 <code>deepep::combine</code> 都注册了 fake/meta 和 autograd，并复用
+同一个 handle：combine 的反向实际调用 cached dispatch，dispatch 的反向实际调用 cached combine，
+分别向专家所在 rank 发送梯度、向 token 所在 rank 传回 token 梯度及所需的 score 梯度。
+cached handle 保存路由与接收计数等 metadata，梯度数据仍需跨 rank 通信；其中 cached dispatch
+复用已知的接收计数，并设置 <code>do_cpu_sync=False</code>，跳过非缓存 dispatch 中等待接收计数的 host 同步。
+<code>deepep::combine</code> 额外接收 <code>num_permuted_tokens_src</code>，它只用于反向恢复 routed 行数——combine
+前向 kernel 不读取其值，这样反向不必从未保存的专家中间结果推导行数。</p>
+<h2 id="_6">通信域与容量</h2>
+<p><code>get_deepep_group(ep_mesh)</code> 为 DeepEP 创建独立 HCCL group：要求 EP&gt;1，使用与源 EP group
+相同的 ranks，<code>group_desc="asc_deepep"</code>、<code>use_local_synchronization=True</code>，并按源 group name
+缓存。<code>AscDeepEPTokenDispatcher</code> 设置 <code>_uses_custom_ep_process_group=True</code>，避免通用 EP
+wiring 在拿 buffer 之前替换掉这个 group。</p>
+<p><code>ElasticBuffer</code> 是进程级单例（classvar），由 <code>AscDeepEPTokenDispatcher.get_buffer_and_group()</code>
+调用 <code>ElasticBuffer(deepep_group, num_max_tokens_per_rank=..., hidden=..., num_topk=...)</code> 构造
+（<code>override/common/token_dispatcher.py</code>）。这四个参数都传给底层算子，用于计算并申请 buffer
+空间：<code>hidden</code> 是 token 宽度、<code>num_topk</code> 是每 token 的 top-k、<code>num_max_tokens_per_rank</code> 是
+每 rank 的输入 token 上限。本仓自身不另行分配通信 buffer；<code>HCCL_BUFFSIZE</code>/<code>hccl_buffer_size</code>
+不是这条路径的容量入口，<code>get_moe_ep_ccl_buffer_size()</code> 的默认值也不代表实际窗口。细节见
+<a href="../ep_process_group/">EP 通信域分离</a>。</p>
+<p><code>num_max_tokens_per_rank</code> 由模型配置的 <code>update_from_config()</code> 调用上游
+<code>update_ep_token_dispatcher_config()</code> 按固定训练参数换算：</p>
+<pre><code class="language-text">num_max_tokens_per_rank = local_batch_size * seq_len
+                          // (context_parallel_degree * tensor_parallel_degree)
+</code></pre>
+<p><code>hidden_dim</code> 取模型维度。<code>seq_len</code> 必须能被 CP×TP 整除，且要求
+<code>expert_parallel_degree &gt; 1</code>；配方显式给出该值时不得小于上式结果，否则配置阶段报错，留空则
+按上式填写。例如 1M 入口（<code>MBS=1</code>、<code>seq_len=1048576</code>、CP=128、TP=1）得到 8192。</p>
+<h2 id="_7">支持组合</h2>
+<table>
+<thead>
+<tr>
+<th>组合</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DP shard + EP</td>
+<td>已验证</td>
+<td>debug 脚本（8 卡、EP8、DP shard 8、CP/TP/PP=1）</td>
+</tr>
+<tr>
+<td>CP &gt; 1</td>
+<td>已验证</td>
+<td>配置阶段校验 <code>seq_len % (CP*TP)</code></td>
+</tr>
+<tr>
+<td>TP &gt; 1 / PP &gt; 1</td>
+<td>未验证</td>
+<td>Muon 暂不支持 TP&gt;1 或 PP&gt;1</td>
+</tr>
+<tr>
+<td>torch.compile</td>
+<td>已验证</td>
+<td>ops 提供 fake/meta 与 autograd</td>
+</tr>
+<tr>
+<td><code>absorb_router_scores=false</code></td>
+<td>已验证</td>
+<td>保留 combine 前加权路径</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_8">与其他特性的关系</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EP 通信域分离</td>
+<td>DeepEP 使用 <code>get_deepep_group</code> 创建的独立 HCCL group；见 <a href="../ep_process_group/">EP 通信域分离</a></td>
+</tr>
+<tr>
+<td>GraphTrainer EP overlap</td>
+<td>GraphTrainer 的 EP chunk 调度，不走 DeepEP dispatch/combine；见 <a href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap</a></td>
+</tr>
+<tr>
+<td>torch.compile</td>
+<td>DeepEP ops 提供 fake/meta；DeepEP 编译已验证</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_9">限制</h2>
+<ul>
+<li>需要 Ascend NPU、<code>torch_npu</code> 和 CANN <code>cann_ops_transformer</code>（<code>ElasticBuffer</code>/<code>EPHandle</code>）；
+  缺失时导入失败。</li>
+<li>要求 <code>expert_parallel_degree &gt; 1</code>；<code>seq_len</code> 必须能被 CP×TP 整除；上限不足会在配置阶段
+  报错。</li>
+<li>只实现 compact 训练 dispatch/combine；不支持上游 expand / CUDA Graph inference 布局。</li>
+<li>量化方向：CANN <code>ElasticBuffer.dispatch</code> 支持 FP8 token 加 scales；<code>ElasticBuffer.combine</code> 的输入与输出暂只接受 bf16 / fp16。</li>
+<li><code>ElasticBuffer</code> 是进程级单例；同一进程内多个 DeepEP group/模型不能各自持有独立 buffer。</li>
+<li>compact 非缓存 dispatch 需要 host 等待接收 token 数，存在 host 同步开销。</li>
+<li><code>absorb_router_scores</code> 当前默认 True，没有 recipe 级关闭开关。</li>
+<li>只有 A5 入口默认选择 DeepEP；A3 与 graph_trainer A5 入口不走 DeepEP。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../cpu_offload/" class="btn btn-neutral float-left" title="CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../deepseek_v4_1_lora/" class="btn btn-neutral float-right" title="DeepSeek-V4.1 LoRA">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../cpu_offload/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../deepseek_v4_1_lora/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

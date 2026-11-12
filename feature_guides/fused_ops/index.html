@@ -75,6 +75,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
@@ -324,7 +326,7 @@
   <code>DeepSeekV4Metadata.from_positions</code> 建好这个几何的 entry（一条 entry 一个 ratio）：整行 document 边界、按自身
   <code>compress_ratio</code> 折好的池网格，以及三个 kernel frame（<code>q</code>/<code>swa_k</code>/<code>cmp_k</code>）——frame 属于模型
   metadata（<code>models/deepseek_v4/metadata.py</code>），参考内核和融合端口读同一份，entry 另带 CP 的交换表
-  （<code>xchg: ExchangeMetadata</code>）。<code>AscCompressedSparseInnerAttention.Config</code>
+  （<code>xchg.cmp: FlattenMetadata</code>、<code>xchg.swa: WindowMetadata</code>）。<code>AscCompressedSparseInnerAttention.Config</code>
   在其上只补四个算子的记录；<code>sparse_attn.asc</code> 桥接 SparseFlashMLA/SMLAG 的正反向，
   <code>lightning_indexer.asc</code> 桥接 <code>lightning_indexer</code>/<code>sparse_lightning_indexer_kl_loss_grad</code> 的正反向，
   几何（heads/head dim）是该 config 自己的必填字段、无默认值，由 override 参数一次写入，默认值即
