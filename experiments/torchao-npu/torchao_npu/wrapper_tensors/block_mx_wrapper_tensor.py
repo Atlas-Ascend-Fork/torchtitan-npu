@@ -249,6 +249,12 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
 
             if self.weight_config.fsdp_prequantize is not True:
                 inner_tensor = data
+                if out is not None and data.size(0) != out.size(0):
+                    # Uneven dim-0 sharding: fsdp_pre_all_gather zero-pads the
+                    # gather buffer to the padded shard size. On step 1+ the
+                    # pre-allocated unsharded param keeps the logical size, so
+                    # trim the pad tail before it becomes the wrapper's _data.
+                    inner_tensor = data.narrow(0, 0, out.size(0))
 
             else:
                 if self.weight_config.fsdp_prequantize_dtype == "fp8":

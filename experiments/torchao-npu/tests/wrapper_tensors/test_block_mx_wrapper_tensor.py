@@ -1144,3 +1144,28 @@ def test_fsdp_uneven_shard_round_trip(device, prequantize_dtype, experts, world_
     assert wrappers[0].fsdp_post_all_gather(gathered, results[0][1], torch.bfloat16, out=out_alloc) is None
     assert out_alloc.shape == weight.shape
     assert_rebuilt_matches_reference(out_alloc._data)
+
+
+@pytest.mark.parametrize("experts", [3, 4], ids=["uneven", "even"])
+def test_hp_post_all_gather_reused_out_preserves_logical_experts(experts):
+    # FSDP retains the padded payload on step 0, then hands post-gather a
+    # logical-size wrapper on subsequent steps. Padding must stay out of _data.
+    logical = torch.arange(experts * 8, dtype=torch.float32).reshape(experts, 2, 4)
+    padded = torch.cat((logical, torch.zeros(4 - experts, 2, 4)))
+    source = BlockMXTrainingWeightWrapperTensor(
+        logical[:2],
+        weight_config=BlockMXQuantizeConfig(fsdp_prequantize=False),
+        activation_config=MXQuantizeConfig(),
+    )
+
+    initial, buffers = source.fsdp_post_all_gather((padded,), (), torch.float32)
+
+    assert initial.shape == (4, 2, 4)
+    assert buffers[0] is padded
+    out = torch.as_strided(initial, logical.shape, logical.stride())
+    for step in (1, 2):
+        gathered = padded + step
+        source.fsdp_post_all_gather((gathered,), (), torch.float32, out=out)
+        assert out.shape == out._data.shape == logical.shape
+        assert torch.equal(out._data, logical + step)
+        assert out._data.untyped_storage().data_ptr() == gathered.untyped_storage().data_ptr()

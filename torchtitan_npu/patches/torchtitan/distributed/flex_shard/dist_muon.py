@@ -1,10 +1,21 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Backport of upstream TorchTitan PR #4122:
 # https://github.com/pytorch/torchtitan/pull/4122
 # Upstream commit: 6ee6b10b934730df00cbcd0cab5c93d04ae2e38a
 # NPU admission issue: https://github.com/pytorch/torchtitan/issues/4405
+# NPU admission fix (separate from storage refresh): https://github.com/pytorch/torchtitan/pull/4530
 # Remove this patch when the pinned TorchTitan dependency includes PR #4122.
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Storage refresh workaround: no matching upstream fix found as of 2026-11-13.
+# Related expert-axis padding discussion (not a storage-signature fix):
+# https://github.com/pytorch/torchtitan/issues/6000
+# Uneven dim-1 sharding is a separate limitation:
+# https://github.com/pytorch/torchtitan/issues/5739
+# PR #4122 above covers redistribution, not this storage refresh workaround.
 
 """Monkey-patch the PR #4122 DistMuon backport and NPU storage admission."""
 
@@ -562,6 +573,67 @@ def _validate_parameter_storage(self) -> torch.device:
     return local_devices.pop()
 
 
+def _preflight_step(self) -> None:
+    """Fail the local worker before bucket communication on invalid input.
+
+    TorchTitan's elastic launcher terminates peer workers after this error
+    escapes. Do not add a validation collective to the optimizer hot path.
+
+    NPU divergence (uneven dim-0 expert sharding): FSDP2's first-forward lazy
+    init re-pads unevenly dim-0-sharded params whose local tensor is a tensor
+    subclass (``FSDPParam.reset_sharded_param`` only recognizes plain-tensor
+    buffers via ``type(...) is torch.Tensor``, so the subclass shard is
+    re-allocated). Only the local storage address moves; storage offset,
+    shape, stride, dtype and device are unchanged. Refresh the cached
+    signature instead of failing; every other change still fails as upstream.
+    """
+    initialize_state = not self._first_step_validated
+    missing_gradients = []
+    changed_parameter_storage_fqn = None
+    changed_gradient_storage_fqn = None
+    gradients = [] if initialize_state else None
+    for compute_layout in self._parameter_compute_layouts:
+        if changed_parameter_storage_fqn is None and compute_layout.storage_is_compute_ready:
+            current = dist_muon._local_storage_signature(compute_layout.param.to_local())
+            cached = compute_layout.local_storage_signature
+            if current != cached:
+                if current[1:] == cached[1:]:
+                    # frozen dataclass: plain assignment raises FrozenInstanceError
+                    object.__setattr__(compute_layout, "local_storage_signature", current)
+                else:
+                    changed_parameter_storage_fqn = compute_layout.fqn
+
+        grad = compute_layout.param.grad
+        if grad is None:
+            missing_gradients.append(compute_layout.fqn)
+        elif not isinstance(grad, DTensor) or not self._has_storage_layout(grad, compute_layout):
+            if changed_gradient_storage_fqn is None:
+                changed_gradient_storage_fqn = compute_layout.fqn
+        elif gradients is not None:
+            gradients.append((compute_layout, grad))
+
+    if missing_gradients:
+        raise RuntimeError(
+            f"DistMuon requires every configured gradient before step(); missing gradients: {missing_gradients}"
+        )
+    if changed_parameter_storage_fqn is not None:
+        raise RuntimeError(f"parameter local storage changed for {changed_parameter_storage_fqn!r}; rebuild DistMuon")
+    if changed_gradient_storage_fqn is not None:
+        raise RuntimeError(f"gradient storage layout changed for {changed_gradient_storage_fqn!r}")
+
+    if gradients is not None:
+        for compute_layout, _grad in gradients:
+            self._validate_momentum(compute_layout)
+
+    # State creation happens only after every gradient and existing state
+    # tensor has passed validation, so a deterministic input error cannot
+    # partially update an earlier bucket.
+    if gradients is not None:
+        for compute_layout, grad in gradients:
+            self._momentum(compute_layout, grad)
+        self._first_step_validated = True
+
+
 def apply() -> None:
     dist_muon._LoweredComputeSharding = Owned | Replicate | Shard | _StridedShard | BlockShard
     dist_muon._AxisComputeSharding = Replicate | Shard | _StridedShard | BlockShard
@@ -576,6 +648,7 @@ def apply() -> None:
     ):
         setattr(dist_muon, function.__name__, _rebind(function, dist_muon.__dict__))
     dist_muon.DistMuon._validate_parameter_storage = _validate_parameter_storage
+    dist_muon.DistMuon._preflight_step = _preflight_step
 
 
 apply()
