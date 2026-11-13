@@ -50,6 +50,9 @@ stages:
         container:
           image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu20.04.05_x86:k8s_v1.1006
       JOB_pre:
+        permissions:
+          repository: read
+          id-token: write
         name: Test_PreBuild
         uses: cann/.gitcode/.gitcode/workflows/pre_action.yml@master
     pre:
@@ -60,12 +63,18 @@ stages:
     name: Compile
     jobs:
       JOB_CodeCheck:
+        permissions:
+          repository: read
+          id-token: write
         name: CodeCheck
         uses: .gitcode/workflows/codecheck_action.yml
         with:
           precommit_image_version: ubuntu24.04_x86_64:wdy05
           codecheck_image_version: ${{ jobs.JOB_image.outputs.codecheck }}
       JOB_staticcheck_md_check:
+        permissions:
+          repository: read
+          id-token: write
         name: CodeCheck_staticcheck_md_check
         uses: .gitcode/workflows/staticcheck_action.yml
         with:
@@ -78,6 +87,9 @@ stages:
     name: UT_PreSmoke
     jobs:
       JOB_UT_Test:
+        permissions:
+          repository: read
+          id-token: write
         name: UT_Test
         uses: .gitcode/workflows/llt_action.yml
         with:
@@ -85,6 +97,9 @@ stages:
           ut_package: 'ut_cov_torchtitan-npu.tar.gz'
           image_version: ${{ jobs.JOB_image.outputs.UT_Test }}
       PreSmoke_A3_part1:
+        permissions:
+          repository: read
+          id-token: write
         name: PreSmoke_A3_part1
         steps:
           -
@@ -95,13 +110,20 @@ stages:
               ref: ${{ atomgit.event.pull_request.merge_commit_sha }}
               allow-unsafe-pr-checkout: true
           -
+            name: oidc_auth
+            uses: huaweicloud-oidc-auth
+            with:
+              audience: ${{ secrets.audience }}
+              agency_urn: ${{ secrets.agency_urn }}
+              provider_urn: ${{ secrets.provider_urn }}
+              region: cn-north-4
+              duration: 3600
+          -
             name: download pr files
             uses: obs-download
             with:
               endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
               bucket: "ascend-ci"
-              access-key: ${{ secrets.AK }}
-              secret-key: ${{ secrets.SK }}
               key: |
                 ${{ env.obs_path }}/pr_filelist.txt
                 ${{ env.obs_path }}/pr_filelist_mod.txt
@@ -118,8 +140,6 @@ stages:
               export obs_path=${{env.obs_path}}
               export obs_smoke_path=${{ env.obs_smoke_path }}
               export pr_id=${{ env.MERGE_ID }}
-              export AK=${{secrets.AK}}
-              export SK=${{secrets.SK}}
               bash ${{ steps.process_checkout.outputs.path }}/torchtitan-npu_smoke.sh
         if: env.TARGET_BRANCH == 'master'
         runs-on: ['self-hosted','npu=4','smoke=301']
@@ -128,6 +148,9 @@ stages:
           # revise-img returns, so this pipeline exercises the image itself.
           image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu24.04_arm:cann_920_0929
       PreSmoke_A3_part2:
+        permissions:
+          repository: read
+          id-token: write
         name: PreSmoke_A3_part2
         steps:
           -
@@ -138,13 +161,20 @@ stages:
               ref: ${{ atomgit.event.pull_request.merge_commit_sha }}
               allow-unsafe-pr-checkout: true
           -
+            name: oidc_auth
+            uses: huaweicloud-oidc-auth
+            with:
+              audience: ${{ secrets.audience }}
+              agency_urn: ${{ secrets.agency_urn }}
+              provider_urn: ${{ secrets.provider_urn }}
+              region: cn-north-4
+              duration: 3600
+          -
             name: download pr files
             uses: obs-download
             with:
               endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
               bucket: "ascend-ci"
-              access-key: ${{ secrets.AK }}
-              secret-key: ${{ secrets.SK }}
               key: |
                 ${{ env.obs_path }}/pr_filelist.txt
                 ${{ env.obs_path }}/pr_filelist_mod.txt
@@ -161,8 +191,6 @@ stages:
               export obs_path=${{env.obs_path}}
               export obs_smoke_path=${{ env.obs_smoke_path }}
               export pr_id=${{ env.MERGE_ID }}
-              export AK=${{secrets.AK}}
-              export SK=${{secrets.SK}}
               bash ${{ steps.process_checkout.outputs.path }}/.ci/integration_test.sh
         if: env.TARGET_BRANCH == 'master'
         runs-on: ['self-hosted','npu=4','smoke=301']
