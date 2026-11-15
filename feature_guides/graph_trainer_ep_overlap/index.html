@@ -230,6 +230,10 @@
 <td>DeepSeek-V4，使用 <code>graph_trainer_deepseek_v4_flash_43layers_16experts</code> 配置</td>
 </tr>
 <tr>
+<td>与 DeepEP MoE 后端的关系</td>
+<td>互斥：模型使用 DeepEP 时本栈自动关闭并告警；见 <a href="../deepseek_v4_graph_trainer/"><code>deepseek_v4_graph_trainer.md</code></a></td>
+</tr>
+<tr>
 <td>训练路径</td>
 <td>GraphTrainer <code>aot_fx_trace</code>；eager 路径不涉及</td>
 </tr>
@@ -442,6 +446,7 @@ return (*chunked, *moved), tuple(user for user in full if user not in moved_set)
 <p>父模块、其他 root 或缺失 FQN 的 dim-0 query 仍可能被归为 full；若未来要支持这些场景，需要额外定义重建方案，不能将当前补丁的适用范围外推为所有 AllToAll shape live-out 都受支持。</p>
 <h2 id="_4">启用方式</h2>
 <p>EP overlap 通过 <code>--compile.ep_overlap.*</code> 打开。满足前述条件的 GraphTrainer MoE recipe 均通过同一组配置项启用；模型入口、dispatcher、并行配置和算子 override 仍由各模型 recipe 负责。当前 A3 GraphTrainer debug 脚本已设置 <code>seq</code> 分块、<code>graph</code> 策略和 NPU auto overlap pipeline，调用它时无需重复传这些配置项。自动调度机制见 <a href="../graph_trainer_auto_overlap/"><code>graph_trainer_auto_overlap.md</code></a>。</p>
+<p>该栈以 <code>_c10d_functional.all_to_all_single</code> token 交换作为切分和调度依据，与 DeepEP 的 <code>deepep::dispatch/combine</code> 不兼容。模型配置使用 DeepEP（<code>*_deepep</code> recipe）时，<code>extensions/torchtitan/experiments/graph_trainer/ep_overlap_deepep_guard.py</code> 在 GraphTrainer 初始化、runtime context patch 与首次 trace 之前关闭 <code>compile.ep_overlap.enabled</code> 并输出 warning，<code>npu_auto_overlap</code> 组合管线回退到基础管线。A5 GraphTrainer 入口默认属于这种情况，因此传入的 <code>--compile.ep_overlap.*</code> 不改变调度；标准 all-to-all dispatcher 的 recipe 不受影响。</p>
 <p>下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers / 16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。</p>
 <pre><code class="language-bash">NGPU=8 \
 HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \

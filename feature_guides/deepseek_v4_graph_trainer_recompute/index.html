@@ -207,7 +207,7 @@ disable_passes = [&quot;cudagraph_pass&quot;]
 <p>配置位置：</p>
 <pre><code class="language-text">torchtitan_npu/models/deepseek_v4/config_registry.py
 </code></pre>
-<p>五个 GraphTrainer recipe 均使用 <code>num_mtp_layers=0</code> 和 <code>memory_policy="full"</code>。</p>
+<p>各 GraphTrainer recipe 均使用 <code>num_mtp_layers=0</code> 和 <code>memory_policy="full"</code>。</p>
 <h3 id="22-dsv4">2.2 切换 DSV4 专用策略</h3>
 <pre><code class="language-bash">--compile.memory-policy dsv4-mhc
 </code></pre>

@@ -87,6 +87,8 @@
         <ul>
     <li class="toctree-l3"><a class="reference internal" href="#_2">配置入口</a>
     </li>
+    <li class="toctree-l3"><a class="reference internal" href="#deepep-moe-backend">DeepEP MoE backend</a>
+    </li>
     <li class="toctree-l3"><a class="reference internal" href="#_3">模型变体</a>
     </li>
     <li class="toctree-l3"><a class="reference internal" href="#_4">并行化</a>
@@ -187,7 +189,7 @@
 <p>编译模式固定为 <code>aot_fx_trace</code>（上游已弃用 <code>aot</code> 与 <code>jit</code> 两种旧模式）。NPU 上必须禁用 <code>cudagraph_pass</code>（CUDA graph capture 在npu上无意义且不兼容），本适配的编译配置已内置该禁用项。</p>
 <h2 id="_1">本仓实现</h2>
 <h3 id="_2">配置入口</h3>
-<p><code>torchtitan_npu/models/deepseek_v4/config_registry.py</code> 新增 5 个配置工厂，均复用对应 eager 配置，经 <code>to_graph_trainer_config</code> 包装为 <code>GraphTrainer.Config</code>：</p>
+<p><code>torchtitan_npu/models/deepseek_v4/config_registry.py</code> 新增 7 个配置工厂，均复用对应 eager 配置，经 <code>to_graph_trainer_config</code> 包装为 <code>GraphTrainer.Config</code>：</p>
 <table>
 <thead>
 <tr>
@@ -205,8 +207,16 @@
 <td><code>deepseek_v4_flash</code></td>
 </tr>
 <tr>
+<td><code>graph_trainer_deepseek_v4_flash_deepep</code></td>
+<td><code>deepseek_v4_flash_deepep</code></td>
+</tr>
+<tr>
 <td><code>graph_trainer_deepseek_v4_flash_43layers_16experts</code></td>
 <td><code>deepseek_v4_flash_43layers_16experts</code></td>
+</tr>
+<tr>
+<td><code>graph_trainer_deepseek_v4_flash_43layers_16experts_deepep</code></td>
+<td><code>deepseek_v4_flash_43layers_16experts_deepep</code></td>
 </tr>
 <tr>
 <td><code>graph_trainer_deepseek_v4_pro</code></td>
@@ -219,6 +229,8 @@
 </tbody>
 </table>
 <p>编译配置统一为 <code>mode="aot_fx_trace"</code>、<code>memory_policy="full"</code>、<code>disable_passes=["cudagraph_pass"]</code>。模型通过 <code>_graph_trainer_model_registry</code> 包装为 <code>GraphTrainerDeepSeekV4Model.Config</code>，并行化函数指向 <code>parallelize_graph_trainer_deepseek_v4</code>。</p>
+<h3 id="deepep-moe-backend">DeepEP MoE backend</h3>
+<p>GraphTrainer 的 EP overlap pass 以 <code>_c10d_functional.all_to_all_single</code> token 交换为切分和调度依据，DeepEP 的 <code>deepep::dispatch/combine</code> 不产生该结构。<code>extensions/torchtitan/experiments/graph_trainer/ep_overlap_deepep_guard.py</code> 在 GraphTrainer 初始化、runtime context patch 与首次 trace 之前检测 DeepEP dispatcher，关闭 <code>compile.ep_overlap.enabled</code> 并输出 warning，同时把 <code>npu_auto_overlap</code> 组合管线回退到基础管线。因此 A5 GraphTrainer 入口仍会传入 <code>--compile.ep_overlap.*</code>，DeepEP 路径下这些参数不生效，通信重叠由 DeepEP 融合 kernel 内部完成。</p>
 <h3 id="_3">模型变体</h3>
 <p><code>GraphTrainerDeepSeekV4Model</code>（<code>model.py</code>）继承 eager 模型，仅在 <code>init_states</code> 外包一层 <code>disable_active_parametrization()</code>：懒初始化 parametrization（如 RoPE 频率缓冲）必须在 FX tracer 记录图之前物化，否则录制到的图不完整。</p>
 <h3 id="_4">并行化</h3>
@@ -286,7 +298,11 @@
 </tr>
 <tr>
 <td>EP overlap（上游实验性 pass）</td>
-<td>已通过 patch 适配；见 <a href="../graph_trainer_ep_overlap/"><code>graph_trainer_ep_overlap.md</code></a></td>
+<td>已通过 patch 适配；标准 all-to-all dispatcher 路径生效</td>
+</tr>
+<tr>
+<td>DeepEP MoE backend</td>
+<td>有限支持：<code>graph_trainer_*_deepep</code> 配置与 <code>asc_deepep</code> override 可用，但 EP overlap pass 在该组合下自动关闭</td>
 </tr>
 </tbody>
 </table>

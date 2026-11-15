@@ -233,8 +233,8 @@ scores 发出，combine 只做 reduction，backward 复用同一 handle 中的 m
 把上游 <code>DeepEPTokenDispatcher</code> 替换为基于 CANN <code>cann_ops_transformer.ElasticBuffer</code> 的
 <code>AscDeepEPTokenDispatcher</code>，由 <code>deepep::dispatch</code> / <code>deepep::combine</code> 自定义算子完成 NPU 侧
 token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override 时生效，且要求
-<code>expert_parallel_degree &gt; 1</code>；当前只有 A5 入口默认选择它，A3 入口与 graph_trainer A5 入口都
-不使用。</p>
+<code>expert_parallel_degree &gt; 1</code>；当前 A5 入口默认选择它，包括 GraphTrainer A5 入口；A3 入口使用
+标准 all-to-all dispatcher。</p>
 <ul>
 <li><strong>CANN ElasticBuffer 实现</strong>：<code>AscDeepEPTokenDispatcher</code> 使用
   <code>cann_ops_transformer.ElasticBuffer</code> 完成 compact（非缓存、可反向）的训练 dispatch/combine。</li>
@@ -244,7 +244,9 @@ token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override
 <li><strong>训练 recipe</strong>：DeepSeek-V4 的 <code>deepseek_v4_flash_deepep</code>、
   <code>deepseek_v4_flash_43layers_16experts_deepep</code>、
   <code>deepseek_v4_pro_61layers_32experts_deepep</code>、
-  <code>deepseek_v4_pro_61layers_12experts_deepep</code>；DeepSeek-V4.1 的
+  <code>deepseek_v4_pro_61layers_12experts_deepep</code>，GraphTrainer 的
+  <code>graph_trainer_deepseek_v4_flash_deepep</code>、
+  <code>graph_trainer_deepseek_v4_flash_43layers_16experts_deepep</code>；DeepSeek-V4.1 的
   <code>deepseek_v4_1_flash_deepep</code>、<code>deepseek_v4_1_flash_text_deepep</code>、
   <code>deepseek_v4_1_flash_40layers_24experts_multimodal_deepep</code>。</li>
 </ul>
@@ -275,7 +277,9 @@ token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override
 <p>当前默认选择 DeepEP 的入口是 A5 脚本：DeepSeek-V4 的 <code>deepseek_v4_flash_cpt_4k_a5.sh</code>、
 <code>debug/deepseek_v4_flash_8p_cpt_4k_a5.sh</code>、<code>debug/deepseek_v4_flash_8p_cpt_4k_a5_hif8.sh</code>、
 <code>debug/deepseek_v4_pro_32p_cpt_4k_a5.sh</code>、
-<code>debug/deepseek_v4_pro_8p_cpt_4k_a5_cpuoffload.sh</code>，DeepSeek-V4.1 的
+<code>debug/deepseek_v4_pro_8p_cpt_4k_a5_cpuoffload.sh</code>、
+<code>deepseek_v4_flash_cpt_4k_a5_graphtrainer.sh</code>、
+<code>debug/deepseek_v4_flash_8p_cpt_4k_a5_graphtrainer.sh</code>，DeepSeek-V4.1 的
 <code>deepseek_v4_1_flash_cpt_4k_a5.sh</code>、<code>deepseek_v4_1_flash_cpt_1m_a5.sh</code>、
 <code>debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh</code>，以及它们的 qat / sft / 1M 派生入口。这些脚本
 默认把 <code>CONFIG</code> 指向对应的 <code>*_deepep</code> recipe，并在 <code>CLI_OVERRIDES</code> 中带上 <code>asc_deepep</code>：</p>
@@ -283,9 +287,6 @@ token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override
 </code></pre>
 <p><code>USE_GOLDEN=1</code> 时这些入口回到标准 dispatcher 的 reference 组合：<code>CONFIG</code> 换回非 deepep
 recipe，<code>CLI_OVERRIDES</code> 不再包含 <code>asc_deepep</code>。</p>
-<p>graph_trainer A5 入口暂不开启 DeepEP：它们用 <code>graph_trainer_*</code> 配置，并在自己的
-<code>CLI_OVERRIDES</code> 里显式选择标准 all-to-all dispatcher 的 <code>token_dispatcher.asc</code>。LoRA 只增加
-adapter 参数，与 dispatcher 的选择无关。</p>
 <h2 id="_4">架构</h2>
 <pre><code class="language-text">model config (moe_comm_backend=&quot;deepep&quot;)
   → DeepEPTokenDispatcher.Config
@@ -401,6 +402,11 @@ wiring 在拿 buffer 之前替换掉这个 group。</p>
 <td>配置阶段校验 <code>seq_len % (CP*TP)</code></td>
 </tr>
 <tr>
+<td>GraphTrainer（<code>aot_fx_trace</code>）+ DeepEP</td>
+<td>有限支持</td>
+<td>可与 DeepEP 组合；EP overlap pass 自动关闭，A5 GraphTrainer 入口默认走该组合</td>
+</tr>
+<tr>
 <td>TP &gt; 1 / PP &gt; 1</td>
 <td>未验证</td>
 <td>Muon 暂不支持 TP&gt;1 或 PP&gt;1</td>
@@ -432,7 +438,7 @@ wiring 在拿 buffer 之前替换掉这个 group。</p>
 </tr>
 <tr>
 <td>GraphTrainer EP overlap</td>
-<td>GraphTrainer 的 EP chunk 调度，不走 DeepEP dispatch/combine；见 <a href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap</a></td>
+<td>GraphTrainer 的 EP chunk 调度，不走 DeepEP dispatch/combine；使能 DeepEP 时 guard 自动关闭并告警；见 <a href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap</a></td>
 </tr>
 <tr>
 <td>torch.compile</td>
@@ -451,7 +457,9 @@ wiring 在拿 buffer 之前替换掉这个 group。</p>
 <li><code>ElasticBuffer</code> 是进程级单例；同一进程内多个 DeepEP group/模型不能各自持有独立 buffer。</li>
 <li>compact 非缓存 dispatch 需要 host 等待接收 token 数，存在 host 同步开销。</li>
 <li><code>absorb_router_scores</code> 当前默认 True，没有 recipe 级关闭开关。</li>
-<li>只有 A5 入口默认选择 DeepEP；A3 与 graph_trainer A5 入口不走 DeepEP。</li>
+<li>只有 A5 入口默认选择 DeepEP；A3 入口走标准 all-to-all dispatcher。</li>
+<li>DeepEP 与 GraphTrainer EP overlap 不能同时生效：模型使用 DeepEP 时 EP overlap pass 自动关闭，
+  该路径下 <code>--compile.ep_overlap.*</code> 不改变调度。</li>
 </ul>
               
             </div>
