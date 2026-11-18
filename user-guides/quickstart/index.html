@@ -91,7 +91,7 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/expert_replication/">Dense 副本与专家分片</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fused_ops/">融合算子接入指南</a>
                   </li>
@@ -197,7 +197,7 @@
 <h2 id="_3">启动训练任务</h2>
 <p>DeepSeek V3 单卡训练任务可直接使用 <code>scripts/run_train.sh</code> 启动。<code>scripts/run_train.sh</code> 默认使用 1 张 NPU 和 <code>deepseek_v3_debugmodel</code> 配置，并把额外命令行参数原样透传给训练入口。</p>
 <h3 id="_4">单卡训练任务</h3>
-<p>使用默认配置启动训练：</p>
+<p>以下示例在默认配置上显式启用实数 RoPE 兼容实现，避免对复数 RoPE cache 进行位置索引：</p>
 <pre><code class="language-bash">NGPU=1 \
 bash scripts/run_train.sh \
   --hf-assets-path tests/assets/deepseek_v3 \
@@ -205,8 +205,10 @@ bash scripts/run_train.sh \
   --dataloader.dataset-path tests/assets/c4_test \
   --training.local-batch-size 1 \
   --training.seq-len 2048 \
-  --training.steps 5
+  --training.steps 5 \
+  --override.imports torchtitan_npu.override.common.rope.workaround
 </code></pre>
+<p>该 override 使用预展开的实数 cos/sin cache 和 PyTorch 算子完成 RoPE，适用于复数位置索引受限的 NPU 环境。它与 <code>torchtitan_npu.override.common.rope.asc_complex</code> 不能同时启用；切换到其他模型或已有 override 组合时，需先核对匹配的配置类型与冲突条件，见 <a href="../../torchtitan_npu/override/README.md#common">RoPE override 说明</a>。</p>
 <blockquote>
 <p>[!NOTE]
 通用 launcher 配置项说明：
@@ -282,7 +284,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 <tr>
 <td><code>all-to-all-quant-format</code></td>
 <td><code>--all-to-all-quant-format mxfp8</code></td>
-<td>默认未设置。指定 <code>mxfp8</code> 时，对标准 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，不支持 DeepEP。开启示例及限制见<a href="../../feature_guides/low_precision_training/#moe-all-to-all-低精度通信">MoE all-to-all 低精度通信</a>。</td>
+<td>默认未设置。指定 <code>mxfp8</code> 时，对 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，支持 DeepEP 和 standard 两种通信方式，启用该配置时自动跟随高精度的通信方式。开启示例及限制见<a href="../../feature_guides/low_precision_training/#moe-all-to-all-低精度通信">MoE all-to-all 低精度通信</a>。</td>
 </tr>
 <tr>
 <td><code>enable-mxfp4-qat</code></td>
@@ -327,7 +329,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 <code>enable-sparse-attention-quantization</code> 启用 KV source Compressor 与稀疏 attention 量化。
 稀疏 attention 量化可单独启用；启用 Lightning Indexer 量化时必须同时启用稀疏 attention
 量化。标准 A5 融合路径提供 BF16 fallback，<code>USE_GOLDEN=1</code> 不提供这些 fallback。启动日志中出现
-<code>Applied TorchAO-NPU recipe=...</code> 表示 recipe 已应用。</p>
+<code>Applied TorchAO-NPU quantization summary: {...}</code> 表示 recipe 已应用（<code>recipe</code> 字段为实际 recipe）。</p>
 <p>DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：</p>
 <pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V41_tokenizer \
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh

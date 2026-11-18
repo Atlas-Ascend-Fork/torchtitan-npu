@@ -91,7 +91,7 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/expert_replication/">Dense 副本与专家分片</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP AllGather 缓冲区的计算流分配</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/fused_ops/">融合算子接入指南</a>
                   </li>
@@ -248,6 +248,16 @@
 <blockquote>
 <p>注：安装 NNAL（Ascend Transformer Boost 加速库）前，请先执行 <code>source /usr/local/Ascend/cann/set_env.sh</code> 配置 CANN 环境变量。</p>
 </blockquote>
+<p>Triton-Ascend 在运行时编译本地扩展，需要支持 C++20 的 C++ 编译器，即使安装 wheel 也需要准备该工具链。同时需确保当前 Python 3.12 环境包含匹配的开发头文件（<code>Python.h</code>）。Debian/Ubuntu 可执行：</p>
+<pre><code class="language-shell">sudo apt-get update
+sudo apt-get install -y build-essential
+</code></pre>
+<p>Triton-Ascend 3.2.1 优先使用 <code>CC</code> 指定的编译器，否则依次查找 <code>clang++</code> 和 <code>g++</code>。如需指定编译器，应将 <code>CC</code> 设置为 C++ 编译器的可执行文件路径，例如 <code>export CC=/usr/bin/g++</code>；仅设置 <code>CXX</code> 不会改变该版本的选择。安装 Python 依赖前，检查实际选择的编译器：</p>
+<pre><code class="language-shell">cxx=&quot;${CC-$(command -v clang++ || command -v g++)}&quot;
+test -n &quot;$cxx&quot; &amp;&amp; &quot;$cxx&quot; --version
+printf '#include &lt;span&gt;\nint main() { int values[] = {0}; return std::span{values}[0]; }\n' | \
+  &quot;$cxx&quot; -std=c++20 -x c++ -fsyntax-only -
+</code></pre>
 <h3 id="2-torchtitan-npu">2. 下载 torchtitan-npu 源码</h3>
 <pre><code class="language-shell">git clone https://gitcode.com/cann/torchtitan-npu.git
 cd torchtitan-npu
