@@ -180,6 +180,7 @@ tests/unit_tests/tooling/training_log_visualization/test_training_log_visualizat
 <p><code>torchtitan_npu/patches/torch_npu/</code> 中的文件不是「上游 torchtitan 临时 patch」：它们改变 PyTorch、Inductor 或 <code>torch_npu</code> 的 NPU 运行时行为，例如 <code>determinism.py</code> 替换 <code>torch.use_deterministic_algorithms</code>，<code>device_copy.py</code> 修改 Inductor 的 <code>DeviceCopy</code> 和 <code>prims.device_put</code>。对应测试镜像到 <code>tests/unit_tests/patches/torch_npu/</code>；强制 eager 的 TorchTitan 兼容行为则归 <code>extensions/torchtitan/</code>。</p>
 <h2 id="_3">执行归属</h2>
 <p>只要测试放在 <code>tests/unit_tests/</code>，现有 <code>.ci/unit_test.sh</code> 的 <code>pytest tests/unit_tests</code> 就能发现它；报告仍须单独标注 <code>tooling</code>，避免把 tooling 通过数写成产品覆盖。后续若保留其他目录外的测试，必须在对应 CI suite 显式列出执行路径，不能依赖开发者手工运行。</p>
+<p><code>experiments/torchao-npu</code> 保留独立测试目录，通过 <code>scripts/run_tests.sh cpu</code> 显式接入主仓 UT CI；其设备和集成测试使用手工入口。环境准备、依赖安装副作用、分层执行及报告判读见 <a href="../../experiments/torchao-npu/tests/README.md">TorchAO-NPU 测试使用说明</a>。</p>
               
             </div>
           </div><footer>
