@@ -157,14 +157,14 @@
               
                 <h1 id="dense">Dense 副本与专家分片</h1>
 <p>DeepSeek-V4 和 DeepSeek-V4.1 可在保留 Dense 参数副本的同时，将路由专家权重分片到全部专家数据并行卡上。
-使用 <code>--parallelism.disable-expert-replication</code> 启用，默认关闭，不改变现有切分方式。</p>
+使用 <code>--parallelism.extensions.disable-expert-replication</code> 启用，默认关闭，不改变现有切分方式。</p>
 <h2 id="_1">配置示例</h2>
 <p>单机 8 卡，Dense 使用 4 分片、2 副本，路由专家使用 EP4、FSDP2，不保留额外副本：</p>
 <pre><code class="language-bash">bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --parallelism.data-parallel-shard-degree 4 \
   --parallelism.data-parallel-replicate-degree 2 \
   --parallelism.expert-parallel-degree 4 \
-  --parallelism.disable-expert-replication \
+  --parallelism.extensions.disable-expert-replication \
   --compile.no-enable \
   --training.global-batch-size 8 \
   --training.steps 10
@@ -199,7 +199,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
   --parallelism.data-parallel-shard-degree 4 \
   --parallelism.data-parallel-replicate-degree 2 \
   --parallelism.expert-parallel-degree 4 \
-  --parallelism.disable-expert-replication \
+  --parallelism.extensions.disable-expert-replication \
   --optimizer.name AdamW --compile.no-enable \
   --training.seq-len 512 --training.global-batch-size 8 --training.steps 10
 </code></pre>

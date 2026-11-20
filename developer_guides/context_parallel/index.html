@@ -63,6 +63,10 @@
     <li class="toctree-l2"><a class="reference internal" href="#3-metadatarank-local-frame">3. metadata：rank-local frame</a>
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#4-kv">4. KV 恢复与通信</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#41-parallelismextensionscontext-parallel-intra-degree">4.1 跨超节点：--parallelism.extensions.context-parallel-intra-degree</a>
+    </li>
+        </ul>
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#5">5. 启用</a>
     </li>
@@ -270,6 +274,27 @@ SWA 前缀交换是本仓扩展。</p>
 平坦化与窗口交换共用路由构造；carry 直接使用邻居关系。SWA 无需按窗口宽度额外 padding。</p>
 <p>arch22 + CP 下 <code>A3KeyWorkaround</code> 的压实行数是 device 值，与 <code>fullgraph=True</code> 的编译不兼容；栈在
 <code>parallelize</code> 里按 <code>is_a5() or cp &lt;= 1</code> 关闭编译（<code>compile_policy.py</code>），退化为 eager 并告警。</p>
+<h3 id="41-parallelismextensionscontext-parallel-intra-degree">4.1 跨超节点：<code>--parallelism.extensions.context-parallel-intra-degree</code></h3>
+<p>后续硬件不允许单个 AllToAllV 跨 128 卡超节点。EP 可以靠选域避开，CP 不行：doc-chunk 把 rank <code>r</code> 的
+query 绑到每篇文档第 <code>r</code> 片，而还原的 KV 归属由 <code>q // C</code> 与置换决定，<code>d</code> 天然遍历整个 CP 轴；跨超节点
+p2p 也不可用（只在 <code>world_rank % 16</code> 相同时合法，<code>intra=8</code> 时列步长是 8），所以跨超节点那一步只能用
+all-gather。</p>
+<p>该开关声明一个 AllToAllV 允许跨越的 CP rank 数（即一个超节点的 NPU 数），<code>-1</code>（默认）不生效。设置后
+<code>extensions/torchtitan/distributed/cp_exchange</code> 把 CP 上用到的 <code>all_to_all_single</code> 换成两步：每 rank 把
+「发往本组之外」的行在列上（每超节点一个 rank）all-gather 一次，再在超节点内 all-to-all 一次，输出与 flat
+交换同序同值。<strong>模型代码不需要感知这个限制</strong>：注入是符号替换，<code>models/</code> 一行不改；<code>-1</code> 时函数不被替换、
+通信域不创建。跨超节点流量（<code>m = cp / intra</code> 个超节点，<code>C</code> 为每 rank 行数）为每 rank 收 <code>(m-1)·C(m-1)/m</code>
+行，<code>m=2</code> 时正好是理论下界（相比 flat 减半），代价是超节点内多一次 all-to-all。</p>
+<pre><code class="language-bash">--parallelism.context-parallel-degree 256 --parallelism.extensions.context-parallel-intra-degree 128   # 128 卡超节点
+--parallelism.context-parallel-degree 16  --parallelism.extensions.context-parallel-intra-degree 8     # 8 卡超节点
+</code></pre>
+<p>该开关要求 <code>--parallelism.tensor-parallel-degree 1</code>：超节点是连续的一段 NPU，而 CP 轴的 rank 只有在 TP=1 时
+才是连续的 world rank，否则一个 <code>intra</code> 块会跨到下一个超节点。<code>-1</code>（默认）不安装；若同一进程里先前安装过，
+<code>-1</code> 会撤销上一次的度数，交换退回 flat 集合通信。</p>
+<p>该开关不支持 <code>torch.compile</code>：交换的 padding 与切片边界来自列内各成员的 split 表，需要在 host 上求值，被
+<code>fullgraph=True</code> 追踪时会直接报错并提示关闭模型编译，而不是编出一个与 flat 不一致的图。只有「CP 轴宽于一个
+超节点」的交换会被拒绝；<code>cp</code> 本身不超过一个超节点时仍走 flat 集合通信，可以正常编译。编译支持需要
+metadata 侧的 seam，留作后续统一处理。</p>
 <h2 id="5">5. 启用</h2>
 <pre><code class="language-bash">--parallelism.context-parallel-degree 2 \
 --parallelism.context-parallel-load-balancer doc_zigzag \
