@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>MoonEP - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "MoonEP";
+        var mkdocs_page_input_path = "feature_guides/moonep.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">MoonEP</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">背景与挑战</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">特性概述</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">启用方式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">架构</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">组件清单</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_6">数据路径</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#1-plan">1. plan</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#2-prefetch_weight">2. prefetch_weight</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#3-dispatch">3. dispatch 与专家计算</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#4">4. 激活检查点</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">通信域与容量</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_8">支持组合</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_9">与其他特性的关系</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_10">限制</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">MoonEP</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="moonep">MoonEP</h1>
+<p>MoonEP 是 DeepEP token dispatch/combine 路径上的专家副本扩展。它在 EP 组内按路由计数为各
+rank 规划远程专家副本（虚拟专家空间为 2E），把副本权重预取到消费 rank，使部分 token 在本地
+副本上完成专家计算；副本产生的权重梯度在反向归并回 home rank。该路径用于专家路由倾斜明显、
+跨 rank token 流量集中在少数专家时的 EP 训练。</p>
+<p>MoonEP 不改变 router、SwiGLU 和专家 GEMM 的数学定义，只改变 token 与专家权重的放置和传输
+方式；专家计算仍由 PyTorch 侧的 grouped experts 完成。它依赖 DeepEP 的 <code>ElasticBuffer</code> 和
+<code>deepep::dispatch/combine</code>，当前不脱离 DeepEP 单独使用。</p>
+<h2 id="_1">背景与挑战</h2>
+<p>EP 把每个 token 按路由结果发送到持有目标专家的 rank。路由倾斜时，持有热门专家的 rank 会同时
+成为 token 接收、专家计算和通信的热点，EP 组的步进时间由最慢的 rank 决定。仅靠 token
+all-to-all 无法消除这种结构性不均衡。</p>
+<p>一种处理方式是把热门专家复制到消费 rank：如果某个 rank 本来就要接收大量发往同一远程专家的
+token，就让该 rank 持有一份该专家的副本，token 直接落到本地虚拟专家上，减少跨 rank token
+流量。这个方案引入三类额外工作：</p>
+<ul>
+<li>需要根据全局每专家 token 计数决定「每个 rank 复制哪些远程专家」，并让所有 rank 得到一致的
+  虚拟专家 id 映射；</li>
+<li>副本权重需要从 home rank 传输到消费 rank，且不能与 token 通信争用同一块 buffer/heap；</li>
+<li>副本行产生的权重梯度需要归并回 home rank，否则专家权重更新会丢梯度。</li>
+</ul>
+<p>MoonEP 把这三部分封装为 <code>moonep_plan</code>、<code>moonep_prefetch_weight</code>、<code>moonep_reduce_grad</code> 三个
+算子，围绕现有 DeepEP 传输完成规划、权重预取和梯度归并。token dispatch/combine 本身仍复用
+<code>ElasticBuffer</code>，不另建一套 token 通信。</p>
+<h2 id="_2">特性概述</h2>
+<ul>
+<li><strong>虚拟专家规划</strong>：<code>moonep_plan</code> 输入每专家 token 计数和 top-k 专家 id，输出虚拟专家 id
+  （扩展空间 2E）、接收区累计偏移 <code>cu_seqlens</code> 和副本清单 <code>experts_to_copy</code>。</li>
+<li><strong>权重预取</strong>：<code>moonep_prefetch_weight</code> 把本 rank 的 gate/up/down 权重和副本行写入私有
+  symmetric heap 的预取槽，返回 <code>2 × 本地专家数</code> 行的 BF16 快照；快照是独立存储，后续层
+  可以复用同一个通信槽。</li>
+<li><strong>副本梯度归并</strong>：预取算子的反向调用 <code>moonep_reduce_grad</code>，把副本行的梯度跨 rank 加回
+  home 行，返回原始本地专家形状的权重梯度。</li>
+<li><strong>复用 DeepEP 传输</strong>：dispatch 使用虚拟专家 id 和 <code>num_experts=2E</code> 进入现有
+  <code>deepep::dispatch</code>；combine 直接继承 <code>AscDeepEPTokenDispatcher</code> 的实现。</li>
+<li><strong>score absorption 兼容</strong>：保留 DeepEP 的 <code>absorb_router_scores</code> 开关，pre-W2 和 post-W2
+  两条路径都可用。</li>
+</ul>
+<h2 id="_3">启用方式</h2>
+<p>MoonEP 由模型配置和 override 两处共同选择：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>moe_comm_backend="deepep"</code></td>
+<td>让模型工厂生成 <code>DeepEPTokenDispatcher.Config</code>；<code>asc_moonep</code> 只匹配这个目标</td>
+</tr>
+<tr>
+<td><code>asc_moonep</code> override</td>
+<td>把 DeepEP dispatcher 换成 <code>AscMoonEPTokenDispatcher</code></td>
+</tr>
+<tr>
+<td><code>expert_hidden_dim</code></td>
+<td>专家 FFN 宽度，用于计算私有 heap 和权重视图；模型工厂的 <code>make_routed_experts_config()</code> 会自动填入 <code>inner_experts.hidden_dim</code>，手工构造配置时必须提供</td>
+</tr>
+<tr>
+<td><code>absorb_router_scores</code></td>
+<td>沿用 DeepEP 语义；MoonEP 不修改该开关</td>
+</tr>
+<tr>
+<td><code>hidden_dim</code>、<code>num_max_tokens_per_rank</code>、<code>top_k</code></td>
+<td>与 DeepEP 相同，由配置阶段的 <code>update_from_config()</code> 填写或校验</td>
+</tr>
+</tbody>
+</table>
+<p>override 名称：</p>
+<pre><code class="language-text">torchtitan_npu.override.common.token_dispatcher.asc_moonep
+</code></pre>
+<p>MoonEP override 只负责替换 dispatcher；fused SwiGLU 由单独的 override 选择，脚本同时启用
+两者，例如 <code>torchtitan_npu.override.common.swiglu_group.asc</code> 和
+<code>torchtitan_npu.override.common.swiglu_group.asc_shared_experts</code>。</p>
+<p>A5 MoonEP 入口在默认的 <code>AC_MODE=selective</code> 下会一并配置 SelectiveAC 的 save-op 编辑，
+避免反向重放规划算子：</p>
+<pre><code class="language-text">torchtitan_npu.override.common.activation_checkpoint.update_save_ops={&quot;edits&quot;:&quot;+torch.ops.torchtitan_npu.moonep_plan.default&quot;}
+</code></pre>
+<p>启动脚本：</p>
+<pre><code class="language-bash">bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5_moonep.sh
+</code></pre>
+<p>该脚本默认：</p>
+<ul>
+<li><code>CONFIG=deepseek_v4_flash_43layers_16experts_deepep</code>；</li>
+<li><code>CLI_OVERRIDES</code> 包含 <code>asc_moonep</code>、fused RoPE/SwiGLU/compressor override；</li>
+<li><code>AC_MODE=selective</code>，并自动追加上面的 <code>moonep_plan</code> save-op 编辑。</li>
+</ul>
+<p><code>USE_GOLDEN=1</code> 时脚本回到非 deepep recipe，且不启用上述 override，MoonEP 不生效。</p>
+<p>MoonEP 要求 <code>expert_parallel_degree &gt; 1</code>，不满足时 <code>init_buffer()</code> 会抛出 <code>ValueError</code>。
+专家权重传输只使用 BF16。量化 dispatcher（带
+<code>mxfp8_quant_params</code>）会被 <code>asc_moonep</code> 拒绝。</p>
+<h2 id="_4">架构</h2>
+<pre><code class="language-text">model config (moe_comm_backend=&quot;deepep&quot;)
+  → DeepEPTokenDispatcher.Config（expert_hidden_dim 由 make_routed_experts_config 填入）
+  → asc_moonep override
+  → AscMoonEPTokenDispatcher
+      ├─ init_buffer()
+      │    ├─ super().init_buffer() → ElasticBuffer（与 DeepEP 共用，见 deepep.md）
+      │    └─ 私有 HCCL group（group_desc=&quot;asc_moonep_weights&quot;）
+      │         + MoonEP symmetric heap / context（按 group、device、专家数、宽度缓存）
+      ├─ dispatch()
+      │    ├─ moonep.plan(...) → virtual_ids / cu_seqlens / experts_to_copy
+      │    ├─ prefetch_expert_weights(...) → staged_weights（2×本地专家行）
+      │    └─ super().dispatch_experts(..., num_experts=2E)
+      ├─ routed experts（functional_call 使用 staged_weights）
+      └─ combine()（继承 AscDeepEPTokenDispatcher）
+</code></pre>
+<p><code>AscMoonEPTokenDispatcher</code> 继承 <code>AscDeepEPTokenDispatcher</code>，因此 token 传输、score
+absorption、combine 和 DeepEP 反向路径全部复用；MoonEP 只在 dispatch 前增加规划与权重预取。</p>
+<h2 id="_5">组件清单</h2>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>override/common/token_dispatcher.py</code></td>
+<td><code>AscMoonEPTokenDispatcher</code>、<code>MoonEPDispatchState</code>、<code>asc_moonep</code> override、weight context 缓存</td>
+</tr>
+<tr>
+<td><code>ops/ascendc/moonep.py</code></td>
+<td><code>torchtitan_npu::moonep_plan</code>、<code>moonep_prefetch_weight</code>、<code>moonep_reduce_grad</code>、<code>MoonEPContextHandle</code>、fake/meta 与反向</td>
+</tr>
+<tr>
+<td><code>patches/torchtitan/models/common/moe.py</code></td>
+<td>给 dispatcher 传专家权重；有 <code>staged_weights</code> 时用 <code>functional_call</code> 替换 W1/W3/W2；填充 <code>expert_hidden_dim</code></td>
+</tr>
+<tr>
+<td><code>patches/torchtitan/models/common/token_dispatcher.py</code></td>
+<td>DeepEP dispatcher 配置增加 <code>expert_hidden_dim</code> 字段</td>
+</tr>
+<tr>
+<td><code>override/common/activation_checkpoint.py</code></td>
+<td><code>update_save_ops</code>，用于把 <code>moonep_plan</code> 加入 SelectiveAC 保存集合</td>
+</tr>
+<tr>
+<td><code>examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5_moonep.sh</code></td>
+<td>A5 MoonEP 入口</td>
+</tr>
+<tr>
+<td><code>tests/unit_tests/ops/ascendc/test_moonep.py</code>、<code>tests/smoke_tests/ops/test_moonep.py</code>、<code>tests/integration_tests/moonep_config.py</code></td>
+<td>契约、2 卡传输和真实模型验证入口</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_6">数据路径</h2>
+<h3 id="1-plan">1. plan</h3>
+<p><code>moonep.plan(counts, ids, num_ranks, context)</code> 在私有 context 上执行跨 rank 的每专家计数交换
+和贪心副本分配，返回：</p>
+<ul>
+<li><code>virtual_ids</code>：与输入 top-k id 同 shape 的 int32 张量，值落在扩展空间 <code>[0, 2E)</code>；</li>
+<li><code>cu_seqlens</code>：虚拟专家升序的接收区累计偏移，长度为 <code>2 × 本地专家数</code>；</li>
+<li><code>experts_to_copy</code>：<code>[num_ranks, num_local_experts]</code> 的副本清单，<code>-1</code> 表示空槽。</li>
+</ul>
+<p>算子内部把后端返回的视图 <code>reshape_as</code>/<code>clone</code> 成独立张量，避免后续调用覆盖；<code>MoonEPDispatchState</code>
+保存这三个结果以及本次分发状态。</p>
+<h3 id="2-prefetch_weight">2. prefetch_weight</h3>
+<p><code>prefetch_expert_weights</code> 把 <code>w1_EFD</code>、<code>w3_EFD</code>、<code>w2_EDF</code> 和 <code>experts_to_copy</code> 交给
+<code>moonep_prefetch_weight</code>。算子在 context 的 3 个权重组和 1 个可复用通信槽上：</p>
+<ul>
+<li>由 home rank 把副本行写入目标 rank 的预取槽；</li>
+<li>返回 3 个 <code>2 × num_local_experts</code> 行的 BF16 快照，前半是本地行，后半是副本行；</li>
+<li>在算子边界内完成 <code>clone</code>，使快照不随通信槽被下一层覆盖。</li>
+</ul>
+<p>快照通过 <code>functional_call</code> 替换 routed experts 的 <code>w1_EFD</code>/<code>w3_EFD</code>/<code>w2_EDF</code>，使 grouped
+experts 按虚拟专家 id 和 <code>2 × 本地专家数</code> 的权重布局计算。</p>
+<h3 id="3-dispatch">3. dispatch 与专家计算</h3>
+<p><code>AscMoonEPTokenDispatcher.dispatch</code> 使用 <code>virtual_ids</code> 调用
+<code>super().dispatch_experts(..., num_experts=2 * self.num_experts)</code>。DeepEP 按每个 rank
+<code>2E / EP</code> 个本地虚拟专家返回接收 token、每虚拟专家计数、<code>recv_scores</code> 和 handle；
+<code>MoonEPDispatchState</code> 在此基础上保留规划结果和 staged weights。</p>
+<p>专家计算仍走现有 routed experts：<code>routed_scores_R</code> 在 <code>absorb_router_scores=True</code> 时于
+SwiGLU 之后、W2 之前乘 score，否则由 combine 前加权。plan 返回的 <code>cu_seqlens</code> 与 dispatch
+返回计数的累计和一致；当前 <code>_ClampGroupedExperts</code> 从每专家计数计算 grouped GEMM offsets。</p>
+<h3 id="4">4. 激活检查点</h3>
+<p><code>moonep_prefetch_weight</code> 的返回值是独立快照，因此反向可以在任意时刻重建；<code>moonep_plan</code>
+包含跨 rank 的计数交换，重放会增加一次规划通信。A5 脚本在 SelectiveAC 下把
+<code>torch.ops.torchtitan_npu.moonep_plan.default</code> 加入保存集合，缓存规划结果、让预取权重在
+重算时重建。</p>
+<h2 id="_7">通信域与容量</h2>
+<p>MoonEP 使用两块互相独立的资源：</p>
+<p><strong>token 传输</strong>沿用 DeepEP 的 <code>ElasticBuffer</code>。<code>AscMoonEPTokenDispatcher</code> 继承
+<code>get_buffer_and_group()</code>，和普通 DeepEP 一样按
+<code>(deepep_group, torch.npu.current_device(), hidden_dim, num_max_tokens_per_rank, top_k)</code>
+缓存；参数相同时与 <code>AscDeepEPTokenDispatcher</code> 共用同一个 token buffer，不额外申请。详见
+<a href="../deepep/#通信域与容量">DeepEP</a>。</p>
+<p><strong>权重传输</strong>使用独立 HCCL group：</p>
+<pre><code class="language-text">group_desc = &quot;asc_moonep_weights&quot;
+ranks      = deepep_group 的 ranks
+</code></pre>
+<p>其 <code>hccl_buffer_size</code> 由 MoonEP 私有 heap 需求换算，而不是 <code>HCCL_BUFFSIZE</code>：</p>
+<pre><code class="language-text">width = hidden_dim * expert_hidden_dim
+need  = HEAP_BASE + reduce_region_end(
+    num_ranks, num_local_experts, width,
+    num_groups=3, slots=1, grad_bytes_per_elem=4,
+)
+</code></pre>
+<p><code>3</code> 个权重组对应 gate/up/down，<code>1</code> 个可复用通信槽承载副本推送，FP32 梯度槽用于副本梯度归并。
+算出的字节数折算成 <code>hccl_buffer_size</code>，创建 context 后调用 <code>check_heap_capacity()</code>，容量不足
+会在初始化阶段报错。</p>
+<p>context 由 <code>AscMoonEPTokenDispatcher._contexts</code> 按
+<code>(deepep_group, torch.npu.current_device(), num_experts, hidden_dim * expert_hidden_dim)</code>
+缓存；同一进程内参数相同的 dispatcher 共享一个 context，不同专家数或宽度各自创建。权重传输
+故意不复用 <code>ElasticBuffer</code> 的 communicator 和 heap，避免 token 通信与权重预取争用同一份
+对称内存。</p>
+<h2 id="_8">支持组合</h2>
+<table>
+<thead>
+<tr>
+<th>组合</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DP shard + EP（EP&gt;1）</td>
+<td>支持</td>
+<td>DeepSeek V4/V4.1可使能asc_moonep</td>
+</tr>
+<tr>
+<td>AC none / full / selective</td>
+<td>支持</td>
+<td>集成套件三种 policy；selective 由脚本缓存 plan</td>
+</tr>
+<tr>
+<td>fused SwiGLU</td>
+<td>支持</td>
+<td>与 MoonEP 是独立的 override，脚本同时启用</td>
+</tr>
+<tr>
+<td>torch.compile</td>
+<td>支持</td>
+<td>ops 提供 fake/meta</td>
+</tr>
+<tr>
+<td>PP / TP</td>
+<td>不支持</td>
+<td>当前没有 PP/TP 组合的验证路径</td>
+</tr>
+<tr>
+<td>量化权重</td>
+<td>不支持</td>
+<td><code>asc_moonep</code> 检测到 <code>mxfp8_quant_params</code> 时直接报错</td>
+</tr>
+<tr>
+<td>A3</td>
+<td>不支持</td>
+<td>仅Ascend 950支持</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_9">与其他特性的关系</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DeepEP</td>
+<td>MoonEP 复用 <code>ElasticBuffer</code>、<code>deepep::dispatch/combine</code> 和反向 handle；见 <a href="../deepep/">DeepEP</a></td>
+</tr>
+<tr>
+<td>EP 通信域分离</td>
+<td>token 组仍由 <code>get_deepep_group()</code> 创建；权重组另建 <code>asc_moonep_weights</code>；见 <a href="../ep_process_group/">EP 通信域分离</a></td>
+</tr>
+<tr>
+<td>fused SwiGLU</td>
+<td>独立 override，需要和 <code>asc_moonep</code> 同时选择；见 <a href="../fused_ops/">融合算子</a></td>
+</tr>
+<tr>
+<td>score absorption</td>
+<td>继承 DeepEP 的 <code>absorb_router_scores</code>，两种模式均可运行</td>
+</tr>
+<tr>
+<td>激活检查点</td>
+<td>SelectiveAC 可缓存 <code>moonep_plan</code>；预取快照支持重算</td>
+</tr>
+<tr>
+<td>低精度训练</td>
+<td>不支持；量化 dispatch/combine 会被拒绝</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_10">限制</h2>
+<ul>
+<li>需要 Ascend 950；缺少
+  <code>moonep_context</code>/<code>moonep_plan</code>/<code>prefetch_weight</code>/<code>reduce_grad</code> 时在初始化或算子调用处导入失败。</li>
+<li>要求 <code>moe_comm_backend="deepep"</code> 且 <code>expert_parallel_degree &gt; 1</code>。不支持 PP、TP。</li>
+<li>只支持 BF16 专家权重传输；当前使能量化 会被 <code>asc_moonep</code> 拒绝。</li>
+<li>权重传输只有一个可复用通信槽，下一层的预取会覆盖该槽。</li>
+<li>私有 heap 容量按 3 个权重组、1 个通信槽和 FP32 梯度槽计算；容量不足在初始化阶段报错，
+  <code>HCCL_BUFFSIZE</code>/<code>hccl_buffer_size</code> 不是这条路径的直接配置入口。</li>
+<li><code>moonep_plan</code> 的重放会增加跨 rank 规划通信；SelectiveAC 下建议按脚本把它加入保存集合。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../low_precision_training/" class="btn btn-neutral float-left" title="低精度训练"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../mtp/" class="btn btn-neutral float-right" title="DeepSeek-V3.2 / DeepSeek-V4 MTP">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../low_precision_training/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../mtp/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

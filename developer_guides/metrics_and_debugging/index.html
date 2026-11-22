@@ -139,6 +139,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/moonep/">MoonEP</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
@@ -401,9 +403,10 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
 <ul>
 <li><code>kernel_details.csv</code>：NPU kernel 级别的耗时统计</li>
 <li><code>api_statistic.csv</code>：PyTorch API 调用统计</li>
-<li><code>ascend_pytorch_profiler_0.db</code>：可用 MindStudio Insight 或 Chrome Tracing 打开的 SQLite 格式 trace</li>
-<li><code>trace_view.json</code>：完整的 trace 视图数据</li>
+<li><code>ascend_pytorch_profiler_0.db</code>：SQLite 格式性能分析数据库，可用 MindStudio Insight 或数据库工具查看</li>
+<li><code>trace_view.json</code>：JSON 格式时间线数据，可用 MindStudio Insight、<code>chrome://tracing/</code> 或 <code>https://ui.perfetto.dev/</code> 打开</li>
 </ul>
+<p>两类产物及查看方式参见 <a href="https://www.hiascend.com/document/detail/zh/mindstudio/latest/msTT_msIT/ascend_pytorch_profiler/docs/zh/ascend_pytorch_profiler/ascend_pytorch_profiler_user_guide.md">Ascend PyTorch Profiler 输出结果说明</a>。</p>
 <h3 id="_8">配置示例</h3>
 <h4 id="_9">周期采集</h4>
 <p>使用 CLI 启用 CANN profiler，并配置周期采集模式：</p>

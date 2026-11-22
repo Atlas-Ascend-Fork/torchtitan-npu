@@ -125,6 +125,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../moonep/">MoonEP</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
@@ -241,6 +243,8 @@ token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override
 <li><strong>Pre-W2 score absorption</strong>：routed experts 在 SwiGLU 之后、W2 之前乘 routing score；
   combine 不再重复加权。</li>
 <li><strong>专用 EP 通信域</strong>：<code>get_deepep_group()</code> 创建独立 HCCL group，与其他通信域隔离。</li>
+<li><strong>MoonEP 复用</strong>：MoonEP dispatcher 继承该路径的 token 传输和 <code>ElasticBuffer</code>，额外提供专家
+  副本规划与权重预取；见 <a href="../moonep/">MoonEP</a>。</li>
 <li><strong>训练 recipe</strong>：DeepSeek-V4 的 <code>deepseek_v4_flash_deepep</code>、<code>deepseek_v4_pro_deepep</code>、
   <code>deepseek_v4_flash_43layers_16experts_deepep</code>、
   <code>deepseek_v4_pro_61layers_32experts_deepep</code>、
@@ -319,7 +323,7 @@ DeepEP 包），而是直接初始化 <code>BaseEPTokenDispatcher</code> 并接�
 <tbody>
 <tr>
 <td><code>override/common/token_dispatcher.py</code></td>
-<td><code>AscDeepEPTokenDispatcher</code>、<code>ElasticBuffer</code> 生命周期、<code>asc_deepep</code></td>
+<td><code>AscDeepEPTokenDispatcher</code>、<code>ElasticBuffer</code> 生命周期、<code>asc_deepep</code>；存在MoonEP 派生类</td>
 </tr>
 <tr>
 <td><code>patches/torchtitan/models/common/token_dispatcher.py</code></td>
@@ -371,12 +375,15 @@ cached handle 保存路由与接收计数等 metadata，梯度数据仍需跨 ra
 相同的 ranks，<code>group_desc="asc_deepep"</code>、<code>use_local_synchronization=True</code>，并按源 group name
 缓存。<code>AscDeepEPTokenDispatcher</code> 设置 <code>_uses_custom_ep_process_group=True</code>，避免通用 EP
 wiring 在拿 buffer 之前替换掉这个 group。</p>
-<p><code>ElasticBuffer</code> 是进程级单例（classvar），由 <code>AscDeepEPTokenDispatcher.get_buffer_and_group()</code>
-调用 <code>ElasticBuffer(deepep_group, num_max_tokens_per_rank=..., hidden=..., num_topk=...)</code> 构造
-（<code>override/common/token_dispatcher.py</code>）。这四个参数都传给底层算子，用于计算并申请 buffer
-空间：<code>hidden</code> 是 token 宽度、<code>num_topk</code> 是每 token 的 top-k、<code>num_max_tokens_per_rank</code> 是
-每 rank 的输入 token 上限。本仓自身不另行分配通信 buffer；<code>HCCL_BUFFSIZE</code>/<code>hccl_buffer_size</code>
-不是这条路径的容量入口，<code>get_moe_ep_ccl_buffer_size()</code> 的默认值也不代表实际窗口。细节见
+<p><code>ElasticBuffer</code> 按进程级缓存复用：<code>AscDeepEPTokenDispatcher.get_buffer_and_group()</code> 以
+<code>(deepep_group, torch.npu.current_device(), hidden_dim, num_max_tokens_per_rank, top_k)</code>
+为 key 缓存（<code>override/common/token_dispatcher.py</code> 的 <code>_buffers</code>）。key 相同（同通信组、
+同 device、同容量和 top-k）时，所有 dispatcher 实例共用一块 buffer，key 不同（不同 EP group、设备、
+hidden 或容量）时各自申请独立 buffer。构造参数 <code>hidden</code>/<code>num_topk</code>/<code>num_max_tokens_per_rank</code>
+都传给底层算子，用于计算并申请 buffer 空间：<code>hidden</code> 是 token 宽度、<code>num_topk</code> 是每 token
+的 top-k、<code>num_max_tokens_per_rank</code> 是每 rank 的输入 token 上限。本仓自身不另行分配通信
+buffer；<code>HCCL_BUFFSIZE</code>/<code>hccl_buffer_size</code> 不是这条路径的容量入口，
+<code>get_moe_ep_ccl_buffer_size()</code> 的默认值也不代表实际窗口。细节见
 <a href="../ep_process_group/">EP 通信域分离</a>。</p>
 <p><code>num_max_tokens_per_rank</code> 由模型配置的 <code>update_from_config()</code> 调用上游
 <code>update_ep_token_dispatcher_config()</code> 按固定训练参数换算：</p>
@@ -442,6 +449,10 @@ wiring 在拿 buffer 之前替换掉这个 group。</p>
 <td>DeepEP 使用 <code>get_deepep_group</code> 创建的独立 HCCL group；见 <a href="../ep_process_group/">EP 通信域分离</a></td>
 </tr>
 <tr>
+<td>MoonEP</td>
+<td>MoonEP 复用 DeepEP 的 dispatch/combine 与 <code>ElasticBuffer</code>，额外提供专家副本规划、权重预取和副本梯度归并；见 <a href="../moonep/">MoonEP</a></td>
+</tr>
+<tr>
 <td>GraphTrainer EP overlap</td>
 <td>GraphTrainer 的 EP chunk 调度，不走 DeepEP dispatch/combine；使能 DeepEP 时 guard 自动关闭并告警；见 <a href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap</a></td>
 </tr>
@@ -459,7 +470,8 @@ wiring 在拿 buffer 之前替换掉这个 group。</p>
   报错。</li>
 <li>只实现 compact 训练 dispatch/combine；不支持上游 expand / CUDA Graph inference 布局。</li>
 <li>量化方向：CANN <code>ElasticBuffer.dispatch</code> 支持 FP8 token 加 scales；<code>ElasticBuffer.combine</code> 的输入与输出暂只接受 bf16 / fp16。</li>
-<li><code>ElasticBuffer</code> 是进程级单例；同一进程内多个 DeepEP group/模型不能各自持有独立 buffer。</li>
+<li><code>ElasticBuffer</code> 缓存不淘汰：同一进程内按 group/device/容量区分的 buffer 独立存活；需要不同
+  容量或通信域时可额外申请 buffer；缓存 key 见「通信域与容量」。</li>
 <li>compact 非缓存 dispatch 需要 host 等待接收 token 数，存在 host 同步开销。</li>
 <li><code>absorb_router_scores</code> 当前默认 True，没有 recipe 级关闭开关。</li>
 <li>只有 A5 入口默认选择 DeepEP；A3 入口走标准 all-to-all dispatcher。</li>
