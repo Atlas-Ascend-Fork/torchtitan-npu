@@ -72,13 +72,19 @@
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#patches">patches/ 的职责和边界</a>
     </li>
-    <li class="toctree-l2"><a class="reference internal" href="#_3">执行归属</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">进程与全局状态隔离</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">执行归属</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#cpu">CPU 环境与可选依赖</a>
     </li>
     </ul>
                   </li>
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/activation_offload/">FullAC 激活卸载</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/aux_loss/">辅助损失框架（AuxLoss）</a>
@@ -96,6 +102,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
                   </li>
@@ -180,15 +188,59 @@ tests/unit_tests/tooling/training_log_visualization/test_training_log_visualizat
 <h2 id="patches"><code>patches/</code> 的职责和边界</h2>
 <p><code>torchtitan_npu/patches/torchtitan/</code> 只保存当前固定上游版本尚未包含、且已有上游 PR 或 commit 依据的临时 patch。上游版本吸收对应改动后，应删除 patch、导入入口和专用测试。</p>
 <p><code>torchtitan_npu/patches/torch_npu/</code> 中的文件不是「上游 torchtitan 临时 patch」：它们改变 PyTorch、Inductor 或 <code>torch_npu</code> 的 NPU 运行时行为，例如 <code>determinism.py</code> 替换 <code>torch.use_deterministic_algorithms</code>，<code>device_copy.py</code> 修改 Inductor 的 <code>DeviceCopy</code> 和 <code>prims.device_put</code>。对应测试镜像到 <code>tests/unit_tests/patches/torch_npu/</code>；强制 eager 的 TorchTitan 兼容行为则归 <code>extensions/torchtitan/</code>。</p>
-<h2 id="_3">执行归属</h2>
+<h2 id="_3">进程与全局状态隔离</h2>
+<p>创建默认 process group 的 fixture 必须在自身作用域内成对清理；将 <code>yield</code> 放在 <code>try/finally</code> 中，在 <code>finally</code> 释放自己创建的 process group，确保测试断言失败时也能完成 teardown。不得让后续测试依赖前一测试留下的默认进程组，也不得用全套结束时的统一清理掩盖泄漏。</p>
+<p>CPU 多进程测试涉及 autograd 时使用局部 <code>spawn</code> context，避免 <code>fork</code> 继承父进程已启动的 autograd 线程状态。worker 必须是可导入模块中的顶层函数；子进程自行准备所需的 CPU 替身、临时环境及 process group，并在退出前清理，不能依赖父进程中的 monkeypatch、导入缓存或全局初始化。单独运行通过后，还应按会触发状态污染的执行顺序组合回归，并报告组合运行与完整套件的实际结果。</p>
+<h2 id="_4">执行归属</h2>
 <p>只要测试放在 <code>tests/unit_tests/</code>，现有 <code>.ci/unit_test.sh</code> 的 <code>pytest tests/unit_tests</code> 就能发现它；报告仍须单独标注 <code>tooling</code>，避免把 tooling 通过数写成产品覆盖。后续若保留其他目录外的测试，必须在对应 CI suite 显式列出执行路径，不能依赖开发者手工运行。</p>
 <p><code>experiments/torchao-npu</code> 保留独立测试目录，通过 <code>scripts/run_tests.sh cpu</code> 显式接入主仓 UT CI；其设备和集成测试使用手工入口。环境准备、依赖安装副作用、分层执行及报告判读见 <a href="../../experiments/torchao-npu/tests/README.md">TorchAO-NPU 测试使用说明</a>。</p>
+<h2 id="cpu">CPU 环境与可选依赖</h2>
+<p>CPU 单测在独立 Python 3.12 环境中执行。先根据 <a href="../../user-guides/installation/">安装指南</a>、<a href="../../requirements.txt">运行依赖</a>和 <a href="../../requirements-dev.txt">开发依赖</a>准备配套运行时；TorchTitan 的固定版本由 <code>requirements.txt</code> 与 <code>.ci/setup_torchtitan.sh</code> 推导。以下命令创建环境并注册当前 checkout，<code>--no-deps</code> 不代替基础运行依赖的安装：</p>
+<pre><code class="language-bash">python3.12 -m venv .venv-cpu
+source .venv-cpu/bin/activate
+# 在该环境中准备上述配套运行时，再安装开发依赖。
+python -m pip install -r requirements-dev.txt
+python -m pip install --no-deps -e .
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -v --tb=short tests/unit_tests
+</code></pre>
+<p>所有 CPU 测试命令都设置 <code>TORCH_DEVICE_BACKEND_AUTOLOAD=0</code>，避免 PyTorch 自动加载设备后端；CPU UT 不证明 NPU kernel、HCCL 或真实训练结果。</p>
+<p>严格 CPU 验证应在没有可用加速器的环境中执行。<code>TORCH_DEVICE_BACKEND_AUTOLOAD=0</code> 不会隐藏已透传的 NPU，也不会阻止显式 <code>torch_npu</code> 调用；主机暴露设备时，需使用不透传设备的独立执行环境或明确记录的 CPU 隔离措施，不能仅凭该变量声称未初始化设备。</p>
+<p>基础 CPU 与含可选依赖的完整 CPU 使用同一测试入口，按实际依赖和跳过原因区分结果：</p>
+<table>
+<thead>
+<tr>
+<th>环境</th>
+<th>TorchFT 测试范围</th>
+<th>结果判读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础 CPU，未安装 TorchFT</td>
+<td><code>patches/torchft</code> 下的正向用例跳过，故意阻止 TorchFT 导入的用例仍执行；TorchFT 扩展目录的测试不收集</td>
+<td>分别报告缺依赖的 skip 与未收集范围，不能声称完成含 TorchFT 的完整验证</td>
+</tr>
+<tr>
+<td>含 TorchFT 的完整 CPU</td>
+<td>安装 <code>torchft</code> extra 后，收集 TorchFT 扩展目录，执行 patch 用例及完整 CPU 套件</td>
+<td>已安装依赖的导入异常、缺少传递依赖或行为失败均为失败，不能转换成 skip</td>
+</tr>
+</tbody>
+</table>
+<p>缺包时，<a href="../../tests/unit_tests/extensions/torchtitan/experiments/torchft/conftest.py">TorchFT 扩展目录的 <code>conftest.py</code></a>通过 <code>collect_ignore_glob = ["test_*.py"]</code> 不收集 <code>tests/unit_tests/extensions/torchtitan/experiments/torchft/</code> 下的测试。该范围与 <a href="../../tests/unit_tests/patches/torchft/test_accelerator.py"><code>patches/torchft/test_accelerator.py</code></a> 中单个正向用例的 skip 不同；仅从 pytest 的 skipped 数量无法看出这部分未收集的测试。</p>
+<p>只有模块和 distribution metadata 均不存在时才按未安装处理。metadata 仍在但模块缺失属于损坏安装，正向测试继续失败，扩展目录也继续收集并暴露导入错误。</p>
+<p><a href="../../pyproject.toml"><code>pyproject.toml</code></a> 的 extra 固定 <code>torchft==0.2.0</code>。在已准备基础运行时的隔离环境中安装后，重新执行完整入口：</p>
+<pre><code class="language-bash">python -m pip install -e '.[torchft]'
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -v --tb=short tests/unit_tests
+</code></pre>
+<p><a href="../../.ci/unit_test.sh"><code>.ci/unit_test.sh</code></a> 为 TorchFT 配置了预编译 wheel 索引，并固定已安装的 Torch 版本。使用该来源前须确认 HTTPS 证书验证通过，且 wheel 的 Python、平台和架构标签匹配当前环境；不能以关闭 TLS 验证代替检查，也不能仅凭 CI 配置认定当前平台已有可用 wheel。</p>
+<p>没有匹配 wheel 时，<code>pip</code> 可能从源码构建。<a href="https://github.com/meta-pytorch/torchft/blob/v0.2.0/README.md#installing-from-source">TorchFT v0.2.0 源码安装说明</a>要求 Rust 工具链、Protobuf 编译器 <code>protoc</code> 与开发库（Ubuntu 包名 <code>protobuf-compiler</code>、<code>libprotobuf-dev</code>），构建后端使用 <code>maturin</code>。Python 环境本身不会提供这些系统工具；<code>Could not find protoc</code> 表示源码构建前置条件未满足。应使用已具备前置条件的独立构建环境或已验证的匹配 wheel；无法满足时，将含可选依赖的完整验证记为 blocked，并记录安装日志，基础 CPU 结果单独报告。</p>
               
             </div>
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
         <a href="../numerical_alignment/" class="btn btn-neutral float-left" title="精度对齐开发指南"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-        <a href="../../feature_guides/anticipatory_routing/" class="btn btn-neutral float-right" title="Loss spike 检测与路由重放（Anticipatory Routing）">Next <span class="icon icon-circle-arrow-right"></span></a>
+        <a href="../../feature_guides/activation_offload/" class="btn btn-neutral float-right" title="FullAC 激活卸载">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
   <hr/>
@@ -214,7 +266,7 @@ tests/unit_tests/tooling/training_log_visualization/test_training_log_visualizat
       <span><a href="../numerical_alignment/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
-      <span><a href="../../feature_guides/anticipatory_routing/" style="color: #fcfcfc">Next &raquo;</a></span>
+      <span><a href="../../feature_guides/activation_offload/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>

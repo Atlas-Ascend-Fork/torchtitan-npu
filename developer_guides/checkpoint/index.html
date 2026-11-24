@@ -84,11 +84,21 @@
     </li>
     <li class="toctree-l2"><a class="reference internal" href="#hugging-face_1">保存 Hugging Face 权重</a>
     </li>
+    <li class="toctree-l2"><a class="reference internal" href="#vllm-ascend">导出 vLLM Ascend 量化权重</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#_5">快速开始</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#recipe">量化层与 recipe</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_6">输出与校验</a>
+    </li>
+        </ul>
+    </li>
     <li class="toctree-l2"><a class="reference internal" href="#seed-checkpoint">创建 seed checkpoint</a>
     </li>
-    <li class="toctree-l2"><a class="reference internal" href="#_5">常见限制与验证范围</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">常见限制与验证范围</a>
     </li>
-    <li class="toctree-l2"><a class="reference internal" href="#_6">相关文档</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_8">相关文档</a>
     </li>
     </ul>
                   </li>
@@ -109,6 +119,8 @@
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/activation_offload/">FullAC 激活卸载</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/aux_loss/">辅助损失框架（AuxLoss）</a>
@@ -126,6 +138,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
                   </li>
@@ -198,7 +212,8 @@
 <li>DCP（Distributed Checkpoint）用于保存和加载分布式训练状态。</li>
 <li>Hugging Face safetensors 只用于模型权重的加载或保存，不能加载优化器和训练步数。</li>
 </ul>
-<p>本文不覆盖权重转换工具。需要转换 Hugging Face 权重时，使用上游仓库提供的转换工具。</p>
+<p>除下文「导出 vLLM Ascend 量化权重」外，本文不覆盖其他权重转换工具。需要转换 Hugging Face 权重时，
+使用上游仓库提供的转换工具。</p>
 <h2 id="_1">当前配置入口</h2>
 <p>训练配置由以下注册表提供：</p>
 <table>
@@ -460,6 +475,111 @@ bash scripts/run_train.sh \
 <p><code>last_save_in_hf</code> 需要模型提供 state-dict adapter，并且必须保持
 <code>last_save_model_only=True</code>。<code>deepseek_v3_2</code> 和 <code>deepseek_v4</code> 模型均提供
 对应的 state-dict adapter；具体可用性仍取决于模型配置和权重格式。</p>
+<h2 id="vllm-ascend">导出 vLLM Ascend 量化权重</h2>
+<p><code>torchtitan_npu/tools/checkpoint_conversion/export_quantized_vllm.py</code> 是离线导出工具：读取训练
+checkpoint 的 master 权重，按量化计划重新量化，写出 vLLM Ascend 可直接加载的 Hugging Face
+safetensors。量化权重是普通的 <code>weight</code> 与 <code>weight_scale</code> 张量，逐参数类型写在
+<code>quant_model_description.json</code>（ModelSlim 格式），serving 时对应 <code>--quantization ascend</code>。</p>
+<p>输入可以是 DCP 或 HF safetensors：DCP 覆盖 <code>deepseek_v4</code>、<code>deepseek_v4_1</code>、<code>qwen3_5</code>；HF 只支持
+Qwen3.5，DeepSeek 的 HF 发布件本身是 fp8/fp4 量化格式，必须从 DCP 导出。工具为单进程程序：
+DCP 读取与命名转换在 CPU 上完成，量化 kernel 在 <code>--quant_device</code> 指定的 NPU 上执行，运行前需要
+<code>torch_npu</code>、CANN 和可用的 Ascend NPU 环境。</p>
+<h3 id="_5">快速开始</h3>
+<p><code>--hf_assets_path</code> 指向 HF 发布件目录（<code>config.json</code>、tokenizer，以及 DCP 导出时用于补齐冻结
+视觉塔的 <code>*.safetensors</code>；所选模型配置不含视觉模块、但 serving 需要视觉塔时加 <code>--needs_vision</code>），
+非权重文件会复制到输出目录。DeepSeek 的 <code>config.json</code> 复制后会把结构字段（层数、专家数、
+hidden/intermediate/vocab、rope 等）按 <code>--model_flavor</code> 的模型配置改写，因此导出裁剪层数或专家数
+的 flavor 时不会残留发布件的完整规格；模型配置未声明的字段保持 assets 原值。视觉开关另行按导出
+的张量集对齐：DeepSeek 的 <code>vision_n_layers</code> 在导出没有视觉塔时置为 0，有视觉塔但配置为 0 时保留
+原值并告警；Qwen3.5 声明 <code>vision_config</code> 而导出没有视觉塔时直接报错。Qwen3.5 的配置项在嵌套的
+<code>text_config</code> 中，暂不改写，保持 assets 原样。运行后先核对日志中的 <code>plan: ...</code>（显式 <code>--recipe</code>
+时为 <code>recipe=... plan: ...</code>，回放 DCP 配置时为 <code>DCP replay plan: ...</code>）与 <code>Quantized N/M tensors</code>。</p>
+<p>DeepSeek-V4.1，DCP 输入，回放 checkpoint 内嵌的量化配置：</p>
+<pre><code class="language-bash">python -m torchtitan_npu.tools.checkpoint_conversion.export_quantized_vllm \
+  /absolute/path/to/dump/checkpoint/step-100 \
+  ./outputs/vllm_quantized \
+  --hf_assets_path /path/to/DeepSeek-V4.1 \
+  --model_name deepseek_v4_1 \
+  --model_flavor deepseek_v4_1_flash
+</code></pre>
+<p>Qwen3.5，HF safetensors 输入，必须显式指定 recipe：</p>
+<pre><code class="language-bash">python -m torchtitan_npu.tools.checkpoint_conversion.export_quantized_vllm \
+  /path/to/Qwen3.5-27B \
+  ./outputs/qwen35_quantized \
+  --hf_assets_path /path/to/Qwen3.5-27B \
+  --model_name qwen3_5 \
+  --model_flavor 27B \
+  --recipe W4A8_MXFP
+</code></pre>
+<h3 id="recipe">量化层与 recipe</h3>
+<p>量化范围由训练 recipe 的 filter 决定（训练侧的层选择规则见
+<a href="../../feature_guides/low_precision_training/">低精度训练</a>），不按「所有 Linear」推断。导出侧在
+<code>vllm_export_specs.py</code> 的 <code>QUANTIZATION_EXPORT_RULES</code> 中把训练 FQN 后缀换成 HF 名字后缀，只有命中
+的张量在描述文件中是非 <code>FLOAT</code> 条目，清单以该表为准（V4.1 Engram 表是例外，见
+<a href="#输出与校验">输出与校验</a>）：</p>
+<ul>
+<li><code>deepseek_v4</code>：<code>DEEPSEEK_V4_DENSE_WEIGHT_SUFFIXES</code>；routed expert 由 <code>ROUTED_WEIGHT_PATTERN</code> 匹配。</li>
+<li><code>deepseek_v4_1</code>：<code>DEEPSEEK_V41_DENSE_WEIGHT_SUFFIXES</code>，在 V4 的清单上增加 <code>.engram.wkv</code>。</li>
+<li><code>qwen3_5</code>：<code>QWEN35_DENSE_WEIGHT_SUFFIXES</code>，无 routed expert。</li>
+</ul>
+<p>其余权重（embedding 与输出层、norm、MoE router、vision 塔、MTP，以及 Qwen3.5 的 <code>conv1d</code> 与 MoE
+专家）不量化，在描述文件中记为 <code>FLOAT</code>。</p>
+<p>量化类型由 recipe 的权重量化配置推导（<code>vllm_export_contract.py</code> 的 <code>quant_description_type</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>recipe</th>
+<th>量化类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>all_mxfp8</code>、<code>mix</code>、<code>all_block_fp8</code></td>
+<td><code>W8A8_MXFP8</code></td>
+</tr>
+<tr>
+<td><code>mix</code>、<code>all_block_fp8</code> + <code>--enable_mxfp4_qat</code></td>
+<td>routed expert 为 <code>W4A8_MXFP</code>，dense 仍为 <code>W8A8_MXFP8</code></td>
+</tr>
+<tr>
+<td><code>W4A8_MXFP</code>（Qwen3.5，内置 MXFP4）</td>
+<td><code>W4A8_MXFP</code></td>
+</tr>
+<tr>
+<td><code>W8A8_MXFP8</code>（Qwen3.5）</td>
+<td><code>W8A8_MXFP8</code></td>
+</tr>
+<tr>
+<td><code>all_hif8</code></td>
+<td>不支持，构建计划阶段报错</td>
+</tr>
+</tbody>
+</table>
+<p>表中的类型是 <code>quant_model_description.json</code> 里每个权重的条目；顶层 <code>model_quant_type</code> 只有在所有
+命中的权重都是 FP4 时才是 <code>W4A8_MXFP</code>，混合导出（<code>mix</code>、<code>all_block_fp8</code> + <code>--enable_mxfp4_qat</code>）
+顶层仍记 <code>W8A8_MXFP8</code>。<code>--enable_mxfp4_qat</code> 只作用于 DeepSeek <code>mix</code>/<code>all_block_fp8</code> 的 routed
+expert，<code>all_mxfp8</code> 与 Qwen3.5 的 recipe 不读取该开关（Qwen3.5 <code>W4A8_MXFP</code> 固有启用）。</p>
+<p>省略 <code>--recipe</code> 时工具回放 DCP 中 <code>torchao_npu</code> wrapper 记录的逐参数配置：Qwen3.5 的
+<code>in_proj_q/k/v</code> 融合成 <code>in_proj_qkv</code> 前会校验三份配置齐全且一致；训练未包成 Linear 的
+serving-only 权重（V4.1 <code>.engram.wkv</code>）借用 dense 配置；任何量化目标缺配置都会报错，而不是导出
+与训练不一致的权重。回放模式下传入 <code>--enable_mxfp4_qat</code> 或 <code>--dst_type_max</code> 会报错，需改用
+<code>--recipe</code>。</p>
+<h3 id="_6">输出与校验</h3>
+<p>输出目录包含模型 shard（<code>model.safetensors</code> 或 <code>model-*-of-*.safetensors</code>）、
+<code>quant_model_description.json</code> 和从 <code>--hf_assets_path</code> 复制的配置文件；多 shard 或含 Engram 表时
+还会生成 <code>model.safetensors.index.json</code>。输出目录不能残留上一次导出的权重或索引文件，否则直接
+报错。导出只包含模型权重与量化描述，不含优化器和训练状态。未量化权重在描述文件中记为 <code>FLOAT</code>；
+DCP 输入时其 dtype 按 HF 发布件的原生 dtype 还原，读不到发布件的 tensor header 或 dtype 不兼容时
+保留 DCP dtype 并告警。V4.1 Engram 表按 vLLM Ascend 的逐行 MXFP8 布局导出：
+<code>layers.&lt;n&gt;.engram.embed.weight</code> 为 <code>float8_e4m3fn</code>，同前缀的 <code>.scale</code> 为 <code>float8_e8m0fnu</code>，
+每行每 32 个元素一个 scale；这两类张量不在 <code>quant_model_description.json</code> 里逐项记录，只写一条
+<code>layers.&lt;n&gt;.engram.embed.quant_type: "MXFP8"</code> 元数据，vLLM Ascend 的 Engram loader 直接读
+safetensors dtype 与 index。</p>
+<p>写盘后工具自检 dtype、scale 形状、描述条目、shard 张量集合与 <code>config.json</code>；不满足 vLLM Ascend
+加载约定时报错并删除本次写出的权重文件。复制过来的 <code>quantization_config</code> 保持 assets 原样：其中
+声明的 <code>quant_method</code>（如 fp8）不会改写成导出格式，自检只记录警告，serving 时必须用
+<code>--quantization ascend</code> 覆盖。<code>--keep_scale_tail_dim</code> 保留 kernel 的
+<code>(..., ceil(blocks/2), 2)</code> scale 布局，只能用于检查，不能直接 serving。其余参数见 <code>--help</code>。</p>
 <h2 id="seed-checkpoint">创建 seed checkpoint</h2>
 <p>seed checkpoint 用于先创建未应用并行切分的模型状态，再由多卡任务通过 DCP 重分片加载。
 以下使用 DeepSeek-V4 debug 配置与匹配的 tokenizer；创建时使用单卡，并将各并行度设为 <code>1</code>：</p>
@@ -478,7 +598,7 @@ bash scripts/run_train.sh \
   --parallelism.expert-parallel-degree 1
 </code></pre>
 <p>生成的 <code>step-0</code> 目录可以作为后续任务的 <code>checkpoint.initial_load_path</code>。</p>
-<h2 id="_5">常见限制与验证范围</h2>
+<h2 id="_7">常见限制与验证范围</h2>
 <ul>
 <li>需要可用的 <code>torch</code>、<code>torch_npu</code>、TorchTitan、CANN 和 Ascend NPU 环境；本文命令未在当前
   Windows 环境执行。</li>
@@ -486,7 +606,7 @@ bash scripts/run_train.sh \
 <li>文档中的模型入口、配置字段和命令来自源码与脚本的静态核对；多卡训练、权重格式兼容性
   和 NPU 性能未在本次文档修改中重新实测。</li>
 </ul>
-<h2 id="_6">相关文档</h2>
+<h2 id="_8">相关文档</h2>
 <ul>
 <li><a href="../../user-guides/quickstart/">快速上手</a></li>
 <li><a href="../../user-guides/installation/">安装指南</a></li>

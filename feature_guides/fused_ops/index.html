@@ -69,6 +69,8 @@
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../activation_offload/">FullAC 激活卸载</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
@@ -86,6 +88,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
@@ -409,7 +413,11 @@ replacement 只支持具体 Config 类型时设置 <code>exact=True</code>；需
   config 自己构建；它必须与 selector 成对配置，单边启用会在模型构建前报 <code>ValueError</code>。CANN 路径用 <code>lightning_indexer.asc</code>，
   PyPTO 路径用 <code>lightning_indexer.pypto</code>。前者在 SMLAG 反向产出 teacher，后者消费它。</li>
 <li>DeepSeek-V4 MHC 的 AscendC 入口声明 <code>HcPre.Config</code>/<code>HcPost.Config</code>，Triton 入口还包含
-  <code>HcHead.Config</code>；同一节点只能选择一个实现。</li>
+  <code>HcHead.Config</code>；同一节点只能选择一个实现。DeepSeek-V4.1 另有
+  <code>tilelang.tilelang_hc_pre</code> / <code>tilelang.tilelang_hc_post</code>，分别声明 V4.1 自己的 <code>HcPre.Config</code> / <code>HcPost.Config</code>；
+  pre 侧与 <code>mhc.asc_sinkhorn</code> / <code>mhc.asc_hc_premix</code> 三者互斥，
+  post 侧与 <code>mhc.asc_hc_post</code> 互斥。Ascend 侧只支持 <code>hc_mult=4</code>，且仅 A5（Ascend 950）可用，
+  要求 <code>bfloat16</code> 输入与 <code>hidden % 64 == 0</code>；launcher 通过 <code>USE_TILELANG</code> 选择。</li>
 <li>两个 override 声明同一节点，或一个声明另一个的祖先/后代节点时会冲突；可移除互斥入口，
   或使用 <code>fqns</code> 缩小范围。</li>
 </ul>

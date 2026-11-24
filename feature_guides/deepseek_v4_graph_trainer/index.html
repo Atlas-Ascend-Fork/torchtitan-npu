@@ -69,6 +69,8 @@
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../activation_offload/">FullAC 激活卸载</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
@@ -114,6 +116,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
@@ -306,12 +310,17 @@
 <td>DeepEP MoE backend</td>
 <td>有限支持：<code>graph_trainer_*_deepep</code> 配置与 <code>asc_deepep</code> override 可用，但 EP overlap pass 在该组合下自动关闭</td>
 </tr>
+<tr>
+<td>ACLGraph 分段入图</td>
+<td>通过 <code>mutation-functionalization+aclgraph</code> pipeline 启用；要求 <code>aot_fx_trace</code>、<code>inductor_compilation=regional</code>、关闭 EP overlap、PP=1、CP=1、MTP=0，不与 Auto Overlap 叠加。实现及 A3 验证记录见 <a href="../dsv4_aclgraph_implementation/">ACLGraph 指南</a></td>
+</tr>
 </tbody>
 </table>
 <h2 id="_7">相关文档</h2>
 <ul>
 <li>上游 GraphTrainer 说明与 EP overlap 用法：<a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/graph_trainer/README.md"><code>torchtitan/experiments/graph_trainer/README.md</code></a></li>
 <li>EP overlap 适配：<a href="../graph_trainer_ep_overlap/"><code>graph_trainer_ep_overlap.md</code></a></li>
+<li>ACLGraph 分段入图、启用限制与 A3 验证：<a href="../dsv4_aclgraph_implementation/"><code>dsv4_aclgraph_implementation.md</code></a></li>
 <li>DSV4 稀疏注意力与 TND 融合路径：<a href="../deepseek_v4_tnd/"><code>deepseek_v4_tnd.md</code></a></li>
 </ul>
               

@@ -69,6 +69,8 @@
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/activation_offload/">FullAC 激活卸载</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/aux_loss/">辅助损失框架（AuxLoss）</a>
@@ -86,6 +88,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/ep_process_group/">EP 通信域分离</a>
                   </li>
@@ -222,11 +226,27 @@ bash scripts/run_train.sh \
 - 脚本后的其他参数会原样传给 <code>torchtitan_npu.train</code>，可用于覆盖配置函数中的训练和并行参数。</p>
 </blockquote>
 <h3 id="8-ep8">单机 8 卡 EP8 训练任务</h3>
-<p>直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 <code>deepseek_v4_flash_43layers_16experts</code> 模型配置。运行前需准备与 DeepSeek-V4 配套的 Tokenizer，并将下面的 <code>HF_ASSETS_PATH</code> 替换为其实际目录：</p>
-<pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+<p>直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 <code>deepseek_v4_flash_43layers_16experts</code> 模型配置，并读取仓库预置的 <code>tests/assets/c4_test</code> 数据集。</p>
+<p>运行前需准备与 DeepSeek-V4 配套的 Tokenizer。<a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/commit/a7aaed80dd2df27620eb534454253ea25eb11c7a">DeepSeek-V4-Flash 官方发布版本</a> 提供了该入口所需的 <code>tokenizer.json</code> 和 <code>tokenizer_config.json</code>。先按 <a href="https://huggingface.co/docs/huggingface_hub/guides/cli#getting-started">Hugging Face CLI 安装说明</a> 准备 <code>hf</code> 命令，再从仓库根目录执行以下命令，仅下载这两个文件，不下载模型权重：</p>
+<pre><code class="language-bash">export HF_ASSETS_PATH=&quot;$PWD/downloads/DeepSeek-V4-Flash-tokenizer&quot;
+hf download deepseek-ai/DeepSeek-V4-Flash \
+  tokenizer.json tokenizer_config.json \
+  --revision a7aaed80dd2df27620eb534454253ea25eb11c7a \
+  --local-dir &quot;$HF_ASSETS_PATH&quot;
+</code></pre>
+<p><code>HF_ASSETS_PATH</code> 指向直接包含这两个文件的目录；使用已有下载时，将其设为实际目录。目录路径不要包含空格。保持该环境变量已导出，在同一 shell 中启动：</p>
+<pre><code class="language-bash">bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5
+</code></pre>
+<p>如仅需检查启动流程，可从仓库根目录使用预置的测试 Tokenizer，无需下载：</p>
+<pre><code class="language-bash">HF_ASSETS_PATH=tests/assets/deepseek_v3 \
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --training.steps 5
 </code></pre>
+<blockquote>
+<p>[!WARNING]
+此替代命令仅用于 smoke 检查。<code>tests/assets/deepseek_v3</code> 是测试用 Tokenizer，其词表和文本编码不代表 DeepSeek-V4，不能用于正式训练。即使 8 张设备可见、进程退出码为 <code>0</code>，或 rank 0 输出 <code>aux_loss</code>，也不能据此证明 V4 资产兼容、训练有效、模型质量或 checkpoint 有效性。</p>
+</blockquote>
 <p>DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 <a href="../../feature_guides/deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>。</p>
 <h3 id="deepseek-v4-torchao-npu">DeepSeek-V4 TorchAO-NPU 低精度训练</h3>
 <p>先按<a href="../installation/#4-安装-torchao-npu可选">软件安装</a>安装仓内适配包，或将

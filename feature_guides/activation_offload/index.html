@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>FullAC 激活卸载 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "FullAC \u6fc0\u6d3b\u5378\u8f7d";
+        var mkdocs_page_input_path = "feature_guides/activation_offload.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">FullAC 激活卸载</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">适用范围</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">启用方式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">工作方式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">限制</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">代码与验证</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../moonep/">MoonEP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">FullAC 激活卸载</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="fullac">FullAC 激活卸载</h1>
+<p>激活卸载为 eager 执行的 FullAC 训练提供逐层边界卸载：前向结束后把满足条件的层边界激活通过 NovaSwap 异步发送到 CPU，反向重计算需要该激活时再异步搬回 NPU。该能力默认关闭，当前实现面向 Ascend NPU 的 eager 训练路径。</p>
+<h2 id="_1">适用范围</h2>
+<p>启用激活卸载时必须同时满足以下条件：</p>
+<ul>
+<li>使用 FullAC（CLI 子命令 <code>activation-checkpoint:full</code>）；</li>
+<li>使用 eager 执行，不能启用 <code>compile</code>；</li>
+<li>不使用 pipeline parallelism；</li>
+<li>运行环境提供 <code>torch_npu</code>、CANN 和可用的 Ascend NPU。</li>
+</ul>
+<p>未启用 <code>--training.enable-activation-offload</code> 时，训练仍走原有路径，不安装激活卸载 hook。</p>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>激活方式</th>
+<th>数据约束</th>
+<th>验证范围</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FullAC 层边界激活 D2H/H2D</td>
+<td><code>--training.enable-activation-offload</code></td>
+<td>NPU、需梯度、连续且覆盖完整 storage 的 Tensor；默认至少 1 MiB</td>
+<td><code>tests/unit_tests/extensions/cpu_offload/test_activation_offload.py</code> 的 CPU 逻辑单测；NPU 传输需在目标环境验证</td>
+<td>有限支持</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_2">启用方式</h2>
+<p>以 DeepSeek-V4 的 FullAC 配置为例：</p>
+<pre><code class="language-bash">torchrun ... \
+  --training.enable-activation-offload \
+  --training.activation-offload-min-bytes=1048576 \
+  activation-checkpoint:full
+</code></pre>
+<p><code>activation-offload-min-bytes</code> 用于过滤小 Tensor；调大该值可以缩小卸载范围。配置字段定义在 <code>torchtitan_npu/config/configs.py</code>，Trainer 接入和约束检查位于 <code>torchtitan_npu/extensions/torchtitan/trainer.py</code>。</p>
+<h2 id="_3">工作方式</h2>
+<p><code>ActivationBoundaryOffload</code> 在已有 FullAC <code>CheckpointWrapper</code> 上安装 hook，不改变模型层级。每个 wrapper 的前向执行期间，saved-tensor hook 收集候选 Tensor；前向返回后选择最大的安全候选，并提交一次 NovaSwap <code>D2H</code>。复制使用 NovaSwap 的 pinned memory、copy stream、事件和存储回收机制。</p>
+<p>反向重计算由 autograd 触发 <code>unpack</code>。<code>unpack</code> 对当前 token 提交 <code>H2D</code>，同时尝试预取前一层已经卸载的 token；在读取前提交 <code>WAIT_DEVICE</code>，随后从 NovaSwap 取回 Tensor。预取失败时退回当前 token 的按需 H2D。激活被消费后释放其 swap 注册，避免把所有重载 Tensor 保留到整个 backward 结束。</p>
+<h2 id="_4">限制</h2>
+<ul>
+<li>当前策略每个 FullAC 层最多选择一个最大的安全候选；它不是通用的“保存了什么就全部卸载”。参数、非连续或部分 storage view、内部 overlap、无梯度和低于阈值的 Tensor 会被跳过。</li>
+<li>只覆盖 FullAC 的 eager 路径，不覆盖 SelectiveAC、pipeline parallelism 或 compile 图路径。</li>
+<li>未针对 MoE 专家、路由和 combine 做独立选择策略；它们只有在其 Tensor 满足通用候选条件并被 FullAC wrapper 保存时才可能参与卸载。</li>
+<li>对无法由 PyTorch pytree 展开的输出容器采取保守策略，保持候选驻留在 NPU，避免错误地释放 autograd 可见别名。</li>
+<li>本次 CPU 单测验证调度、预取、生命周期、FSDP 输入 view 和边界过滤；没有把 CPU 单测结果当作 NPU 传输或性能结论。</li>
+</ul>
+<h2 id="_5">代码与验证</h2>
+<ul>
+<li>实现：<code>torchtitan_npu/extensions/cpu_offload/activation_offload.py</code></li>
+<li>Trainer 接入：<code>torchtitan_npu/extensions/torchtitan/trainer.py</code></li>
+<li>配置：<code>torchtitan_npu/config/configs.py</code></li>
+<li>CPU 单测：<code>tests/unit_tests/extensions/cpu_offload/test_activation_offload.py</code></li>
+</ul>
+<p>在仓库根目录运行：</p>
+<pre><code class="language-bash">python -m pytest tests/unit_tests/extensions/cpu_offload/test_activation_offload.py
+</code></pre>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../../developer_guides/unit-test-architecture/" class="btn btn-neutral float-left" title="Unit Test 架构与迁移方案"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../anticipatory_routing/" class="btn btn-neutral float-right" title="Loss spike 检测与路由重放（Anticipatory Routing）">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../../developer_guides/unit-test-architecture/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../anticipatory_routing/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

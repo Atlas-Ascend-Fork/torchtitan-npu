@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DeepSeek-V4 ACLGraph 的分段入图与捕获边界 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DeepSeek-V4 ACLGraph \u7684\u5206\u6bb5\u5165\u56fe\u4e0e\u6355\u83b7\u8fb9\u754c";
+        var mkdocs_page_input_path = "feature_guides/dsv4_aclgraph_implementation.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../activation_offload/">FullAC 激活卸载</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">启用方式与限制</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">哪些部分留在图外</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#moe">MoE 保留原来的动态布局</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#attention-metadata">Attention 为什么仍需要固定 metadata</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#pass">分区 pass 做什么</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">运行时为什么仍需要管理地址和存活期</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">验证与判读</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#a3-8-100">A3 8 卡 100 步精度对比</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#_5">对照配置</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#_6">指标与判定</a>
+    </li>
+        </ul>
+    </li>
+        </ul>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../moonep/">MoonEP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="deepseek-v4-aclgraph">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</h1>
+<p>ACLGraph 采用分段入图策略：在 GraphTrainer 的前反向 joint FX 图中，将形状稳定的连续设备计算捕获为多个区域并重放，以减少逐算子下发开销。MoE 的路由专家路径继续按真实路由量运行，不为捕获补齐专家容量。数据加载、模型预处理和优化器更新仍由原训练流程执行。</p>
+<h2 id="_1">启用方式与限制</h2>
+<p>使用普通 GraphTrainer recipe，例如 <code>graph_trainer_deepseek_v4_flash_43layers_16experts</code>，通过 <code>compile.pass_pipeline</code> 选择。DSV4 recipe 默认使用 <code>mutation-functionalization</code>：它保留 GraphTrainer 默认图变换，并修复重计算时的原地操作。ACLGraph 只叠加在这条普通管线上：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>pipeline</th>
+<th>EP overlap</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始 GraphTrainer</td>
+<td><code>mutation-functionalization</code></td>
+<td>关闭</td>
+</tr>
+<tr>
+<td>分段入图</td>
+<td><code>mutation-functionalization+aclgraph</code></td>
+<td>关闭</td>
+</tr>
+</tbody>
+</table>
+<p>ACLGraph pipeline 要求 <code>compile.mode=aot_fx_trace</code>、<code>compile.inductor_compilation=regional</code>、关闭 EP overlap、PP=1、CP=1。不提供与 Auto Overlap 的组合。启用 PP 时，初始化会在队列切换和模型准备之前报错，需设置 PP=1 或关闭 ACLGraph。MTP 会在修改模型前报错，需设置 <code>num_mtp_layers=0</code> 或关闭 ACLGraph。TP 及量化组合应在目标设备单独验证。</p>
+<p><code>compile.backend</code> 与 ACLGraph pass 是两个层次的设置。四卡集成用例使用 <code>aot_eager</code>；该设置仍经过 AOT joint graph、区域编译与图捕获，不等于跳过 GraphTrainer。</p>
+<p>在 ACLGraph pipeline 中添加 <code>--compile.disable-passes aclgraph_pass</code>，会跳过模型 metadata 准备、队列切换和附加捕获 pass，返回原 pipeline。CLI 禁用列表会覆盖 recipe 默认列表，hook 会补回 NPU 所需的 <code>cudagraph_pass</code> 禁用项。该对照测量的是完整适配的效果。</p>
+<h2 id="_2">哪些部分留在图外</h2>
+<p><a href="../../torchtitan_npu/extensions/torchtitan/experiments/graph_trainer/aclgraph.py">aclgraph.py</a> 的 <code>_eager_boundary</code> 检查当前节点及其直接输入的 FX metadata：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>原因</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>module_fqn</code> 包含完整路径分量 <code>routed_experts</code></td>
+<td>路由量决定通信 splits、重排输出行数和专家计算尺寸</td>
+<td>整个路由专家子树保持 eager，包括重计算与反向</td>
+</tr>
+<tr>
+<td><code>aten._local_scalar_dense</code></td>
+<td>把设备或 CPU Tensor 内容读成 Python 标量，需要执行当前批次的读取</td>
+<td>保留运行时读取</td>
+</tr>
+<tr>
+<td>自身或直接输入含 CPU Tensor</td>
+<td>包括 D2H、CPU splits 整理及其他 host 计算</td>
+<td>保持 eager</td>
+</tr>
+<tr>
+<td>Tensor 的 shape/stride 含 unbacked 符号，或输入/输出是含 unbacked 符号的标量</td>
+<td>尺寸或标量依赖本批实际数据，捕获时的具体值不能代表后续步骤</td>
+<td>连同消费这些动态值的节点保持 eager</td>
+</tr>
+</tbody>
+</table>
+<p>unbacked 符号指由数据内容产生的符号，例如真实接收 token 数。它不同于仅用符号表达但布局已知的普通输入尺寸。这里只排除包含数据相关符号的部分，不把所有符号尺寸一概排除。</p>
+<p>路由专家边界覆盖：</p>
+<pre><code class="language-text">dispatch：统计/交换路由量、构造 splits、token 重排、All-to-All
+    → inner_experts：随接收行数变化的专家计算
+    → combine：恢复专家顺序、反向 All-to-All、还原 token 布局
+</code></pre>
+<p>仅排除 CPU 的 <code>item()</code> 不够：后面的 All-to-All 和 GEMM 仍可能用变化的尺寸，因此显式排除整个 <code>routed_experts</code> 子树。动态形状检查则补充保护模块标记不完整的节点。</p>
+<p>Attention、共享专家、路由器中固定布局的设备计算，以及其他稳定的前反向工作，可按最终图顺序捕获。实际捕获范围取决于 FX metadata 与调度结果，不能据模块名称承诺整层都进入同一张图。</p>
+<h2 id="moe">MoE 保留原来的动态布局</h2>
+<p><a href="../../torchtitan_npu/models/deepseek_v4/aclgraph.py">模型准备</a> 不替换 <code>token_dispatcher</code>。显式选择 Ascend dispatcher 时，仍使用 <a href="../../torchtitan_npu/override/common/token_dispatcher.py">AscAllToAllTokenDispatcher</a>；其他配置继续使用原 dispatcher。</p>
+<p>每个 rank 每步按真实路由数组织紧凑数据和通信 splits，专家输入行数可增可减。图外执行会重新计算这些值，不要求各 rank 容量相同，也不要求各 step 容量相同。每条通信边的发送量和接收量仍须匹配，这是 All-to-All 自身的要求。</p>
+<p>模型准备保留原 dispatcher 的 <code>absorb_router_scores</code> 行为、mesh 和参数对象，不引入专家容量桶或专用重排算子。</p>
+<p>这样减少了 padding、无效专家计算与固定布局维护量，也放弃了路由专家区域的捕获收益。剩余捕获能否抵消区域调用、输入复制和输出保护开销，需要同卡性能对照。</p>
+<h2 id="attention-metadata">Attention 为什么仍需要固定 metadata</h2>
+<p>EP 的动态容量与 Attention 的文档 metadata 是两个独立问题。Attention 主输入可以始终为 <code>[B,S,D]</code>，但 packed batch 每步包含的文档数不同，<code>cu_seqlens</code> 和 <code>seqused</code> 的长度仍可能变化。继续捕获 Attention 时，需要解决这部分变化。</p>
+<p><a href="../../torchtitan_npu/extensions/torchtitan/experiments/graph_trainer/aclgraph.py">prepare_aclgraph_trainer</a> 按实际训练与 dataloader 配置计算：</p>
+<pre><code class="language-python">document_capacity = local_batch_size * (seq_len // document_alignment)
+prepare(document_capacity=document_capacity)
+</code></pre>
+<p>每段至少占一个对齐单元；B=1、S=4096、对齐粒度为 128 时，最多预留 32 段。对齐粒度必须为正并整除序列长度；未知 loader 按每 token 一段给出上界。</p>
+<p><a href="../../torchtitan_npu/models/deepseek_v4/aclgraph_metadata.py">aclgraph_metadata.py</a> 在文档边界数组左侧补零：额外槽位表示零长度文档，不增加真实 token。压缩率对应的 query、SWA、compressed KV 边界保持同一文档槽位关系。实际文档数超过上界时明确报错。</p>
+<p><a href="../../torchtitan_npu/models/deepseek_v4/aclgraph.py">模型准备</a> 仅修改当前模型实例的方法：</p>
+<ol>
+<li><code>_fixed_attention_metadata</code> 按 <code>attention_metadata_key</code> 为各类 Attention geometry 构造固定长度 metadata。</li>
+<li><code>reuse_metadata_buffers</code> 将每步新值复制进 <code>_static_metadata_buffers</code>，保持设备地址稳定。</li>
+<li><a href="../../torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py">Ascend Attention backend</a> 按这些边界生成自身需要的 CANN records。</li>
+</ol>
+<p>metadata 中的 Tensor 是位置、文档边界和 backend 辅助记录；输入 token、activation、参数不是通过这些数组承载。普通 token 数据仍按原训练输入传入。</p>
+<h2 id="pass">分区 pass 做什么</h2>
+<p><code>construct_aclgraph_passes</code> 保留普通 pipeline 的 pass 顺序，去掉 CUDA 捕获与逐节点 kernel 注解，随后追加 loss 累积缓冲复用和 ACLGraph 分区。</p>
+<p><code>reinplace_loss_accumulation_pass</code> 只恢复 loss 中独占的二维 FP32 梯度累积缓冲，将满足别名安全条件的 <code>add</code> 改回 <code>add_</code>。这处理的是单个 microbatch 内分块 LM head 的反向累加，与 GBS 是否触发跨 microbatch 梯度累积不同。</p>
+<p><code>aclgraph_pass</code> 按最终 FX 顺序，把连续 eager 节点与连续可捕获节点分别组成子图。边界由计算类型和存储所有权共同决定：</p>
+<ol>
+<li><code>_eager_boundary</code> 保留路由专家、设备标量读取和动态尺寸计算。</li>
+<li>与 caller 输入共享存储的返回值，以及空存储等无法安全重建的输出别名，按 <code>eager_alias_storages</code> 保留原地址。</li>
+<li><code>_partition_storage_safe_regions</code> 追踪动态 eager 来源。对这些存储的写入、跨分区或返回 step 外的 view，以及含动态 Tensor 的容器解包留在 eager；普通只读计算仍可捕获。新增边界后重新检查，直到没有新的不安全节点。</li>
+</ol>
+<p>图内生成、只在图内消费的 view 可以继续捕获。动态 eager 结果的 view 若进入稳定输入副本并逃逸，则无法同时保留来源别名和跨步结果，因此需保留原始 eager 运算。</p>
+<p><code>split_module(..., keep_original_order=True)</code> 保持原有执行顺序。eager 子图沿用其 <code>forward</code>，其余子图安装 <code>ACLGraphWrapper</code>。摘要保存在 <code>gm.meta["aclgraph_partitions"]</code>，使用 <code>eager</code> 和 <code>capture</code> 字段。</p>
+<h2 id="_3">运行时为什么仍需要管理地址和存活期</h2>
+<p><a href="../../torchtitan_npu/extensions/torchtitan/experiments/graph_trainer/aclgraph_runtime.py">aclgraph_runtime.py</a> 继续负责稳定区域的捕获与重放：</p>
+<ul>
+<li>首次调用执行 warmup；第二次调用捕获并重放；后续检查输入、更新缓冲并 replay。</li>
+<li>参数、状态和地址稳定的被写入输入保留原地址；写入每步新分配的 eager 结果时，相关写操作留在 eager。可复制的 root 动态输入写入共享持久缓冲，允许每步数据与来源地址变化。</li>
+<li>root 输入若共享同一存储和布局，按整个别名组决定是否 staging；组内任一输入标记为 producer 持有的静态缓冲时，全组透传。运行前检查实际别名和 Tensor 元数据。</li>
+<li>图外专家计算返回固定形状的 token 输出时，后续捕获区域将新内容复制进自身稳定输入；不能把 eager producer 的地址当作捕获所有权。</li>
+<li>图内 producer 的中间存储可供后续区域借用；weak Tensor handle 与 FX 最后使用管理减少长期持有 activation 和未分片权重。</li>
+<li>返回 joint 图外的梯度按需要 clone，避免下一步覆盖 <code>param.grad</code>；与静态状态共享存储的输出保留别名。</li>
+</ul>
+<p>正常路径在 joint step 出口保护返回值。区域内和区域间保留捕获存储的原始别名，在最后一次写入后，按设备和底层分配地址分组，每组复制一次原始字节，再重建返回 view 的 shape、stride、dtype 和 offset。同一分配的多个返回值继续共享复制后的存储，下一步 replay 不会覆盖已返回的梯度。</p>
+<p>首次捕获返回拥有存储的 Tensor，FX 负责将其保留到最后一次使用或 step 出口复制完成；后续 replay 使用非拥有 handle。缺少输出 alias metadata 时，退回区域级复制，并限制后续借用。<code>ACLGraphWrapper</code> 的 <code>clone_output_indices</code> 接收扁平输出叶子索引，默认 <code>None</code> 保持独立 wrapper 的保护范围。</p>
+<p>输入 staging 分两类：FX 已知只读取连续逻辑区域时，仅复制 Tensor 的逻辑元素，允许相同前缀来自不同长度的底层存储；非零 offset、非连续布局、conj/neg view 或涉及 <code>storage_offset</code> 的访问则保留完整字节存储。完整存储复制不按 dtype 截断尾部字节。独立 wrapper 缺少 FX 访问分析，默认采用完整存储策略。</p>
+<p>guard 检查 shape、stride、dtype、device、Tensor 类型与 dispatch keys、offset、静态地址及 Python 标量；完整存储策略还检查底层字节数。所有输入检查通过后才更新稳定缓冲，避免后面的非法参数导致前面的输入或共享槽位先被修改。C++ guard 拒绝时始终报错，即使 Python 诊断未找到更具体原因，也不会放行。稳定区域的布局变化不会自动重捕获。路由专家的动态尺寸已经留在图外，不再依靠容量上限容纳它们。</p>
+<p><code>_CaptureCoordinator</code> 在 warmup/capture 时核对跨 rank 区域顺序并协调进入捕获，稳定 replay 不额外执行 Gloo barrier。捕获内对设备输出调用 <code>wait_tensor</code>，接入待完成的 HCCL stream。关闭 trainer 时先释放图和协调组。</p>
+<p>初始化还会将不支持捕获的任务队列模式 2 切换到 1。该模式为进程级设置，关闭时不会恢复；性能对照必须记录这项差异。</p>
+<h2 id="_4">验证与判读</h2>
+<p><a href="../../tests/unit_tests/extensions/torchtitan/experiments/graph_trainer/test_aclgraph.py">CPU 回归</a> 直接执行分区后的 joint 图，让路由行数按 2、4、1、0、3 变化，以独立公式比较 loss 与输入梯度，并确认稳定区域各捕获一次。模型准备测试检查 dispatcher 对象未被替换，同时验证固定文档 metadata 的计算语义与地址复用。</p>
+<p><a href="../../tests/smoke_tests/extensions/torchtitan/experiments/graph_trainer/test_aclgraph_smoke.py">单卡 NPU 冒烟</a> 验证 16K 文档帧的 Compressor 重放和捕获存储所有权。<a href="../../tests/integration_tests/deepseek_v4.py">四卡集成用例</a> 的 <code>dsv4_aclgraph_ep4_fsdp4</code> 使用真实路由、EP4/FSDP4、S640、普通管线与 ACLGraph，关闭 EP overlap，检查四步训练完成。</p>
+<h3 id="a3-8-100">A3 8 卡 100 步精度对比</h3>
+<p>2026-11-13 使用 <a href="../../scripts/numerical_alignment/loss_compare.py">训练指标比较工具</a>，在同一组 A3 设备上依次运行修改前后两个提交，从 TensorBoard 读取未截断的逐步 <code>loss</code> 和 <code>grad_norm</code>，对齐 step 1～100。<strong>本次是不开 ACLGraph 与开启 ACLGraph 的对比；数值近似检查通过，逐位一致检查未通过，严格确定性验证未完成。</strong></p>
+<h4 id="_5">对照配置</h4>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>基线组</th>
+<th>ACLGraph 组</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>实测提交</td>
+<td><code>6aa5a7f56554e09922c4796398c71a769c200569</code></td>
+<td><code>9be63bdf1c44b1955846dc06be3afc58ed2a2cc9</code></td>
+</tr>
+<tr>
+<td><code>compile.pass_pipeline</code></td>
+<td><code>mutation-functionalization</code></td>
+<td><code>mutation-functionalization+aclgraph</code></td>
+</tr>
+<tr>
+<td>ACLGraph</td>
+<td>关闭</td>
+<td>开启</td>
+</tr>
+<tr>
+<td>任务队列模式</td>
+<td>2</td>
+<td>初始化时由 2 切换为 1</td>
+</tr>
+<tr>
+<td><code>debug.deterministic</code> / <code>debug.deterministic_warn_only</code></td>
+<td>均为 <code>false</code></td>
+<td>均为 <code>false</code></td>
+</tr>
+<tr>
+<td>EP overlap / profiler</td>
+<td>均关闭</td>
+<td>均关闭</td>
+</tr>
+</tbody>
+</table>
+<p>除 pipeline 和各自输出目录外，两侧打印的配置一致；配置核对仅忽略初始化函数文本表示中的进程内存地址。该对照包含固定 Attention metadata、任务队列切换和图捕获等完整适配，不只比较 <code>replay()</code> 调用。</p>
+<ul>
+<li><strong>设备与环境：</strong>8 卡 A3 <code>Ascend910_9362</code>，同一组逻辑设备 0～7；CANN 9.2.0，Python 3.12.10，torch <code>2.14.0.dev20260811+cpu</code>，torch_npu <code>2.14.0+git2d91fb5</code>；上游 torchtitan 提交 <code>086bf6c166ec85c1298eb5596fa9bf95f6a2d840</code>。</li>
+<li><strong>模型与并行：</strong><code>graph_trainer_deepseek_v4_flash_43layers_16experts</code>，43 层、16 专家，共 24,578,655,831 参数，MTP=0；EP8/FSDP8，DP replicate、TP、CP、PP 均为 1，SPMD backend 为 <code>partial_dtensor</code>。</li>
+<li><strong>批量与精度：</strong>MBS=1、GBS=8、S4096，梯度累积 1 次，各运行 100 步；FP32 主参数、BF16 混合精度计算、FP32 梯度归约，量化关闭，<code>training.extension.allow_hf32=true</code>。</li>
+<li><strong>编译路径：</strong><code>aot_fx_trace</code>、<code>compile.backend=inductor</code>、<code>inductor_compilation=regional</code>、<code>memory_policy=dsv4-mhc-moe-save</code>；保留融合 Attention 和真实 MoE 路由。</li>
+<li><strong>共同起点与数据：</strong>加载同一份完整 step-0 DCP 模型权重，<code>seed=42</code>，相同 tokenizer、<code>c4_test</code> 数据和 128 token 文档对齐；相同 DistMuon/AdamW 参数分组及学习率调度器，优化器和数据游标均从新训练开始。</li>
+</ul>
+<h4 id="_6">指标与判定</h4>
+<p>数值近似阈值沿用 <a href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>：<code>MEAN_AE &lt;= 0.02</code>、<code>MAX_RE &lt;= 0.005</code>、<code>MEAN_RE &lt;= 0.005</code>。相对误差分母为 <code>max(abs(baseline), 1e-4)</code>；下表的相对误差以比例表示，<code>0.005</code> 对应 <code>0.5%</code>。</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">MEAN_AE</th>
+<th style="text-align: right;">MAX_RE</th>
+<th style="text-align: right;">MEAN_RE</th>
+<th>数值近似判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>loss</code></td>
+<td style="text-align: right;"><code>1.59034729e-4</code></td>
+<td style="text-align: right;"><code>5.33851308e-5</code></td>
+<td style="text-align: right;"><code>1.55679142e-5</code></td>
+<td>PASS</td>
+</tr>
+<tr>
+<td><code>grad_norm</code></td>
+<td style="text-align: right;"><code>2.16837883e-3</code></td>
+<td style="text-align: right;"><code>2.06360508e-3</code></td>
+<td style="text-align: right;"><code>3.50064229e-4</code></td>
+<td>PASS</td>
+</tr>
+</tbody>
+</table>
+<p>两组均完成 100 步，训练退出码和比较工具退出码均为 0，指标没有缺步、NaN 或 Inf。ACLGraph 组 rank0 捕获 173 个区域，每个区域只捕获一次，后续持续 replay；基线没有 ACLGraph 捕获记录。</p>
+<p>按零容差逐步检查，<code>loss</code> 仅第 1 步完全相同，最大绝对误差为 <code>5.50270081e-4</code>（step 44）；<code>grad_norm</code> 的 100 步均存在差异，最大绝对误差为 <code>1.20439529e-2</code>（step 72）。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../deepseek_v4_tnd/" class="btn btn-neutral float-left" title="DeepSeek-V4 TND 适配"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../ep_process_group/" class="btn btn-neutral float-right" title="EP 通信域分离">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../deepseek_v4_tnd/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../ep_process_group/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
