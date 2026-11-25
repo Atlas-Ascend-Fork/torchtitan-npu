@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>TorchFT 计划抢占 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "TorchFT \u8ba1\u5212\u62a2\u5360";
+        var mkdocs_page_input_path = "feature_guides/torchft_preemption.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../activation_offload/">FullAC 激活卸载</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../moonep/">MoonEP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torchft_last_words/">TorchFT 遗言保存</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">TorchFT 计划抢占</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#wheel">安装配套 wheel</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#wheel_1">从源码构建同一功能的 wheel</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_1">配置作业环境</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#lighthouse">启动 Lighthouse</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">启动训练</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">抢占与恢复</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">TorchFT 计划抢占</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="torchft">TorchFT 计划抢占</h1>
+<p>Ascend 上的同步 TorchFT 训练可以在运行中释放整个副本的 NPU，供其他任务使用。Lighthouse 根据申请的卡数和节点选择副本，在下一次 quorum 成员决策中移出目标实例并终止其 Manager。节点上的 launcher 负责清理该实例的本地进程，资源归还后重新拉起副本。幸存副本继续训练。</p>
+<p>以下以双机双副本为例。节点 <code>node-a</code> 运行 Lighthouse 和副本 0，节点 <code>node-b</code> 运行副本 1，每个副本使用本机的 0、1 号卡。将节点名替换为实际主机名，确认训练节点之间的 Manager、checkpoint 和 HCCL 通信可达。以下命令使用 Bash，从各自的 torchtitan-npu 仓库根目录执行。</p>
+<h2 id="wheel">安装配套 wheel</h2>
+<p>在各节点激活可运行 DeepSeek-V4 Flash TorchFT 训练的 Python 和 CANN 环境，再安装与该环境匹配、包含 Lighthouse <code>POST /preemption</code> 接口的配套 torchft wheel。控制端和 Lighthouse 使用相同构建。配套 wheel 与上游标准包都可能显示为 <code>0.2.0</code>，可用下面的 <code>status</code> 命令确认实际运行的服务支持抢占。<a href="https://github.com/chango9543/torchft/pull/1">配套 torchft 实现</a></p>
+<p>节点 launcher 使用 <code>psutil</code> 检查和清理训练进程。项目的 <code>torchft</code> 可选依赖已包含 <code>psutil</code>。如果跳过该可选依赖，直接用下方的 <code>--no-deps</code> 命令安装预编译或自行构建的 wheel，请先在每个运行 launcher 的 Python 环境中执行 <code>python -m pip install psutil</code>。</p>
+<pre><code class="language-bash">python -m pip install --force-reinstall --no-deps --no-index --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torchft-suspend/index.html torchft==0.2.0+preempt.1
+</code></pre>
+<h3 id="wheel_1">从源码构建同一功能的 wheel</h3>
+<p>需要自行构建时，使用仓内的 <a href="../../torchtitan_npu/patches/torchft/torchft-0.2.0-lighthouse-preemption.patch">Lighthouse 抢占补丁</a>。补丁在编译 torchft 时应用，将抢占路由和 quorum 成员管理编入 <code>torchft._torchft</code>。训练环境只需安装构建产物。</p>
+<p>在与部署环境匹配的 Linux 架构和 Python 环境中准备 Rust 工具链、C 链接器、<code>protoc</code> 和 <code>maturin&gt;=1.7,&lt;2.0</code>。将 <code>TORCHFT_SRC</code> 设为独立、干净的 torchft 0.2.0 源码目录（Git 标签 <code>v0.2.0</code> 的检出目录或解压后的源码包）。以下命令从 torchtitan-npu 仓库根目录执行。若使用解压包，先执行 <code>git -C "$TORCHFT_SRC" init -q</code>，使补丁相对该源码根目录应用。</p>
+<pre><code class="language-bash">(
+  set -e
+  patch_file=&quot;$PWD/torchtitan_npu/patches/torchft/torchft-0.2.0-lighthouse-preemption.patch&quot;
+  cd &quot;${TORCHFT_SRC:?请设置原版 torchft 0.2.0 源码目录}&quot;
+  git apply --check &quot;$patch_file&quot;
+  git apply &quot;$patch_file&quot;
+  cargo test --release --lib
+  maturin build --release --interpreter &quot;$(command -v python)&quot; --out dist
+)
+</code></pre>
+<p>将 <code>$TORCHFT_SRC/dist/</code> 中生成的 wheel 分发到各节点，在各自的运行环境中用确切文件路径安装，随后用下文的 <code>status</code> 命令验证服务。</p>
+<pre><code class="language-bash">python -m pip install --force-reinstall --no-deps &quot;${TORCHFT_WHEEL:?请设置构建产物的绝对路径}&quot;
+</code></pre>
+<h2 id="_1">配置作业环境</h2>
+<p>在 Lighthouse、launcher 和发送控制命令的终端分别加载以下设置。将地址改为各节点可访问的 Lighthouse 地址，所有终端输入同一作业的 token。示例使用 HTTP，适用于可信训练网络。</p>
+<pre><code class="language-bash">export TORCHFT_LIGHTHOUSE=http://node-a:29920
+read -rs -p 'TorchFT job token: ' TORCHFT_PREEMPT_TOKEN
+echo
+export TORCHFT_PREEMPT_TOKEN
+PREEMPT=torchtitan_npu/extensions/torchtitan/experiments/torchft/preempt.py
+JOB_DIR=&quot;$PWD/outputs/preempt-demo&quot;
+mkdir -p &quot;$JOB_DIR&quot;
+</code></pre>
+<h2 id="lighthouse">启动 Lighthouse</h2>
+<p>在 <code>node-a</code> 创建布局文件。键 <code>torchtitan_ft_N</code> 对应训练参数 <code>replica_id=N</code>。每个节点的数组列出该副本占用的物理设备 ID，顺序与该节点的 <code>ASCEND_RT_VISIBLE_DEVICES</code> 一致。同一设备只分配给一个副本。<code>TORCHFT_PREEMPT_LAYOUT</code> 是 Lighthouse 本机的文件路径。</p>
+<pre><code class="language-bash">export TORCHFT_PREEMPT_LAYOUT=&quot;$JOB_DIR/layout.json&quot;
+cat &gt; &quot;$TORCHFT_PREEMPT_LAYOUT&quot; &lt;&lt;'JSON'
+{
+  &quot;torchtitan_ft_0&quot;: {&quot;node-a&quot;: [0, 1]},
+  &quot;torchtitan_ft_1&quot;: {&quot;node-b&quot;: [0, 1]}
+}
+JSON
+torchft_lighthouse --bind node-a:29920 --min_replicas 1 --join_timeout_ms 5000
+</code></pre>
+<p>保持 Lighthouse 运行，在另一终端执行 <code>python "$PREEMPT" status</code>。返回的 <code>layout</code> 应与文件内容一致。此时 <code>quorum</code> 可以为空。连接失败时检查监听地址和端口；HTTP 401 时核对 token；HTTP 404 时核对运行 Lighthouse 的 wheel 以及启动进程时是否设置了 <code>TORCHFT_PREEMPT_LAYOUT</code>。</p>
+<h2 id="_2">启动训练</h2>
+<p>两个训练节点各运行一个 launcher。将下面头两行在 <code>node-a</code> 设为 <code>REPLICA=0</code>、<code>NODE=node-a</code>，在 <code>node-b</code> 设为 <code>REPLICA=1</code>、<code>NODE=node-b</code>。每个副本都在一台机器内组成独立的 torchrun 作业。训练开关 <code>fault_tolerance.enable_preemption</code> 默认关闭；启用时，由 launcher 给每次拉起的训练进程注入本地登记目录 <code>TT_PREEMPT_LOCAL</code> 和逻辑副本名 <code>TT_PREEMPT_SLOT</code>。</p>
+<pre><code class="language-bash">REPLICA=0
+NODE=node-a
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export TRITON_NPU_COMPILER_PATH=&quot;${TRITON_NPU_COMPILER_PATH:-$ASCEND_HOME_PATH/tools/bisheng_compiler/bin}&quot;
+python &quot;$PREEMPT&quot; launch --replica &quot;$REPLICA&quot; --node &quot;$NODE&quot; --state-dir &quot;$JOB_DIR/workers&quot; -- \
+  torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --max-restarts=0 \
+  --rdzv-backend=static --master-addr=&quot;${NODE_IP:-$NODE}&quot; --master-port=&quot;$((29921 + REPLICA))&quot; \
+  -m torchtitan_npu.train \
+  --module torchtitan_npu.models.deepseek_v4 --config deepseek_v4_flash_8p_torchft \
+  --dump-folder &quot;$JOB_DIR/replica$REPLICA&quot; --training.steps 200 --training.seq-len 256 \
+  --debug.seed 42 --metrics.log-freq 1 \
+  --hf-assets-path &quot;$PWD/tests/assets/deepseek_v3&quot; \
+  --dataloader.dataset c4_test --dataloader.dataset-path &quot;$PWD/tests/assets/c4_test&quot; \
+  --checkpoint.folder &quot;$JOB_DIR/replica$REPLICA/checkpoints&quot; --checkpoint.load-only \
+  --fault-tolerance.enable-preemption --fault-tolerance.replica-id &quot;$REPLICA&quot; \
+  --fault-tolerance.group-size 2 --fault-tolerance.min-replica-size 1 \
+  --fault-tolerance.process-group-timeout-ms 120000 --fault-tolerance.quorum-warmup-timeout-ms 600000 \
+  --parallelism.data-parallel-shard-degree 2 --parallelism.expert-parallel-degree 2 \
+  --override.imports torchtitan_npu.override.common.rope.workaround
+</code></pre>
+<p><code>group-size</code> 统计 TorchFT 副本数，<code>nproc-per-node</code> 统计当前 torchrun 作业在本节点的 rank 数。TorchFT 会向对端公布本副本的 TCPStore 地址；如果主机名解析到回环地址或管理网卡，设置 <code>NODE_IP</code> 为对端可访问的本机训练网卡 IP。双副本释放一个后还要继续提交训练步，Lighthouse 的 <code>--min_replicas</code> 和训练端的 <code>--fault-tolerance.min-replica-size</code> 均设为 1。保持 launcher 运行，由它负责计划内重新拉起。</p>
+<p>单机运行两个副本时，把两个布局条目都指向同一节点，分配互不重叠的设备列表，并为两个 launcher 分配互不重叠的 <code>HCCL_NPU_SOCKET_PORT_RANGE</code>。一个副本跨多台机器时，在该副本的布局条目中列出所有参与节点，每节点运行一个相同 <code>--replica</code> 的 launcher，并沿用该副本原有的多机 torchrun rendezvous 参数。</p>
+<h2 id="_3">抢占与恢复</h2>
+<ol>
+<li>执行 <code>python "$PREEMPT" status</code>，等待 <code>quorum</code> 同时包含 <code>torchtitan_ft_0:&lt;实例 ID&gt;</code> 和 <code>torchtitan_ft_1:&lt;实例 ID&gt;</code>。记录副本 1 的实例 ID。</li>
+<li>执行 <code>python "$PREEMPT" suspend --request inference-1 --cards 2 --node node-b</code>。此例要求在 <code>node-b</code> 释放两张卡，Lighthouse 会选中副本 1。省略 <code>--node</code> 时按整个作业的可释放卡数选择。资源以整个副本为单位释放，实际卡数可能大于申请值。</li>
+<li>用 <code>status</code> 检查 <code>lease.targets</code>。当 <code>lease.phase</code> 变为 <code>released</code>，目标副本各节点均已确认释放，此时可将对应设备交给抢占任务。训练日志应显示副本 0 继续提交。</li>
+<li>抢占任务归还设备后，执行 <code>python "$PREEMPT" resume --request inference-1</code>。目标 launcher 使用原命令重启训练。用 <code>status</code> 确认 <code>lease.phase</code> 为 <code>restored</code>、副本 1 以新的实例 ID 加入 quorum，再从训练日志确认两个副本均已提交新的训练步。</li>
+</ol>
+<p>同一作业一次处理一个成员变更，下一次抢占使用新的请求 ID。若请求返回 <code>insufficient releasable cards</code>，检查指定节点的设备数，以及保留最少副本后可释放的卡数。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../torchft_last_words/" class="btn btn-neutral float-left" title="TorchFT 遗言保存"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../virtual_optimizer/" class="btn btn-neutral float-right" title="Virtual Optimizer - 优化器显存虚拟化特性">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../torchft_last_words/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../virtual_optimizer/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

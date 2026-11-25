@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>TorchFT 遗言保存 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "TorchFT \u9057\u8a00\u4fdd\u5b58";
+        var mkdocs_page_input_path = "feature_guides/torchft_last_words.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../AGENTS/">文档规则</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../architecture/">torchtitan-npu 架构边界</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Developer guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/config_extensions/">NPU 配置扩展指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/context_parallel/">DeepSeek-V4 系列上下文并行：切分原理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/lint_guide/">Lint 指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/low-value-ut-principles/">低价值 UT 原则</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/numerical_alignment/">精度对齐开发指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../developer_guides/unit-test-architecture/">Unit Test 架构与迁移方案</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../activation_offload/">FullAC 激活卸载</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../anticipatory_routing/">Loss spike 检测与路由重放（Anticipatory Routing）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../aux_loss/">辅助损失框架（AuxLoss）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../cpu_offload/">CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepep/">DeepEP - NPU MoE dispatch/combine</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_1_lora/">DeepSeek-V4.1 LoRA</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer/">DeepSeek-V4 GraphTrainer 编译路径适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dsv4_aclgraph_implementation/">DeepSeek-V4 ACLGraph 的分段入图与捕获边界</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../expert_replication/">Dense 副本与专家分片</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_compute_stream_allocation/">FSDP 通信缓冲的计算流内存复用</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_auto_overlap/">GraphTrainer NPU Auto Overlap</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_cv_parallel/">DeepSeek-V4 batch 双流调度</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../moonep/">MoonEP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">TorchFT 遗言保存</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">适用条件</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">启动方式</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">保存流程</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">结果与检查点</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">验证入口</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torchft_preemption/">TorchFT 计划抢占</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/sdc/">静默数据损坏检测（SDC）</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">TorchFT 遗言保存</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="torchft">TorchFT 遗言保存</h1>
+<p>遗言机制在故障或提交拒绝后，让剩余健康 replica 停在完整更新边界，选出一个 replica 保存完整 checkpoint，减少训练进度损失。本功能只保存并结束本次训练，不启动、重新拉起或重新接入训练进程；writer 保存失败或超时后直接报失败，不切换备用 writer。</p>
+<h2 id="_1">适用条件</h2>
+<ul>
+<li>使用仓库支持的 DeepSeek-V4 Flash TorchFT recipe，同步 FSDP + EP；不支持 TP、CP、PP、LocalSGD、DiLoCo。</li>
+<li>至少两个完整 replica；一个 replica 的分片可以跨多台机器，rank 使用该 replica 的全局 rank。</li>
+<li>开启 checkpoint 和每 replica 的 dataloader checkpoint，设置 <code>--fault-tolerance.no-enable-elastic</code>，且 <code>min_replica_size == group_size</code>。关闭遗言后，原生 TorchFT elastic 功能不受本功能控制。</li>
+<li>所有 replica 使用同一 checkpoint 根目录，要求 POSIX 文件系统正确支持原子替换和 fsync。部署方应预留完整 checkpoint 及全部游标副本所需空间，不依赖自动清理。</li>
+<li>依赖见<a href="../../user-guides/installation/">安装说明</a>和 <a href="../../requirements.txt">requirements.txt</a>。service 仅使用 Python 标准库，训练仍需要匹配的 TorchTitan、TorchFT、PyTorch 和 NPU 软件栈。</li>
+</ul>
+<h2 id="_2">启动方式</h2>
+<p>部署方为整个作业启动一个 Lighthouse 和一个独立遗言 service，再在每个节点启动普通 torchrun。每个训练 rank 启动一个心跳控制线程，上报本 rank 的状态并接收停止请求。遗言 service 检测 rank 失联和全局保存超时。每个 replica 的 rank 0 另用后台线程持久化游标并发布标记。</p>
+<p>旧 <code>last_words_job.py</code>、<code>last_words_external.py</code>、<code>last_words_nodes.py</code> 入口及 job/cluster spec 已移除。两个仓库 launcher 使用普通 torchrun，不再自动启动 service 或 Lighthouse。</p>
+<p>同一作业的遗言 service 和全部 worker 应使用同一源码版本。正常收尾使用 RPC v4，部署时请一起升级并重新启动作业。已有 checkpoint 可按原格式加载。</p>
+<p>以下命令从源码根目录执行，所有变量由部署方指定。<code>RUN_ID</code> 每次启动必须全新，所有 replica 共用；<code>SESSION_DIR</code> 必须是尚不存在的私有目录；<code>SHARDS_PER_REPLICA</code> 是一个 replica 跨全部节点的 rank 总数。</p>
+<p>单机 service（单独终端）：</p>
+<pre><code class="language-bash">python torchtitan_npu/extensions/torchtitan/experiments/torchft/last_words/service.py \
+  --bind=&quot;127.0.0.1:${SERVICE_PORT}&quot; \
+  --session-dir=&quot;${SESSION_DIR}&quot; --run-id=&quot;${RUN_ID}&quot; \
+  --num-replicas=&quot;${NUM_REPLICAS}&quot; --world-size=&quot;${SHARDS_PER_REPLICA}&quot; \
+  --heartbeat-seconds=60 --startup-seconds=900 --timeout-seconds=300
+</code></pre>
+<p>跨主机必须使用双向 TLS，证书 SAN 包含 <code>SERVICE_HOST</code>。使用以下 service 命令：</p>
+<pre><code class="language-bash">python torchtitan_npu/extensions/torchtitan/experiments/torchft/last_words/service.py \
+  --bind=&quot;0.0.0.0:${SERVICE_PORT}&quot; \
+  --advertise-address=&quot;https://${SERVICE_HOST}:${SERVICE_PORT}&quot; \
+  --tls-cert=&quot;${SERVER_CERT}&quot; --tls-key=&quot;${SERVER_KEY}&quot; --tls-ca=&quot;${CLIENT_CA}&quot; \
+  --session-dir=&quot;${SESSION_DIR}&quot; --run-id=&quot;${RUN_ID}&quot; \
+  --num-replicas=&quot;${NUM_REPLICAS}&quot; --world-size=&quot;${SHARDS_PER_REPLICA}&quot; \
+  --heartbeat-seconds=60 --startup-seconds=900 --timeout-seconds=300
+</code></pre>
+<p>service 生成 <code>replica-0.json</code> 等私有凭据文件，只交给对应 replica 的节点，不应改写或放入公开日志。共享目录或受控文件分发均可。各节点设置 <code>LAST_WORDS_SESSION_FILE</code>；TLS worker 另设 <code>LAST_WORDS_SERVICE_CA_FILE</code>、<code>LAST_WORDS_SERVICE_CERT_FILE</code>、<code>LAST_WORDS_SERVICE_KEY_FILE</code>，不需要 SSH 隧道。</p>
+<p>Lighthouse 由用户或外部平台独立启动，全部 replica 使用同一可达地址：</p>
+<pre><code class="language-bash">torchft_lighthouse --bind=&quot;${LIGHTHOUSE_BIND}:${LIGHTHOUSE_PORT}&quot; --min_replicas=&quot;${NUM_REPLICAS}&quot;
+</code></pre>
+<p>每个节点执行普通训练命令。<code>REPLICA_ID</code> 是 replica 编号；<code>NODE_RANK</code> 是 replica 内节点编号；<code>MASTER_ADDR</code> 指向该 replica 首节点，同机不同 replica 的端口不能冲突。<code>NNODES * NPUS_PER_NODE</code> 必须等于 <code>SHARDS_PER_REPLICA</code>。</p>
+<pre><code class="language-bash">export TORCHFT_LIGHTHOUSE=&quot;http://${LIGHTHOUSE_HOST}:${LIGHTHOUSE_PORT}&quot;
+export LAST_WORDS_SESSION_FILE=&quot;${SESSION_DIR}/replica-${REPLICA_ID}.json&quot;
+export ASCEND_RT_VISIBLE_DEVICES=&quot;${DEVICES}&quot;
+torchrun --nnodes=&quot;${NNODES}&quot; --node-rank=&quot;${NODE_RANK}&quot; \
+  --nproc-per-node=&quot;${NPUS_PER_NODE}&quot; --master-addr=&quot;${MASTER_ADDR}&quot; \
+  --master-port=&quot;${MASTER_PORT}&quot; --max-restarts=0 \
+  -m torchtitan_npu.train \
+  --module=torchtitan_npu.models.deepseek_v4 --config=deepseek_v4_flash_8p_torchft \
+  --dump-folder=&quot;${DUMP_FOLDER}&quot; --hf-assets-path=&quot;${HF_ASSETS}&quot; \
+  --dataloader.dataset-path=&quot;${DATASET}&quot; \
+  --parallelism.data-parallel-shard-degree=&quot;${SHARDS_PER_REPLICA}&quot; \
+  --parallelism.expert-parallel-degree=&quot;${EP_DEGREE}&quot; \
+  --training.global-batch-size=&quot;${GLOBAL_BATCH_SIZE}&quot; \
+  --fault-tolerance.group-size=&quot;${NUM_REPLICAS}&quot; \
+  --fault-tolerance.min-replica-size=&quot;${NUM_REPLICAS}&quot; \
+  --fault-tolerance.replica-id=&quot;${REPLICA_ID}&quot; \
+  --fault-tolerance.no-enable-elastic --fault-tolerance.process-group-timeout-ms=60000 \
+  --fault-tolerance.last-words.enable --fault-tolerance.last-words.run-id=&quot;${RUN_ID}&quot; \
+  --fault-tolerance.last-words.heartbeat-timeout-seconds=60 \
+  --fault-tolerance.last-words.timeout-seconds=300
+</code></pre>
+<p>两机各 16 卡、每机一个 replica：<code>NUM_REPLICAS=2</code>、<code>NNODES=1</code>、<code>NODE_RANK=0</code>、<code>SHARDS_PER_REPLICA=16</code>。四机各 16 卡、每 replica 两机：<code>NUM_REPLICAS=2</code>、<code>NNODES=2</code>、各 replica 内 <code>NODE_RANK=0/1</code>、<code>SHARDS_PER_REPLICA=32</code>。EP、batch、网络接口等仍须匹配实际拓扑。</p>
+<h2 id="_3">保存流程</h2>
+<ol>
+<li>worker 上报训练阶段；异常、提交拒绝或心跳超时触发停止请求。部分更新、初始 healing 未完成等不安全 replica 不能保存。</li>
+<li>健康 replica 等待完整更新边界。优化器、pre/post-hook、调度器和设备同步全部完成后才记录完成版本；当前 TorchFT 遗言不支持 EMA 权重。replica 内各 rank 在 CPU 控制组上对停训请求投票。冻结后，每个 rank 根据 service 返回的分片状态核对所有 rank 的完成版本。</li>
+<li>service 收集冻结状态和游标准备结果，在完整就绪候选中按完整更新计数、训练步、replica ID 选择唯一 writer，授权固定为 round 1。其他健康 replica 等待；故障 replica 不参与保存 collective，不拼接不同 replica 的模型分片。</li>
+<li>writer 的 rank 0 先持久化本轮授权绑定，复制各 replica 的安全游标，并把准备结果广播给其他 writer rank。准备成功后，所有 writer rank 共同保存模型和训练状态；rank 0 同步文件与目录，发布 manifest 和 publication。各 writer rank 看到 publication 后向 service 确认；rank 0 从 service 快照确认全部 writer rank 已上报，再执行生产预检，检查模型、优化器、调度器、训练状态、RNG、游标 schema 和 DCP 分片范围。service 收到全 rank 确认及 rank 0 校验报告后才宣布成功，存活的健康 rank 等待该最终结果后结束本次训练。确认过程不再写入或轮询 <code>ack-&lt;rank&gt;.json</code>。</li>
+<li>授权前缺少分片的 replica 不能入选，其他就绪 replica 仍可获选。授权后若 writer 在 service 裁决前失联、未集齐发布确认、预检失败或超过保存期限，本轮失败。service 的裁决一旦发布就不能更改，迟到确认不会触发重新授权。收到成功裁决后，writer 的 rank 0 先持久化回执，所有 writer rank 再通过最终 barrier 并正常退出。写回执或 barrier 失败仍可能导致训练进程非零退出。远端进程收尾由用户或外部调度平台负责。</li>
+</ol>
+<p>worker/service 的心跳和保存期限必须一致。<code>startup_seconds</code> 为尚未注册的 rank 留出初始化宽限；已有候选就绪时，service 最多等到故障发生后的一个心跳期限，再从就绪候选中选 writer。若仍有副本在准备且没有候选就绪，service 可继续等待，直至有候选就绪、所有副本失去资格或总保存期限到达。当仍有副本在准备时，若总保存期限不大于心跳期限，即使其他副本已就绪，也可能在选出 writer 前超时。设置总期限时应为 writer 选举后的写盘与预检留出时间。</p>
+<p>每个 rank 的心跳线程报告 CPU 侧状态。service 检查心跳是否逾期，并从首次收到停训请求或检测到故障时开始计算保存期限。若 NPU 卡死但 CPU 仍发送心跳，或 service 本身失效，由外部调度平台处理作业收尾。</p>
+<h2 id="_4">结果与检查点</h2>
+<p>service 私有目录保存 <code>grant.json</code> 和 <code>result.json</code>。结果 <code>success=true</code> 且 <code>replica_id</code> 非空表示紧急保存确认成功，<code>success=false</code> 表示失败。</p>
+<p>达到训练步数或同步读完有限数据集时，各 rank 等待后台 checkpoint 写入结束。若已结束的异步写入仅因游标存储错误而失败，该 rank 上报停训，保留使用共同游标保存的机会；写入成功的 rank 报告准备退出。等同一 replica 的所有 rank 都准备好，service 通过心跳要求它们作最终确认。每个 rank 此时再次检查本地停训请求，有请求就上报停训，否则投正常退出票。投票后，各 rank 继续等待同一个 service 决定。service 若先收到停训请求，该副本转入故障保存流程；若先收齐全部正常退出票，则确认该副本结束。所有副本正常结束后，作业进入 <code>COMPLETED</code>，结果为 <code>success=true, round=0, replica_id=null</code>。</p>
+<p>service 在返回裁决前同步结果文件和所在目录。若目录同步失败，即使 <code>result.json</code> 已经可见，也需等 service 重试成功再使用该文件。service 保留终态并继续运行，由外部停止；每次新作业启动新 service 和会话目录，不复用旧授权或 run ID。</p>
+<pre><code class="language-text">checkpoint/
+  ft-replicat-&lt;id&gt;/&lt;run_id&gt;/step-&lt;step&gt;/  # 已发布游标及 RNG
+  last_words/control/&lt;run_id&gt;/         # 可选的 worker 故障诊断，读写失败时记日志
+  last_words/&lt;run_id&gt;/replica-&lt;writer_id&gt;/
+    model/
+    cursors/replica-&lt;id&gt;/
+    coordinator-binding.json
+    manifest.json
+    publication.json
+    service-result.json
+</code></pre>
+<p>游标沿用 TorchFT 每步异步上传，只在 future 成功并完成持久化后发布。已结束且仅包含存储错误的游标上传可以使用旧成功游标；未结束的 staging、通信错误、模型保存失败不能这样回退。只选当前启动分支及明确绑定的恢复 anchor；游标不能晚于模型，但允许落后，因此可能重读数据，不承诺逐样本恰好一次或恢复轨迹逐位一致。</p>
+<p>不完整目录保留诊断价值，但不能凭 manifest 或 publication 可见认定 service 已确认成功。旧 checkpoint 中的 ack 文件不影响加载，也不作为加载条件。service 成功表示保存和预检已经完成，不保证所有进程都收到最终响应后外部平台才结束进程。分片范围预检识别缺失、截断和路径越界，不是内容 checksum。目录 fsync 失败后文件仍可能可见，不能据此声称断电持久性。</p>
+<p>需要再训练时，外部先确认旧作业收尾，再独立启动新作业。保留现有 checkpoint 加载能力：可设置 <code>--fault-tolerance.last-words.resume-path</code> 指定已核验候选，未指定时选择兼容已发布候选或周期 checkpoint。加载不创建新进程；正步数加载要求完整状态及恢复链，旧或 schema 不匹配工件拒绝加载。writer 的 rank 0 收到与本次授权匹配的成功裁决后，将其原子写入候选目录的 <code>service-result.json</code>，同步文件及目录后，与同一 writer 的其他 rank 在已有控制进程组汇合，再结束保存。心跳先收到成功裁决时，训练线程复用该结果，仍执行回执和汇合步骤。自动选择要求裁决与授权的 run ID、service 实例、round 和 writer 身份一致，并检查 publication 和 DCP。外部平台在正常收尾前应等待该文件可见。若 writer 在 service 成功后未能写回裁决，可以将该次 service 私有目录中已核实的成功 <code>result.json</code> 复制为候选的 <code>service-result.json</code>。</p>
+<p>自动续训合并同一 replica 各 rank 枚举到的周期目录和遗言 manifest。发现与本作业配置匹配的正步数遗言或周期 checkpoint 后，会优先保留已提交的训练进度。若回执、模型分片或游标恢复链校验失败，会继续查找有效的正步数恢复点。例如，周期 <code>step-8</code> 的游标均不可用时，可以回退到有效的 <code>step-4</code>；若只剩 <code>step-0</code> 或没有可用恢复点，启动会报出失败候选的路径和原因。只有初态的新作业可以正常启动，也可以显式指定 <code>--checkpoint.load-step 0</code> 加载初态。</p>
+<p>恢复周期 checkpoint 时，同一副本先合并各 rank 列出的游标候选，再按恢复顺序逐个核对。若最新游标仅部分 rank 可见，但有各 rank 都能验证的较早游标，则保留原模型步数并加载该共同游标。核实原 service 成功后，缺回执的 v1 候选可通过 <code>--fault-tolerance.last-words.resume-path</code> 显式加载；v2 候选必须先补齐匹配的成功回执。外部候选的游标导入后作为不可变 anchor，供后续周期 checkpoint 引用。</p>
+<p>训练最后一步默认只导出模型权重。需要从最后一步续训时，设置 <code>--checkpoint.no-last-save-model-only</code>，让最终保存包含完整训练状态和恢复绑定。</p>
+<p>自动和显式加载都只接受遗言 manifest 版本 1 和 2。每个逻辑 replica 的游标必须对应自己的 <code>cursors/replica-&lt;id&gt;/</code>，各 shard 的 RNG 设备类型必须与本次训练一致。显式指定的候选校验失败时会报错，自动选择则继续检查其他候选。</p>
+<p>新作业使用版本化的恢复签名，按 FSDP/EP 实际拓扑参数绑定并行布局；模型、数据、优化器和调度器配置仍参与匹配。在支持的 DeepSeek-V4 TorchFT 配置（CP=1）下，加载器也识别旧版压缩器含 <code>carry_exchange</code> 时生成的配置签名。它按本次作业的完整配置重建该签名，仍会校验并行拓扑、数据配置和模型状态。恢复成功后，新游标和后续 checkpoint 沿用已加载的签名，使同一条恢复链可以继续保存和加载。</p>
+<p>新保存的游标与 checkpoint 还记录分词器资产的 SHA-256。相同资产可以迁移目录，改变生效的词表、分词规则或配置会使对应候选失去恢复资格。旧 checkpoint 缺少该摘要时仍按原规则校验，部署方需确认分词器与保存时一致。从旧 checkpoint 续训后，新产物会记录本次使用的资产摘要。</p>
+<p>空间清理由部署方负责。不要删除仍被 <code>last_words_binding.json</code> 引用的游标、anchor 或候选。本功能不再提供自动清理、迁移或容量准入脚本。</p>
+<h2 id="_5">验证入口</h2>
+<p>CPU 单测覆盖正常训练收尾、唯一 writer 授权、遗言 checkpoint 成功保存与续训加载。跨主机 HCCL 和 NPU 训练需在相应硬件上验证。</p>
+<pre><code class="language-bash">python -m pytest tests/unit_tests/extensions/torchtitan/experiments/torchft
+</code></pre>
+<p>四卡用例 <code>dsv4_torchft_last_words_emergency_save_2x2</code> 在安全边界注入进程退出，逐 rank 核验唯一 writer 完成最终 barrier，并等待其 torchrun 以退出码 0 结束。测试 runner 随后启动新作业，检查完整训练状态、各副本游标及 RNG 的恢复结果，并验证续训提交。<code>dsv4_torchft_last_words_numerical_2x2</code> 从统一初态比较基线、遗言关闭和遗言开启三组结果。当前版本的实测范围记录在 PR 中。</p>
+<p>未配置独立基线时，suite 跳过精度用例，故障保存用例仍可运行。精度用例通过 <code>LAST_WORDS_BASELINE_REPO</code> 指定本次修复前的基线源码（<code>324ecaf27c70ed8c3cbe7944ed40ae584c5e74d3</code>）。支持该提交的干净 Git 工作树或完整源码归档；启动训练前会核验 <code>torchtitan_npu</code> 下全部 Python 文件的路径和内容。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../torch_compile/" class="btn btn-neutral float-left" title="torch.compile 与 AscendC AutoFuse 特性"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../torchft_preemption/" class="btn btn-neutral float-right" title="TorchFT 计划抢占">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../torch_compile/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../torchft_preemption/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

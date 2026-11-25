@@ -117,6 +117,10 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torchft_last_words/">TorchFT 遗言保存</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torchft_preemption/">TorchFT 计划抢占</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
                   </li>
               </ul>
@@ -202,6 +206,8 @@
 <p>无需在当前 shell 中重复执行 <code>source</code>。</p>
 <h2 id="_3">启动训练任务</h2>
 <p>DeepSeek V3 单卡训练任务可直接使用 <code>scripts/run_train.sh</code> 启动。<code>scripts/run_train.sh</code> 默认使用 1 张 NPU 和 <code>deepseek_v3_debugmodel</code> 配置，并把额外命令行参数原样透传给训练入口。</p>
+<p>使用 DeepSeek-V4 Flash TorchFT 遗言功能时，先独立启动 Lighthouse 与遗言 service，再为各 replica 配置凭据及 <code>--fault-tolerance.last-words.enable</code>。训练入口仍使用普通 torchrun，<code>NGPU</code> 表示当前节点为该 replica 启动的进程数；配置见 <a href="../../feature_guides/torchft_last_words/#启动方式">TorchFT 遗言指南</a>。</p>
+<p>每个 replica 的 FSDP/EP 分片跨机器时，在该 replica 的每个节点分别启动 <code>run_train_multinodes.sh</code>，在各节点设置相同的 <code>NODE_IPS</code>（仅列出该 replica 的节点 IP，按节点顺序排列）和 <code>MASTER_PORT</code>。脚本按本机 IP 在列表中的位置计算 <code>NODE_RANK</code>，默认以首节点为 <code>MASTER_ADDR</code>。遗言 service 只协调一次保存，不托管节点进程、不重新拉起训练或替换失败的 writer；拓扑示例见同一指南。</p>
 <h3 id="_4">单卡训练任务</h3>
 <p>以下示例在默认配置上显式启用实数 RoPE 兼容实现，避免对复数 RoPE cache 进行位置索引：</p>
 <pre><code class="language-bash">NGPU=1 \

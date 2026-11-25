@@ -141,6 +141,10 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../feature_guides/torch_compile/">torch.compile 与 AscendC AutoFuse 特性</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../feature_guides/torchft_last_words/">TorchFT 遗言保存</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../feature_guides/torchft_preemption/">TorchFT 计划抢占</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
                   </li>
               </ul>
@@ -265,6 +269,8 @@ tests/           CPU UT、NPU ST 与 tooling 自测
 <h3 id="extensions">extensions</h3>
 <p><code>extensions/torchtitan/</code> 放镜像上游结构的 monkey-patch 激活模块；新增替换必须声明 owner 和顺序。现有 <code>MetricsProcessor.log</code>、<code>CheckpointManager</code> 与 <code>ConfigManager._load_config</code> 的多层包装保留为历史例外，包装顺序由对应测试保护，本轮不合并其业务行为。<code>extensions/components/</code> 放带声明名称的自包含集成；当前 TrainerEx、checkpoint extension 和 DeepSeek-V4.1 配置仍存在组件顶层接线或反向使用，这是迁移债务，不是新组件约束。<code>extensions/compile/</code> 放 graph-pass 注册基础设施和具体 pattern。</p>
 <p><code>extensions/</code> 当前还包含 <code>adaptor/</code>、<code>cpu_offload/</code>、<code>distributed/</code>、<code>mx_storage_reader/</code>、<code>novaswap/</code> 与 <code>experiment/</code>。其中仅包入口显式列出的模块自动加载；其余目录由调用路径按需导入。各目录的职责和加载方式见 <a href="../torchtitan_npu/extensions/AGENTS.md">extensions 规则</a>。</p>
+<p>TorchFT 遗言协调 service 只维护保存状态与授权，独立网络端点采用双向 TLS；单机可使用 loopback HTTP。训练由各节点的普通 torchrun 启动，作业生命周期由用户或外部调度平台管理。service 不使用 SSH、不启动或重新拉起进程；一次故障只授权一个完整健康 replica 保存，writer 失败后结束会话，不再重选。</p>
+<p>TorchFT 遗言 service、worker 和配套 checkpoint 实现随 <code>extensions/torchtitan/experiments/torchft/last_words/</code> 分发。service 通过文件入口和同目录轻量加载启动，避免触发训练包的初始化；worker 在训练进程内维护心跳和安全边界。<code>tests/integration_tests/</code> 保留标准 runner 所需的测试定义、训练辅助和模型配置，验证机专用 Docker/NPU 审计工具不随仓库分发。</p>
 <p><code>extensions/torchtitan/config/override.py</code> 是 <code>apply_overrides</code> 配置观察包装的唯一 owner，在 EP process-group 扩展之后、trainer 扩展之前激活，并刷新已加载的 config、trainer、TorchFT 同名捕获绑定。它委托 <code>patches/torchtitan/config/override.py</code> 中的 TorchTitan v0.3.0 补丁执行替换并合并 <code>[Override]</code> 成功日志，在扩展里保留零命中候选、解析失败/冲突分类以及最终 Config owner、量化和几何汇总。<code>[Override configured]</code> 仅表示构建前选定实现，不表示设备 kernel 已执行；不修改工厂执行次数或张量计算。</p>
 <h3 id="overridemodels-ops">override、models 与 ops</h3>
 <p>override 使用 <code>@override</code> 注册并由完整 <code>module.function</code> 选择；它保持输入输出、DTensor、sharding、checkpoint 与 <code>torch.compile</code> 语义。依赖 extension 的 override 显式声明此前提；extension 禁用时 warn-once 是禁用开关落地后的目标行为。</p>
