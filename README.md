@@ -42,7 +42,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 - [Apr. 2026]: 🚀 **torchtitan‑npu 正式开源**：在 NPU 上支持 4D 并行等 torchtitan 原生特性，并引入 Virtual Optimizer 等 NPU 亲和优化。
 
 ***
-* [torchtitan-npu 0day 支持 DeepSeek-V4 续训练，助力训练场景轻松入图，开箱即优](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v4_torchtitan_npu_autofuse.md)
+* [torchtitan-npu 0day 支持 DeepSeek-V4 续训练，助力训练场景轻松入图，开箱即优](https://gitcode.com/cann/cann-recipes-docs/blob/master/train/llm_pretrain/deepseek_v4/zh/deepseek-v4_torchtitan_npu_autofuse.md)
 
 # Roadmap
 
