@@ -354,7 +354,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `lightning_indexer.asc` | `InnerIndexer.Config` | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
 | `lightning_indexer.pypto` | `InnerIndexer.Config` | `PyPTOInnerIndexer.Config` | 与 `lightning_indexer.asc` 同一契约的 PyPTO 实现；需额外安装与当前 CANN 匹配的 `pypto` runtime |
 | `lightning_indexer.pypto_pro` | `InnerIndexer.Config` | `PyPTOProInnerIndexer.Config` | PyPTO-Pro 实现的 LI 选分与 SLIKG 反向；同样需 `pypto` runtime |
-| `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
+| `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用融合算子 `cann_ops_transformer.mhc_pre_sinkhorn`（A3/A5 统一） |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
 | `mhc.triton_hc_pre` | `HcPre.Config` | `TritonHcPre.Config` | 使用 `mhc_pre_sinkhorn_op` + `mhc_pre_bmm_op` |

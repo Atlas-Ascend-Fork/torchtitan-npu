@@ -119,12 +119,12 @@ def test_forward_omits_hf32_on_legacy_schema(monkeypatch):
     ascendc._mhc_pre_sinkhorn_accepts_hf32.cache_clear()
 
     hc_pre = _make_hc_pre()
-    h_in, h_post, h_res = hc_pre._forward_fused(torch.randn(2, 3, 8))
+    h_in, h_post, h_res = hc_pre.forward(torch.randn(2, 3, 8))
 
     assert calls == [{}]
     assert h_in.shape == (2, 3, 8)
     assert h_post.shape == (2, 3, 2)
-    assert h_res.shape == (2, 3, 4)
+    assert h_res.shape == (2, 3, 2, 2)
 
 
 def test_forward_follows_aclnn_hf32_on_new_schema(monkeypatch):
@@ -140,11 +140,11 @@ def test_forward_follows_aclnn_hf32_on_new_schema(monkeypatch):
 
     monkeypatch.setattr(torch_npu.npu.aclnn, "allow_hf32", False, raising=False)
     hc_pre = _make_hc_pre()
-    hc_pre._forward_fused(torch.randn(2, 3, 8))
+    hc_pre.forward(torch.randn(2, 3, 8))
     assert calls == [{"enable_hf32": False}]
 
     monkeypatch.setattr(torch_npu.npu.aclnn, "allow_hf32", True, raising=False)
-    hc_pre._forward_fused(torch.randn(2, 3, 8))
+    hc_pre.forward(torch.randn(2, 3, 8))
     assert calls[-1] == {"enable_hf32": True}
 
 

@@ -136,17 +136,28 @@ def test_setup_context_accepts_keyword_only_inputs():
         def save_for_backward(self, *tensors):
             self.saved = tensors
 
+        def set_materialize_grads(self, enabled):
+            self.materialize_grads = enabled
+
+        def mark_non_differentiable(self, *tensors):
+            self.non_differentiable = tensors
+
     ctx = _Context()
     inputs = [torch.zeros(1) for _ in range(4)] + [2, 3, 1e-6, 2e-6, True, None]
+    output = [torch.zeros(1) for _ in range(8)]
     mhc_ops._mhc_pre_sinkhorn_setup_context(
         ctx=ctx,
         inputs=inputs,
         keyword_only_inputs={"enable_hf32": True},
-        output=[torch.zeros(1) for _ in range(8)],
+        output=output,
     )
 
     assert ctx.hc_eps == pytest.approx(1e-6)
     assert len(ctx.saved) == 9
+    # The trailing five outputs are backward-only bookkeeping: the
+    # registration must stop PyTorch from materializing their gradients.
+    assert ctx.materialize_grads is False
+    assert ctx.non_differentiable == tuple(output[3:])
 
 
 @pytest.mark.parametrize(

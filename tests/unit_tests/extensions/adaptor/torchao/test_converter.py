@@ -1064,3 +1064,38 @@ def test_selective_ac_save_op_hooks_deduplicate_repeated_logs(converter_module, 
     assert "not registered: cann_ops_transformer.lightning_indexer.default" in block_logs[0]
     assert "not registered:" not in block_logs[1]
     assert len(hif8_logs) == 1
+
+
+def test_selective_ac_save_block_ops_level2_tracks_fused_mhc_pre(converter_module, monkeypatch):
+    """Level 2 must save the ops the mHC forward actually dispatches.
+
+    The unified AscHcPre forward runs ``cann_ops_transformer.mhc_pre_sinkhorn``
+    on both A3 and A5, so that op has to be on the level-2 save list while the
+    now caller-less split-only ``npu.npu_mhc_pre`` must not be.
+    """
+    from torchtitan.distributed import activation_checkpoint as ac
+
+    from torchtitan_npu.extensions.adaptor.torchao import param_swaps
+
+    monkeypatch.setattr(ac, "_get_default_save_ops", lambda: set())
+    monkeypatch.setattr(converter_module, "_AC_BLOCK_OPS_PATCHED", [False])
+
+    resolved_ops: dict[str, object] = {
+        "cann_ops_transformer.mhc_pre_sinkhorn.default": object(),
+        "cann_ops_transformer.mhc_post.default": object(),
+        "npu.npu_mhc_sinkhorn.default": object(),
+    }
+    requested: list[str] = []
+
+    def _fake_resolve(path):
+        requested.append(path)
+        return resolved_ops.get(path)
+
+    monkeypatch.setattr(param_swaps, "_resolve_torch_op", _fake_resolve)
+
+    converter_module._save_block_ops_under_selective_ac(2)
+    ops = ac._get_default_save_ops()
+
+    assert "cann_ops_transformer.mhc_pre_sinkhorn.default" in requested
+    assert "npu.npu_mhc_pre.default" not in requested
+    assert set(ops) == set(resolved_ops.values())

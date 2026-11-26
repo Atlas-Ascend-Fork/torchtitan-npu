@@ -89,7 +89,7 @@ _BLOCK_SAVE_OPS = (
     (1, "cann_ops_transformer.sparse_flash_mla.default"),
     (1, "cann_ops_transformer.lightning_indexer.default"),
     # 2: mHC
-    (2, "npu.npu_mhc_pre.default"),
+    (2, "cann_ops_transformer.mhc_pre_sinkhorn.default"),
     (2, "cann_ops_transformer.mhc_post.default"),
     (2, "npu.npu_mhc_sinkhorn.default"),
     # 3: MoE routing

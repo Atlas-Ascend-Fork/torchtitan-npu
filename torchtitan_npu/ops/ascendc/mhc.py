@@ -79,6 +79,12 @@ def _mhc_pre_sinkhorn_setup_context(ctx, inputs, output, keyword_only_inputs=Non
     # (x, phi, alpha, bias, hcMult, numIters, hcEps, normEps, outFlag); the
     # optional tail appended after ``outFlag`` never shifts it.
     ctx.hc_eps = inputs[6]
+    # The trailing five outputs are backward-only bookkeeping that the
+    # autograd graph never consumes. With the default materialization PyTorch
+    # launches a ZerosLike for every unconsumed output on each backward
+    # (+5 per iteration), so stop it and let the backward stand None grads in.
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(*output[3:])
 
 
 def _mhc_pre_sinkhorn_backward(ctx, grad_h_in, grad_h_post, grad_h_res, *_):
@@ -93,6 +99,15 @@ def _mhc_pre_sinkhorn_backward(ctx, grad_h_in, grad_h_post, grad_h_res, *_):
         sum_out,
         norm_out,
     ) = ctx.saved_tensors
+
+    # Materialization is off, so the gradients of outputs the graph does not
+    # consume arrive as None; the kernel contract needs zero stand-ins.
+    if grad_h_in is None:
+        grad_h_in = torch.zeros((*x.shape[:-2], x.shape[-1]), dtype=x.dtype, device=x.device)
+    if grad_h_post is None:
+        grad_h_post = torch.zeros_like(h_pre)
+    if grad_h_res is None:
+        grad_h_res = torch.zeros(*x.shape[:2], x.shape[2] * x.shape[2], dtype=h_pre.dtype, device=h_pre.device)
 
     grad_x, grad_phi, grad_alpha, grad_bias = torch.ops.cann_ops_transformer.mhc_pre_sinkhorn_backward(
         grad_h_in,

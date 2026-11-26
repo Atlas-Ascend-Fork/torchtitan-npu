@@ -29,7 +29,7 @@ from .triton import TritonHcHead, TritonHcPost, TritonHcPre
 @override(
     target=HcPre.Config,
     exact=True,
-    description="NPU DeepSeek-V4 HcPre with A3 fused and A5 split operators",
+    description="NPU fused DeepSeek-V4 HcPre via cann_ops_transformer.mhc_pre_sinkhorn",
 )
 def asc_hc_pre(cfg: HcPre.Config) -> AscHcPre.Config:
     return derive(cfg, AscHcPre.Config)
