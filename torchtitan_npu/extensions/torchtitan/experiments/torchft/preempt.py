@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This source code is licensed under the BSD-style license found in LICENSE.
 
-"""Node launcher and control client for native Lighthouse planned preemption."""
+"""Node launcher for native Lighthouse planned preemption."""
 
 import argparse
-import errno
 import json
 import os
 import shutil
@@ -21,10 +20,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 _REQUEST_TIMEOUT = 10.0
-_STATUS_RETRY_SECONDS = 30.0
 
 
-def _request(action, params, timeout):
+def send_request(action, *, timeout=_REQUEST_TIMEOUT, **params):
+    """Send one authenticated Lighthouse request. The caller owns retries."""
     url = os.environ["TORCHFT_LIGHTHOUSE"].rstrip("/") + "/preemption"
     headers = {"Authorization": "Bearer " + os.environ["TORCHFT_PREEMPT_TOKEN"], "Content-Type": "application/json"}
     req = Request(url, data=json.dumps({"action": action, **params}).encode(), headers=headers)
@@ -37,51 +36,12 @@ def _request(action, params, timeout):
         raise RuntimeError(f"Lighthouse {action}: {error.code} {error.read().decode()}") from error
 
 
-def control(action, *, retry_status=True, **params):
-    """Retry read-only polling across a short Lighthouse transport outage."""
-    if action != "status" or not retry_status:
-        return _request(action, params, _REQUEST_TIMEOUT)
-
-    started = time.monotonic()
-    deadline = started + _STATUS_RETRY_SECONDS
-    last_error = None
-    while (remaining := deadline - time.monotonic()) > 0:
-        try:
-            state = _request(action, params, min(_REQUEST_TIMEOUT, remaining))
-        except (OSError, IncompleteRead) as error:
-            cause = error.reason if isinstance(error, URLError) else error
-            if not isinstance(cause, (ConnectionError, TimeoutError, IncompleteRead)) and getattr(
-                cause, "errno", None
-            ) not in (errno.ENETUNREACH, errno.EHOSTUNREACH, socket.EAI_AGAIN):
-                raise
-            if last_error is None:
-                print(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S %z')} Lighthouse status unreachable "
-                    f"at {os.environ['TORCHFT_LIGHTHOUSE']} ({error}); retrying for up to {_STATUS_RETRY_SECONDS}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            last_error = error
-            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-        else:
-            if last_error is not None:
-                elapsed = time.monotonic() - started
-                print(f"Lighthouse status recovered after {elapsed:.1f}s", file=sys.stderr, flush=True)
-            return state
-    raise TimeoutError(
-        f"Lighthouse status at {os.environ['TORCHFT_LIGHTHOUSE']} unavailable for "
-        f"{time.monotonic() - started:.1f}s; last error: {last_error}"
-    ) from last_error
-
-
 def launcher_control(action, *, child=None, **params):
-    if action == "status":
-        params["retry_status"] = False
     delay = 0.25
     failures = 0
     while True:
         try:
-            result = control(action, **params)
+            result = send_request(action, **params)
             if failures:
                 print(f"Lighthouse {action} recovered", file=sys.stderr, flush=True)
             return result
@@ -246,28 +206,18 @@ def launch(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("status")
-    s = sub.add_parser("suspend")
-    s.add_argument("--request", required=True)
-    s.add_argument("--cards", type=int, required=True)
-    s.add_argument("--node")
-    for action in ("resume", "retry", "cancel"):
-        sub.add_parser(action).add_argument("--request", required=True)
     worker = sub.add_parser("launch")
     worker.add_argument("--replica", type=int, required=True)
     worker.add_argument("--node", default=socket.gethostname())
     worker.add_argument("--state-dir", required=True)
     worker.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.action == "launch":
 
-        def terminate(signum, frame):
-            raise SystemExit(128 + signum)
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
 
-        signal.signal(signal.SIGTERM, terminate)
-        launch(args)
-    else:
-        print(json.dumps(control(**vars(args), retry_status=False), indent=2))
+    signal.signal(signal.SIGTERM, terminate)
+    launch(args)
 
 
 if __name__ == "__main__":

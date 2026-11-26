@@ -15,10 +15,20 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-_PATH = Path(__file__).resolve().parents[6] / "torchtitan_npu/extensions/torchtitan/experiments/torchft/preempt.py"
-_SPEC = importlib.util.spec_from_file_location("torchft_preemption_cli", _PATH)
-preempt = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(preempt)
+_ROOT = Path(__file__).resolve().parents[6]
+_LAUNCHER = _ROOT / "torchtitan_npu/extensions/torchtitan/experiments/torchft/preempt.py"
+_SCHEDULER = _ROOT / "tests/integration_tests/torchft_preemption.py"
+
+
+def load_script(path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+preempt = load_script(_LAUNCHER)
+scheduler = load_script(_SCHEDULER)
 
 
 @pytest.mark.parametrize(
@@ -81,7 +91,7 @@ def test_unplanned_exit_does_not_release_cards(tmp_path, monkeypatch):
         calls.append(action)
         return {"lease": None}
 
-    monkeypatch.setattr(preempt, "control", status)
+    monkeypatch.setattr(preempt, "send_request", status)
     child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
     child.wait(timeout=10)
     with pytest.raises(RuntimeError, match="Unplanned torchrun exit 3"):
@@ -95,12 +105,12 @@ def test_supervise_keeps_training_through_status_disconnect(tmp_path, monkeypatc
     # The child stays alive throughout the outage and exits after connectivity returns.
     child.poll.side_effect = lambda: 0 if status.call_count >= 2 else None
     stop = Mock()
-    monkeypatch.setattr(preempt, "control", status)
+    monkeypatch.setattr(preempt, "send_request", status)
     monkeypatch.setattr(preempt, "stop_local", stop)
     monkeypatch.setattr(preempt.time, "sleep", lambda _: None)
 
     assert preempt.supervise(child, tmp_path, "torchtitan_ft_0", "node-a") is False
-    assert status.call_args_list == [call("status", retry_status=False), call("status", retry_status=False)]
+    assert status.call_args_list == [call("status"), call("status")]
     stop.assert_not_called()
 
 
@@ -133,7 +143,7 @@ def test_supervise_retries_release_for_registered_instance(tmp_path, monkeypatch
             raise URLError("temporarily unavailable")
         return {"lease": {**lease, "phase": "released", "receipts": [[slot, "node-b"]]}}
 
-    monkeypatch.setattr(preempt, "control", control)
+    monkeypatch.setattr(preempt, "send_request", control)
     monkeypatch.setattr(preempt, "stop_local", lambda child, directory: events.append("stopped"))
     monkeypatch.setattr(preempt.time, "sleep", lambda _: None)
 
@@ -156,12 +166,12 @@ def test_supervise_ignores_drain_for_an_older_instance(tmp_path, monkeypatch):
     child = Mock(returncode=0)
     child.poll.side_effect = lambda: 0 if status.call_count >= 2 else None
     stop = Mock()
-    monkeypatch.setattr(preempt, "control", status)
+    monkeypatch.setattr(preempt, "send_request", status)
     monkeypatch.setattr(preempt, "stop_local", stop)
     monkeypatch.setattr(preempt.time, "sleep", lambda _: None)
 
     assert preempt.supervise(child, tmp_path, slot, "node-b") is False
-    assert status.call_args_list == [call("status", retry_status=False), call("status", retry_status=False)]
+    assert status.call_args_list == [call("status"), call("status")]
     stop.assert_not_called()
 
 
@@ -194,7 +204,7 @@ def test_launcher_restart_finishes_drain_before_starting_new_instance(tmp_path, 
         return status
 
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2")
-    monkeypatch.setattr(preempt, "control", control)
+    monkeypatch.setattr(preempt, "send_request", control)
     monkeypatch.setattr(preempt, "stop_local", cleanup)
     monkeypatch.setattr(preempt.time, "sleep", lambda _: None)
     monkeypatch.setattr(preempt.subprocess, "Popen", popen)
@@ -256,7 +266,7 @@ Path(sys.argv[2]).touch()
 
 def test_status_outage_expires_with_last_error(monkeypatch):
     monkeypatch.setenv("TORCHFT_LIGHTHOUSE", "http://lighthouse")
-    monkeypatch.setattr(preempt, "_STATUS_RETRY_SECONDS", 2.5)
+    monkeypatch.setattr(scheduler, "_STATUS_RETRY_SECONDS", 2.5)
     now = 0.0
     timeouts = []
 
@@ -264,14 +274,16 @@ def test_status_outage_expires_with_last_error(monkeypatch):
         nonlocal now
         now += seconds
 
-    def refused(action, params, timeout):
+    def refused(action, *, timeout):
         timeouts.append(timeout)
         raise URLError(ConnectionRefusedError("still down"))
 
-    monkeypatch.setattr(preempt, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep, strftime=lambda _: "now"))
-    monkeypatch.setattr(preempt, "_request", refused)
+    monkeypatch.setattr(
+        scheduler, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep, strftime=lambda _: "now")
+    )
+    monkeypatch.setattr(scheduler, "send_request", refused)
     with pytest.raises(TimeoutError, match=r"unavailable for 2\.5s; last error: .*still down"):
-        preempt.control("status")
+        scheduler.control("status")
     assert timeouts == [2.5, 1.5, 0.5]
 
 
@@ -288,6 +300,32 @@ def test_http_errors_and_failed_writes_are_reported_immediately(action, monkeypa
         raise URLError(ConnectionRefusedError("refused"))
 
     monkeypatch.setattr(preempt, "urlopen", fail)
+    monkeypatch.setattr(scheduler, "send_request", preempt.send_request)
     with pytest.raises((RuntimeError, URLError), match=r"401 invalid token|refused"):
-        preempt.control(action)
+        scheduler.control(action)
     assert calls == [action]
+
+
+@pytest.mark.parametrize(
+    ("args", "payload"),
+    [
+        (["status"], {"action": "status"}),
+        (
+            ["suspend", "--request", "job", "--cards", "4", "--node", "node-b"],
+            {"action": "suspend", "request": "job", "cards": 4, "node": "node-b"},
+        ),
+        (["resume", "--request", "job"], {"action": "resume", "request": "job"}),
+        (["retry", "--request", "job"], {"action": "retry", "request": "job"}),
+        (["cancel", "--request", "job"], {"action": "cancel", "request": "job"}),
+    ],
+)
+def test_scheduler_cli_sends_one_lighthouse_command(args, payload, monkeypatch, capsys):
+    send = Mock(return_value={"ok": True})
+    monkeypatch.setattr(scheduler, "send_request", send)
+    monkeypatch.setattr(sys, "argv", [str(_SCHEDULER), *args])
+
+    scheduler.main()
+
+    action = payload["action"]
+    send.assert_called_once_with(action, **{k: v for k, v in payload.items() if k != "action"})
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
