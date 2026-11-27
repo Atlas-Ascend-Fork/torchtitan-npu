@@ -203,7 +203,8 @@
 read -rs -p 'TorchFT job token: ' TORCHFT_PREEMPT_TOKEN
 echo
 export TORCHFT_PREEMPT_TOKEN
-PREEMPT=torchtitan_npu/extensions/torchtitan/experiments/torchft/preempt.py
+LAUNCHER=torchtitan_npu/extensions/torchtitan/experiments/torchft/preempt.py
+CONTROL=tests/integration_tests/torchft_preemption.py
 JOB_DIR=&quot;$PWD/outputs/preempt-demo&quot;
 mkdir -p &quot;$JOB_DIR&quot;
 </code></pre>
@@ -218,14 +219,14 @@ cat &gt; &quot;$TORCHFT_PREEMPT_LAYOUT&quot; &lt;&lt;'JSON'
 JSON
 torchft_lighthouse --bind node-a:29920 --min_replicas 1 --join_timeout_ms 5000
 </code></pre>
-<p>保持 Lighthouse 运行，在另一终端执行 <code>python "$PREEMPT" status</code>。返回的 <code>layout</code> 应与文件内容一致。此时 <code>quorum</code> 可以为空。连接失败时检查监听地址和端口；HTTP 401 时核对 token；HTTP 404 时核对运行 Lighthouse 的 wheel 以及启动进程时是否设置了 <code>TORCHFT_PREEMPT_LAYOUT</code>。</p>
+<p>保持 Lighthouse 运行，在另一终端执行 <code>python "$CONTROL" status</code>。返回的 <code>layout</code> 应与文件内容一致。此时 <code>quorum</code> 可以为空。连接失败时检查监听地址和端口；HTTP 401 时核对 token；HTTP 404 时核对运行 Lighthouse 的 wheel 以及启动进程时是否设置了 <code>TORCHFT_PREEMPT_LAYOUT</code>。</p>
 <h2 id="_2">启动训练</h2>
 <p>两个训练节点各运行一个 launcher。将下面头两行在 <code>node-a</code> 设为 <code>REPLICA=0</code>、<code>NODE=node-a</code>，在 <code>node-b</code> 设为 <code>REPLICA=1</code>、<code>NODE=node-b</code>。每个副本都在一台机器内组成独立的 torchrun 作业。训练开关 <code>fault_tolerance.enable_preemption</code> 默认关闭；启用时，由 launcher 给每次拉起的训练进程注入本地登记目录 <code>TT_PREEMPT_LOCAL</code> 和逻辑副本名 <code>TT_PREEMPT_SLOT</code>。</p>
 <pre><code class="language-bash">REPLICA=0
 NODE=node-a
 export ASCEND_RT_VISIBLE_DEVICES=0,1
 export TRITON_NPU_COMPILER_PATH=&quot;${TRITON_NPU_COMPILER_PATH:-$ASCEND_HOME_PATH/tools/bisheng_compiler/bin}&quot;
-python &quot;$PREEMPT&quot; launch --replica &quot;$REPLICA&quot; --node &quot;$NODE&quot; --state-dir &quot;$JOB_DIR/workers&quot; -- \
+python &quot;$LAUNCHER&quot; launch --replica &quot;$REPLICA&quot; --node &quot;$NODE&quot; --state-dir &quot;$JOB_DIR/workers&quot; -- \
   torchrun --nnodes=1 --node-rank=0 --nproc-per-node=2 --max-restarts=0 \
   --rdzv-backend=static --master-addr=&quot;${NODE_IP:-$NODE}&quot; --master-port=&quot;$((29921 + REPLICA))&quot; \
   -m torchtitan_npu.train \
@@ -244,13 +245,19 @@ python &quot;$PREEMPT&quot; launch --replica &quot;$REPLICA&quot; --node &quot;$
 <p><code>group-size</code> 统计 TorchFT 副本数，<code>nproc-per-node</code> 统计当前 torchrun 作业在本节点的 rank 数。TorchFT 会向对端公布本副本的 TCPStore 地址；如果主机名解析到回环地址或管理网卡，设置 <code>NODE_IP</code> 为对端可访问的本机训练网卡 IP。双副本释放一个后还要继续提交训练步，Lighthouse 的 <code>--min_replicas</code> 和训练端的 <code>--fault-tolerance.min-replica-size</code> 均设为 1。保持 launcher 运行，由它负责计划内重新拉起。</p>
 <p>单机运行两个副本时，把两个布局条目都指向同一节点，分配互不重叠的设备列表，并为两个 launcher 分配互不重叠的 <code>HCCL_NPU_SOCKET_PORT_RANGE</code>。一个副本跨多台机器时，在该副本的布局条目中列出所有参与节点，每节点运行一个相同 <code>--replica</code> 的 launcher，并沿用该副本原有的多机 torchrun rendezvous 参数。</p>
 <h2 id="_3">抢占与恢复</h2>
+<p>外部调度器通过 Lighthouse 的 <code>POST /preemption</code> 接口申请和归还资源。请求头使用 <code>Authorization: Bearer &lt;作业 token&gt;</code> 和 <code>Content-Type: application/json</code>。抢占请求示例为 <code>{"action":"suspend","request":"inference-1","cards":2,"node":"node-b"}</code>，归还资源时发送 <code>{"action":"resume","request":"inference-1"}</code>。同一次操作使用相同的请求 ID。</p>
+<p>以下命令使用仓内集成测试工具模拟调度器。节点 launcher 继续通过 <code>preempt.py launch</code> 运行。</p>
 <ol>
-<li>执行 <code>python "$PREEMPT" status</code>，等待 <code>quorum</code> 同时包含 <code>torchtitan_ft_0:&lt;实例 ID&gt;</code> 和 <code>torchtitan_ft_1:&lt;实例 ID&gt;</code>。记录副本 1 的实例 ID。</li>
-<li>执行 <code>python "$PREEMPT" suspend --request inference-1 --cards 2 --node node-b</code>。此例要求在 <code>node-b</code> 释放两张卡，Lighthouse 会选中副本 1。省略 <code>--node</code> 时按整个作业的可释放卡数选择。资源以整个副本为单位释放，实际卡数可能大于申请值。</li>
+<li>执行 <code>python "$CONTROL" status</code>，等待 <code>quorum</code> 同时包含 <code>torchtitan_ft_0:&lt;实例 ID&gt;</code> 和 <code>torchtitan_ft_1:&lt;实例 ID&gt;</code>。记录副本 1 的实例 ID。</li>
+<li>执行 <code>python "$CONTROL" suspend --request inference-1 --cards 2 --node node-b</code>。此例要求在 <code>node-b</code> 释放两张卡，Lighthouse 会选中副本 1。省略 <code>--node</code> 时按整个作业的可释放卡数选择。资源以整个副本为单位释放，实际卡数可能大于申请值。</li>
 <li>用 <code>status</code> 检查 <code>lease.targets</code>。当 <code>lease.phase</code> 变为 <code>released</code>，目标副本各节点均已确认释放，此时可将对应设备交给抢占任务。训练日志应显示副本 0 继续提交。</li>
-<li>抢占任务归还设备后，执行 <code>python "$PREEMPT" resume --request inference-1</code>。目标 launcher 使用原命令重启训练。用 <code>status</code> 确认 <code>lease.phase</code> 为 <code>restored</code>、副本 1 以新的实例 ID 加入 quorum，再从训练日志确认两个副本均已提交新的训练步。</li>
+<li>抢占任务归还设备后，执行 <code>python "$CONTROL" resume --request inference-1</code>。目标 launcher 使用原命令重启训练。用 <code>status</code> 确认 <code>lease.phase</code> 为 <code>restored</code>、副本 1 以新的实例 ID 加入 quorum，再从训练日志确认两个副本均已提交新的训练步。</li>
 </ol>
 <p>同一作业一次处理一个成员变更，下一次抢占使用新的请求 ID。若请求返回 <code>insufficient releasable cards</code>，检查指定节点的设备数，以及保留最少副本后可释放的卡数。</p>
+<p>要自动验证两个单节点副本（可在同一台机器上）的完整流程，可在申请释放设备的节点上执行下列命令。先启动 Lighthouse 和两个 launcher，并预留足够训练步数供副本重新加入。将卡数改为本次申请值，布局中的节点名使用本机主机名。</p>
+<pre><code class="language-bash">python &quot;$CONTROL&quot; verify --cards 2 --after-step 3 --timeout 900 --probe
+</code></pre>
+<p>验证依次检查双副本训练、目标实例退出及节点释放回执、幸存副本单独推进。加上 <code>--probe</code> 后，独立进程会在每张释放的 NPU 上执行计算。工具随后发送 <code>resume</code>，等待新实例加入，并确认两个副本的进度都超过重入时的最高步数。</p>
               
             </div>
           </div><footer>
